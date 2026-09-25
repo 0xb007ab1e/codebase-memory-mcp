@@ -3361,8 +3361,22 @@ TEST(watcher_callback_data_passed) {
 }
 
 TEST(watcher_unwatch_drains_pending_free) {
-    /* Unwatch moves project_state to pending_free; the next poll_once
-     * must drain it without crash or leak. */
+    /* Contract: unwatch parks the project's state on the deferred-free list
+     * (an in-flight poll snapshot may still hold it), and the NEXT poll_once
+     * frees it, exactly once, without admitting index work for the unwatched
+     * project.
+     *
+     * No assertion here depends on a git probe succeeding. The earlier
+     * version asserted as a precondition that one dirty poll reindexed
+     * exactly once, which needs every git subprocess of that poll to
+     * succeed. A transient probe failure (spawn refused under runner load, a
+     * non-zero exit) makes that poll a fail-closed no-op by design (#937:
+     * the baseline stays uncommitted and the next poll retries), so the
+     * precondition read 0 on loaded macos-14 runners. Holding a spawn
+     * failure with cbm_subprocess_force_spawn_eagain_for_testing reproduces
+     * that CI log exactly. Dirty-poll-reindexes stays covered by
+     * watcher_detects_dirty_worktree and watcher_modify_tracked_file; this
+     * test pins the drain itself, through the pending-free seam. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_df_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -3383,28 +3397,35 @@ TEST(watcher_unwatch_drains_pending_free) {
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
     cbm_watcher_watch(w, "df-repo", tmpdir);
     ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    ASSERT_EQ(cbm_watcher_test_pending_free_count(w), 0);
     index_call_count = 0;
 
-    /* Baseline */
+    /* Baseline: the state goes through a poll snapshot. Its outcome is not
+     * asserted; a baseline poll never indexes, whatever git answers. */
     cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 0);
 
-    /* Make dirty + detect change */
+    /* Leave a new dirty state behind: if the unwatched state were still
+     * polled, the next poll would index it. */
     {
         char p[300];
         th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "dirty\n");
     }
     cbm_watcher_touch(w, "df-repo");
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 1);
 
-    /* Unwatch — state moves to pending_free */
+    /* Unwatch: the state leaves the table and is parked, not freed. */
     cbm_watcher_unwatch(w, "df-repo");
     ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    ASSERT_EQ(cbm_watcher_test_pending_free_count(w), 1);
 
-    /* Next poll drains pending_free — no crash, no double-free */
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 1);
+    /* The next poll drains it and admits no index work. */
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(cbm_watcher_test_pending_free_count(w), 0);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* A further poll finds nothing left to free (no double free). */
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(cbm_watcher_test_pending_free_count(w), 0);
+    ASSERT_EQ(index_call_count, 0);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
