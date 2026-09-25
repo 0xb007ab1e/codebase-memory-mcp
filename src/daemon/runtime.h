@@ -301,6 +301,17 @@ bool cbm_daemon_runtime_request_stop(const cbm_daemon_ipc_endpoint_t *endpoint,
                                      uint32_t timeout_ms,
                                      cbm_daemon_runtime_stop_result_t *result_out);
 
+/* #2277: the actionable half of a version/build conflict refusal. The
+ * conflict text itself (cbm_daemon_conflict_format) is wire-validated
+ * byte-for-byte across generations and must not change, so the remedy is a
+ * separate, client-side sentence built from the cross-build STATUS probe:
+ * which daemon holds the endpoint (pid, version, lifetime), which CBM
+ * sessions keep it alive, and how to clear it. active may be NULL when the
+ * status probe did not answer. Returns false (out empty) on truncation. */
+#define CBM_DAEMON_CONFLICT_REMEDY_SIZE 640U
+bool cbm_daemon_conflict_remedy_format(const cbm_daemon_runtime_status_t *active, char *out,
+                                       size_t out_size);
+
 /* Performs the complete guarded first-participant handoff, starts listening
  * synchronously, then owns both that participant claim and its
  * accept/connection threads. All config scalar/text data is copied. endpoint
