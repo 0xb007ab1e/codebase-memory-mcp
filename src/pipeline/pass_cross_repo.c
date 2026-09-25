@@ -1094,15 +1094,13 @@ static int collect_all_projects(char ***out, cr_run_context_t *ctx) {
             failed = true;
             break;
         }
+        /* Internal stores are exact filenames (cbm_is_internal_cache_db).
+         * Substring filtering would hide legitimate projects such as
+         * orders_config_service or api-wal. */
+        if (!cbm_is_project_index_db(ent->name)) {
+            continue;
+        }
         size_t len = strlen(ent->name);
-        if (len < CR_COL_4 || strcmp(ent->name + len - CR_DB_EXT_LEN, ".db") != 0) {
-            continue;
-        }
-        /* Internal stores are exact filenames. Substring filtering would hide
-         * legitimate projects such as orders_config_service or api-wal. */
-        if (strcmp(ent->name, "_cross_repo.db") == 0 || strcmp(ent->name, "_config.db") == 0) {
-            continue;
-        }
         if (count >= CR_MAX_PROJECTS) {
             failed = true;
             break;

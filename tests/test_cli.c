@@ -2285,6 +2285,71 @@ TEST(cli_remove_indexes_deletes_orphan_sqlite_sidecars_issue2054) {
     PASS();
 }
 
+/* The cache directory also holds internal stores next to the project
+ * indexes: the user's settings (_config.db) and the cross-repo store
+ * (_cross_repo.db). Index enumeration treated every *.db as a project, so
+ * install --reset-indexes / uninstall deleted the user's config along with
+ * the indexes, and list/count over-reported. Internal stores are exact
+ * filenames: a real project whose name starts with "_" is still an index. */
+TEST(cli_index_enumeration_skips_internal_cache_dbs) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-internal-dbs-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+
+    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    int set_rc = cfg ? cbm_config_set(cfg, "auto_index", "true") : -1;
+    cbm_config_close(cfg);
+
+    char config_path[640];
+    char cross_path[640];
+    char proj_path[640];
+    char underscore_proj_path[640];
+    snprintf(config_path, sizeof(config_path), "%s/_config.db", cache_dir);
+    snprintf(cross_path, sizeof(cross_path), "%s/_cross_repo.db", cache_dir);
+    snprintf(proj_path, sizeof(proj_path), "%s/proj.db", cache_dir);
+    snprintf(underscore_proj_path, sizeof(underscore_proj_path), "%s/_work-api.db", cache_dir);
+    write_test_file(cross_path, "cross");
+    write_test_file(proj_path, "db");
+    write_test_file(underscore_proj_path, "db");
+
+    int listed = cbm_list_indexes(tmpdir);
+    int removed = cbm_remove_indexes(tmpdir);
+
+    struct stat st;
+    bool config_kept = stat(config_path, &st) == 0;
+    bool cross_kept = stat(cross_path, &st) == 0;
+    bool proj_absent = stat(proj_path, &st) != 0;
+    bool underscore_proj_absent = stat(underscore_proj_path, &st) != 0;
+    char value[32] = "";
+    cfg = cbm_config_open(cache_dir);
+    if (cfg) {
+        snprintf(value, sizeof(value), "%s", cbm_config_get(cfg, "auto_index", ""));
+        cbm_config_close(cfg);
+    }
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(set_rc, 0);
+    ASSERT_EQ(listed, 2);
+    ASSERT_EQ(removed, 2);
+    ASSERT_TRUE(config_kept);
+    ASSERT_TRUE(cross_kept);
+    ASSERT_TRUE(proj_absent);
+    ASSERT_TRUE(underscore_proj_absent);
+    ASSERT_STR_EQ(value, "true");
+    PASS();
+}
+
 TEST(cli_install_config_only_waits_for_cohort_drain) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-install-config-race-XXXXXX");
@@ -16264,6 +16329,7 @@ SUITE(cli) {
     RUN_TEST(cli_activation_commands_reject_malformed_and_unknown_flags);
     RUN_TEST(cli_install_reset_deletion_waits_for_final_activation_guard);
     RUN_TEST(cli_remove_indexes_deletes_orphan_sqlite_sidecars_issue2054);
+    RUN_TEST(cli_index_enumeration_skips_internal_cache_dbs);
     RUN_TEST(cli_install_config_only_waits_for_cohort_drain);
     RUN_TEST(cli_install_config_and_path_finish_before_guard_release);
     RUN_TEST(cli_install_config_failure_keeps_published_binary);
