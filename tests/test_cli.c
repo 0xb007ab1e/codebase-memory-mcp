@@ -7412,6 +7412,109 @@ TEST(cli_tiered_codex_profiles_migrate_preserve_and_uninstall) {
     PASS();
 }
 
+/* The OpenCode subagent profile as v0.10.8 wrote it: today's rendering minus
+ * the tool_search / tool_search_regex permission lines #1933 added in
+ * v0.11.0. Derived by deleting exactly those lines, so the test states the
+ * released bytes without going through any production legacy renderer. */
+static char *opencode_profile_before_tool_search(cbm_graph_tier_t tier) {
+    char *current =
+        cbm_render_graph_profile(CBM_GRAPH_DIALECT_OPENCODE, tier, CBM_GRAPH_ACCESS_DIRECT, NULL);
+    if (!current) {
+        return NULL;
+    }
+    const char *const added[] = {"  tool_search: allow\n", "  tool_search_regex: allow\n"};
+    for (size_t i = 0U; i < sizeof(added) / sizeof(added[0]); i++) {
+        char *at = strstr(current, added[i]);
+        if (!at) {
+            free(current);
+            return NULL;
+        }
+        size_t len = strlen(added[i]);
+        memmove(at, at + len, strlen(at + len) + 1U);
+    }
+    return current;
+}
+
+/* #2264: upgrading v0.10.8 -> v0.11.0 reported all three OpenCode profiles
+ * as "preserved modified profile" + op=agent_install errors and stopped the
+ * activation, although nobody had edited them: the release render changed
+ * and the previous render was not recognised as ours. */
+TEST(cli_tiered_opencode_profiles_migrate_v0108_render) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-tiered-opencode-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {
+        "HOME",           "PATH",      "CODEX_HOME",      "QWEN_HOME",          "COPILOT_HOME",
+        "CLINE_DATA_DIR", "KIRO_HOME", "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    char agents_dir[512];
+    snprintf(agents_dir, sizeof(agents_dir), "%s/.config/opencode/agents", tmpdir);
+    test_mkdirp(agents_dir);
+    char paths[CBM_GRAPH_TIER_COUNT][640];
+    bool seeded = true;
+    for (int t = 0; t < (int)CBM_GRAPH_TIER_COUNT; t++) {
+        cbm_graph_tier_t tier = (cbm_graph_tier_t)t;
+        snprintf(paths[t], sizeof(paths[t]), "%s/%s.md", agents_dir, cbm_graph_tier_slug(tier));
+        char *old = opencode_profile_before_tool_search(tier);
+        seeded = seeded && old != NULL;
+        if (old) {
+            write_test_file(paths[t], old);
+            free(old);
+        }
+    }
+
+    char installed_binary[640];
+    snprintf(installed_binary, sizeof(installed_binary), "%s/.local/bin/codebase-memory-mcp",
+             tmpdir);
+    int install_rc = cbm_install_agent_configs(tmpdir, installed_binary, false, false);
+    bool migrated = true;
+    for (int t = 0; t < (int)CBM_GRAPH_TIER_COUNT; t++) {
+        char *after = read_test_file_alloc(paths[t]);
+        migrated = migrated && after && strstr(after, "  tool_search: allow\n") &&
+                   strstr(after, "  tool_search_regex: allow\n");
+        free(after);
+    }
+
+    /* Uninstall must also recognise the v0.10.8 bytes as ours. */
+    for (int t = 0; t < (int)CBM_GRAPH_TIER_COUNT; t++) {
+        char *old = opencode_profile_before_tool_search((cbm_graph_tier_t)t);
+        if (old) {
+            write_test_file(paths[t], old);
+            free(old);
+        }
+    }
+    char *argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    bool removed = true;
+    struct stat state;
+    for (int t = 0; t < (int)CBM_GRAPH_TIER_COUNT; t++) {
+        removed = removed && stat(paths[t], &state) != 0;
+    }
+
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!seeded)
+        FAIL("v0.10.8 OpenCode profile bytes could not be derived");
+    ASSERT_EQ(install_rc, 0);
+    if (!migrated)
+        FAIL("v0.10.8 OpenCode profiles must be upgraded in place, not preserved as modified");
+    ASSERT_EQ(uninstall_rc, 0);
+    if (!removed)
+        FAIL("uninstall must remove v0.10.8 OpenCode profiles as owned");
+    PASS();
+}
+
 TEST(cli_tiered_vibe_installs_matching_agent_prompt_sets) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-tiered-vibe-XXXXXX");
@@ -16428,6 +16531,7 @@ SUITE(cli) {
     RUN_TEST(cli_warp_installs_shared_skill_without_mcp_or_permissions);
     RUN_TEST(cli_owned_durable_profiles_preserve_user_files);
     RUN_TEST(cli_tiered_codex_profiles_migrate_preserve_and_uninstall);
+    RUN_TEST(cli_tiered_opencode_profiles_migrate_v0108_render);
     RUN_TEST(cli_tiered_vibe_installs_matching_agent_prompt_sets);
     RUN_TEST(cli_tiered_grok_installs_profiles_and_withholds_hooks);
     RUN_TEST(cli_grok_mcp_preserves_foreign_table);
