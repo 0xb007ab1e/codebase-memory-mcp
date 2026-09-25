@@ -769,14 +769,19 @@ typedef struct {
  * left in place, never quarantined or rebuilt — quarantine/rebuild is reserved
  * for write-side opens (index_repository, manage_adr writes). That is what
  * makes readOnlyHint=true honest for them and lets plan-mode clients expose
- * them (the "read-only analysis tools" surface described in #1100). */
+ * them (the "read-only analysis tools" surface described in #1100).
+ * get_file_outline reads through the same resolve_store() path, and
+ * ingest_traces only validates and counts its input (edge creation is not
+ * implemented), so both are read-only too (#2118). Only handlers that write
+ * user-visible state -- index_repository, manage_adr, delete_project -- may
+ * clear readOnlyHint. */
 static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"index_repository", false, false, true, false},
     {"search_graph", true, false, true, false},
     {"query_graph", true, false, true, false},
     {"trace_path", true, false, true, false},
     {"get_code_snippet", true, false, true, false},
-    {"get_file_outline", false, true, true, false},
+    {"get_file_outline", true, false, true, false},
     {"get_graph_schema", true, false, true, false},
     {"compare_graphs", true, false, true, false},
     {"get_architecture", true, false, true, false},
@@ -787,7 +792,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"check_index_coverage", true, false, true, false},
     {"detect_changes", true, false, true, false},
     {"manage_adr", false, true, false, false},
-    {"ingest_traces", false, false, false, false},
+    {"ingest_traces", true, false, true, false},
 };
 
 static const tool_annotation_def_t *mcp_tool_annotations(const char *name) {
