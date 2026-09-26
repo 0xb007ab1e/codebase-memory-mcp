@@ -2723,18 +2723,23 @@ static void project_record_clear(mcp_project_record_t *record) {
     memset(record, 0, sizeof(*record));
 }
 
+/* strcmp that orders NULL like "". */
+static int nullable_strcmp(const char *a, const char *b) {
+    return strcmp(a ? a : "", b ? b : "");
+}
+
 static int project_record_compare(const void *left, const void *right) {
     const mcp_project_record_t *a = left;
     const mcp_project_record_t *b = right;
-    int by_name = strcmp(a->name ? a->name : "", b->name ? b->name : "");
+    int by_name = nullable_strcmp(a->name, b->name);
     if (by_name != 0) {
         return by_name;
     }
-    int by_root = strcmp(a->root_path ? a->root_path : "", b->root_path ? b->root_path : "");
+    int by_root = nullable_strcmp(a->root_path, b->root_path);
     if (by_root != 0) {
         return by_root;
     }
-    return strcmp(a->db_file ? a->db_file : "", b->db_file ? b->db_file : "");
+    return nullable_strcmp(a->db_file, b->db_file);
 }
 
 typedef enum {
@@ -12605,12 +12610,11 @@ static int search_result_cmp(const void *a, const void *b) {
     if (score_order != 0) {
         return score_order;
     }
-    int qn_order = strcmp(ra->qualified_name ? ra->qualified_name : "",
-                          rb->qualified_name ? rb->qualified_name : "");
+    int qn_order = nullable_strcmp(ra->qualified_name, rb->qualified_name);
     if (qn_order != 0) {
         return qn_order;
     }
-    int file_order = strcmp(ra->file ? ra->file : "", rb->file ? rb->file : "");
+    int file_order = nullable_strcmp(ra->file, rb->file);
     if (file_order != 0) {
         return file_order;
     }
