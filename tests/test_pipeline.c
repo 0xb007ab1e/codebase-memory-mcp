@@ -14729,8 +14729,16 @@ TEST(pipeline_python_iris_cls_class_aware_calls) {
     write_temp_file(tmp, "A.cls", cls);
     snprintf(cls, sizeof(cls), "Class Pkg.B Extends %%RegisteredObject\n%s", run_body);
     write_temp_file(tmp, "B.cls", cls);
+    /* A third, unrelated Run: a bare "Run" callee could weak-match it. */
+    write_temp_file(tmp, "util.py",
+                    "def Run(x):\n"
+                    "    return x\n");
     write_temp_file(tmp, "caller.py",
                     "import iris\n"
+                    "\n"
+                    "class Helper:\n"
+                    "    def Run(self, x):\n"
+                    "        return x\n"
                     "\n"
                     "def want_a():\n"
                     "    return iris.cls(\"Pkg.A\").Run(\"x\")\n"
@@ -14763,6 +14771,10 @@ TEST(pipeline_python_iris_cls_class_aware_calls) {
     ASSERT_EQ(iris_cls_calls(s, project, "want_a", NULL), 1);
     ASSERT_EQ(iris_cls_calls(s, project, "want_b", "Pkg.B.Run"), 1);
     ASSERT_EQ(iris_cls_calls(s, project, "want_b", NULL), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_a", "util.Run"), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_b", "util.Run"), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_a", "Helper.Run"), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_b", "Helper.Run"), 0);
     ASSERT_EQ(iris_cls_calls(s, project, "want_nonexistent", NULL), 0);
     ASSERT_EQ(iris_cls_calls(s, project, "unrelated_receiver", NULL), 0);
     ASSERT_EQ(iris_cls_calls(s, project, "via_classmethodvalue", "Pkg.B.Run"), 1);

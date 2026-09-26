@@ -3285,6 +3285,28 @@ static int count_calls_in_func(CBMFileResult *r, const char *callee, const char 
     return n;
 }
 
+/* #1260: calls in `func` whose callee is "Run" or ends in ".Run", whatever
+ * the qualifier. One iris.cls("X").Run() site must emit exactly one. */
+static int count_run_calls_in_func(CBMFileResult *r, const char *func) {
+    int n = 0;
+    size_t flen = strlen(func);
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (!c->callee_name || !c->enclosing_func_qn) {
+            continue;
+        }
+        size_t cl = strlen(c->callee_name);
+        bool is_run = strcmp(c->callee_name, "Run") == 0 ||
+                      (cl > 4 && strcmp(c->callee_name + cl - 4, ".Run") == 0);
+        size_t qlen = strlen(c->enclosing_func_qn);
+        if (is_run && qlen > flen && c->enclosing_func_qn[qlen - flen - 1] == '.' &&
+            strcmp(c->enclosing_func_qn + qlen - flen, func) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
 TEST(python_iris_cls_receiver_is_class_aware) {
     CBMFileResult *r = extract("import iris\n"
                                "def want_a():\n"
@@ -3303,6 +3325,10 @@ TEST(python_iris_cls_receiver_is_class_aware) {
     ASSERT_EQ(count_calls_in_func(r, "Pkg.A.Run", "want_a"), 1);
     ASSERT_EQ(count_calls_in_func(r, "Pkg.B.Run", "want_b"), 1);
     ASSERT_EQ(count_calls_in_func(r, "Pkg.A.Run", "want_b"), 0);
+    /* The class-qualified callee replaces the bare one: no second call per site. */
+    ASSERT_EQ(count_run_calls_in_func(r, "want_a"), 1);
+    ASSERT_EQ(count_run_calls_in_func(r, "want_b"), 1);
+    ASSERT_EQ(count_run_calls_in_func(r, "dynamic"), 1);
     /* A non-literal class argument names nothing: no class-qualified callee. */
     ASSERT_EQ(count_calls_in_func(r, "name.Run", "dynamic"), 0);
     /* An f-string is a Python "string" node but not a class name. */

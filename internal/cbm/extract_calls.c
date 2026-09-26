@@ -3931,6 +3931,16 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 }
             }
 
+            // #1260: iris.cls("Pkg.X").M() names its class, so the qualified
+            // callee replaces the bare one. Keeping both would let the bare
+            // name weak-match an unrelated same-named method.
+            if (ctx->language == CBM_LANG_PYTHON) {
+                const char *iris_callee = python_iris_cls_callee(ctx, node);
+                if (iris_callee) {
+                    call.callee_name = iris_callee;
+                    call.is_method = false;
+                }
+            }
             cbm_calls_push(&ctx->result->calls, ctx->arena, call);
             invocation = describe_emitted_primary_call(node, &callee);
 
@@ -3953,17 +3963,6 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                         }
                         break;
                     }
-                }
-            }
-            if (ctx->language == CBM_LANG_PYTHON) {
-                const char *iris_callee = python_iris_cls_callee(ctx, node);
-                if (iris_callee) {
-                    CBMCall xcall = {0};
-                    xcall.callee_name = iris_callee;
-                    xcall.enclosing_func_qn = call.enclosing_func_qn;
-                    xcall.site_start_byte = call.site_start_byte;
-                    xcall.site_end_byte = call.site_end_byte;
-                    cbm_calls_push(&ctx->result->calls, ctx->arena, xcall);
                 }
             }
         }
