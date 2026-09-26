@@ -16,6 +16,8 @@
 #include "result_spill.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "iris_export_xml.h"
+#include "helpers.h"    /* cbm_count_branching (walker stack cap) */
+#include "lang_specs.h" /* cbm_lang_spec, cbm_ts_language */
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -5512,6 +5514,101 @@ TEST(walk_defs_wide_file_extracts_every_definition) {
     PASS();
 }
 
+/* ── Walker stacks must never cap graph content ──────────────────────
+ *
+ * The complexity walkers and the body-token sampler used fixed-size pending
+ * stacks (4096 / 512 nodes) and silently stopped pushing children once full.
+ * Children are pushed last-to-first, so a wide body lost its FIRST statements:
+ * a function with 5000 top-level branches under-reported its cyclomatic count,
+ * and the token sampler started mid-body. These build bodies wider than either
+ * old cap and assert the exact metrics. */
+enum { WIDE_STMTS = 5000, WIDE_CALLS = 600, BODY_TOKEN_PREFIX = 100 };
+
+/* C function `wide` whose body holds `n` top-level statements alternating
+ * `if (x) g();` and `while (x) g();`. Caller frees. */
+static char *build_wide_branch_fn(int n) {
+    size_t cap = (size_t)n * 24 + 64;
+    char *src = malloc(cap);
+    if (!src)
+        return NULL;
+    size_t pos = (size_t)snprintf(src, cap, "void g(void);\nvoid wide(int x) {\n");
+    for (int i = 0; i < n; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "%s",
+                                (i % 2 == 0) ? "if (x) g();\n" : "while (x) g();\n");
+    }
+    snprintf(src + pos, cap - pos, "}\n");
+    return src;
+}
+
+TEST(complexity_wide_body_exceeds_old_stack_cap) {
+    char *src = build_wide_branch_fn(WIDE_STMTS);
+    ASSERT_NOT_NULL(src);
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "wide.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "wide");
+    ASSERT_NOT_NULL(d);
+    /* every if/while is one branching node at nesting depth 0 */
+    ASSERT_EQ(d->complexity, WIDE_STMTS);
+    ASSERT_EQ(d->cognitive, WIDE_STMTS);
+    ASSERT_EQ(d->loop_count, WIDE_STMTS / 2);
+    ASSERT_EQ(d->loop_depth, 1);
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+TEST(count_branching_wide_body_exceeds_old_stack_cap) {
+    char *src = build_wide_branch_fn(WIDE_STMTS);
+    ASSERT_NOT_NULL(src);
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_C)));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(tree);
+    int n = cbm_count_branching(ts_tree_root_node(tree),
+                                cbm_lang_spec(CBM_LANG_C)->branching_node_types);
+    ASSERT_EQ(n, WIDE_STMTS);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    free(src);
+    PASS();
+}
+
+/* The body-token sampler's contract is "the first BODY_TOKEN_CAP unique
+ * identifiers in source order". A body with 600 distinct calls must sample
+ * from f0 on, not a window starting mid-body (the capped stack began at f91).
+ * Only the source-order prefix f0..f99 is asserted: the sampler's dedupe key
+ * (hash | 1) also merges identifiers whose hashes differ only in bit 0, which
+ * drops a few later names (f122, f124, ...) -- a separate dedupe property this
+ * test deliberately does not pin. */
+TEST(body_tokens_wide_body_samples_from_the_start) {
+    size_t cap = (size_t)WIDE_CALLS * 16 + 64;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = (size_t)snprintf(src, cap, "void wide_calls(void) {\n");
+    for (int i = 0; i < WIDE_CALLS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "f%d();\n", i);
+    }
+    snprintf(src + pos, cap - pos, "}\n");
+    char expect[BODY_TOKEN_PREFIX * 8];
+    size_t ep = 0;
+    for (int i = 0; i < BODY_TOKEN_PREFIX; i++) {
+        ep += (size_t)snprintf(expect + ep, sizeof(expect) - ep, "f%d ", i);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "wide_calls.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "wide_calls");
+    ASSERT_NOT_NULL(d);
+    ASSERT_NOT_NULL(d->body_tokens);
+    ASSERT_GTE(strlen(d->body_tokens), ep);
+    ASSERT_MEM_EQ(d->body_tokens, expect, ep);
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Perl call-graph noise (#459 follow-up)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -8771,6 +8868,9 @@ SUITE(extraction) {
     RUN_TEST(complexity_delegation_receivers_not_recursive_issue876);
     RUN_TEST(complexity_access_depth_and_params);
     RUN_TEST(walk_defs_wide_file_extracts_every_definition);
+    RUN_TEST(complexity_wide_body_exceeds_old_stack_cap);
+    RUN_TEST(count_branching_wide_body_exceeds_old_stack_cap);
+    RUN_TEST(body_tokens_wide_body_samples_from_the_start);
     RUN_TEST(extract_c_ifdef_split_brace_fn_recovered_issue961);
     RUN_TEST(extract_cpp_preproc_signature_gap_issue946);
     RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);
