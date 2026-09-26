@@ -812,6 +812,126 @@ TEST(handles_aspnet_csharp) {
     PASS();
 }
 
+/* ASP.NET Core attribute routing (C#, #1692) — the reporter's controller shape:
+ * stacked class attributes with a relative [Route("api/[controller]")] prefix,
+ * verb attributes with and without a template, and a verb + separate method
+ * [Route]. Every action got 0 Route nodes: the route extractor knew no
+ * HttpGet/HttpPost/Route attribute, and relative templates were dropped for lacking a
+ * leading '/'. The exact Route-name set also pins the [controller] token
+ * (class name minus "Controller") and the class-prefix join. */
+TEST(handles_aspnet_attribute_routes_issue1692) {
+    static const char *routes[] = {"/api/Quotes/{symbol}", "/api/Quotes/orders/{id}/confirm",
+                                   "/api/Quotes/x/{id}", NULL};
+    static const EtFile f[] = {
+        {"Controllers/QuotesController.cs",
+         "using Microsoft.AspNetCore.Mvc;\n\n"
+         "namespace Feeder.Api.Controllers\n{\n"
+         "    [ServiceFilter(typeof(ClientIpCheckFilter))]\n"
+         "    [Route(\"api/[controller]\")]\n"
+         "    [ApiController]\n"
+         "    public class QuotesController : ControllerBase\n    {\n"
+         "        [HttpGet(\"{symbol}\")]\n"
+         "        public IActionResult Get(string symbol) { return Ok(symbol); }\n\n"
+         "        [HttpPost]\n"
+         "        [Route(\"orders/{id}/confirm\")]\n"
+         "        public IActionResult Confirm(int id) { return Ok(id); }\n\n"
+         "        [HttpPut(\"x/{id}\")]\n"
+         "        public IActionResult Update(int id) { return Ok(id); }\n    }\n}\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 3));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* ASP.NET Core (#1041) — the reporter's shape: [ApiController] before a
+ * versioned [Route("api/v1/[controller]")] and an async [HttpPost("login")]
+ * action produced no server-side Route node at all. */
+TEST(handles_aspnet_attribute_routes_issue1041) {
+    static const char *routes[] = {"/api/v1/Auth/login", NULL};
+    static const EtFile f[] = {
+        {"Controllers/AuthController.cs",
+         "using System.Threading.Tasks;\n"
+         "using Microsoft.AspNetCore.Mvc;\n\n"
+         "[ApiController]\n"
+         "[Route(\"api/v1/[controller]\")]\n"
+         "public class AuthController : ControllerBase\n{\n"
+         "    [HttpPost(\"login\")]\n"
+         "    public async Task<IActionResult> Login(LoginRequest req) { return Ok(); }\n}\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* ASP.NET Core [controller]/[action] token replacement (#1692): the action
+ * token is the method name ("Async" suffix trimmed, as ASP.NET Core does by
+ * default) or its [ActionName]; [AcceptVerbs] takes its path from Route=. */
+TEST(handles_aspnet_route_tokens_issue1692) {
+    static const char *routes[] = {"/api/Items/List", "/api/Items/Details/{id}",
+                                   "/api/Items/Find/{name}", "/api/Items/archive", NULL};
+    static const EtFile f[] = {
+        {"ItemsController.cs", "using Microsoft.AspNetCore.Mvc;\n\n"
+                               "[Route(\"api/[controller]\")]\n"
+                               "public class ItemsController : Controller\n{\n"
+                               "    [HttpGet(\"[action]\")]\n"
+                               "    public IActionResult List() { return View(); }\n\n"
+                               "    [HttpGet(\"[action]/{id}\")]\n"
+                               "    public System.Threading.Tasks.Task<IActionResult> "
+                               "DetailsAsync(int id) { return null; }\n\n"
+                               "    [HttpGet(\"[action]/{name}\")]\n"
+                               "    [ActionName(\"Find\")]\n"
+                               "    public IActionResult Search(string name) { return View(); }\n\n"
+                               "    [AcceptVerbs(\"POST\", \"PUT\", Route = \"archive\")]\n"
+                               "    public IActionResult Archive() { return View(); }\n}\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* ASP.NET Core absolute override + constraints (#1692): a method template that
+ * starts with "/" or "~/" ignores the class prefix; route constraints,
+ * optional markers and defaults are stripped to the bare parameter so the
+ * Route name matches the clients' "{id}" spelling ("{code:regex(...)}" nests
+ * braces). A controller without a class [Route] uses the method template as
+ * the whole path. */
+TEST(handles_aspnet_override_constraints_issue1692) {
+    static const char *routes[] = {
+        "/health", "/ping", "/api/Orders/{id}", "/api/Orders/{code}/{page}", "/api/ping", NULL};
+    static const EtFile f[] = {
+        {"OrdersController.cs",
+         "using Microsoft.AspNetCore.Mvc;\n\n"
+         "[Route(\"api/[controller]\")]\n"
+         "public class OrdersController : ControllerBase\n{\n"
+         "    [HttpGet(\"/health\")]\n"
+         "    public IActionResult Health() { return Ok(); }\n\n"
+         "    [Microsoft.AspNetCore.Mvc.HttpHeadAttribute(\"~/ping\")]\n"
+         "    public IActionResult Ping() { return Ok(); }\n\n"
+         "    [HttpDelete(\"{id:int:min(1)}\")]\n"
+         "    public IActionResult Delete(int id) { return Ok(); }\n\n"
+         "    [HttpGet(\"{code:regex(^\\\\d{{3}}$)}/{page=1}\")]\n"
+         "    public IActionResult ByCode(string code, int page) { return Ok(); }\n}\n"},
+        {"PingController.cs", "using Microsoft.AspNetCore.Mvc;\n\n"
+                              "public class PingController : ControllerBase\n{\n"
+                              "    [HttpGet(\"api/ping\", Name = \"PingRoute\")]\n"
+                              "    public IActionResult Get() { return Ok(); }\n}\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 2, routes));
+    PASS();
+}
+
+/* Control (#1692): a C# class with ordinary attributes — including string
+ * arguments that look like paths — must not produce Route nodes. */
+TEST(handles_aspnet_non_controller_control_issue1692) {
+    static const char *routes[] = {NULL};
+    static const EtFile f[] = {{"Helper.cs", "using System;\n\n"
+                                             "[Serializable]\n"
+                                             "[Description(\"api/helper\")]\n"
+                                             "public class Helper\n{\n"
+                                             "    [Obsolete(\"/use/other\")]\n"
+                                             "    public void Run() { }\n\n"
+                                             "    [Fact]\n"
+                                             "    [Trait(\"Category\", \"api/[controller]\")]\n"
+                                             "    public void Check() { }\n}\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
 /* Laravel (PHP) — Route facade whose QN contains "Laravel".
  * REAL BUG: internal/cbm/extract_calls.c:extract_handler_arg only accepts an
  * identifier/member_expression/selector_expression/attribute/field_expression as
@@ -2596,6 +2716,11 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_spring_java_relative_string_not_route);
     RUN_TEST(handles_jaxrs_scala);
     RUN_TEST(handles_aspnet_csharp);
+    RUN_TEST(handles_aspnet_attribute_routes_issue1692);
+    RUN_TEST(handles_aspnet_attribute_routes_issue1041);
+    RUN_TEST(handles_aspnet_route_tokens_issue1692);
+    RUN_TEST(handles_aspnet_override_constraints_issue1692);
+    RUN_TEST(handles_aspnet_non_controller_control_issue1692);
     RUN_TEST(handles_laravel_php);
     RUN_TEST(handles_laravel_facade_routes_issue952);
     RUN_TEST(handles_laravel_facade_no_junk_routes_issue952);
