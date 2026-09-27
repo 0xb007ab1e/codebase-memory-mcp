@@ -8622,9 +8622,9 @@ TEST(tool_index_repository_reuses_existing_project_for_root_issue2134) {
     if (!cbm_mkdtemp(repo) || !cbm_mkdtemp(cache)) {
         FAIL("mkdtemp failed");
     }
-    char canonical_repo[CBM_SZ_1K];
-    if (!realpath(repo, canonical_repo)) {
-        FAIL("realpath failed");
+    char canonical_repo[CBM_SZ_4K]; /* cbm_canonical_path needs >= 4096 bytes */
+    if (!cbm_canonical_path(repo, canonical_repo, sizeof(canonical_repo))) {
+        FAIL("cbm_canonical_path failed");
     }
     const char *saved_cache = getenv("CBM_CACHE_DIR");
     char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
