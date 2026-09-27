@@ -30,8 +30,8 @@
 
 #include "test_framework.h"
 #include "cbm.h"
-#include "sql_values.h"                 /* #1735 value-row scanner */
-#include "pipeline/pipeline_internal.h" /* CBM_EXTRACT_BUDGET */
+#include "sql_values.h"        /* #1735 value-row scanner */
+#include "foundation/compat.h" /* cbm_setenv / cbm_unsetenv */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1241,9 +1241,9 @@ static int count_calls_named(const CBMFileResult *r, const char *name) {
 
 /* The same source parsed with the row exclusion and without it (test seam). */
 static CBMFileResult *extract_sql_full(const char *src, const char *path) {
-    setenv("CBM_TEST_SQL_FULL_PARSE_ON", path, 1);
+    cbm_setenv("CBM_TEST_SQL_FULL_PARSE_ON", path, 1);
     CBMFileResult *r = do_extract(src, CBM_LANG_SQL, path);
-    unsetenv("CBM_TEST_SQL_FULL_PARSE_ON");
+    cbm_unsetenv("CBM_TEST_SQL_FULL_PARSE_ON");
     return r;
 }
 
@@ -1318,23 +1318,35 @@ TEST(sql_dump_parse_does_not_grow_with_the_row_count_issue1735) {
 }
 
 TEST(sql_dump_of_many_megabytes_is_indexed_not_timed_out_issue1735) {
-    /* ~26 MB with MySQL escapes, extracted under the production parse budget.
-     * The outcome is asserted — the file is indexed and its tables are in the
-     * graph — never how long it took. */
+    /* ~26 MB with MySQL escapes. The production parse budget is CPU time, so
+     * extracting under it made the verdict a function of runner speed (an
+     * ASan arm leg tripped it). The property behind "indexed, not timed out"
+     * is a count: the parse work is set by the statements, not by the rows.
+     * So: extract unbudgeted, assert the outcome, and bound the tree by the
+     * same 330 statements carrying only a handful of rows each (the full
+     * parse built a tree node for every row token). */
     char *src = sql_dump(330, 2000, true, true);
+    char *few = sql_dump(330, 4, true, true);
     ASSERT_NOT_NULL(src);
+    ASSERT_NOT_NULL(few);
     size_t len = strlen(src);
     ASSERT_GT(len, (size_t)24 * 1024 * 1024);
-    CBMFileResult *r = cbm_extract_file(src, (int)len, CBM_LANG_SQL, "covproj", "world.sql",
-                                        CBM_EXTRACT_BUDGET, NULL, NULL);
-    ASSERT_NOT_NULL(r);
-    if (r->has_error) {
-        FAIL(r->error_msg ? r->error_msg : "extraction failed");
-    }
-    ASSERT_TRUE(has_def(r, "big_cities"));
-    ASSERT_TRUE(has_usage_named(r, "country"));
-    cbm_free_result(r);
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)len, CBM_LANG_SQL, "covproj", "world.sql", 0, NULL, NULL);
+    CBMFileResult *rf =
+        cbm_extract_file(few, (int)strlen(few), CBM_LANG_SQL, "covproj", "few.sql", 0, NULL, NULL);
     free(src);
+    free(few);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(rf);
+    bool indexed = !r->has_error && has_def(r, "big_cities") && has_usage_named(r, "country");
+    uint32_t nodes = r->tree_nodes;
+    uint32_t few_nodes = rf->tree_nodes;
+    cbm_free_result(r);
+    cbm_free_result(rf);
+    ASSERT_TRUE(indexed);
+    ASSERT_GT(few_nodes, 0);
+    ASSERT_LTE(nodes, 2 * few_nodes);
     PASS();
 }
 

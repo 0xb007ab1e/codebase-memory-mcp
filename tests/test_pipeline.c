@@ -479,9 +479,9 @@ TEST(pipeline_sql_dump_graph_matches_the_full_parse_issue1735) {
         free(src);
 
         char *cut = index_and_list(tmp, "cut.db");
-        setenv("CBM_TEST_SQL_FULL_PARSE_ON", "dump.sql", 1);
+        cbm_setenv("CBM_TEST_SQL_FULL_PARSE_ON", "dump.sql", 1);
         char *full = index_and_list(tmp, "full.db");
-        unsetenv("CBM_TEST_SQL_FULL_PARSE_ON");
+        cbm_unsetenv("CBM_TEST_SQL_FULL_PARSE_ON");
         th_rmtree(tmp);
         ASSERT_NOT_NULL(cut);
         ASSERT_NOT_NULL(full);
