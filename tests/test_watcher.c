@@ -2121,21 +2121,34 @@ TEST(watcher_sustained_failure_logs_once_issue2015) {
     failing_index_calls = 0;
     failing_index_fail_first_n = 100; /* never succeeds */
 
-    cbm_watcher_poll_once(w); /* baseline */
+    /* Baseline poll. Its outcome is not asserted: if a git probe fails here,
+     * the first loop poll takes the baseline instead. */
+    cbm_watcher_poll_once(w);
 
+    /* The change is a DIRTY worktree, not a commit. The baseline leaves the
+     * dirty signature at "clean known", so this change is seen whenever the
+     * baseline lands. A commit made before a late (or HEAD-less) baseline
+     * would be adopted as the baseline HEAD and never reindexed. */
     {
         char p[300];
         th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "world\n");
     }
-    wt_git(tmpdir, "add file.txt");
-    wt_git(tmpdir, "commit -q -m add-world");
 
     sustained_log_hits = 0;
     cbm_log_set_sink(sustained_log_sink);
 
-    /* Drive well past the threshold (10). touch clears the deadline each time
-     * so every iteration actually attempts a reindex. */
-    for (int i = 0; i < 14; i++) {
+    /* Drive well past the threshold (10): poll until the 14th failed reindex.
+     * A poll does not always reach the index callback: when one of its git
+     * probes fails transiently (spawn refused under runner load) it is a
+     * fail-closed no-op by design (#937) and the next poll retries. So the
+     * loop waits for the attempt count instead of assuming one per poll;
+     * touch clears the backoff deadline each time. Each poll runs at most one
+     * attempt for this single project, so the loop stops at exactly 14. A
+     * watcher that never reindexes hangs here, which the runner reports as a
+     * failure, never a pass. No-op polls cannot add log lines to the count:
+     * sustained_failure is emitted only on a failed index attempt, when the
+     * streak EQUALS the threshold. */
+    while (failing_index_calls < 14) {
         cbm_watcher_touch(w, "sust-repo");
         cbm_watcher_poll_once(w);
     }
