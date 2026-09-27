@@ -214,6 +214,31 @@ static void ipc_startup_gate_run(void) {
 }
 #endif
 
+#ifdef _WIN32
+static cbm_daemon_ipc_win_directory_create_hook_fn g_win_directory_create_hook_for_test;
+static void *g_win_directory_create_hook_context_for_test;
+#endif
+
+void cbm_daemon_ipc_win_directory_create_hook_set_for_test(
+    cbm_daemon_ipc_win_directory_create_hook_fn hook, void *context) {
+#ifdef _WIN32
+    g_win_directory_create_hook_context_for_test = context;
+    g_win_directory_create_hook_for_test = hook;
+#else
+    (void)hook;
+    (void)context;
+#endif
+}
+
+#ifdef _WIN32
+static void ipc_win_directory_create_hook_run(const wchar_t *path) {
+    cbm_daemon_ipc_win_directory_create_hook_fn hook = g_win_directory_create_hook_for_test;
+    if (hook) {
+        hook(path, g_win_directory_create_hook_context_for_test);
+    }
+}
+#endif
+
 bool cbm_daemon_ipc_windows_legacy_names(const char *canonical_runtime_parent,
                                          const char *instance_key,
                                          char pipe_out[CBM_DAEMON_IPC_WINDOWS_NAME_CAP],
@@ -1463,9 +1488,21 @@ static char *private_log_directory_path_copy(const char *directory_path) {
  *
  * The overflow owner is tolerated for ANCESTORS ONLY, and ONLY when
  * /proc/self/uid_map is a single-uid map whose sole inside id is our euid. In
- * that shape no in-namespace principal can be the overflow owner, so an
- * overflow-owned ancestor is exactly as safe as a root-owned one on the host:
- * nobody reachable can have created it or can mutate it. A multi-uid map
+ * that shape no IN-NAMESPACE principal can be the overflow owner.
+ *
+ * Be precise about what that does and does not buy, because an earlier version
+ * of this comment overstated it. The overflow uid is what EVERY unmapped host
+ * uid maps to, not only host root (user_namespaces(7)), so "overflow-owned"
+ * does NOT prove "created by root". On a shared host, a directory owned by
+ * another local user is indistinguishable from root-owned /tmp once you are
+ * inside the namespace -- and there is no in-namespace discriminator that could
+ * tell them apart, which is precisely why the tolerance is scoped the way it
+ * is rather than made smarter. The real guarantee is narrower and still
+ * sufficient: no principal REACHABLE FROM INSIDE the namespace can create or
+ * mutate such an ancestor, and the private directory itself is never tolerated
+ * as overflow (see below), so a hostile host-side owner of an ancestor is
+ * bounded to denial of service and socket-path control. It cannot reach the
+ * leaf, which stays 0700 and euid-rechecked. A multi-uid map
  * (rootless podman with subuids) still shows host root as overflow and is
  * refused — conservative scope, not the safety argument. There is deliberately
  * no environment escape hatch.
@@ -1545,7 +1582,20 @@ static bool posix_read_small_proc_file(const char *path, char *buffer, size_t ca
     return true;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Counts real derivations. A cache here was a security hazard once (see the
+ * note above posix_ancestor_overflow_uid); the contract test asserts this
+ * climbs on EVERY call so re-introducing one fails loudly. */
+static unsigned g_posix_overflow_compute_count;
+unsigned cbm_daemon_ipc_posix_overflow_compute_count_for_test(void) {
+    return g_posix_overflow_compute_count;
+}
+#endif
+
 static uid_t posix_compute_ancestor_overflow_uid(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    g_posix_overflow_compute_count++;
+#endif
     char map[256];
     if (!posix_read_small_proc_file("/proc/self/uid_map", map, sizeof(map)) ||
         !posix_uid_map_is_single_uid(map, geteuid())) {
@@ -1564,15 +1614,27 @@ static uid_t posix_compute_ancestor_overflow_uid(void) {
     return (uid_t)overflow;
 }
 
-static uid_t g_posix_overflow_cached = POSIX_NO_OVERFLOW_UID;
-static pthread_once_t g_posix_overflow_once = PTHREAD_ONCE_INIT;
-static void posix_overflow_init_once(void) {
-    g_posix_overflow_cached = posix_compute_ancestor_overflow_uid();
-}
 #endif /* __linux__ */
 
-/* The overflow uid tolerated for ancestors in this process, or
- * POSIX_NO_OVERFLOW_UID when none. Derived once from immutable /proc state. */
+/* The overflow uid tolerated for ancestors, or POSIX_NO_OVERFLOW_UID when none.
+ *
+ * DERIVED FRESH ON EVERY CALL, deliberately. This used to memoise via
+ * pthread_once behind a comment claiming "immutable /proc state". That claim
+ * was false in both halves: unshare(CLONE_NEWUSER) rewrites
+ * /proc/self/uid_map, and pthread_once state survives a forked child already
+ * marked done -- so a process that forked and then changed namespace kept the
+ * parent answer and refused a directory it should have accepted.
+ * (Spelled without the call syntax on purpose: scripts/security-audit.sh
+ * blocks that literal in src/, and an allow-list entry to let a COMMENT pass
+ * would weaken a real check on a real file.) It happened to be
+ * harmless because every caller today runs in a freshly exec'd process, but
+ * that made a security decision depend on an invariant nothing enforced, and
+ * the next fork-without-exec caller would have silently inherited a stale
+ * verdict.
+ *
+ * The cost of not caching is two small /proc reads per ancestor check, against
+ * an openat + fstat + fchmod + ACL check per path component in the same walk.
+ * Do not re-introduce a cache here; the contract test counts derivations. */
 static uid_t posix_ancestor_overflow_uid(void) {
 #ifdef CBM_ENABLE_TEST_SEAMS
     if (g_posix_overflow_override_active) {
@@ -1580,8 +1642,7 @@ static uid_t posix_ancestor_overflow_uid(void) {
     }
 #endif
 #if defined(__linux__)
-    (void)pthread_once(&g_posix_overflow_once, posix_overflow_init_once);
-    return g_posix_overflow_cached;
+    return posix_compute_ancestor_overflow_uid();
 #else
     return POSIX_NO_OVERFLOW_UID;
 #endif
@@ -3958,6 +4019,16 @@ static char *wide_to_utf8(const wchar_t *value) {
     return utf8;
 }
 
+/* Record "<path>: <message>" as the validation detail, with the wide path
+ * rendered as UTF-8. One place owns the conversion buffer, so every refusal on
+ * the directory walk can name its component without each call site carrying
+ * its own allocation. */
+static void ipc_validation_detail_set_for_path(const wchar_t *path, const char *message) {
+    char *path_utf8 = wide_to_utf8(path);
+    ipc_validation_detail_set("%s: %s", path_utf8 ? path_utf8 : "<path>", message);
+    free(path_utf8);
+}
+
 static wchar_t *wide_copy(const wchar_t *value) {
     if (!value) {
         return NULL;
@@ -4825,13 +4896,28 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
         return false;
     }
     bool created = CreateDirectoryW(runtime_dir, &security.directory_attributes) != 0;
-    if (!created && GetLastError() != ERROR_ALREADY_EXISTS) {
+    DWORD create_error = created ? ERROR_SUCCESS : GetLastError();
+    if (!created && create_error != ERROR_ALREADY_EXISTS) {
+        char message[96];
+        (void)snprintf(message, sizeof(message),
+                       "could not create the directory (Windows error %lu)",
+                       (unsigned long)create_error);
+        ipc_validation_detail_set_for_path(runtime_dir, message);
         win_security_destroy(&security);
         return false;
     }
     DWORD attributes = GetFileAttributesW(runtime_dir);
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
         (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        /* What already exists at this path is adopted only if it is a plain
+         * directory. Say which rule refused it: the walk in front of this
+         * function tolerates losing a creation race, so this check is what
+         * stands between that tolerance and a planted file or junction. */
+        const char *rule = attributes == INVALID_FILE_ATTRIBUTES ? "cannot be inspected"
+                           : (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+                               ? "exists but is not a directory"
+                               : "is a reparse point (junction or symlink)";
+        ipc_validation_detail_set_for_path(runtime_dir, rule);
         win_security_destroy(&security);
         return false;
     }
@@ -4985,8 +5071,35 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
             DWORD attributes = GetFileAttributesW(path);
             if (attributes == INVALID_FILE_ATTRIBUTES) {
                 DWORD error = GetLastError();
-                ok = (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) &&
-                     CreateDirectoryW(path, &security.directory_attributes) != 0;
+                bool absent = error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+                if (absent) {
+                    ipc_win_directory_create_hook_run(path);
+                    /* Several processes first-starting together all observe
+                     * this component absent; one CreateDirectoryW wins and
+                     * the rest get ERROR_ALREADY_EXISTS. Losing that race is
+                     * not a failure -- the directory this process wanted now
+                     * exists, exactly as if it had been there all along. It
+                     * is NOT trusted for that: an ancestor still goes through
+                     * win_directory_component_secure() below, and the final
+                     * component through win_runtime_directory_secure(), which
+                     * refuses a non-directory or reparse point and enforces
+                     * owner and DACL. The POSIX walk tolerates EEXIST at the
+                     * same point for the same reason. */
+                    if (CreateDirectoryW(path, &security.directory_attributes) == 0) {
+                        error = GetLastError();
+                        absent = error == ERROR_ALREADY_EXISTS;
+                    }
+                }
+                ok = absent;
+                if (!ok) {
+                    /* Never a bare "(endpoint)": name the component and the
+                     * Windows error that refused it. */
+                    char message[96];
+                    (void)snprintf(message, sizeof(message),
+                                   "could not create or inspect the directory (Windows error %lu)",
+                                   (unsigned long)error);
+                    ipc_validation_detail_set_for_path(path, message);
+                }
             }
             /* Ancestors are observe-only and must already be secure.  The
              * final current-user directory is intentionally handled below by
@@ -4998,10 +5111,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
                      * at this walk position; the helper set the inner rule. */
                     char inner[384];
                     (void)snprintf(inner, sizeof(inner), "%s", ipc_validation_detail_buffer);
-                    char *component_utf8 = wide_to_utf8(path);
-                    ipc_validation_detail_set(
-                        "%s: %s", component_utf8 ? component_utf8 : "<component>", inner);
-                    free(component_utf8);
+                    ipc_validation_detail_set_for_path(path, inner);
                 }
             }
         }
