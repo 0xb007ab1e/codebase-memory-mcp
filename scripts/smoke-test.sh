@@ -22,6 +22,8 @@ they stage the release fixture, start the fixture server, and sandbox
 HOME/TEMP/agent-config destinations. Called bare, the download/checksum/
 install-script phases (12-13) SKIP for lack of a fixture server, and the run
 mutates the REAL profile — the venue-parity contract forbids that in any venue.
+The daemon runtime and cache are private to the run either way: every product
+process is started under a CBM_RUNTIME_DIR/CBM_CACHE_DIR this harness owns.
 
 Arguments:
   <binary-path>         product binary to smoke
@@ -40,6 +42,20 @@ if [ -n "$SMOKE_MODE" ] && [ "$SMOKE_MODE" != "--agent-config-only" ]; then
   exit 2
 fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+
+# Every product process below — the phases, the install/update E2E and the
+# daemon retirements — must reach a daemon rendezvous this run owns. Only
+# CBM_RUNTIME_DIR moves that rendezvous; the wrappers' HOME/TMPDIR/CBM_CACHE_DIR
+# sandbox does not, so without this the retirements land on the operator's live
+# account daemon (#1691, #1696).
+# shellcheck source=test-runtime.sh
+source "$REPO_ROOT/scripts/test-runtime.sh"
+cbm_test_runtime_init
+# Armed here rather than only with the fixture trap below: the fixture mktemp
+# and its cygpath conversion sit between the two, and under `set -e` a failure
+# there would otherwise leave the private root behind. The fixture trap
+# replaces this one and keeps the same cleanup as its first step.
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
 
 smoke_mktemp_file() {
   if [ -n "${SMOKE_TEMP_ROOT:-}" ]; then
@@ -100,8 +116,8 @@ copy_smoke_binary() {
   cp "$BINARY" "$destination"
 }
 
-# Retire the shared account daemon (if one is running) and wait until it
-# reports not-running. Install/uninstall flows leave an ephemeral daemon
+# Retire this run's private account daemon (if one is running) and wait until
+# it reports not-running. Install/uninstall flows leave an ephemeral daemon
 # draining asynchronously whose mapped generation backing and open logs
 # block rm on Windows (POSIX rm doesn't care) — so every cleanup of a
 # fixture HOME that received an install, and the final cache removal, must
@@ -144,11 +160,16 @@ run_no_crash() {
 
 TMPDIR=$(smoke_mktemp_dir)
 DRYRUN_HOME=""
+CODEX_LIFECYCLE_HOME=""
 # On MSYS2/Windows, convert POSIX path to native Windows path for the binary
 if command -v cygpath &>/dev/null; then
     TMPDIR=$(cygpath -m "$TMPDIR")
 fi
-trap 'smoke_rmtree "$TMPDIR" "${DRYRUN_HOME:-}"' EXIT
+# Runtime cleanup first, so no earlier cleanup step stands between the exit
+# and the private daemon's retirement; on Windows that retirement is also what
+# unblocks the fixture rm (mapped binary, open logs). smoke_rmtree never fails,
+# so the fixture removal still runs after it.
+trap 'cbm_test_runtime_cleanup "$BINARY"; smoke_rmtree "$TMPDIR" "${DRYRUN_HOME:-}" "${CODEX_LIFECYCLE_HOME:-}"' EXIT
 
 CLI_STDERR=$(smoke_mktemp_file)
 # 10 of the cli call sites assign directly (VAR=$(cli ...)). Under
@@ -171,6 +192,29 @@ cli() {
     } >&2
   fi
   return "$rc"
+}
+
+# A worker failure says "inspect log: <path>" — and in CI that path dies with the
+# job's sandbox, so the one artifact naming the cause is the one nobody can open.
+# A worker killed by a signal writes no summary of its own either, which is
+# exactly the case that most needs the log (PR #2233: "index worker ended with
+# killed (exit=-1, signal=9)" on ubuntu-latest, unreproducible on every local
+# venue). Print it while it still exists.
+smoke_dump_worker_log() {
+  local log
+  log=$(sed -n 's/.*inspect log: \([^ ]*\).*/\1/p' "$CLI_STDERR" 2>/dev/null | tail -1)
+  if [ -z "$log" ] || [ ! -f "$log" ]; then
+    # The path is only printed for some failures; fall back to the newest log
+    # the run produced.
+    log=$(ls -t "${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}"/logs/.worker-log-* 2>/dev/null | head -1)
+  fi
+  if [ -n "$log" ] && [ -f "$log" ]; then
+    echo "--- worker log: $log ---"
+    tail -80 "$log"
+    echo "--- end worker log ---"
+  else
+    echo "--- no worker log found (cache ${CBM_CACHE_DIR:-unset}) ---"
+  fi
 }
 
 echo "=== Phase 1: version ==="
@@ -333,6 +377,7 @@ GENEOF
 if ! RESULT=$(cli index_repository --repo-path "$TMPDIR"); then
   echo "FAIL: index_repository (flag form) exited non-zero"
   cat "$CLI_STDERR"
+  smoke_dump_worker_log
   exit 1
 fi
 echo "$RESULT"
@@ -1432,6 +1477,7 @@ echo '# Personal Rovo guidance' > "$ROVO_INSTRUCTIONS"
 PHASE8_INSTALL_RC=0
 PHASE8_INSTALL_LOG=$(smoke_mktemp_file)
 HOME="$FAKE_HOME" \
+  CODEX_HOME="$FAKE_HOME/.codex" \
   XDG_CONFIG_HOME="$FAKE_HOME/.config" \
   APPDATA="$FAKE_HOME/AppData/Roaming" \
   LOCALAPPDATA="$FAKE_HOME/AppData/Local" \
@@ -1704,12 +1750,139 @@ if ! grep -q 'existing_section' "$FAKE_HOME/.codex/config.toml"; then
 fi
 echo "OK 8f-h: Codex TOML (MCP + preserved existing)"
 
-# 8i: Codex instructions
-if [ ! -f "$FAKE_HOME/.codex/AGENTS.md" ] || ! grep -q 'codebase-memory-mcp' "$FAKE_HOME/.codex/AGENTS.md"; then
-  echo "FAIL 8i: Codex AGENTS.md missing"
+# 8i: Codex keeps only a tiny global activation pointer; the installed skill
+# owns all detailed behavior. Exercise the complete lifecycle in a second HOME
+# so Codex-only reinstalls cannot perturb the all-agent fixture below.
+CODEX_POINTER_EXPECTED=$(smoke_mktemp_file)
+printf '%s\n' \
+  '<!-- codebase-memory-mcp:start -->' \
+  'For structural codebase exploration, use the installed `codebase-memory` skill.' \
+  '<!-- codebase-memory-mcp:end -->' > "$CODEX_POINTER_EXPECTED"
+if [ ! -f "$FAKE_HOME/.codex/AGENTS.md" ] ||
+   [ "$(smoke_file_sha256 "$FAKE_HOME/.codex/AGENTS.md")" != \
+     "$(smoke_file_sha256 "$CODEX_POINTER_EXPECTED")" ]; then
+  echo "FAIL 8i: fresh Codex install did not create the exact activation pointer"
   exit 1
 fi
-echo "OK 8i: Codex instructions"
+
+CODEX_LIFECYCLE_HOME=$(smoke_mktemp_dir)
+CODEX_LIFECYCLE_ROOT="$CODEX_LIFECYCLE_HOME/.codex"
+CODEX_INSTRUCTIONS="$CODEX_LIFECYCLE_ROOT/AGENTS.md"
+mkdir -p "$CODEX_LIFECYCLE_ROOT"
+
+CODEX_FRESH_LOG=$(smoke_mktemp_file)
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --skip-binary --clients=codex -y > "$CODEX_FRESH_LOG" 2>&1
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_POINTER_EXPECTED")" ] ||
+   ! grep -q '\[mcp_servers.codebase-memory-mcp\]' "$CODEX_LIFECYCLE_ROOT/config.toml" ||
+   ! grep -q 'search_graph' "$CODEX_LIFECYCLE_ROOT/skills/codebase-memory/SKILL.md" ||
+   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-scout.toml" ] ||
+   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory.toml" ] ||
+   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-auditor.toml" ] ||
+   ! grep -q 'SessionStart' "$CODEX_LIFECYCLE_ROOT/config.toml" ||
+   ! grep -q 'SubagentStart' "$CODEX_LIFECYCLE_ROOT/config.toml"; then
+  echo "FAIL 8i: isolated fresh Codex install lost the pointer or another surface"
+  exit 1
+fi
+
+printf '%s\n' \
+  '# Personal Codex guidance' \
+  '<!-- codebase-memory-mcp:start -->' \
+  'legacy managed guidance' \
+  '<!-- codebase-memory-mcp:end -->' \
+  '# Keep this line' > "$CODEX_INSTRUCTIONS"
+CODEX_EXPECTED_MIGRATED=$(smoke_mktemp_file)
+printf '%s\n' \
+  '# Personal Codex guidance' \
+  '<!-- codebase-memory-mcp:start -->' \
+  'For structural codebase exploration, use the installed `codebase-memory` skill.' \
+  '<!-- codebase-memory-mcp:end -->' \
+  '# Keep this line' > "$CODEX_EXPECTED_MIGRATED"
+CODEX_EXPECTED_USER=$(smoke_mktemp_file)
+printf '%s\n' '# Personal Codex guidance' '# Keep this line' > "$CODEX_EXPECTED_USER"
+CODEX_LEGACY_SHA=$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")
+
+CODEX_PLAN=$(smoke_mktemp_file)
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --plan --skip-binary --clients=codex > "$CODEX_PLAN"
+CODEX_INSTRUCTION_PATH=$(json_get "$CODEX_PLAN" \
+  "next((str(x) for x in d.get('instruction_files_planned', []) if str(x).replace('\\\\','/').endswith('/.codex/AGENTS.md')), '')")
+CODEX_CLEANUP_COUNT=$(json_get "$CODEX_PLAN" "len(d.get('cleanup_actions_planned', []))")
+if ! exact_path_match "$CODEX_INSTRUCTION_PATH" "$CODEX_INSTRUCTIONS" ||
+   [ "$CODEX_CLEANUP_COUNT" != "0" ] ||
+   [ "$CODEX_LEGACY_SHA" != "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" ]; then
+  echo "FAIL 8i: Codex plan did not describe a non-mutating pointer upsert"
+  exit 1
+fi
+
+CODEX_DRY_LOG=$(smoke_mktemp_file)
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --dry-run --skip-binary --clients=codex -y > "$CODEX_DRY_LOG" 2>&1
+if ! grep -q 'managed activation pointer' "$CODEX_DRY_LOG" ||
+   [ "$CODEX_LEGACY_SHA" != "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" ]; then
+  echo "FAIL 8i: Codex dry-run did not preview a byte-identical pointer migration"
+  exit 1
+fi
+
+CODEX_MIGRATE_LOG=$(smoke_mktemp_file)
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --skip-binary --clients=codex -y > "$CODEX_MIGRATE_LOG" 2>&1
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_MIGRATED")" ]; then
+  echo "FAIL 8i: Codex migration did not replace only the legacy managed block"
+  exit 1
+fi
+
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --skip-binary --clients=codex -y > /dev/null 2>&1
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_MIGRATED")" ] ||
+   [ "$(grep -c '<!-- codebase-memory-mcp:start -->' "$CODEX_INSTRUCTIONS")" -ne 1 ]; then
+  echo "FAIL 8i: Codex reinstall changed or duplicated the activation pointer"
+  exit 1
+fi
+CODEX_UNINSTALL_LOG=$(smoke_mktemp_file)
+if ! HOME="$CODEX_LIFECYCLE_HOME" \
+     CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+     XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+     APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+     LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+     "$BINARY" uninstall -y -n > "$CODEX_UNINSTALL_LOG" 2>&1; then
+  echo "FAIL 8i: Codex uninstall returned nonzero"
+  cat "$CODEX_UNINSTALL_LOG"
+  exit 1
+fi
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_USER")" ]; then
+  echo "FAIL 8i: Codex uninstall did not remove only the activation pointer"
+  exit 1
+fi
+echo "OK 8i: isolated Codex activation-pointer lifecycle"
 
 # 8j-l: Gemini MCP + hooks + merge
 CMD=$(json_get "$FAKE_HOME/.gemini/settings.json" "d['mcpServers']['codebase-memory-mcp']['command']")
@@ -2728,6 +2901,7 @@ if [[ "$BINARY" == *.exe ]]; then
   UNINSTALL_BINARY="$SELF_PATH"
 fi
 HOME="$FAKE_HOME" \
+  CODEX_HOME="$FAKE_HOME/.codex" \
   XDG_CONFIG_HOME="$FAKE_HOME/.config" \
   APPDATA="$FAKE_HOME/AppData/Roaming" \
   LOCALAPPDATA="$FAKE_HOME/AppData/Local" \

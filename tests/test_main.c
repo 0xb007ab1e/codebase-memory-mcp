@@ -23,7 +23,7 @@ int tf_skip_count = 0;
 #include "daemon/version_cohort.h" /* Windows crash-turnover re-exec probe */
 #include "mcp/index_supervisor.h"  /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"               /* cbm_mcp_handle_tool — act as a real worker */
-#include "ui/http_server.h"       /* deleted-self executable probe */
+#include "ui/http_server.h"        /* deleted-self executable probe */
 #include <sqlite3.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -33,7 +33,10 @@ int tf_skip_count = 0;
 #include <string.h>
 #include <signal.h>
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
 #include <winsock2.h> /* #798 follow-up: socket-isolation re-exec probe */
+#include <windows.h>
 #else
 #include <unistd.h>
 #ifdef __APPLE__
@@ -50,6 +53,29 @@ int tf_skip_count = 0;
  * invocations see the marker and exit cleanly, allowing the parent shell to
  * unwind after either production containment or the test's verified backstop. */
 #define TF_BLOCKING_GIT_MARKER_ENV "CBM_TEST_RUNTIME_BLOCKING_GIT_PID_FILE"
+
+/* Native child for subprocess_windows_job_object_enforces_memory_limit. The
+ * fixed-size commit keeps the RED path bounded: without a Job memory limit it
+ * succeeds and exits 0; with the limit it is denied and exits with the sentinel
+ * code expected by the parent test. */
+static int tf_maybe_run_windows_memory_limit_probe(int argc, char **argv) {
+#ifdef _WIN32
+    if (argc == 2 && argv && strcmp(argv[1], "__cbm_windows_memory_limit_probe") == 0) {
+        const SIZE_T allocation_size = (SIZE_T)2U * 1024U * 1024U * 1024U;
+        void *allocation =
+            VirtualAlloc(NULL, allocation_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!allocation) {
+            return 73;
+        }
+        (void)VirtualFree(allocation, 0, MEM_RELEASE);
+        return 0;
+    }
+#else
+    (void)argc;
+    (void)argv;
+#endif
+    return -1;
+}
 
 #ifdef _WIN32
 static bool tf_invoked_as_windows_git_module(void) {
@@ -752,6 +778,7 @@ extern void suite_dyn_array(void);
 extern void suite_str_intern(void);
 extern void suite_log(void);
 extern void suite_str_util(void);
+extern void suite_index_policy(void);
 extern void suite_workspace(void);
 extern void suite_platform(void);
 extern void suite_diagnostics(void);
@@ -827,6 +854,7 @@ extern void suite_store_pragmas(void);
 extern void suite_store_checkpoint(void);
 extern void suite_traces(void);
 extern void suite_configlink(void);
+extern void suite_doclinks(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
 extern void suite_agent_clients(void);
@@ -856,6 +884,7 @@ extern void suite_repro_harness_cleanup(void);
 extern void suite_repro_runner_filter(void);
 extern void suite_call_reference_contract(void);
 extern void suite_mem(void);
+extern void suite_mem_events(void);
 extern void suite_ui(void);
 extern void suite_httpd(void);
 extern void suite_security(void);
@@ -894,16 +923,9 @@ extern void suite_dump_verify_io(void);
 extern void cbm_kind_in_set_free_cache(void);
 
 int main(int argc, char **argv) {
-    /* Skip the multi-hundred-MB executable-image hash that computes the exact
-     * build fingerprint: it is tens of seconds per spawned worker/daemon under
-     * ASan on constrained CI runners and the sole cause of the daemon-family
-     * readiness-timeout flakes. Set once here; every forked child and re-exec'd
-     * worker inherits it, so exact-build match/mismatch still works (a
-     * mismatch test still passes a DIFFERENT fingerprint via argv). Honoured
-     * only under CBM_CLI_ENABLE_TEST_API — never in a production binary. */
-    if (!getenv("CBM_TEST_BUILD_FINGERPRINT")) {
-        (void)cbm_setenv("CBM_TEST_BUILD_FINGERPRINT",
-                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1);
+    int memory_limit_probe_rc = tf_maybe_run_windows_memory_limit_probe(argc, argv);
+    if (memory_limit_probe_rc >= 0) {
+        return memory_limit_probe_rc;
     }
     int blocking_git_rc = tf_maybe_run_blocking_git_probe(argc, argv);
     if (blocking_git_rc >= 0) {
@@ -915,6 +937,57 @@ int main(int argc, char **argv) {
         (void)puts("codebase-memory-mcp test-runner");
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "--build-config") == 0) {
+#ifdef _WIN32
+        if (_setmode(cbm_fileno(stdout), _O_BINARY) == -1) {
+            fprintf(stderr, "failed to set build-config stdout to binary mode\n");
+            return 2;
+        }
+#endif
+#if defined(CBM_SANITIZED_BUILD) && CBM_SANITIZED_BUILD
+        const int sanitized = 1;
+#else
+        const int sanitized = 0;
+#endif
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        const int test_seams = 1;
+#else
+        const int test_seams = 0;
+#endif
+        (void)printf("sanitized=%d test_seams=%d\n", sanitized, test_seams);
+        return 0;
+    }
+    /* Skip the multi-hundred-MB executable-image hash that computes the exact
+     * build fingerprint: it is tens of seconds per spawned worker/daemon under
+     * ASan on constrained CI runners and the sole cause of the daemon-family
+     * readiness-timeout flakes. Set once here; every forked child and re-exec'd
+     * worker inherits it, so exact-build match/mismatch still works (a
+     * mismatch test still passes a DIFFERENT fingerprint via argv). Honoured
+     * only under CBM_CLI_ENABLE_TEST_API — never in a production binary. */
+    if (!getenv("CBM_TEST_BUILD_FINGERPRINT")) {
+        (void)cbm_setenv("CBM_TEST_BUILD_FINGERPRINT",
+                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1);
+    }
+    /* #1830 userns smoke probe -- see the test that spawns it.
+     *
+     * The ancestor overflow uid is derived ONCE per process (pthread_once in
+     * src/daemon/ipc.c) from /proc/self/uid_map. That file is not immutable:
+     * unshare(CLONE_NEWUSER) is exactly what changes it, and pthread_once state
+     * survives fork(). A forked child therefore keeps the HOST answer and never
+     * re-derives inside its new namespace, so a fork-only smoke test refuses and
+     * cannot pass once anything earlier in the suite has primed the cache --
+     * seven call sites do. Re-exec into this probe so the decision is made by a
+     * process that STARTED inside the namespace, which is the production shape
+     * the test means to cover. */
+#if defined(__linux__) && defined(CBM_ENABLE_TEST_SEAMS)
+    if (argc == 3 && strcmp(argv[1], "--userns-secure-probe") == 0) {
+        /* _exit, not return: this process exists to answer ONE boolean. A
+         * return runs the atexit chain, and the runner is built with
+         * -fsanitize=address, so a future leak anywhere in the prologue would
+         * exit 23 and read as a security verdict on a test that has none. */
+        _exit(cbm_daemon_ipc_private_directory_secure(argv[2]) ? 0 : 1);
+    }
+#endif
     int mcp_idxfailclosed_rc = tf_maybe_run_mcp_idxfailclosed_probe(argc, argv);
     if (mcp_idxfailclosed_rc >= 0) {
         return mcp_idxfailclosed_rc;
@@ -1005,6 +1078,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(str_intern);
     RUN_SELECTED_SUITE(log);
     RUN_SELECTED_SUITE(str_util);
+    RUN_SELECTED_SUITE(index_policy);
     RUN_SELECTED_SUITE(workspace);
     RUN_SELECTED_SUITE(platform);
     RUN_SELECTED_SUITE(diagnostics);
@@ -1130,6 +1204,9 @@ int main(int argc, char **argv) {
     /* Config link */
     RUN_SELECTED_SUITE(configlink);
 
+    /* Markdown file reference link */
+    RUN_SELECTED_SUITE(doclinks);
+
     /* Infrastructure scanning */
     RUN_SELECTED_SUITE(infrascan);
 
@@ -1156,6 +1233,7 @@ int main(int argc, char **argv) {
     /* mem + arena + slab integration */
     RUN_SELECTED_SUITE(slab_alloc);
     RUN_SELECTED_SUITE(mem);
+    RUN_SELECTED_SUITE(mem_events);
 
     /* UI (config, external asset pack, layout) */
     RUN_SELECTED_SUITE(ui);

@@ -36,6 +36,10 @@ enum {
     /* search miss sentinel */ /* mask for ebuf ring buffer (8 entries) */
 };
 #define CYP_DBL_MAX 1e308
+/* execute_single binds the first pattern's leading node even when the query
+ * leaves it unnamed, so the engine needs a name for it. The binding slot is
+ * real, which is why check_pattern_var_capacity counts it. */
+#define CYP_ANON_HEAD_VAR "_n0"
 
 #include <ctype.h>
 #include <limits.h> // INT_MAX
@@ -1826,20 +1830,27 @@ tail:
         }
     }
 
-    /* Optional SKIP */
+    /* Optional SKIP. A non-numeric operand is a loud parse error: expect() has
+     * already filled p->error, and dropping the clause instead would leave
+     * r->skip at its "none" default while the query still reports success. */
     if (match(p, TOK_SKIP)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (num) {
-            r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
+        if (!num) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
         }
+        r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
-    /* Optional LIMIT */
+    /* Optional LIMIT. Same rule: a dropped LIMIT is the failure mode #1334
+     * banned - the caller would silently receive the whole result set. */
     if (match(p, TOK_LIMIT)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (num) {
-            r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
+        if (!num) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
         }
+        r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
     *out = r;
@@ -4446,9 +4457,31 @@ static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item
 }
 
 /* Accumulate a binding into RETURN aggregation */
+static bool binding_has_value(binding_t *b, const char *var, const char *prop) {
+    if (!var || strcmp(var, "*") == 0) {
+        return true;
+    }
+    char full[CBM_SZ_256];
+    if (prop) {
+        snprintf(full, sizeof(full), "%s.%s", var, prop);
+    } else {
+        snprintf(full, sizeof(full), "%s", var);
+    }
+    for (int i = 0; i < b->var_count; i++) {
+        if (strcmp(b->var_names[i], full) == 0) {
+            return true;
+        }
+    }
+    return binding_get_edge(b, var) != NULL || binding_get(b, var) != NULL;
+}
+
 static void ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret, binding_t *b) {
     for (int ci = 0; ci < ret->count; ci++) {
         if (!is_aggregate_func(ret->items[ci].func)) {
+            continue;
+        }
+        if (strcmp(ret->items[ci].func, "COUNT") == 0 &&
+            !binding_has_value(b, ret->items[ci].variable, ret->items[ci].property)) {
             continue;
         }
         entry->counts[ci]++;
@@ -4981,8 +5014,107 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
                         limit_is_engine_budget);
 }
 
+/* ── Planner: seed a single-hop pattern from its selective end ──────────────
+ *
+ * The executor scans pattern node 0 and expands from there. Written as
+ * `MATCH (a)-[:CALLS]->(b) WHERE b.name = '_printk'`, that scans every node
+ * in the store before the filter on `b` can discard any — on an 8.5 M node
+ * kernel graph the query hit the execution-time limit while the anchored
+ * spelling `MATCH (b:Function {name:'_printk'})<-[:CALLS]-(a)` answered in
+ * seconds (2026-09-16 probe). A reader should not have to know which end to
+ * write first: when the far node carries an equality on name/qualified_name,
+ * an inline property, or a label and the near node carries less, the pattern
+ * is walked from the far end with the relationship direction inverted. The
+ * result set is identical; only the enumeration order changes. Restricted to
+ * one single-relationship pattern with an explicit RETURN, and never to an
+ * OPTIONAL MATCH, whose anchor is part of its meaning. */
+static int cypher_cond_selectivity(const cbm_condition_t *c, const char *var) {
+    if (!c || !c->variable || !var || strcmp(c->variable, var) != 0 || c->negated) {
+        return 0;
+    }
+    if (!c->op || strcmp(c->op, "=") != 0 || !c->property) {
+        return 0;
+    }
+    return (strcmp(c->property, "name") == 0 || strcmp(c->property, "qualified_name") == 0) ? 3 : 2;
+}
+
+static int cypher_expr_selectivity(const cbm_expr_t *e, const char *var) {
+    if (!e) {
+        return 0;
+    }
+    if (e->type == EXPR_CONDITION) {
+        return cypher_cond_selectivity(&e->cond, var);
+    }
+    if (e->type == EXPR_AND) {
+        int l = cypher_expr_selectivity(e->left, var);
+        int r = cypher_expr_selectivity(e->right, var);
+        return l > r ? l : r;
+    }
+    return 0; /* OR / NOT / XOR: no single equality to seed from */
+}
+
+static int cypher_node_selectivity(const cbm_node_pattern_t *n, const cbm_where_clause_t *w) {
+    int s = 0;
+    for (int i = 0; i < n->prop_count; i++) {
+        const char *k = n->props[i].key;
+        int v = (k && (strcmp(k, "name") == 0 || strcmp(k, "qualified_name") == 0)) ? 3 : 2;
+        if (v > s) {
+            s = v;
+        }
+    }
+    if (w && n->variable) {
+        int v = 0;
+        if (w->root) {
+            v = cypher_expr_selectivity(w->root, n->variable);
+        } else if (!w->op || strcmp(w->op, "AND") == 0) {
+            for (int i = 0; i < w->count; i++) {
+                int c = cypher_cond_selectivity(&w->conditions[i], n->variable);
+                if (c > v) {
+                    v = c;
+                }
+            }
+        }
+        if (v > s) {
+            s = v;
+        }
+    }
+    if (s == 0 && n->label) {
+        s = 1;
+    }
+    return s;
+}
+
+static void cypher_plan_seed_from_selective_end(cbm_query_t *q) {
+    if (!q || q->pattern_count != 1 || !q->ret || (q->pattern_optional && q->pattern_optional[0])) {
+        return;
+    }
+    cbm_pattern_t *p = &q->patterns[0];
+    if (p->rel_count != 1 || p->node_count != 2) {
+        return;
+    }
+    if (cypher_node_selectivity(&p->nodes[1], q->where) <=
+        cypher_node_selectivity(&p->nodes[0], q->where)) {
+        return;
+    }
+    cbm_node_pattern_t tmp = p->nodes[0];
+    p->nodes[0] = p->nodes[1];
+    p->nodes[1] = tmp;
+    cbm_rel_pattern_t *r = &p->rels[0];
+    const char *inverted = NULL;
+    if (r->direction && strcmp(r->direction, "outbound") == 0) {
+        inverted = "inbound";
+    } else if (r->direction && strcmp(r->direction, "inbound") == 0) {
+        inverted = "outbound";
+    }
+    if (inverted) {
+        safe_str_free(&r->direction);
+        r->direction = heap_strdup(inverted);
+    }
+}
+
 static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
                           result_builder_t *rb) {
+    cypher_plan_seed_from_selective_end(q);
     cbm_pattern_t *pat0 = &q->patterns[0];
 
     /* Step 1: Scan initial nodes */
@@ -4994,7 +5126,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     int bind_cap = scan_count > max_rows ? scan_count : (max_rows > 0 ? max_rows : SKIP_ONE);
     binding_t *bindings = malloc((bind_cap + SKIP_ONE) * sizeof(binding_t));
     int bind_count = 0;
-    const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : "_n0";
+    const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : CYP_ANON_HEAD_VAR;
 
     for (int i = 0; i < scan_count && bind_count < bind_cap; i++) {
         if ((i & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
@@ -5164,13 +5296,98 @@ static const char *scope_checkable_var(const cbm_return_item_t *item) {
     return item->variable;
 }
 
+/* Says which limit the query passed and how to get under it. An unnamed node
+ * takes no slot — except the head of the first pattern, which the engine binds
+ * either way — so dropping a name the query never uses is the cheap way out.
+ * Splitting the MATCH is NOT — every pattern of one query shares one binding,
+ * which is why the caller counts across all of them. Separate queries do work,
+ * because each gets a binding of its own. */
+static char *var_capacity_error(const char *kind, int limit) {
+    char buf[CBM_SZ_256];
+    snprintf(buf, sizeof(buf),
+             "too many %s variables: a query can name at most %d — "
+             "leave the name off the ones you do not use, or run separate queries",
+             kind, limit);
+    return heap_strdup(buf);
+}
+
+/* A binding holds a fixed number of variables: CYP_MAX_VARS node variables and
+ * CYP_MAX_EDGE_VARS edge variables, both in plain arrays (see binding_t).
+ * binding_set and binding_set_edge drop anything past those without a word, so
+ * a query naming more variables than a binding holds cannot be answered — the
+ * extra names bind to nothing and project as empty strings, which reads as
+ * "the graph holds no such data" rather than "this query is too wide".
+ *
+ * Refuse such a query instead, before any row is touched. Bounding the input
+ * here is also what stops collect_declared_names below overflowing its array:
+ * the patterns contribute at most CYP_MAX_VARS + CYP_MAX_EDGE_VARS names, plus
+ * one UNWIND alias, which is well inside CYP_SCOPE_MAX_NAMES.
+ *
+ * Counts DISTINCT variables across every pattern, because they all land in the
+ * same binding: a multi-MATCH query shares one, and an OPTIONAL MATCH pattern
+ * sits in this same array (q->pattern_optional marks which). A node variable
+ * and an edge variable may share a name and each take a slot, because the
+ * binding keeps the two in separate arrays. */
+static char *check_pattern_var_capacity(const cbm_query_t *q) {
+    /* Initialized because cppcheck cannot see that scope_holds reads only the
+     * node_n / edge_n entries already written, and reports the first call as a
+     * read of an uninitialized array. */
+    const char *node_vars[CYP_MAX_VARS] = {NULL};
+    const char *edge_vars[CYP_MAX_EDGE_VARS] = {NULL};
+    int node_n = 0;
+    int edge_n = 0;
+    /* The head of the first pattern always takes a node slot, named or not:
+     * execute_single binds it under CYP_ANON_HEAD_VAR when the query leaves it
+     * unnamed. Count it first, or a query with an unnamed head and CYP_MAX_VARS
+     * named nodes passes this check and still loses its last name in
+     * binding_set — the exact silence this guard exists to remove. */
+    if (q->pattern_count > 0 && q->patterns[0].node_count > 0 &&
+        !q->patterns[0].nodes[0].variable) {
+        node_vars[node_n++] = CYP_ANON_HEAD_VAR;
+    }
+    for (int pi = 0; pi < q->pattern_count; pi++) {
+        const cbm_pattern_t *pat = &q->patterns[pi];
+        for (int ni = 0; ni < pat->node_count; ni++) {
+            const char *var = pat->nodes[ni].variable;
+            if (!var || scope_holds(node_vars, node_n, var)) {
+                continue;
+            }
+            if (node_n >= CYP_MAX_VARS) {
+                return var_capacity_error("node", CYP_MAX_VARS);
+            }
+            node_vars[node_n++] = var;
+        }
+        for (int ri = 0; ri < pat->rel_count; ri++) {
+            const char *var = pat->rels[ri].variable;
+            if (!var || scope_holds(edge_vars, edge_n, var)) {
+                continue;
+            }
+            if (edge_n >= CYP_MAX_EDGE_VARS) {
+                return var_capacity_error("edge", CYP_MAX_EDGE_VARS);
+            }
+            edge_vars[edge_n++] = var;
+        }
+    }
+    return NULL;
+}
+
 /* Answers NULL when the query is fine, or a heap message naming the first
  * variable that is not in scope. Checks one query; the caller walks a UNION. */
 static char *check_projection_scope(const cbm_query_t *q) {
+    /* Runs first, so the rest of this function can trust that the query names
+     * no more variables than the arrays below can model. */
+    char *capacity_err = check_pattern_var_capacity(q);
+    if (capacity_err) {
+        return capacity_err;
+    }
+
     const char *declared[CYP_SCOPE_MAX_NAMES];
     int declared_n = collect_declared_names(q, declared, CYP_SCOPE_MAX_NAMES);
     if (declared_n < 0) {
-        return NULL; /* too many names to model — stay quiet rather than guess */
+        /* Unreachable while the capacity check above holds. Kept so the guard
+         * still stands if either bound ever moves. Skipping the check was the
+         * old behaviour, and it let an out-of-scope name through in silence. */
+        return NULL;
     }
 
     /* A WITH still reads the pattern variables. */
@@ -5194,7 +5411,7 @@ static char *check_projection_scope(const cbm_query_t *q) {
     if (q->with_clause) {
         scope_n = collect_with_names(q->with_clause, after_with, CYP_SCOPE_MAX_NAMES);
         if (scope_n < 0) {
-            return NULL;
+            return NULL; /* unreachable: a WITH holds at most CYP_SCOPE_MAX_NAMES items */
         }
         scope = after_with;
     }
