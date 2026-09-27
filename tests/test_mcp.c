@@ -3786,6 +3786,124 @@ TEST(tool_search_graph_bm25_reports_candidate_saturation) {
     PASS();
 }
 
+/* Shared fixture for the two BM25 findability probes (2026-09-16, measured on
+ * JetBrains/Exposed and django/django): a Class named exactly like the query,
+ * that class's own Methods, and test Methods whose long names repeat the
+ * query token — the shapes that outranked the class and hid it entirely. */
+static void bm25_findability_fixture(cbm_store_t *store, const char *project) {
+    cbm_store_upsert_project(store, project, "/tmp/bm25-findability");
+    struct {
+        const char *label, *name, *qn, *file;
+    } rows[] = {
+        {"Class", "Table", "bm25-find.core.Table.Table", "core/Table.kt"},
+        {"Method", "unquoted", "bm25-find.core.Table.Table.unquoted", "core/Table.kt"},
+        {"Method", "describe", "bm25-find.core.Table.Table.describe", "core/Table.kt"},
+        {"Method", "table references table with same name in other database",
+         "bm25-find.tests.SchemaTests.table_references_table_with_same_name", "tests/Schema.kt"},
+        {"Method", "table references table with same name in mysql",
+         "bm25-find.tests.SchemaTests.table_references_table_with_same_name_mysql",
+         "tests/Schema.kt"},
+        {"Function", "get_object_or_404", "bm25-find.shortcuts.get_object_or_404", "shortcuts.py"},
+        {"Method", "test_get_object_or_404",
+         "bm25-find.tests.GetObjectOr404Tests.test_get_object_or_404", "tests/tests.py"},
+        {"Method", "test_get_object_or_404_queryset_attribute_error",
+         "bm25-find.tests.GetObjectOr404Tests.test_get_object_or_404_queryset_attribute_error",
+         "tests/tests.py"},
+        {"Method", "test_get_object_or_404_bad_class",
+         "bm25-find.tests.GetListObjectOr404Test.test_get_object_or_404_bad_class",
+         "tests/async.py"},
+    };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        cbm_node_t node = {.project = project,
+                           .label = rows[i].label,
+                           .name = rows[i].name,
+                           .qualified_name = rows[i].qn,
+                           .file_path = rows[i].file,
+                           .start_line = (int)i + 1,
+                           .end_line = (int)i + 2};
+        cbm_store_upsert_node(store, &node);
+    }
+    cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                          "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                          "label, file_path FROM nodes;");
+}
+
+/* The label filter must apply in query (BM25) mode exactly as in structural
+ * mode: `query=Table label=Class` returns the class, and no Method. */
+TEST(tool_search_graph_bm25_applies_label_filter) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-find";
+    cbm_mcp_server_set_project(srv, project);
+    bm25_findability_fixture(store, project);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":554,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"Table\",\"label\":\"Class\","
+             "\"limit\":5,\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-find.core.Table.Table\",\"Class\""));
+    ASSERT_NULL(strstr(inner, "\"Method\""));
+    /* The reported total describes the filtered rows, not the unfiltered window. */
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":1"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* The definition whose NAME is the query ranks first: the `Table` class above
+ * its own methods and above test methods that repeat "table" three times; the
+ * `get_object_or_404` function above the test methods that contain it. */
+TEST(tool_search_graph_bm25_ranks_exact_name_first) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-find";
+    cbm_mcp_server_set_project(srv, project);
+    bm25_findability_fixture(store, project);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":555,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"Table\",\"limit\":5,\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    const char *rows = strstr(inner, "\"rows\":[");
+    ASSERT_NOT_NULL(rows);
+    const char *first_qn = strstr(rows, "[\"");
+    ASSERT_NOT_NULL(first_qn);
+    ASSERT_EQ(strncmp(first_qn, "[\"bm25-find.core.Table.Table\"", 29), 0);
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":556,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"get_object_or_404\",\"limit\":5,"
+             "\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    rows = strstr(inner, "\"rows\":[");
+    ASSERT_NOT_NULL(rows);
+    first_qn = strstr(rows, "[\"");
+    ASSERT_NOT_NULL(first_qn);
+    ASSERT_EQ(strncmp(first_qn, "[\"bm25-find.shortcuts.get_object_or_404\"", 40), 0);
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* `query` selects the BM25 fast path, which returns before semantic_query is
  * evaluated. Accepting both therefore used to report success while silently
  * discarding one of the caller's two requested result sets. The contract is
@@ -5583,9 +5701,9 @@ TEST(tool_check_index_coverage_reports_truncation_marker_issue963) {
 
     /* The marked file: both real ranges survive, the marker is flagged, and the
      * "12" from the marker never becomes a range of its own. */
-    char *marked =
-        cbm_mcp_handle_tool(srv, "check_index_coverage",
-                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/marked.c\"],\"format\":\"json\"}");
+    char *marked = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-marker\",\"paths\":[\"src/marked.c\"],\"format\":\"json\"}");
     ASSERT_NOT_NULL(marked);
     char *marked_inner = extract_text_content(marked);
     ASSERT_NOT_NULL(marked_inner);
@@ -5597,9 +5715,9 @@ TEST(tool_check_index_coverage_reports_truncation_marker_issue963) {
     free(marked);
 
     /* The same ranges without a marker must NOT be reported as truncated. */
-    char *plain =
-        cbm_mcp_handle_tool(srv, "check_index_coverage",
-                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/plain.c\"],\"format\":\"json\"}");
+    char *plain = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-marker\",\"paths\":[\"src/plain.c\"],\"format\":\"json\"}");
     ASSERT_NOT_NULL(plain);
     char *plain_inner = extract_text_content(plain);
     ASSERT_NOT_NULL(plain_inner);
@@ -5610,9 +5728,9 @@ TEST(tool_check_index_coverage_reports_truncation_marker_issue963) {
 
     /* The reader's own limit stops the list early, so it must say so even
      * though the producer sent no marker. */
-    char *widest =
-        cbm_mcp_handle_tool(srv, "check_index_coverage",
-                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/wide.c\"],\"format\":\"json\"}");
+    char *widest = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-marker\",\"paths\":[\"src/wide.c\"],\"format\":\"json\"}");
     ASSERT_NOT_NULL(widest);
     char *wide_inner = extract_text_content(widest);
     ASSERT_NOT_NULL(wide_inner);
@@ -5726,20 +5844,15 @@ TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_
     ASSERT_NOT_NULL(store);
     char source_path[512];
     snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
-    struct stat source_stat;
-    ASSERT_EQ(stat(source_path, &source_stat), 0);
-#ifdef __APPLE__
-    int64_t source_mtime_ns =
-        ((int64_t)source_stat.st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-        (int64_t)source_stat.st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    int64_t source_mtime_ns = (int64_t)source_stat.st_mtime * (int64_t)CBM_NSEC_PER_SEC;
-#else
-    int64_t source_mtime_ns = ((int64_t)source_stat.st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-                              (int64_t)source_stat.st_mtim.tv_nsec;
-#endif
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", source_mtime_ns,
-                                         source_stat.st_size),
+    /* The fixture must record the hash with the SAME mtime source the indexer
+     * writes with — cbm_path_info_utf8 — not struct stat. On Windows stat
+     * truncates to seconds while the stored record carries FILETIME-derived
+     * nanoseconds, so a stat-written fixture would never compare equal and the
+     * metadata_match contract below would fail. */
+    cbm_path_info_t path_info;
+    ASSERT_EQ(cbm_path_info_utf8(source_path, &path_info), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", path_info.mtime_ns,
+                                         path_info.size),
               CBM_STORE_OK);
     cbm_project_t project = {0};
     ASSERT_EQ(cbm_store_get_project(store, "test-project", &project), CBM_STORE_OK);
@@ -5779,6 +5892,63 @@ TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_
     free(response);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* #1714: coverage freshness must compare mtime_ns at the SAME precision the
+ * indexer records it. The pipeline records cbm_path_info_utf8's value (which
+ * on Windows derives from FILETIME — nanosecond), while the freshness reader
+ * used to recompute from struct stat, which on Windows truncates to seconds
+ * (st_mtime). A byte-identical file therefore never matched and every path was
+ * reported metadata_changed. The reader now uses the indexer's own source. */
+TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
+    cbm_path_info_t info;
+    ASSERT_EQ(cbm_path_info_utf8(source_path, &info), 0);
+
+    /* The hash exactly as the indexer writes it: same source, ns precision. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", info.mtime_ns,
+                                         info.size),
+              CBM_STORE_OK);
+
+    /* format=json, like every other coverage test here: the DEFAULT response is
+     * the compact table, in which a field name never appears. Keeping the
+     * assertion on the JSON field is what makes it exact — a bare strstr for
+     * "metadata_match" would also be satisfied by a neighbouring column or by
+     * another path's row. */
+    char *response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                         "{\"project\":\"test-project\",\"paths\":[\"main.go\"],"
+                                         "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"freshness\":\"metadata_match\""));
+    free(response);
+
+    /* A hash stored at seconds precision — what a stat-based reader previously
+     * compared against — must NOT match an unchanged file: the comparison must
+     * stay nanosecond-exact, or part of mtime resolution is silently dropped. */
+    int64_t seconds_mtime_ns = (info.mtime_ns / (int64_t)CBM_NSEC_PER_SEC) *
+                               (int64_t)CBM_NSEC_PER_SEC;
+    if (seconds_mtime_ns != info.mtime_ns) {
+        ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "",
+                                             seconds_mtime_ns, info.size),
+                  CBM_STORE_OK);
+        response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                       "{\"project\":\"test-project\",\"paths\":[\"main.go\"],"
+                                       "\"format\":\"json\"}");
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "\"freshness\":\"metadata_changed\""));
+        free(response);
+    }
+
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
     PASS();
 }
 
@@ -17773,8 +17943,15 @@ TEST(index_repository_over_budget_reports_named_reason) {
     bool reason_named = second_reason && strcmp(second_reason, "over_memory_budget") == 0;
     bool previous_preserved = second_previous && strcmp(second_previous, "preserved") == 0;
     bool hint_names_knob = second_hint && strstr(second_hint, "CBM_MEM_BUDGET_MB") != NULL;
+    /* The hint must also say that peak_rss_mb is NOT the requirement. The abort
+     * fires when RSS crosses the budget, so the peak is pinned just above it by
+     * construction; a caller who retries at peak+10% fails again. Measured on
+     * the linux kernel 2026-09-13: aborted at 25622 MB against a 24576 MB
+     * budget, but completing it took 31.75 GB. */
+    bool hint_warns_peak_is_not_need = second_hint && strstr(second_hint, "STOPPED") != NULL;
     int budget_mb = budget_doc_int(second_doc, "budget_mb", -1);
     int peak_rss_mb = budget_doc_int(second_doc, "peak_rss_mb", -1);
+    int suggested_mb = budget_doc_int(second_doc, "suggested_budget_mb", -1);
     yyjson_doc_free(second_doc);
     free(second);
     long db_size_after = (long)cbm_file_size(db_path);
@@ -17817,8 +17994,11 @@ TEST(index_repository_over_budget_reports_named_reason) {
     ASSERT_TRUE(reason_named);
     ASSERT_TRUE(previous_preserved);
     ASSERT_TRUE(hint_names_knob);
+    ASSERT_TRUE(hint_warns_peak_is_not_need);
     ASSERT_EQ(budget_mb, 1);
     ASSERT_GT(peak_rss_mb, budget_mb);
+    /* A CONCRETE retry value, not just the knob name: 1.5x the budget. */
+    ASSERT_GT(suggested_mb, budget_mb);
     /* Preserved on disk and still served: same file size, same node count. */
     ASSERT_GT(db_size_before, 0L);
     ASSERT_EQ(db_size_after, db_size_before);
@@ -19099,22 +19279,72 @@ TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
- *  #1466 — autoindex.skip must report the effective numeric limit
+ *  #1466 / #713 — the auto_index_limit guard
+ *
+ *  #1466: autoindex.skip must report the effective numeric limit.
+ *  #713:  the guard must bound NON-git roots. The 0.8.x guard counted
+ *         `git ls-files | wc -l`, which is 0 outside a checkout, so a plain
+ *         directory of 60k files was walked in full (tens of GB RSS). The
+ *         bounded discovery count applies to every root, and the skip line
+ *         names the limit AND the root so the reporter can act on it.
  * ══════════════════════════════════════════════════════════════════ */
 
 static char autoindex_skip_log[1024];
+static bool autoindex_saw_done;
 
-/* Keeps only the too_many_files skip line, so later lines cannot displace it. */
-static void autoindex_skip_capture_log(const char *line) {
-    if (line && strstr(line, "msg=autoindex.skip") && strstr(line, "reason=too_many_files")) {
+/* Keeps only the too_many_files skip line, so later lines cannot displace it,
+ * and records whether an admitted auto-index actually ran to completion. */
+static void autoindex_limit_capture_log(const char *line) {
+    if (!line) {
+        return;
+    }
+    if (strstr(line, "msg=autoindex.skip") && strstr(line, "reason=too_many_files")) {
         snprintf(autoindex_skip_log, sizeof(autoindex_skip_log), "%s", line);
+    }
+    if (strstr(line, "msg=autoindex.done")) {
+        autoindex_saw_done = true;
     }
 }
 
-/* Drive initialize → maybe_auto_index over a fresh project holding more tracked
- * files than auto_index_limit, and capture the resulting skip warning.
+typedef struct {
+    int files;     /* indexable .py files written into the root */
+    int limit;     /* auto_index_limit */
+    bool git_root; /* emulate a checkout via <root>/.git/HEAD (no git binary) */
+} autoindex_limit_probe_t;
+
+static bool autoindex_limit_write_fixture(const char *repodir,
+                                          const autoindex_limit_probe_t *probe) {
+    if (th_mkdir_p(repodir) != 0) {
+        return false;
+    }
+    for (int i = 0; i < probe->files; i++) {
+        char path[640];
+        char body[96];
+        snprintf(path, sizeof(path), "%s/f%d.py", repodir, i);
+        snprintf(body, sizeof(body), "def f%d():\n    return %d\n", i, i);
+        if (th_write_file(path, body) != 0) {
+            return false;
+        }
+    }
+    if (probe->git_root) {
+        char gitdir[640];
+        char head[700];
+        snprintf(gitdir, sizeof(gitdir), "%s/.git", repodir);
+        snprintf(head, sizeof(head), "%s/HEAD", gitdir);
+        if (th_mkdir_p(gitdir) != 0 || th_write_file(head, "ref: refs/heads/main\n") != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Drive initialize → maybe_auto_index over a fresh root holding probe->files
+ * indexable files under auto_index_limit=probe->limit. skip_out receives the
+ * too_many_files warning (empty when admitted); *done_out reports whether an
+ * admitted auto-index ran to completion (the server free joins the thread).
  * Returns false on fixture setup failure. */
-static bool autoindex_skip_warning(char *out, size_t out_size) {
+static bool autoindex_limit_probe(const autoindex_limit_probe_t *probe, char *skip_out,
+                                  size_t skip_size, bool *done_out) {
     char cache[256];
     snprintf(cache, sizeof(cache), "%s/cbm-autoindex-limit-XXXXXX", cbm_tmpdir());
     if (!cbm_mkdtemp(cache)) {
@@ -19123,12 +19353,7 @@ static bool autoindex_skip_warning(char *out, size_t out_size) {
 
     char repodir[512];
     snprintf(repodir, sizeof(repodir), "%s/repo", cache);
-    char file_a[640];
-    char file_b[640];
-    snprintf(file_a, sizeof(file_a), "%s/a.py", repodir);
-    snprintf(file_b, sizeof(file_b), "%s/b.py", repodir);
-    if (th_mkdir_p(repodir) != 0 || th_write_file(file_a, "def a():\n    return 1\n") != 0 ||
-        th_write_file(file_b, "def b():\n    return 2\n") != 0) {
+    if (!autoindex_limit_write_fixture(repodir, probe)) {
         th_rmtree(cache);
         return false;
     }
@@ -19148,27 +19373,31 @@ static bool autoindex_skip_warning(char *out, size_t out_size) {
     bool ok = false;
     cbm_config_t *cfg = cbm_config_open(cache);
     if (cfg) {
+        char limit[32];
+        snprintf(limit, sizeof(limit), "%d", probe->limit);
         cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
-        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "1");
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, limit);
 
         cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
         if (srv) {
             autoindex_skip_log[0] = '\0';
+            autoindex_saw_done = false;
             CBMLogLevel prev_level = cbm_log_get_level();
-            cbm_log_set_level(CBM_LOG_WARN);
+            cbm_log_set_level(CBM_LOG_INFO);
             cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
-            cbm_log_set_sink_ex(autoindex_skip_capture_log, CBM_LOG_SINK_REPLACE);
+            cbm_log_set_sink_ex(autoindex_limit_capture_log, CBM_LOG_SINK_REPLACE);
 
             cbm_mcp_server_set_config(srv, cfg);
             char *resp = cbm_mcp_server_handle(
                 srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
             free(resp);
-            cbm_mcp_server_free(srv);
+            cbm_mcp_server_free(srv); /* joins an admitted autoindex thread */
 
             cbm_log_set_sink(NULL);
             cbm_log_set_level(prev_level);
 
-            snprintf(out, out_size, "%s", autoindex_skip_log);
+            snprintf(skip_out, skip_size, "%s", autoindex_skip_log);
+            *done_out = autoindex_saw_done;
             ok = true;
         }
         cbm_config_close(cfg);
@@ -19184,8 +19413,10 @@ static bool autoindex_skip_warning(char *out, size_t out_size) {
 /* RED before the fix: the warning carries `limit=auto_index_limit`, the config
  * key constant, instead of the configured value. */
 TEST(autoindex_skip_reports_numeric_limit_issue1466) {
+    autoindex_limit_probe_t probe = {.files = 2, .limit = 1, .git_root = false};
     char warning[1024];
-    if (!autoindex_skip_warning(warning, sizeof(warning))) {
+    bool done = false;
+    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
         PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
     }
     /* Not vacuous: the skip path must actually have been taken. */
@@ -19194,6 +19425,58 @@ TEST(autoindex_skip_reports_numeric_limit_issue1466) {
     ASSERT_NOT_NULL(strstr(warning, "files=2"));
     ASSERT_NOT_NULL(strstr(warning, "limit=1"));
     ASSERT_NULL(strstr(warning, "limit=auto_index_limit"));
+    ASSERT_FALSE(done);
+    PASS();
+}
+
+/* #713 at the reporter's shape scaled down (60 files vs limit 50, from
+ * 60k vs 50k): a PLAIN directory over the limit is refused, and the line
+ * names the limit and the root. RED on the `git ls-files` guard (count 0 →
+ * admitted → indexed) and RED while the line does not name the root. */
+TEST(autoindex_limit_guards_non_git_root_issue713) {
+    autoindex_limit_probe_t probe = {.files = 60, .limit = 50, .git_root = false};
+    char warning[1024];
+    bool done = false;
+    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
+    ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
+    ASSERT_NOT_NULL(strstr(warning, "limit=50"));
+    const char *root = strstr(warning, "root=");
+    ASSERT_NOT_NULL(root);
+    ASSERT_NOT_NULL(strstr(root, "/repo"));
+    ASSERT_FALSE(done);
+    PASS();
+}
+
+/* The same plain directory one file UNDER the limit is admitted and indexed:
+ * the guard bounds, it does not fail closed on every non-git root. */
+TEST(autoindex_limit_admits_non_git_root_under_limit_issue713) {
+    autoindex_limit_probe_t probe = {.files = 49, .limit = 50, .git_root = false};
+    char warning[1024];
+    bool done = false;
+    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    ASSERT(warning[0] == '\0');
+    ASSERT_TRUE(done);
+    PASS();
+}
+
+/* A checkout keeps its behaviour: one bounded count for both root kinds. */
+TEST(autoindex_limit_guards_git_root_issue713) {
+    autoindex_limit_probe_t probe = {.files = 60, .limit = 50, .git_root = true};
+    char warning[1024];
+    bool done = false;
+    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
+    ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
+    ASSERT_NOT_NULL(strstr(warning, "limit=50"));
+    ASSERT_NOT_NULL(strstr(warning, "root="));
+    ASSERT_FALSE(done);
     PASS();
 }
 
@@ -20253,6 +20536,8 @@ SUITE(mcp) {
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_bm25_reports_candidate_saturation);
+    RUN_TEST(tool_search_graph_bm25_applies_label_filter);
+    RUN_TEST(tool_search_graph_bm25_ranks_exact_name_first);
     RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);
     RUN_TEST(tool_search_graph_semantic_ceiling_never_emits_unusable_continuation);
     RUN_TEST(tool_search_graph_semantic_pagination_is_lossless_and_independent);
@@ -20276,6 +20561,7 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_preserves_multiple_scope_labels);
     RUN_TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_issue1613);
     RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
+    RUN_TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714);
     RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_index_status_includes_git_metadata);
@@ -20477,6 +20763,9 @@ SUITE(mcp) {
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
     RUN_TEST(autoindex_skip_reports_numeric_limit_issue1466);
+    RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
+    RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
+    RUN_TEST(autoindex_limit_guards_git_root_issue713);
 }
 
 /* Kept separate so daemon-coordination regressions can be iterated without
