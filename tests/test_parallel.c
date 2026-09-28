@@ -720,7 +720,7 @@ TEST(parallel_post_extract_projection_spills_before_resolve) {
 
     cbm_mem_set_charged_for_tests(latch);
     int cached_near = -1;
-    cbm_gbuf_t *near =
+    cbm_gbuf_t *gb_near =
         run_parallel_with_extract_opts_and_mutator("par-test", g_par_tmpdir, files, file_count, 2,
                                                    NULL, count_cached_results, &cached_near, false);
     int64_t parked_near = g_harness_parked;
@@ -736,7 +736,7 @@ TEST(parallel_post_extract_projection_spills_before_resolve) {
     g_harness_spill = false;
     cbm_mem_set_budget_for_tests(saved_budget);
     cbm_discover_free(files, file_count);
-    ASSERT(near != NULL);
+    ASSERT(gb_near != NULL);
     ASSERT(roomy != NULL);
 
     /* A: every result went to disk before registry build. */
@@ -746,7 +746,7 @@ TEST(parallel_post_extract_projection_spills_before_resolve) {
     ASSERT_EQ((int)parked_roomy, -1);
     ASSERT_GT(cached_roomy, 0);
 
-    graph_fp_t fp_near = graph_fingerprint(near);
+    graph_fp_t fp_near = graph_fingerprint(gb_near);
     graph_fp_t fp_roomy = graph_fingerprint(roomy);
     graph_fp_t fp_mem = graph_fingerprint(g_par_gbuf);
     ASSERT_GT(fp_mem.count, 0);
@@ -754,7 +754,7 @@ TEST(parallel_post_extract_projection_spills_before_resolve) {
     ASSERT_EQ(fp_roomy.count, fp_mem.count);
     ASSERT_TRUE(fp_near.sum == fp_mem.sum && fp_near.xr == fp_mem.xr);
     ASSERT_TRUE(fp_roomy.sum == fp_mem.sum && fp_roomy.xr == fp_mem.xr);
-    cbm_gbuf_free(near);
+    cbm_gbuf_free(gb_near);
     cbm_gbuf_free(roomy);
     PASS();
 }
