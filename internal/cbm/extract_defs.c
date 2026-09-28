@@ -87,10 +87,18 @@ static bool try_append_ident(const char *source, uint32_t s, int len, uint32_t *
 }
 
 /* Walk AST body, collect unique identifier text as space-separated string.
- * Returns arena-allocated string or NULL. */
+ * Contract: the first BT_MAX_IDENTS unique identifiers in pre-order (source
+ * order), bounded by BT_BUF bytes. The ident/byte caps ARE the sampling
+ * contract; the pending stack is not — BT_STACK is only the on-stack first
+ * chunk and spills to the heap, because a full fixed stack dropped a wide
+ * body's FIRST children and sampled a mid-body window instead.
+ * Returns arena-allocated string, or NULL when there are no identifiers or the
+ * stack could not be grown (logged; no truncated sample is ever returned). */
 static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
     enum { BT_STACK = 512, BT_BUF = 2048, BT_MAX_IDENTS = 128, BT_SEEN = 256, BT_SEEN_MASK = 255 };
-    TSNode bt_stack[BT_STACK];
+    TSNode bt_inline[BT_STACK];
+    TSNode *bt_stack = bt_inline;
+    int bt_cap = BT_STACK;
     int bt_top = 0;
     bt_stack[bt_top++] = body;
     char bt_buf[BT_BUF];
@@ -120,11 +128,17 @@ static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
                 }
             }
         } else {
-            for (int i = (int)nc - SKIP_ONE; i >= 0 && bt_top < BT_STACK; i--) {
+            if (!cbm_walk_stack_reserve((void **)&bt_stack, &bt_cap, bt_top + (int)nc,
+                                        sizeof(TSNode), bt_inline, "body_ident_tokens")) {
+                bt_pos = 0; /* sentinel: no sample rather than a truncated one */
+                break;
+            }
+            for (int i = (int)nc - SKIP_ONE; i >= 0; i--) {
                 bt_stack[bt_top++] = ts_node_child(nd, (uint32_t)i);
             }
         }
     }
+    cbm_walk_stack_release(bt_stack, bt_inline);
     if (bt_pos > 0) {
         bt_buf[bt_pos] = '\0';
         return cbm_arena_strdup(ctx->arena, bt_buf);
