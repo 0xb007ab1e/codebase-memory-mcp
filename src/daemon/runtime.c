@@ -2857,6 +2857,73 @@ bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint
     return true;
 }
 
+/* "; CBM sessions using it: pids 1, 2 and 3 more" — empty when none are known. */
+static bool remedy_sessions_format(const cbm_daemon_runtime_status_t *active, char *out,
+                                   size_t out_size) {
+    out[0] = '\0';
+    size_t listed = active->client_count;
+    if (listed > CBM_DAEMON_CONTROL_CLIENT_CAP) {
+        listed = CBM_DAEMON_CONTROL_CLIENT_CAP;
+    }
+    size_t used = 0;
+    for (size_t i = 0; i < listed; i++) {
+        int written = snprintf(out + used, out_size - used, "%s%lu",
+                               i == 0 ? "; CBM sessions using it: pids " : ", ",
+                               (unsigned long)active->client_pids[i]);
+        if (written < 0 || (size_t)written >= out_size - used) {
+            return false;
+        }
+        used += (size_t)written;
+    }
+    if (listed > 0 && active->committed_clients > listed) {
+        int written = snprintf(out + used, out_size - used, " and %lu more",
+                               (unsigned long)(active->committed_clients - listed));
+        if (written < 0 || (size_t)written >= out_size - used) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool cbm_daemon_conflict_remedy_format(const cbm_daemon_runtime_status_t *active, char *out,
+                                       size_t out_size) {
+    if (!out || out_size == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    static const char install_hint[] =
+        "Usually another editor or agent session (for example Codex or Claude Code) "
+        "launched a different codebase-memory-mcp install: close it, or point every client "
+        "at one binary (compare `which -a codebase-memory-mcp` with each client's MCP "
+        "config).";
+    int written;
+    if (!active) {
+        written = snprintf(out, out_size,
+                           "Run `codebase-memory-mcp daemon status` to see the active daemon and "
+                           "the sessions using it. %s `codebase-memory-mcp daemon stop` retires "
+                           "the daemon once no session uses it.",
+                           install_hint);
+    } else {
+        char sessions[160];
+        if (!remedy_sessions_format(active, sessions, sizeof(sessions))) {
+            return false;
+        }
+        const char *lifetime =
+            active->permanent ? "permanent" : "session-managed, exits when its last session closes";
+        written = snprintf(out, out_size,
+                           "Active daemon: pid %lu, version %s, %s%s%s. %s "
+                           "`codebase-memory-mcp daemon stop` retires the daemon once no session "
+                           "uses it.",
+                           (unsigned long)active->daemon_pid, active->semantic_version, lifetime,
+                           active->stopping ? ", already stopping" : "", sessions, install_hint);
+    }
+    if (written < 0 || (size_t)written >= out_size) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
 bool cbm_daemon_runtime_request_stop(const cbm_daemon_ipc_endpoint_t *endpoint,
                                      const cbm_daemon_build_identity_t *identity,
                                      uint32_t timeout_ms,

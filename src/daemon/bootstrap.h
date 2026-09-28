@@ -93,6 +93,9 @@ typedef struct {
     cbm_daemon_runtime_connect_result_t connect_result;
     bool daemon_spawned;
     char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
+    /* #2277: filled by the client on a CONFLICT only — who holds the
+     * endpoint and how to clear it (cbm_daemon_conflict_remedy_format). */
+    char remedy[CBM_DAEMON_CONFLICT_REMEDY_SIZE];
 } cbm_daemon_bootstrap_result_t;
 
 /* A probe distinguishes an absent endpoint from a reserved endpoint whose
