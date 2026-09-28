@@ -8717,6 +8717,54 @@ static cbm_graph_access_t cbm_tiered_profile_set_access(cbm_tiered_profile_set_t
                : CBM_GRAPH_ACCESS_HANDOFF;
 }
 
+/* Every earlier rendering of one tier's profile that install/uninstall must
+ * still recognise as ours: the other access mode, the v0.9.1-rc.1 Codex
+ * shape, the pre-tier Verify file, and the v0.10.8 OpenCode shape (#2264). */
+typedef struct {
+    char *owned[4];
+    size_t owned_count;
+    const char *content[5];
+    size_t count;
+} tiered_released_profiles_t;
+
+static void tiered_released_profiles_keep(tiered_released_profiles_t *released, char *rendered) {
+    if (rendered) {
+        released->owned[released->owned_count++] = rendered;
+        released->content[released->count++] = rendered;
+    }
+}
+
+static void tiered_released_profiles_collect(cbm_tiered_profile_set_t profiles,
+                                             cbm_graph_tier_t tier, cbm_graph_access_t access,
+                                             tiered_released_profiles_t *released) {
+    memset(released, 0, sizeof(*released));
+    cbm_graph_access_t alternate_access =
+        access == CBM_GRAPH_ACCESS_DIRECT ? CBM_GRAPH_ACCESS_HANDOFF : CBM_GRAPH_ACCESS_DIRECT;
+    tiered_released_profiles_keep(
+        released,
+        cbm_render_graph_profile(profiles.dialect, tier, alternate_access, profiles.binary_path));
+    if (profiles.dialect == CBM_GRAPH_DIALECT_CODEX && access == CBM_GRAPH_ACCESS_DIRECT) {
+        tiered_released_profiles_keep(released, cbm_render_graph_profile_codex_rc1(tier));
+    }
+    if (profiles.dialect == CBM_GRAPH_DIALECT_OPENCODE) {
+        tiered_released_profiles_keep(released,
+                                      cbm_render_graph_profile_opencode_v0108(tier, access));
+        tiered_released_profiles_keep(
+            released, cbm_render_graph_profile_opencode_v0108(tier, alternate_access));
+    }
+    if (tier == CBM_GRAPH_TIER_VERIFY && profiles.legacy_verify_content) {
+        released->content[released->count++] = profiles.legacy_verify_content;
+    }
+}
+
+static void tiered_released_profiles_free(tiered_released_profiles_t *released) {
+    for (size_t i = 0U; i < released->owned_count; i++) {
+        free(released->owned[i]);
+    }
+    released->owned_count = 0U;
+    released->count = 0U;
+}
+
 static void install_tiered_agent_profiles(cbm_tiered_profile_set_t profiles, bool dry_run) {
     cbm_graph_access_t access = cbm_tiered_profile_set_access(profiles);
     for (int value = 0; value < (int)CBM_GRAPH_TIER_COUNT; value++) {
@@ -8740,30 +8788,13 @@ static void install_tiered_agent_profiles(cbm_tiered_profile_set_t profiles, boo
             record_agent_config_error(false, profiles.label, "agent_render", path);
             continue;
         }
-        cbm_graph_access_t alternate_access =
-            access == CBM_GRAPH_ACCESS_DIRECT ? CBM_GRAPH_ACCESS_HANDOFF : CBM_GRAPH_ACCESS_DIRECT;
-        char *alternate = cbm_render_graph_profile(profiles.dialect, tier, alternate_access,
-                                                   profiles.binary_path);
-        char *codex_rc1 =
-            profiles.dialect == CBM_GRAPH_DIALECT_CODEX && access == CBM_GRAPH_ACCESS_DIRECT
-                ? cbm_render_graph_profile_codex_rc1(tier)
-                : NULL;
-        const char *released[3];
-        size_t released_count = 0U;
-        if (alternate) {
-            released[released_count++] = alternate;
-        }
-        if (codex_rc1) {
-            released[released_count++] = codex_rc1;
-        }
-        if (tier == CBM_GRAPH_TIER_VERIFY && profiles.legacy_verify_content) {
-            released[released_count++] = profiles.legacy_verify_content;
-        }
-        int result = prepare_config_parent(path)
-                         ? cbm_text_migrate_owned_document(path, current, released, released_count)
-                         : CLI_ERR;
-        free(codex_rc1);
-        free(alternate);
+        tiered_released_profiles_t released;
+        tiered_released_profiles_collect(profiles, tier, access, &released);
+        int result =
+            prepare_config_parent(path)
+                ? cbm_text_migrate_owned_document(path, current, released.content, released.count)
+                : CLI_ERR;
+        tiered_released_profiles_free(&released);
         free(current);
         if (result != CLI_OK) {
             if (result > CLI_OK) {
@@ -8795,28 +8826,11 @@ static void uninstall_tiered_agent_profiles(cbm_tiered_profile_set_t profiles, b
             record_agent_config_error(true, profiles.label, "agent_render", path);
             continue;
         }
-        cbm_graph_access_t alternate_access =
-            access == CBM_GRAPH_ACCESS_DIRECT ? CBM_GRAPH_ACCESS_HANDOFF : CBM_GRAPH_ACCESS_DIRECT;
-        char *alternate = cbm_render_graph_profile(profiles.dialect, tier, alternate_access,
-                                                   profiles.binary_path);
-        char *codex_rc1 =
-            profiles.dialect == CBM_GRAPH_DIALECT_CODEX && access == CBM_GRAPH_ACCESS_DIRECT
-                ? cbm_render_graph_profile_codex_rc1(tier)
-                : NULL;
-        const char *released[3];
-        size_t released_count = 0U;
-        if (alternate) {
-            released[released_count++] = alternate;
-        }
-        if (codex_rc1) {
-            released[released_count++] = codex_rc1;
-        }
-        if (tier == CBM_GRAPH_TIER_VERIFY && profiles.legacy_verify_content) {
-            released[released_count++] = profiles.legacy_verify_content;
-        }
-        int result = cbm_text_remove_owned_document_any(path, current, released, released_count);
-        free(codex_rc1);
-        free(alternate);
+        tiered_released_profiles_t released;
+        tiered_released_profiles_collect(profiles, tier, access, &released);
+        int result =
+            cbm_text_remove_owned_document_any(path, current, released.content, released.count);
+        tiered_released_profiles_free(&released);
         free(current);
         if (result < CLI_OK) {
             record_agent_config_error(true, profiles.label, "agent_uninstall", path);
