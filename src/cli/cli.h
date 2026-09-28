@@ -504,6 +504,12 @@ void cbm_cli_set_activation_ops_for_test(const cbm_cli_activation_ops_t *ops);
 void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent);
 const char *cbm_cli_activation_runtime_parent_for_test(void);
 
+/* Internal integration-test seam: the activation scope read reports the active
+ * cohort's cache fingerprint as unreadable (blank), exactly what the scope
+ * decision sees when that field cannot be recovered. false restores the real
+ * read. Not a command-line or environment override. */
+void cbm_cli_set_activation_scope_cache_unreadable_for_test(bool unreadable);
+
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 
 /* install: copy binary, install skills, install editor MCP configs, ensure PATH.

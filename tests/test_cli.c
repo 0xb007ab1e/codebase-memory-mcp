@@ -18,11 +18,13 @@
 #include <cli/cli.h>
 #include <cli/progress_sink.h>
 #include <daemon/bootstrap.h>
+#include <daemon/ipc.h>
 #include <daemon/runtime.h>
 #include <daemon/version_cohort.h>
 #include <foundation/constants.h>
 #include <foundation/log.h>
 #include <foundation/platform.h>
+#include <foundation/private_file_lock.h>
 #include <foundation/sha256.h>
 #include <mcp/mcp.h>
 #include <mcp/index_supervisor.h>
@@ -2035,6 +2037,139 @@ TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing) {
     ASSERT_EQ(host_exit, 0);
     ASSERT_TRUE(completed);
     ASSERT_TRUE(nothing_drained);
+    PASS();
+}
+
+/* cli_scope_install with the activation's stdout captured into out. */
+static int cli_scope_install_captured(cli_scope_fixture_t *fixture, const char *home,
+                                      const char *cache, const char *bin_dir, bool skip_binary,
+                                      char *out, size_t out_size) {
+    out[0] = '\0';
+    FILE *capture = tmpfile();
+    int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
+    bool redirected = false;
+    if (capture && saved_stdout >= 0) {
+        fflush(stdout);
+        redirected = dup2(fileno(capture), STDOUT_FILENO) >= 0;
+    }
+    int rc = redirected ? cli_scope_install(fixture, home, cache, bin_dir, skip_binary) : -1;
+    if (redirected) {
+        fflush(stdout);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+    }
+    if (saved_stdout >= 0) {
+        close(saved_stdout);
+    }
+    if (capture) {
+        rewind(capture);
+        size_t count = fread(out, 1, out_size - 1U, capture);
+        out[count] = '\0';
+        fclose(capture);
+    }
+    return rc;
+}
+
+/* The notice an activation prints when it leaves a daemon it could not
+ * confirm as its own: names the daemon by pid and tells the user how to stop
+ * it themselves. Never the "Stopping ..." banner of a drain. */
+static bool cli_scope_kept_notice_names_host(const char *output, pid_t host) {
+    char pid_text[48];
+    snprintf(pid_text, sizeof(pid_text), "(pid %ld, version %s)", (long)host, CBM_VERSION);
+    return strstr(output, "Leaving the running CBM daemon untouched") != NULL &&
+           strstr(output, pid_text) != NULL &&
+           strstr(output, "codebase-memory-mcp daemon stop") != NULL &&
+           strstr(output, "Stopping active CBM sessions") == NULL;
+}
+
+/* (e) USER DECISION 2026-09-28, "unknown = foreign, keep it": the scope read
+ * reaches the active cohort but cannot read its cache identity. Ownership is
+ * unconfirmed, so the sandbox install must leave the host daemon serving,
+ * stop no session, and say which daemon it left and how to stop it. The
+ * install publishes a binary (no --skip-binary): an activation that replaces
+ * nothing never consults the cohort at all (test d). */
+TEST(cli_install_foreign_home_unreadable_cohort_cache_keeps_host_daemon) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "unread");
+    char foreign_home[512];
+    char foreign_cache[576];
+    char foreign_bin[640];
+    char activation_log[704];
+    cli_scope_foreign_paths(&fixture, foreign_home, foreign_cache, foreign_bin, activation_log);
+    bool prepared = ready && cbm_mkdir_p(foreign_home, 0700);
+    char output[16384];
+    output[0] = '\0';
+    cbm_cli_set_activation_scope_cache_unreadable_for_test(true);
+    int install_rc = prepared
+                         ? cli_scope_install_captured(&fixture, foreign_home, foreign_cache,
+                                                      foreign_bin, false, output, sizeof(output))
+                         : -1;
+    cbm_cli_set_activation_scope_cache_unreadable_for_test(false);
+    bool host_serving = prepared && cli_scope_host_serving(&fixture);
+    bool notice = cli_scope_kept_notice_names_host(output, fixture.host);
+    const char *events = read_test_file(activation_log);
+    bool completed = events && strstr(events, "\"phase\":\"completed\"") != NULL;
+    bool nothing_drained = events && strstr(events, "cohort drained") == NULL;
+    int host_exit = cli_scope_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(host_serving);
+    ASSERT_EQ(host_exit, 0);
+    ASSERT_TRUE(nothing_drained);
+    ASSERT_TRUE(notice);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(completed);
+    PASS();
+}
+
+/* (f) Same decision, busy group: another activation holds the cohort
+ * maintenance gate, so the scope read cannot reach the active identity at
+ * all. Unconfirmed ownership keeps the host daemon; the sandbox install
+ * completes without draining anyone. The gate is held through the product's
+ * own lock-directory handle on the name version_cohort.c uses. */
+TEST(cli_install_foreign_home_busy_cohort_keeps_host_daemon) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "busy");
+    char foreign_home[512];
+    char foreign_cache[576];
+    char foreign_bin[640];
+    char activation_log[704];
+    cli_scope_foreign_paths(&fixture, foreign_home, foreign_cache, foreign_bin, activation_log);
+    cbm_private_lock_directory_t *lock_directory = NULL;
+    cbm_private_file_lock_t *maintenance = NULL;
+    bool held = ready &&
+                cbm_daemon_ipc_private_lock_directory_new(fixture.endpoint, &lock_directory) ==
+                    CBM_PRIVATE_FILE_LOCK_OK &&
+                cbm_private_file_lock_try_acquire(
+                    lock_directory, "cbm-version-cohort-maintenance-v1.lock",
+                    CBM_PRIVATE_FILE_LOCK_EX, &maintenance) == CBM_PRIVATE_FILE_LOCK_OK;
+    bool prepared = held && cbm_mkdir_p(foreign_home, 0700);
+    char output[16384];
+    output[0] = '\0';
+    int install_rc = prepared
+                         ? cli_scope_install_captured(&fixture, foreign_home, foreign_cache,
+                                                      foreign_bin, false, output, sizeof(output))
+                         : -1;
+    bool host_serving = prepared && cli_scope_host_serving(&fixture);
+    bool released =
+        maintenance && cbm_private_file_lock_release(&maintenance) == CBM_PRIVATE_FILE_LOCK_OK;
+    if (lock_directory) {
+        cbm_private_lock_directory_close(lock_directory);
+    }
+    bool notice = cli_scope_kept_notice_names_host(output, fixture.host);
+    const char *events = read_test_file(activation_log);
+    bool completed = events && strstr(events, "\"phase\":\"completed\"") != NULL;
+    bool nothing_drained = events && strstr(events, "cohort drained") == NULL;
+    int host_exit = cli_scope_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(held);
+    ASSERT_TRUE(host_serving);
+    ASSERT_EQ(host_exit, 0);
+    ASSERT_TRUE(nothing_drained);
+    ASSERT_TRUE(notice);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(released);
     PASS();
 }
 #endif
@@ -16259,6 +16394,8 @@ SUITE(cli) {
     RUN_TEST(cli_install_binary_into_foreign_home_never_drains_host_cohort);
     RUN_TEST(cli_install_into_host_namespace_still_drains_host_cohort);
     RUN_TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing);
+    RUN_TEST(cli_install_foreign_home_unreadable_cohort_cache_keeps_host_daemon);
+    RUN_TEST(cli_install_foreign_home_busy_cohort_keeps_host_daemon);
 #endif
     RUN_TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary);
     RUN_TEST(cli_install_dir_and_skip_config_stage_first_install_safely);
