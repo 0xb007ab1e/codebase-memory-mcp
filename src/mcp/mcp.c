@@ -9178,6 +9178,9 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     if (node_count == 0) {
         cbm_node_t qn_node = {0};
         if (cbm_store_find_node_by_qn(store, project, func_name, &qn_node) == CBM_STORE_OK) {
+            /* A zero-row name lookup still returns its allocated (empty)
+             * array; release it before the fallback replaces the pointer. */
+            cbm_store_free_nodes(nodes, 0);
             nodes = malloc(sizeof(cbm_node_t));
             if (nodes) {
                 nodes[0] = qn_node;
