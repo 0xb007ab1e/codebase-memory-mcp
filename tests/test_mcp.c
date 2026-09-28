@@ -8626,6 +8626,8 @@ TEST(tool_index_repository_reuses_existing_project_for_root_issue2134) {
     if (!cbm_canonical_path(repo, canonical_repo, sizeof(canonical_repo))) {
         FAIL("cbm_canonical_path failed");
     }
+    /* Stored root_path values use forward slashes on every platform. */
+    cbm_normalize_path_sep(canonical_repo);
     const char *saved_cache = getenv("CBM_CACHE_DIR");
     char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
     const char *saved_sup = getenv("CBM_INDEX_SUPERVISOR");
