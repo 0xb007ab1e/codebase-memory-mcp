@@ -1327,7 +1327,10 @@ static bool incr_label_is_registry_symbol(const char *label) {
 /* Callback for cbm_gbuf_foreach_node: seed the registry with the existing
  * project's definition symbols so the resolver can match cross-file symbols
  * during incremental. Mirrors the full-index registry contents exactly so an
- * incremental re-resolve picks the same nodes a full reindex would. */
+ * incremental re-resolve picks the same nodes a full reindex would -- including
+ * a Python function's locals, which cbm_registry_add_lang keeps out of the
+ * short-name index there too (nodes load ORDER BY id and a file's defs are
+ * inserted parent first, so the enclosing function is seeded before its locals). */
 /* Each symbol is seeded with its file's DETECTED language, exactly what the
  * full index recorded (pass_definitions.c / pass_parallel.c), so the cross-
  * language veto judges an incremental re-resolve the same way. Stored nodes carry no

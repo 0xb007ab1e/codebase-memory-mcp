@@ -253,7 +253,11 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 
 /* As cbm_registry_add, recording `lang`: the DETECTED language of the file
  * that defines the symbol (CBM_LANG_COUNT = unknown), which the cross-language
- * veto (cbm_registry_name_guess_vetoed) checks against the caller. */
+ * veto (cbm_registry_name_guess_vetoed) checks against the caller. A Python
+ * symbol declared inside a function body (see cbm_registry_qn_is_function_local)
+ * is registered for exact lookups only, never offered to the short-name
+ * strategies; every registration site seeds through this, so full and
+ * incremental indexes agree. */
 void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
                            const char *label, CBMLanguage lang);
 
@@ -267,6 +271,17 @@ bool cbm_lang_resolution_compatible(CBMLanguage caller, CBMLanguage target);
  * layer ("<python-builtins>" -> Python, "<kotlin-builtins>" -> Kotlin);
  * CBM_LANG_COUNT for anything else. */
 CBMLanguage cbm_registry_synthetic_path_language(const char *file_path);
+
+/* True when a proper prefix of `qualified_name` is a registered Function or
+ * Method, i.e. the symbol was declared inside a function body. */
+bool cbm_registry_qn_is_function_local(const cbm_registry_t *r, const char *qualified_name);
+
+/* Python bare-name lexical lookup: the def or class named `callee_name` bound
+ * in the nearest function scope enclosing `scope_qn` (the caller's QN),
+ * skipping class bodies, stopping at the module. Strategy "lexical_scope";
+ * qualified_name is NULL when no such local exists. */
+cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const char *callee_name,
+                                              const char *scope_qn);
 
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.

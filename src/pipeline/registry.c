@@ -62,6 +62,8 @@ const char *cbm_confidence_band(double score) {
 #define CONF_IMPORT_MAP_SUFFIX 0.85
 /* Strategy 2: same_module — same file/package → high confidence */
 #define CONF_SAME_MODULE 0.90
+/* Python lexical scope — a def bound in an enclosing function (LEGB) */
+#define CONF_LEXICAL_SCOPE 0.95
 /* Strategy 3: unique_name — only one candidate project-wide */
 #define CONF_UNIQUE_NAME 0.75
 /* Strategy 4: suffix_match — multiple candidates, filtered */
@@ -1181,20 +1183,33 @@ static void index_under_name(cbm_registry_t *r, const char *key, const char *own
     }
 }
 
-void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
-                      const char *label) {
-    cbm_registry_add_lang(r, name, qualified_name, label, CBM_LANG_COUNT);
+static bool registry_label_is_callable(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0);
 }
 
-void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
-                           const char *label, CBMLanguage lang) {
-    if (!r || !qualified_name || !label) {
-        return;
+bool cbm_registry_qn_is_function_local(const cbm_registry_t *r, const char *qualified_name) {
+    char scope[CBM_SZ_512];
+    size_t len = qualified_name ? strlen(qualified_name) : 0;
+    if (!r || len == 0 || len >= sizeof(scope)) {
+        return false;
     }
+    memcpy(scope, qualified_name, len + SKIP_ONE);
+    for (char *dot = strrchr(scope, '.'); dot; dot = strrchr(scope, '.')) {
+        *dot = '\0';
+        if (registry_label_is_callable(cbm_ht_get(r->exact, scope))) {
+            return true;
+        }
+    }
+    return false;
+}
 
+/* Record `qualified_name` in the exact map. Returns the registry's owned copy
+ * of the QN, or NULL when it is already registered or cannot be recorded. */
+static const char *registry_add_exact(cbm_registry_t *r, const char *qualified_name,
+                                      const char *label) {
     /* Check for duplicate */
     if (cbm_ht_get(r->exact, qualified_name)) {
-        return;
+        return NULL;
     }
 
     /* Intern the label (bounded set; linear scan is fine at this size). */
@@ -1211,14 +1226,45 @@ void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qual
         r->label_pool_n++;
     }
     if (!interned) {
-        return; /* pool exhausted (cannot happen with sane label sets) */
+        return NULL; /* pool exhausted (cannot happen with sane label sets) */
     }
 
     /* Store in exact map: QN → interned label. The key is the registry's ONE
-     * owned copy of the QN; by_name below borrows it (same lifetime) instead
+     * owned copy of the QN; by_name borrows it (same lifetime) instead
      * of a second strdup — this pair of copies was ~280 MB on the kernel. */
     cbm_ht_set(r->exact, strdup(qualified_name), (void *)interned);
-    const char *owned_qn = cbm_ht_get_key(r->exact, qualified_name);
+    return cbm_ht_get_key(r->exact, qualified_name);
+}
+
+void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
+                      const char *label) {
+    cbm_registry_add_lang(r, name, qualified_name, label, CBM_LANG_COUNT);
+}
+
+/* Python nests defs: a def or class declared in a function body -- a closure,
+ * an app factory's route handler, a local class and its methods -- is a local
+ * of that function, and its QN extends the function's
+ * (proj.mod.create_app.index). No code outside the function can name it, so it
+ * stays out of the short-name index: the weak name strategies (unique_name,
+ * suffix_match) must not offer django's per-test `class MyModelAdmin` or a
+ * decorator's `def wrapper` to a caller in another function or file. The exact
+ * map still holds it, for LSP targets and cbm_registry_resolve_lexical. One
+ * file's defs register parent first, so the enclosing function is already in
+ * the exact map when its locals arrive. Gated to Python: probing every
+ * prefix of every symbol would cost a kernel index seconds for nothing. */
+void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
+                           const char *label, CBMLanguage lang) {
+    if (!r || !qualified_name || !label) {
+        return;
+    }
+    if (lang == CBM_LANG_PYTHON && cbm_registry_qn_is_function_local(r, qualified_name)) {
+        (void)registry_add_exact(r, qualified_name, label);
+        return;
+    }
+    const char *owned_qn = registry_add_exact(r, qualified_name, label);
+    if (!owned_qn) {
+        return;
+    }
 
     /* Index the symbol under the QN's last dot segment, and additionally under
      * the name its caller passed when that segment carries a '#' fence.
@@ -2121,6 +2167,69 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
      * few distinct relation refs, so the chain walk stays cheap. */
     return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
                                   import_map_count, module_qn ? strlen(module_qn) : 0, false);
+}
+
+/* Python looks a bare name up in the calling def's own scope, then in each
+ * enclosing def's scope, and only then in the module and the builtins; a class
+ * body is never among them. So a bare `index()` in create_app, or `visit(...)`
+ * in a def nested in method Tree.visit, names the def bound in the nearest
+ * enclosing def -- create_app.index, Tree.visit.visit -- before anything a
+ * module-wide strategy would find. Walks scope_qn outward while its prefixes
+ * are registered defs or classes (skipping the classes) and stops at the
+ * module, which the other strategies own. Empty unless such a local exists.
+ * Uncached: the answer depends on the caller, not only on the name. */
+cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const char *callee_name,
+                                              const char *scope_qn) {
+    char scope[CBM_SZ_512];
+    char candidate[CBM_SZ_512];
+    size_t len = scope_qn ? strlen(scope_qn) : 0;
+    if (!r || !callee_name || !callee_name[0] || strchr(callee_name, '.') ||
+        strstr(callee_name, "::") || len == 0 || len >= sizeof(scope)) {
+        return empty_result();
+    }
+    memcpy(scope, scope_qn, len + SKIP_ONE);
+    for (;;) {
+        const char *label = cbm_ht_get(r->exact, scope);
+        if (!label) {
+            break;
+        }
+        if (registry_label_is_callable(label)) {
+            int n = snprintf(candidate, sizeof(candidate), "%s.%s", scope, callee_name);
+            const char *stored_key =
+                n > 0 && (size_t)n < sizeof(candidate) ? cbm_ht_get_key(r->exact, candidate) : NULL;
+            if (stored_key) {
+                return (cbm_resolution_t){stored_key, "lexical_scope", CONF_LEXICAL_SCOPE,
+                                          REG_RESOLVED};
+            }
+        }
+        char *dot = strrchr(scope, '.');
+        if (!dot) {
+            break;
+        }
+        *dot = '\0';
+    }
+    return empty_result();
+}
+
+/* The registry step both call resolvers (pass_calls.c, pass_parallel.c) run
+ * once the LSP has not answered: a Python bare name bound in an enclosing def
+ * first (the LSP binds those locals itself; this covers the sites it did not
+ * resolve), then the language-aware chain. One entry point, so the two
+ * resolvers cannot diverge on the rule. */
+cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const char *callee_name,
+                                                  const char *module_qn,
+                                                  const char **import_map_keys,
+                                                  const char **import_map_vals,
+                                                  int import_map_count, CBMLanguage lang,
+                                                  const char *scope_qn) {
+    if (lang == CBM_LANG_PYTHON) {
+        cbm_resolution_t lexical = cbm_registry_resolve_lexical(r, callee_name, scope_qn);
+        if (lexical.qualified_name && lexical.qualified_name[0]) {
+            return lexical;
+        }
+    }
+    return cbm_registry_resolve_call_lang(r, callee_name, module_qn, import_map_keys,
+                                          import_map_vals, import_map_count, lang);
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */

@@ -587,9 +587,19 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
              esc_fa);
     cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props);
     if (call->second_arg_name != NULL && call->second_arg_name[0] != '\0') {
-        cbm_resolution_t hres =
-            cbm_registry_resolve_handler(ctx->registry, call->second_arg_name, module_qn, imp_keys,
-                                         imp_vals, imp_count, ctx->gbuf, lang);
+        /* Python: an app factory registers its local defs
+         * (`app.add_url_rule("/", "index", index)` inside create_app); only the
+         * lexical lookup sees a function's locals. MUST match pass_parallel.c. */
+        cbm_resolution_t hres = {0};
+        if (lang == CBM_LANG_PYTHON) {
+            hres = cbm_registry_resolve_lexical(ctx->registry, call->second_arg_name,
+                                                call->enclosing_func_qn);
+        }
+        if (!hres.qualified_name) {
+            hres = cbm_registry_resolve_handler(ctx->registry, call->second_arg_name,
+                                                module_qn, imp_keys, imp_vals, imp_count,
+                                                ctx->gbuf, lang);
+        }
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
             if (handler != NULL) {
@@ -967,8 +977,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                     lang, lsp->strategy, lsp->callee_qn, ctx->project_name);
     cbm_resolution_t res = {0};
     if (!rust_external && !php_vendor_call) {
-        res = cbm_registry_resolve_call_lang(ctx->registry, call->callee_name, module_qn, imp_keys,
-                                             imp_vals, imp_count, lang);
+        /* Python LEGB fallback first (MUST match pass_parallel.c). */
+        res = cbm_registry_resolve_call_scoped(ctx->registry, call->callee_name, module_qn,
+                                               imp_keys, imp_vals, imp_count, lang,
+                                               call->enclosing_func_qn);
         /* Cross-language veto: a name-only guess never binds another
          * language's symbol (a JS app.get must not become Python's
          * builtins.dict.get). The vetoed answer becomes EMPTY here, before

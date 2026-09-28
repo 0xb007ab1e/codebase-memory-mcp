@@ -1962,6 +1962,96 @@ TEST(registry_python_scope_qualified_terminal_bucket_uncapped) {
     bool seeded = cbm_registry_size(r) == 302;
     cbm_registry_free(r);
     ASSERT_TRUE(shape && seeded && resolved);
+/* #1548: a Python def or class declared in a function body is a local of it.
+ * It is registered for exact lookups but kept out of the short-name index, so
+ * no weak strategy offers it to a caller elsewhere. A class nested in a class
+ * (proj.m.Outer.Inner) is an attribute, not a local, and stays nameable; so
+ * does the same QN shape from another language. */
+TEST(registry_python_function_local_is_exact_only_issue1548) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_lang(r, "create_app", "proj.web.create_app", "Function",
+                                  CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "index", "proj.web.create_app.index", "Function",
+                                  CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "Settings", "proj.web.create_app.Settings", "Class",
+                                  CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "value", "proj.web.create_app.Settings.value", "Method",
+                                  CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "Outer", "proj.web.Outer", "Class", CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "Inner", "proj.web.Outer.Inner", "Class", CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "f", "proj.ts.f", "Function", CBM_LANG_TYPESCRIPT);
+    cbm_registry_add_lang(r, "g", "proj.ts.f.g", "Function", CBM_LANG_TYPESCRIPT);
+
+    static const char *const local[] = {"proj.web.create_app.index", "proj.web.create_app.Settings",
+                                        "proj.web.create_app.Settings.value"};
+    for (int i = 0; i < 3; i++) {
+        ASSERT_TRUE(cbm_registry_exists(r, local[i]));
+        ASSERT_TRUE(cbm_registry_qn_is_function_local(r, local[i]));
+        const char *simple = strrchr(local[i], '.') + 1;
+        const char **out = NULL;
+        int count = -1;
+        cbm_registry_find_by_name(r, simple, &out, &count);
+        ASSERT_EQ(count, 0);
+    }
+    static const char *const nameable[][2] = {{"create_app", "proj.web.create_app"},
+                                              {"Inner", "proj.web.Outer.Inner"},
+                                              {"g", "proj.ts.f.g"}};
+    for (int i = 0; i < 3; i++) {
+        const char **out = NULL;
+        int count = 0;
+        cbm_registry_find_by_name(r, nameable[i][0], &out, &count);
+        ASSERT_EQ(count, 1);
+        ASSERT_STR_EQ(out[0], nameable[i][1]);
+    }
+    ASSERT_FALSE(cbm_registry_qn_is_function_local(r, "proj.web.Outer.Inner"));
+    /* A weak strategy cannot reach the local; before, index() anywhere in
+     * the project resolved to it by unique_name. */
+    cbm_resolution_t res = cbm_registry_resolve(r, "index", "proj.other", NULL, NULL, 0);
+    ASSERT_NULL(res.qualified_name);
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Python LEGB for bare names: the caller's own def first, then each enclosing
+ * def outward; a class body is not a scope its methods see; the module is left
+ * to the other strategies. A dotted callee is not a bare name. */
+TEST(registry_resolve_lexical_walks_enclosing_defs_issue1548) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_lang(r, "Tree", "proj.m.Tree", "Class", CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "visit", "proj.m.Tree.visit", "Method", CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "visit", "proj.m.Tree.visit.visit", "Function",
+                                  CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "helper", "proj.m.Tree.helper", "Method", CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "factory", "proj.m.factory", "Function", CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "helper", "proj.m.factory.helper", "Function",
+                                  CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "Local", "proj.m.factory.Local", "Class", CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "run", "proj.m.factory.Local.run", "Method", CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "top", "proj.m.top", "Function", CBM_LANG_PYTHON);
+
+    /* In method Tree.visit, `visit` is its nested def; so it is inside that
+     * nested def (its own recursion). */
+    cbm_resolution_t res = cbm_registry_resolve_lexical(r, "visit", "proj.m.Tree.visit");
+    ASSERT_STR_EQ(res.qualified_name, "proj.m.Tree.visit.visit");
+    ASSERT_STR_EQ(res.strategy, "lexical_scope");
+    res = cbm_registry_resolve_lexical(r, "visit", "proj.m.Tree.visit.visit");
+    ASSERT_STR_EQ(res.qualified_name, "proj.m.Tree.visit.visit");
+    /* The class body is skipped: Tree.helper is not a bare name in a method. */
+    res = cbm_registry_resolve_lexical(r, "helper", "proj.m.Tree.visit.visit");
+    ASSERT_NULL(res.qualified_name);
+    /* A method of a local class sees the def enclosing its class. */
+    res = cbm_registry_resolve_lexical(r, "helper", "proj.m.factory.Local.run");
+    ASSERT_STR_EQ(res.qualified_name, "proj.m.factory.helper");
+    res = cbm_registry_resolve_lexical(r, "Local", "proj.m.factory");
+    ASSERT_STR_EQ(res.qualified_name, "proj.m.factory.Local");
+    /* Module-level names and dotted callees are not this strategy's. */
+    res = cbm_registry_resolve_lexical(r, "top", "proj.m.factory");
+    ASSERT_NULL(res.qualified_name);
+    res = cbm_registry_resolve_lexical(r, "self.helper", "proj.m.factory");
+    ASSERT_NULL(res.qualified_name);
+    res = cbm_registry_resolve_lexical(r, "helper", "proj.m");
+    ASSERT_NULL(res.qualified_name);
+    cbm_registry_free(r);
     PASS();
 }
 
@@ -2069,4 +2159,6 @@ SUITE(registry) {
     RUN_TEST(python_import_binding_contradicts_only_foreign_chains);
     RUN_TEST(python_external_base_contradicts_django_shapes);
     RUN_TEST(weak_call_guards_share_one_drop_list);
+    RUN_TEST(registry_python_function_local_is_exact_only_issue1548);
+    RUN_TEST(registry_resolve_lexical_walks_enclosing_defs_issue1548);
 }

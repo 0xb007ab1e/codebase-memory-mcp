@@ -2410,8 +2410,17 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
              esc_rp);
     cbm_gbuf_insert_edge(gbuf, source->id, rid, "CALLS", props);
     if (handler_ref && handler_ref[0] != '\0') {
-        cbm_resolution_t hres = cbm_registry_resolve_handler(registry, handler_ref, module_qn, ik,
-                                                             iv, ic, main_gbuf, lang);
+        /* Python: a handler an app factory registers is usually its local def
+         * (`app.add_url_rule("/", "index", index)` inside create_app); only the
+         * lexical lookup sees a function's locals. MUST match pass_calls.c. */
+        cbm_resolution_t hres = {0};
+        if (lang == CBM_LANG_PYTHON) {
+            hres = cbm_registry_resolve_lexical(registry, handler_ref, call->enclosing_func_qn);
+        }
+        if (!hres.qualified_name) {
+            hres = cbm_registry_resolve_handler(registry, handler_ref, module_qn, ik, iv, ic,
+                                                main_gbuf, lang);
+        }
         if (hres.qualified_name && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn(main_gbuf, hres.qualified_name);
             if (h) {
@@ -3267,8 +3276,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                         lang, lsp->strategy, lsp->callee_qn, rc->project_name);
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
             !rust_external && !php_vendor_call) {
-            res = cbm_registry_resolve_call_lang(rc->registry, call->callee_name, module_qn,
-                                                 imp_keys, imp_vals, imp_count, lang);
+            /* Python LEGB fallback first (MUST match pass_calls.c). */
+            res = cbm_registry_resolve_call_scoped(rc->registry, call->callee_name, module_qn,
+                                                   imp_keys, imp_vals, imp_count, lang,
+                                                   call->enclosing_func_qn);
         }
         /* `p->open(fd)`: the registry does not split a callee on the arrow.
          * The object's type decides, as for the dot call handled further

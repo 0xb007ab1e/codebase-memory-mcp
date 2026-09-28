@@ -6624,11 +6624,16 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
      * scope. Note the call-scope side (compute_func_qn in extract_unified.c) is
      * NOT language-gated — it qualifies whenever a scope is pushed — so this gate
      * and the scope-push rule must move together, or a call QN names a def QN that
-     * was never minted and the edge is dropped at write. */
+     * was never minted and the edge is dropped at write.
+     *
+     * Python: the only enclosing scope that reaches here is the def a nested
+     * def sits in (py_push_def_body), so `def index()` inside create_app is
+     * proj.mod.create_app.index. */
     if (ctx->enclosing_class_qn &&
         (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA ||
          ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX ||
-         ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_NIX)) {
+         ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_NIX ||
+         ctx->language == CBM_LANG_PYTHON)) {
         def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, qn_name);
     }
     def.label = "Function";
@@ -11667,6 +11672,51 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_st
     }
 }
 
+/* Python: a def's body is a scope of its own, and a `def` or `class` statement
+ * in it is a definition like any other -- closures, decorator wrappers, the
+ * route handlers of an app factory (`@app.route` inside create_app), local
+ * classes. Walk the body with the def's QN as the enclosing scope, so a nested
+ * def is qualified by the def it sits in: proj.mod.create_app.index. That is
+ * the QN the Python LSP already gives the calls inside it (py_process_function)
+ * and the one the call-scope walk computes (extract_unified.c
+ * py_nearest_scope_qn). Only the body is walked: parameters,
+ * annotations and decorators hold expressions, never statements. A lambda or
+ * a comprehension holds no statements either, so neither becomes a def. */
+static void py_push_def_body(wd_stack_t *s, TSNode def_node, const char *def_qn) {
+    TSNode body = ts_node_child_by_field_name(def_node, TS_FIELD("body"));
+    if (def_qn && !ts_node_is_null(body)) {
+        wd_push(s, body, def_qn);
+    }
+}
+
+/* Python methods are extracted by extract_class_methods, not by the walk, so
+ * their bodies are pushed here, under the QN push_method_def gave the method
+ * (class_qn.name), in source order. */
+static void py_push_method_bodies(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
+                                  wd_stack_t *s) {
+    TSNode body = find_class_member_body(class_node, ctx->language);
+    if (ts_node_is_null(body) || !class_qn) {
+        return;
+    }
+    for (int i = (int)ts_node_named_child_count(body) - SKIP_CHAR; i >= 0; i--) {
+        TSNode method = ts_node_named_child(body, (uint32_t)i);
+        if (strcmp(ts_node_type(method), "decorated_definition") == 0) {
+            method = ts_node_child_by_field_name(method, TS_FIELD("definition"));
+        }
+        if (ts_node_is_null(method) || strcmp(ts_node_type(method), "function_definition") != 0) {
+            continue;
+        }
+        TSNode name_node = resolve_method_name(method, ctx->language);
+        char *name =
+            ts_node_is_null(name_node)
+                ? NULL
+                : cbm_func_name_node_text(ctx->arena, name_node, ctx->source, ctx->language);
+        if (name && name[0]) {
+            py_push_def_body(s, method, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, name));
+        }
+    }
+}
+
 // ASCII case-insensitive equality vs a lowercase literal (CFML attribute names
 // are case-insensitive, e.g. NAME / Name / name).
 static bool ascii_ci_equals(const char *s, const char *lower_lit) {
@@ -12211,7 +12261,16 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         }
         if (cbm_kind_in_set(node, spec->function_node_types)) {
             if (!is_template_class_node(node, ctx->language)) {
+                int defs_before = ctx->result->defs.count;
                 extract_func_def(ctx, node, spec);
+                if (ctx->language == CBM_LANG_PYTHON) {
+                    if (ctx->result->defs.count > defs_before) {
+                        py_push_def_body(&s, node,
+                                         ctx->result->defs.items[ctx->result->defs.count - SKIP_ONE]
+                                             .qualified_name);
+                    }
+                    continue;
+                }
                 // Most languages stop here. JS/TS (and Wolfram) descend into the
                 // function body so NESTED named definitions are also captured —
                 // e.g. arrow methods of an object literal returned from a factory
@@ -12268,6 +12327,9 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             extract_class_def(ctx, node, spec);
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
             push_class_body_children(node, spec, &s, new_enclosing, ctx);
+            if (ctx->language == CBM_LANG_PYTHON && new_enclosing != frame.enclosing_class_qn) {
+                py_push_method_bodies(ctx, node, new_enclosing, &s);
+            }
             continue;
         }
 
