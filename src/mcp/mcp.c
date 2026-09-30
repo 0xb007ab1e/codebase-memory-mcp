@@ -14474,7 +14474,7 @@ static bool compile_path_filter(const char *filter, cbm_regex_t *re) {
 static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
     cbm_mcp_server_t *srv, const char *command, char output_path[CBM_SZ_2K], size_t output_limit,
     uint64_t deadline_ms, bool deadline_enabled, bool deadline_latched, bool exit_one_is_no_match,
-    cbm_proc_result_t *result_out);
+    bool git_child, cbm_proc_result_t *result_out);
 
 static char *search_code_timeout_result(void) {
     static const char message[] = "search_code scan exceeded its execution deadline";
@@ -14815,7 +14815,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
             srv->search_scan_command_override ? srv->search_scan_command_override : cmd;
         mcp_scan_cause_t scan_cause = mcp_run_shell_command_cancellable_bounded(
             srv, scan_command, output_path, scan_output_limit, scan_deadline_ms, true,
-            scan_deadline_latched, /*exit_one_is_no_match=*/false, &scan_result);
+            scan_deadline_latched, /*exit_one_is_no_match=*/false, /*git_child=*/false,
+            &scan_result);
         /* Both POSIX commands wrap grep and map its no-match status to 0, so any
          * non-zero exit (a failed find/sort, an unreadable operand, a broken
          * grep) is an incomplete scan and fails closed. */
@@ -15175,7 +15176,7 @@ static mcp_scan_cause_t mcp_scan_pre_spawn_cause(cbm_mcp_server_t *srv, const ch
 static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
     cbm_mcp_server_t *srv, const char *command, char output_path[CBM_SZ_2K], size_t output_limit,
     uint64_t deadline_ms, bool deadline_enabled, bool deadline_latched, bool exit_one_is_no_match,
-    cbm_proc_result_t *result_out) {
+    bool git_child, cbm_proc_result_t *result_out) {
     if (!srv || !command || !output_path || !result_out) {
         return MCP_SCAN_COMMAND_FAILURE;
     }
@@ -15233,6 +15234,7 @@ static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
         .quiet_timeout_ms = 0,
         .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
         .delete_log_on_exit = false,
+        .strip_git_repo_env = git_child,
     };
     pre_spawn_cause =
         mcp_scan_pre_spawn_cause(srv, output_path, output_limit, deadline_ms, deadline_enabled,
@@ -15310,11 +15312,14 @@ static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
                                                  : MCP_SCAN_CONTAINED_COMMAND_FAILURE;
 }
 
+/* Every caller is a detect_changes git command: the child environment drops
+ * git's repository-local variables so an inherited GIT_DIR cannot redirect
+ * `git -C <root>` (#2003). */
 static int mcp_run_shell_command_cancellable(cbm_mcp_server_t *srv, const char *command,
                                              char output_path[CBM_SZ_2K],
                                              cbm_proc_result_t *result_out) {
     mcp_scan_cause_t cause = mcp_run_shell_command_cancellable_bounded(
-        srv, command, output_path, 0, 0, false, false, false, result_out);
+        srv, command, output_path, 0, 0, false, false, false, /*git_child=*/true, result_out);
     /* Legacy callers inspect result_out for cancellation/exit status. Preserve
      * their original contract: any contained terminal tree is transport
      * success; only spawn/rejection or failed supervision is a wrapper error. */
