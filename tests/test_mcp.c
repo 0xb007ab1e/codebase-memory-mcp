@@ -1397,13 +1397,13 @@ TEST(mcp_tools_have_behavior_annotations) {
          * left in place, never quarantined or rebuilt. Quarantine/rebuild is
          * a write-side job (index_repository, manage_adr writes), so the
          * read-only annotations are honest and plan-mode clients can expose
-         * these tools. get_file_outline arrived after this split and keeps
-         * its upstream conservative annotation. */
+         * these tools. get_file_outline reads through the same resolve_store
+         * path and is annotated the same way (#2118). */
         {"search_graph", true, false, true, false},
         {"query_graph", true, false, true, false},
         {"trace_path", true, false, true, false},
         {"get_code_snippet", true, false, true, false},
-        {"get_file_outline", false, true, true, false},
+        {"get_file_outline", true, false, true, false},
         {"get_graph_schema", true, false, true, false},
         {"compare_graphs", true, false, true, false},
         {"get_architecture", true, false, true, false},
@@ -1414,7 +1414,10 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"check_index_coverage", true, false, true, false},
         {"detect_changes", true, false, true, false},
         {"manage_adr", false, true, false, false},
-        {"ingest_traces", false, false, false, false},
+        /* ingest_traces only validates and counts its input; it writes
+         * nothing, so it is read-only and idempotent until edge creation
+         * actually lands (#2118). */
+        {"ingest_traces", true, false, true, false},
     };
 
     char *json = cbm_mcp_tools_list();
@@ -1462,6 +1465,80 @@ TEST(mcp_tools_have_behavior_annotations) {
     }
 
     ASSERT_EQ(matched, sizeof(expected) / sizeof(expected[0]));
+    yyjson_doc_free(doc);
+    free(json);
+    PASS();
+}
+
+/* #2118: annotations drive client auto-approval, so a mis-stamped read tool
+ * is a real integration bug. Walk the REGISTERED tool list (not a mirrored
+ * table) so a newly added tool cannot slip through: every tool must carry
+ * annotations, a read-only tool can never be destructive, and only the tools
+ * whose handlers actually mutate state may be non-read-only. */
+static yyjson_val *find_tool_json(yyjson_val *tools, const char *name) {
+    yyjson_arr_iter iter;
+    yyjson_arr_iter_init(tools, &iter);
+    yyjson_val *tool;
+    while ((tool = yyjson_arr_iter_next(&iter)) != NULL) {
+        const char *tool_name = yyjson_get_str(yyjson_obj_get(tool, "name"));
+        if (tool_name && strcmp(tool_name, name) == 0) {
+            return tool;
+        }
+    }
+    return NULL;
+}
+
+static bool tool_in_list(const char *name, const char *const *list, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(name, list[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+TEST(mcp_tool_annotations_only_mutators_are_writable_issue2118) {
+    /* Handlers that write user-visible state: index_repository (builds the
+     * index), manage_adr (writes/overwrites ADR sections), delete_project
+     * (removes the index). Everything else must be read-only. */
+    static const char *const mutating[] = {"index_repository", "manage_adr", "delete_project"};
+    /* Of those, only the ones that can remove/overwrite existing data. */
+    static const char *const destructive[] = {"manage_adr", "delete_project"};
+    const size_t n_mut = sizeof(mutating) / sizeof(mutating[0]);
+    const size_t n_des = sizeof(destructive) / sizeof(destructive[0]);
+
+    char *json = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *tools = yyjson_obj_get(yyjson_doc_get_root(doc), "tools");
+    ASSERT_NOT_NULL(tools);
+
+    int count = cbm_mcp_tool_count();
+    ASSERT_GT(count, 0);
+    ASSERT_EQ(yyjson_arr_size(tools), (size_t)count);
+    for (int i = 0; i < count; i++) {
+        const char *name = cbm_mcp_tool_name(i);
+        ASSERT_NOT_NULL(name);
+        yyjson_val *tool = find_tool_json(tools, name);
+        ASSERT_NOT_NULL(tool);
+        yyjson_val *annotations = yyjson_obj_get(tool, "annotations");
+        ASSERT_NOT_NULL(annotations);
+        yyjson_val *read_only = yyjson_obj_get(annotations, "readOnlyHint");
+        yyjson_val *destr = yyjson_obj_get(annotations, "destructiveHint");
+        ASSERT_TRUE(yyjson_is_bool(read_only));
+        ASSERT_TRUE(yyjson_is_bool(destr));
+        bool is_mut = tool_in_list(name, mutating, n_mut);
+        bool is_des = tool_in_list(name, destructive, n_des);
+        if (yyjson_get_bool(read_only) == is_mut || yyjson_get_bool(destr) != is_des) {
+            printf("  tool %s: readOnlyHint=%d destructiveHint=%d (want %d/%d)\n", name,
+                   (int)yyjson_get_bool(read_only), (int)yyjson_get_bool(destr), (int)!is_mut,
+                   (int)is_des);
+        }
+        ASSERT_EQ(yyjson_get_bool(read_only), !is_mut);
+        ASSERT_EQ(yyjson_get_bool(destr), is_des);
+    }
+
     yyjson_doc_free(doc);
     free(json);
     PASS();
@@ -20791,6 +20868,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_discovery_defaults_match_runtime_contract);
     RUN_TEST(mcp_metadata_byte_budget);
     RUN_TEST(mcp_tools_have_behavior_annotations);
+    RUN_TEST(mcp_tool_annotations_only_mutators_are_writable_issue2118);
     RUN_TEST(mcp_index_repository_declares_name_override_issue571);
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
