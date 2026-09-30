@@ -11392,8 +11392,9 @@ static bool index_call_mode_arg(const char *args, const char *key, bool *value_o
 
 /* The project key a status query names: an explicit name override wins (the
  * key the index call used), then repo_path resolved exactly as for indexing
- * (session root, canonical form, workspace boundary), then a known project
- * alias. NULL with *error_out set when none identifies a project. */
+ * (session root, canonical form, workspace boundary, and the #2134 root owner
+ * an unnamed start adopts), then a known project alias. NULL with *error_out
+ * set when none identifies a project. */
 static char *index_status_project_key(cbm_mcp_server_t *srv, const char *args, char *error_out,
                                       size_t error_size) {
     char *name = cbm_mcp_get_string_arg(args, "name");
@@ -11427,7 +11428,21 @@ static char *index_status_project_key(cbm_mcp_server_t *srv, const char *args, c
         safe_free(repo_path);
         return NULL;
     }
-    char *key = repo_path ? cbm_project_name_from_path(repo_path) : NULL;
+    /* An unnamed start of a root another project owns keys its job by that
+     * owner (#2134), so the poll naming the same repo_path must resolve the
+     * same owner, and fail on the same ambiguity, or it never finds the job. */
+    char *owner = NULL;
+    char *owner_error = NULL;
+    if (repo_path && repo_path[0] && !index_root_owner_resolve(repo_path, &owner, &owner_error)) {
+        (void)snprintf(error_out, error_size, "%s",
+                       owner_error ? owner_error : "could not resolve index project name");
+        safe_free(owner_error);
+        safe_free(repo_path);
+        return NULL;
+    }
+    const char *key_source = owner ? owner : repo_path;
+    char *key = key_source ? cbm_project_name_from_path(key_source) : NULL;
+    safe_free(owner);
     safe_free(repo_path);
     if (!key) {
         (void)snprintf(error_out, error_size, "could not resolve index project name");
@@ -11445,7 +11460,7 @@ static char *handle_index_repository_status(cbm_mcp_server_t *srv, const char *a
                                    "this in-process server tracks no index jobs",
                                    true);
     }
-    char error[CBM_SZ_1K] = {0};
+    char error[CBM_SZ_4K] = {0}; /* the #2134 ambiguity error lists every owner */
     char *project = index_status_project_key(srv, args, error, sizeof(error));
     if (!project) {
         return cbm_mcp_text_result(error[0] ? error : "could not resolve index project name", true);
