@@ -24,6 +24,7 @@ int tf_skip_count = 0;
 #include "mcp/index_supervisor.h"  /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"               /* cbm_mcp_handle_tool — act as a real worker */
 #include "ui/http_server.h"        /* deleted-self executable probe */
+#include "result_spill.h"          /* pinned free disk: spill verdicts ignore the host disk */
 #include <sqlite3.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -957,6 +958,14 @@ int main(int argc, char **argv) {
         (void)printf("sanitized=%d test_seams=%d\n", sanitized, test_seams);
         return 0;
     }
+    /* A test's verdict is a pure function of code, test, platform and seed --
+     * never of how full this machine's disk is. The spill store refuses to open
+     * below 10 GB free, so without this pin every spill test failed, and every
+     * budget-driven pipeline test silently took the no-store path, on a host
+     * with less free space. Pin ample space for this process and every worker
+     * it re-execs; the refusal itself is pinned on purpose by
+     * extraction::extract_spill_refuses_below_the_free_disk_floor. */
+    (void)cbm_result_spill_pin_free_bytes_for_tests((size_t)64 * 1024 * 1024 * 1024);
     /* Skip the multi-hundred-MB executable-image hash that computes the exact
      * build fingerprint: it is tens of seconds per spawned worker/daemon under
      * ASan on constrained CI runners and the sole cause of the daemon-family

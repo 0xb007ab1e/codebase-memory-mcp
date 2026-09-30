@@ -8726,6 +8726,37 @@ TEST(extract_spill_round_trip_keeps_every_field) {
     PASS();
 }
 
+/* The low-disk guard, pinned through the free-space seam rather than the host
+ * disk: one byte under the floor refuses (spilling onto a nearly full disk is
+ * a worse failure than the memory pressure it relieves), the floor itself
+ * opens. The runner pins ample space everywhere else; restored before asserts. */
+TEST(extract_spill_refuses_below_the_free_disk_floor) {
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/cbm_spill_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+
+    size_t floor_bytes = cbm_result_spill_free_floor_bytes_for_tests();
+    size_t saved = cbm_result_spill_pin_free_bytes_for_tests(floor_bytes - 1);
+    cbm_result_spill_t *below = cbm_result_spill_open(dir, 1, 1);
+    (void)cbm_result_spill_pin_free_bytes_for_tests(floor_bytes);
+    cbm_result_spill_t *at = cbm_result_spill_open(dir, 1, 1);
+    (void)cbm_result_spill_pin_free_bytes_for_tests(saved);
+
+    bool refused = below == NULL;
+    bool opened = at != NULL;
+    cbm_result_spill_close(below);
+    cbm_result_spill_close(at);
+    char spill_sub[600];
+    snprintf(spill_sub, sizeof(spill_sub), "%s/spill", dir);
+    cbm_rmdir(spill_sub);
+    cbm_rmdir(dir);
+
+    ASSERT_EQ(floor_bytes, (size_t)10 * 1024 * 1024 * 1024);
+    ASSERT_TRUE(refused);
+    ASSERT_TRUE(opened);
+    PASS();
+}
+
 /* ── A skipped file gets no LSP walk, per-file or cross-file ── */
 
 /* CBM_TEST_LSP_SKIP_ON names the file: the result carries lsp_skipped, the
@@ -8785,6 +8816,7 @@ SUITE(extraction) {
     RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
     RUN_TEST(extract_spill_round_trip_keeps_every_field);
+    RUN_TEST(extract_spill_refuses_below_the_free_disk_floor);
     RUN_TEST(extract_lsp_skipped_file_gets_no_walk);
     RUN_TEST(extract_walk_truncated_when_a_node_budget_is_set);
     /* Initialize extraction library */
