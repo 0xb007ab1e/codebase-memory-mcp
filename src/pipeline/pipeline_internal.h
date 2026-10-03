@@ -246,6 +246,15 @@ bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_
                                          int left_count, const cbm_file_hash_t *right,
                                          int right_count);
 
+/* Internal explicit-language resolution; public raw/lineage APIs stay raw. */
+cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
+                                           const char *module_qn, const char **import_map_keys,
+                                           const char **import_map_vals, int import_map_count,
+                                           CBMLanguage lang);
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_pxc_test_import_probe_fail_after(int successful_allocations);
+#endif
+
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
 /* Per-file tree-sitter parse budget, in MICROSECONDS of this thread's CPU time
@@ -604,11 +613,12 @@ void cbm_pipeline_set_pkgmap(CBMHashTable *map);
  * (#1186). Only a class no prefix covers falls back to the one candidate whose
  * directories end with the class's namespace. Never by short name alone, so a
  * vendor controller that is not in the repo gets no handler. A reference
- * without "::" resolves exactly as cbm_registry_resolve does. */
+ * without "::" resolves exactly as cbm_registry_resolve_lang does for the
+ * calling file's language. */
 cbm_resolution_t cbm_registry_resolve_handler(const cbm_registry_t *r, const char *handler_ref,
                                               const char *module_qn, const char **import_map_keys,
                                               const char **import_map_vals, int import_map_count,
-                                              const cbm_gbuf_t *gbuf);
+                                              const cbm_gbuf_t *gbuf, CBMLanguage lang);
 
 /* Where composer's PSR-4 autoloader places a PHP class member. Tri-state, so
  * "no prefix covers the class" (another strategy may answer) is never

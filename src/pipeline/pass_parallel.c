@@ -604,9 +604,9 @@ static bool is_checked_exception(const char *name) {
 
 static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
                                     const char *module_qn, const char **imp_keys,
-                                    const char **imp_vals, int imp_count) {
+                                    const char **imp_vals, int imp_count, CBMLanguage lang) {
     cbm_resolution_t res =
-        cbm_registry_resolve(reg, name, module_qn, imp_keys, imp_vals, imp_count);
+        cbm_registry_resolve_lang(reg, name, module_qn, imp_keys, imp_vals, imp_count, lang);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         return NULL;
     }
@@ -2363,7 +2363,7 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
                                     const char *handler_ref, const char *module_qn,
                                     const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
                                     const char **ik, const char **iv, int ic,
-                                    const char *route_mount) {
+                                    const char *route_mount, CBMLanguage lang) {
     const char *method = cbm_service_pattern_route_method(call->callee_name);
     char mounted[CBM_SZ_256];
     route_path = cbm_laravel_mount_route(route_mount, route_path, mounted, sizeof(mounted));
@@ -2384,8 +2384,8 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
              esc_rp);
     cbm_gbuf_insert_edge(gbuf, source->id, rid, "CALLS", props);
     if (handler_ref && handler_ref[0] != '\0') {
-        cbm_resolution_t hres =
-            cbm_registry_resolve_handler(registry, handler_ref, module_qn, ik, iv, ic, main_gbuf);
+        cbm_resolution_t hres = cbm_registry_resolve_handler(registry, handler_ref, module_qn, ik,
+                                                             iv, ic, main_gbuf, lang);
         if (hres.qualified_name && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn(main_gbuf, hres.qualified_name);
             if (h) {
@@ -2681,7 +2681,8 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const cbm_resolution_t *res, const char *module_qn,
                               const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
                               const char **imp_keys, const char **imp_vals, int imp_count,
-                              bool suppress_plain_calls, const char *route_mount) {
+                              bool suppress_plain_calls, const char *route_mount,
+                              CBMLanguage lang) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     const char *arg = call->first_string_arg;
 
@@ -2709,7 +2710,7 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         if (route_path) {
             emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
                                     registry, main_gbuf, imp_keys, imp_vals, imp_count,
-                                    route_mount);
+                                    route_mount, lang);
             return;
         }
         /* No path found — fall through to normal CALLS edge */
@@ -2759,7 +2760,7 @@ static void emit_xlang_refused_route(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *so
                                      const CBMCall *call, const char *module_qn,
                                      const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
                                      const char **imp_keys, const char **imp_vals, int imp_count,
-                                     const char *route_mount) {
+                                     const char *route_mount, CBMLanguage lang) {
     if (cbm_service_pattern_route_method(call->callee_name) == NULL) {
         return;
     }
@@ -2771,7 +2772,7 @@ static void emit_xlang_refused_route(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *so
     const char *route_path = find_route_path_in_args(call, &handler_ref);
     if (route_path) {
         emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn, registry,
-                                main_gbuf, imp_keys, imp_vals, imp_count, route_mount);
+                                main_gbuf, imp_keys, imp_vals, imp_count, route_mount, lang);
     }
 }
 
@@ -3201,8 +3202,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                         lang, lsp->strategy, lsp->callee_qn, rc->project_name);
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
             !rust_external) {
-            res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
-                                       imp_vals, imp_count);
+            res = cbm_registry_resolve_lang(rc->registry, call->callee_name, module_qn, imp_keys,
+                                            imp_vals, imp_count, lang);
         }
         /* `p->open(fd)`: the registry does not split a callee on the arrow.
          * The object's type decides, as for the dot call handled further
@@ -3330,7 +3331,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                             .strategy = "service_pattern"};
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, false, route_mount);
+                                  imp_count, false, route_mount, lang);
                 continue;
             }
         }
@@ -3357,7 +3358,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                  * route/HTTP/service classification is unchanged. */
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, true, route_mount);
+                                  imp_count, true, route_mount, lang);
             } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
                 /* Native `fetch()` (#856): only the global API once resolution
                  * has failed to find a local/imported `fetch`. Call the low-level
@@ -3418,7 +3419,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * CALLS edge across a language boundary. A route registration
              * behind the refused binding still gets its Route. */
             emit_xlang_refused_route(ws->local_edge_buf, source_node, call, module_qn, rc->registry,
-                                     rc->main_gbuf, imp_keys, imp_vals, imp_count, route_mount);
+                                     rc->main_gbuf, imp_keys, imp_vals, imp_count, route_mount,
+                                     lang);
             continue;
         }
         if (!target_node || source_node->id == target_node->id) {
@@ -3436,7 +3438,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 if (url_or_topic) {
                     emit_service_edge(ws->local_edge_buf, source_node, NULL, call, &res, module_qn,
                                       rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                                      false, route_mount);
+                                      false, route_mount, lang);
                     ws->calls_resolved++;
                 }
             }
@@ -3445,7 +3447,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         _rc_t0 = extract_now_ns();
         emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
                           rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                          drop_plain_call, route_mount);
+                          drop_plain_call, route_mount, lang);
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;
@@ -3555,8 +3557,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                 (lang == CBM_LANG_SQL)
                     ? cbm_registry_resolve_lineage(rc->registry, usage->ref_name, module_qn,
                                                    imp_keys, imp_vals, imp_count)
-                    : cbm_registry_resolve(rc->registry, usage->ref_name, module_qn, imp_keys,
-                                           imp_vals, imp_count);
+                    : cbm_registry_resolve_lang(rc->registry, usage->ref_name, module_qn, imp_keys,
+                                                imp_vals, imp_count, lang);
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 continue;
             }
@@ -3612,7 +3614,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
 /* Resolve throws/raises for one file. */
 static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                 CBMFileResult *result, const char *rel, const char *module_qn,
-                                const char **imp_keys, const char **imp_vals, int imp_count) {
+                                const char **imp_keys, const char **imp_vals, int imp_count,
+                                CBMLanguage lang) {
     for (int t = 0; t < result->throws.count; t++) {
         CBMThrow *thr = &result->throws.items[t];
         if (!thr->exception_name || !thr->enclosing_func_qn) {
@@ -3627,8 +3630,8 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             continue;
         }
         const char *edge_type = is_checked_exception(thr->exception_name) ? "THROWS" : "RAISES";
-        cbm_resolution_t res = cbm_registry_resolve(rc->registry, thr->exception_name, module_qn,
-                                                    imp_keys, imp_vals, imp_count);
+        cbm_resolution_t res = cbm_registry_resolve_lang(
+            rc->registry, thr->exception_name, module_qn, imp_keys, imp_vals, imp_count, lang);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             continue;
         }
@@ -3686,8 +3689,8 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
             }
             continue;
         }
-        cbm_resolution_t res = cbm_registry_resolve(rc->registry, rw->var_name, module_qn, imp_keys,
-                                                    imp_vals, imp_count);
+        cbm_resolution_t res = cbm_registry_resolve_lang(rc->registry, rw->var_name, module_qn,
+                                                         imp_keys, imp_vals, imp_count, lang);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             continue;
         }
@@ -3729,7 +3732,8 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         return;
     }
     for (int b = 0; def->base_classes[b]; b++) {
-        const char *bqn = resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic);
+        const char *bqn =
+            resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic, fs->lang);
         /* Same external-base gate as the sequential semantic pass. */
         if (!bqn ||
             cbm_python_external_base_contradicts(fs->lang, fs->imports, def->base_classes[b], bqn,
@@ -3751,7 +3755,8 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
 /* Resolve decorators → DECORATES edges for one definition. */
 static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                    const CBMDefinition *def, const cbm_gbuf_node_t *node,
-                                   const char *mq, const char **ik, const char **iv, int ic) {
+                                   const char *mq, const char **ik, const char **iv, int ic,
+                                   CBMLanguage lang) {
     if (!def->decorators) {
         return;
     }
@@ -3761,14 +3766,14 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
         if (fn[0] == '\0') {
             continue;
         }
-        cbm_resolution_t res = cbm_registry_resolve(rc->registry, fn, mq, ik, iv, ic);
+        cbm_resolution_t res = cbm_registry_resolve_lang(rc->registry, fn, mq, ik, iv, ic, lang);
         if ((!res.qualified_name || res.qualified_name[0] == '\0') && !strchr(fn, '.')) {
             /* C# attributes are referenced by their short name (`[Log]`) but
              * declared with an `Attribute` suffix (`class LogAttribute`). */
             char with_suffix[CBM_SZ_256];
             int wn = snprintf(with_suffix, sizeof(with_suffix), "%sAttribute", fn);
             if (wn > 0 && (size_t)wn < sizeof(with_suffix)) {
-                res = cbm_registry_resolve(rc->registry, with_suffix, mq, ik, iv, ic);
+                res = cbm_registry_resolve_lang(rc->registry, with_suffix, mq, ik, iv, ic, lang);
             }
         }
         const cbm_gbuf_node_t *dn = NULL;
@@ -3834,7 +3839,7 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             continue;
         }
         resolve_def_inherits(rc, ws, def, node, &fs, module_qn, imp_keys, imp_vals, imp_count);
-        resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count, lang);
     }
     for (int t = 0; t < result->impl_traits.count; t++) {
         CBMImplTrait *it = &result->impl_traits.items[t];
@@ -3842,9 +3847,9 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             continue;
         }
         const char *tqn = resolve_as_class(rc->registry, it->trait_name, module_qn, imp_keys,
-                                           imp_vals, imp_count);
+                                           imp_vals, imp_count, lang);
         const char *sqn = resolve_as_class(rc->registry, it->struct_name, module_qn, imp_keys,
-                                           imp_vals, imp_count);
+                                           imp_vals, imp_count, lang);
         if (!tqn || !sqn) {
             continue;
         }
@@ -4191,7 +4196,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                     (strcmp(result->error_msg, CBM_C_LSP_MEMO_ERROR) == 0 ||
                      strcmp(result->error_msg, CBM_PY_LSP_MEMO_ERROR) == 0 ||
                      strcmp(result->error_msg, CBM_C_LSP_DEPTH_ERROR) == 0 ||
-                     strcmp(result->error_msg, CBM_PY_LSP_DEPTH_ERROR) == 0)) {
+                     strcmp(result->error_msg, CBM_PY_LSP_DEPTH_ERROR) == 0 ||
+                     strcmp(result->error_msg, CBM_PY_LSP_SCOPE_ERROR) == 0)) {
                     rc->lsp_failures[file_idx] = result->error_msg;
                     ws->errors++;
                 }
@@ -4253,7 +4259,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* ── THROWS / RAISES ───────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_throws(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_file_throws(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang);
         atomic_fetch_add_explicit(&rc->time_ns_throws, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 
