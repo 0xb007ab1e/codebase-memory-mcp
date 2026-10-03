@@ -2472,9 +2472,23 @@ static bool arg_is_topic(const CBMCallArg *arg) {
     return false;
 }
 
+/* File-language scope of the client-navigation heuristic (#1250): the JS/TS
+ * family and the hosts that embed it. Kept explicit so changes to the
+ * weak-member guard cannot broaden it. */
+static bool pp_client_navigation_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+           lang == CBM_LANG_ARKTS || lang == CBM_LANG_HTML || lang == CBM_LANG_VUE ||
+           lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO;
+}
+
 /* Detect API paths in call arguments and create HTTP_CALLS edges. */
 static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
-                               cbm_svc_kind_t svc) {
+                               cbm_svc_kind_t svc, bool js_family) {
+    /* Only the generic argument heuristic is suppressed: explicit HTTP service
+     * classification above this call still emits its edge. */
+    if (cbm_service_pattern_is_client_navigation(js_family, call->callee_name)) {
+        return;
+    }
     /* A resolved alias may be ASYNC even when its source spelling is unknown.
      * Neither raw slash topics nor URL projections are HTTP evidence there. */
     if (svc == CBM_SVC_ASYNC || cbm_service_pattern_match(call->callee_name) == CBM_SVC_ASYNC) {
@@ -2772,7 +2786,7 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
      * __route__ANY__ twin of the typed edge, which cross-repo matching then
      * bound to server handlers of any method. */
     if (!http_edge_emitted) {
-        detect_url_in_args(gbuf, source, call, svc);
+        detect_url_in_args(gbuf, source, call, svc, pp_client_navigation_lang(lang));
     }
 }
 
