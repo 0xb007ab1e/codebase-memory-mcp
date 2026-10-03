@@ -671,7 +671,8 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count, CBMLanguage lang,
-                               const CBMImportArray *imports, const char *route_mount) {
+                               const CBMImportArray *imports, const char *route_mount,
+                               const cbm_php_vendor_names_t *php_vendor) {
     const CBMResolvedCallArray *lsp_calls = &result->resolved_calls;
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
     if (!source_node) {
@@ -683,6 +684,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
     const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_in_graph(
         lsp_calls, call, allow_tail, ctx->gbuf, ctx->project_name);
+    /* #1186: a PHP call on a vendor type (`new Request`, or a receiver the LSP
+     * typed as an imported vendor class) takes the LSP result or no target: a
+     * same-named project symbol found by name alone is never the vendor's.
+     * Service/route classification below still runs. Mirrors pass_parallel.c. */
+    bool php_vendor_call = cbm_pipeline_php_vendor_call(php_vendor, result, call) ||
+                           cbm_pipeline_lsp_external_receiver(lsp);
     if (lsp) {
         bool exact_external_target = call->requires_lsp_resolution &&
                                      cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
@@ -774,7 +781,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     bool rust_external = lsp && cbm_pipeline_rust_external_target(
                                     lang, lsp->strategy, lsp->callee_qn, ctx->project_name);
     cbm_resolution_t res = {0};
-    if (!rust_external) {
+    if (!rust_external && !php_vendor_call) {
         res = cbm_registry_resolve_lang(ctx->registry, call->callee_name, module_qn, imp_keys,
                                         imp_vals, imp_count, lang);
         /* Cross-language veto: a name-only guess never binds another
@@ -1147,6 +1154,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         const char **imp_vals = NULL;
         int imp_count = 0;
         build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        cbm_php_vendor_names_t php_vendor;
+        cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
 
         /* Compute module QN for same-module resolution (directory-based for
          * Java/Go so it matches their def-node QNs in the registry). */
@@ -1166,7 +1175,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             }
             total_calls++;
             if (resolve_single_call(ctx, call, result, rel, module_qn, imp_keys, imp_vals,
-                                    imp_count, files[i].language, &result->imports, route_mount)) {
+                                    imp_count, files[i].language, &result->imports, route_mount,
+                                    &php_vendor)) {
                 resolved++;
             } else {
                 unresolved++;
@@ -1174,6 +1184,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         }
 
         free(module_qn);
+        cbm_pipeline_php_vendor_names_free(&php_vendor);
         free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);
