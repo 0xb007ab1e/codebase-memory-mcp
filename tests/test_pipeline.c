@@ -9073,6 +9073,137 @@ TEST(pipeline_swift_nested_url_makes_route_issue1892) {
     PASS();
 }
 
+/* HANDLES edges from the function named `source_name` to Routes whose
+ * qualified name equals `route_qn`. */
+static int handles_to_route(cbm_store_t *s, const char *project, const char *source_name,
+                            const char *route_qn) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "HANDLES", &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.qualified_name &&
+            (!source_name || strcmp(source.name, source_name) == 0) &&
+            strcmp(target.qualified_name, route_qn) == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* fastapi (2026-10-05): one binary indexed the same tree to 3,253 or to
+ * 1,119,241 HANDLES edges. A prefix Route took the directory of whichever
+ * registrar's CALLS edge came first (worker order) and linked every decorated
+ * handler under it, with no filter for the root prefix `/`; every infra URL
+ * then copied the handlers of the root route. Now: every registrar counts, a
+ * root mount bridges nothing, and an infra URL matches a root route only of
+ * its own service. */
+TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_routebridge_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    /* two apps mounted at the root and under /api, from two directories */
+    write_temp_file(tmp, "svc/a/main.py",
+                    "from fastapi import FastAPI\n"
+                    "app = FastAPI()\n"
+                    "app.mount(\"/\", None)\n"
+                    "app.mount(\"/api\", None)\n"
+                    "\n"
+                    "@app.get(\"/items\")\n"
+                    "def read_items():\n"
+                    "    return []\n");
+    write_temp_file(tmp, "svc/a/api/routes.py",
+                    "from fastapi import APIRouter\n"
+                    "router = APIRouter()\n"
+                    "\n"
+                    "@router.get(\"/ax\")\n"
+                    "def api_a():\n"
+                    "    return 1\n");
+    write_temp_file(tmp, "svc/b/main.py",
+                    "from fastapi import FastAPI\n"
+                    "app = FastAPI()\n"
+                    "app.mount(\"/\", None)\n"
+                    "app.mount(\"/api\", None)\n"
+                    "app.mount(\"/c\", None)\n"
+                    "\n"
+                    "@app.get(\"/users\")\n"
+                    "def read_users():\n"
+                    "    return []\n");
+    write_temp_file(tmp, "svc/b/api/routes.py",
+                    "from fastapi import APIRouter\n"
+                    "router = APIRouter()\n"
+                    "\n"
+                    "@router.get(\"/by\")\n"
+                    "def api_b():\n"
+                    "    return 2\n");
+    /* a real root handler, and a documentation site's link to a chat server */
+    write_temp_file(tmp, "web/site.py",
+                    "from flask import Flask\n"
+                    "app = Flask(__name__)\n"
+                    "\n"
+                    "@app.route(\"/\")\n"
+                    "def index():\n"
+                    "    return \"ok\"\n"
+                    "\n"
+                    "@app.route(\"/c\")\n"
+                    "def contact():\n"
+                    "    return \"c\"\n");
+    write_temp_file(tmp, "mkdocs.yml",
+                    "site_name: demo\n"
+                    "extra:\n"
+                    "  social:\n"
+                    "    - icon: fontawesome/brands/discord\n"
+                    "      link: https://discord.com/invite/abc123\n"
+                    "    - icon: fontawesome/brands/github\n"
+                    "      link: https://github.com/carol\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/routebridge.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* decorator routes are untouched */
+    ASSERT_EQ(handles_to_route(s, project, "read_items", "__route__GET__/items"), 1);
+    ASSERT_EQ(handles_to_route(s, project, "index", "__route__ANY__/"), 1);
+    /* a root mount names no part of a handler's path: nothing is bridged */
+    ASSERT_EQ(handles_to_route(s, project, "read_items", "__route__ANY__/"), 0);
+    ASSERT_EQ(handles_to_route(s, project, "read_users", "__route__ANY__/"), 0);
+    /* /api is registered from both directories: both api handlers, whatever
+     * order the registrations' CALLS edges landed in */
+    ASSERT_EQ(handles_to_route(s, project, "api_a", "__route__ANY__/api"), 1);
+    ASSERT_EQ(handles_to_route(s, project, "api_b", "__route__ANY__/api"), 1);
+    /* a prefix and a URL path match on whole segments only: `c` is no segment
+     * of svc/b/main.py, and `/c` is no route of github.com/carol */
+    ASSERT_EQ(handles_to_route(s, project, "read_users", "__route__ANY__/c"), 0);
+    ASSERT_EQ(handles_to_route(s, project, "contact", "__route__ANY__/c"), 1);
+    ASSERT_EQ(handles_to_route(s, project, NULL, "__route__infra__https://github.com/carol"), 0);
+    /* the chat link is no route of this repository's root handler */
+    ASSERT_EQ(
+        handles_to_route(s, project, NULL, "__route__infra__https://discord.com/invite/abc123"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(pipeline_swift_http_call_makes_route_issue1892) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_swifthttp_XXXXXX");
@@ -19431,6 +19562,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
+    RUN_TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
     RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin);
