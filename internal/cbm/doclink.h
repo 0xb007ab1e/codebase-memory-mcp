@@ -85,6 +85,16 @@
     X(CBM_DOCLINK_CS_INHERITDOC, CBM_LANG_CSHARP, "inheritdoc", false, true, "MENTIONS")       \
     /* go (doclink_go.c): [Name] doc links; held until its held-out audit passes */            \
     X(CBM_DOCLINK_GO_DOC_LINK, CBM_LANG_GO, "doc_link", false, false, "MENTIONS")              \
+    /* java and kotlin (doclink_jvm.c): Javadoc and KDoc; held until their audit passes */     \
+    X(CBM_DOCLINK_JAVA_LINK, CBM_LANG_JAVA, "link", false, false, "MENTIONS")                  \
+    X(CBM_DOCLINK_JAVA_LINKPLAIN, CBM_LANG_JAVA, "linkplain", false, false, "MENTIONS")        \
+    X(CBM_DOCLINK_JAVA_SEE, CBM_LANG_JAVA, "see", false, false, "MENTIONS")                    \
+    X(CBM_DOCLINK_JAVA_THROWS, CBM_LANG_JAVA, "throws", false, false, "MENTIONS")              \
+    X(CBM_DOCLINK_JAVA_VALUE, CBM_LANG_JAVA, "value", false, false, "MENTIONS")                \
+    X(CBM_DOCLINK_KT_KDOC_LINK, CBM_LANG_KOTLIN, "kdoc_link", false, false, "MENTIONS")        \
+    X(CBM_DOCLINK_KT_SEE, CBM_LANG_KOTLIN, "see", false, false, "MENTIONS")                    \
+    X(CBM_DOCLINK_KT_THROWS, CBM_LANG_KOTLIN, "throws", false, false, "MENTIONS")              \
+    X(CBM_DOCLINK_KT_SAMPLE, CBM_LANG_KOTLIN, "sample", false, false, "MENTIONS")              \
     /* markdown (doclink_md.c): what a document's text names explicitly */                     \
     X(CBM_DOCLINK_MD_LINK, CBM_LANG_MARKDOWN, "link", false, true, "MENTIONS")                 \
     X(CBM_DOCLINK_MD_PATH, CBM_LANG_MARKDOWN, "path", false, true, "MENTIONS")                 \
@@ -427,5 +437,29 @@ bool cbm_doclink_go_parse_ref(const char *raw, size_t len, CBMDocLinkGoRef *out)
 
 /* The Go scope blob (Go files and go.mod files) starts with this tag line. */
 #define CBM_DOCLINK_GO_SCOPE_TAG "go1"
+/* ── Java and Kotlin (doclink_jvm.c) ───────────────────────────────── */
+
+void cbm_doclink_java_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                                uint32_t doc_line);
+void cbm_doclink_kotlin_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                                  uint32_t doc_line);
+const char *cbm_doclink_java_scan_scope(CBMExtractCtx *ctx);
+const char *cbm_doclink_kotlin_scan_scope(CBMExtractCtx *ctx);
+char *cbm_doclink_jvm_portable_scope(const char *scope);
+
+/* Normalize one Java parameter type as written in a declaration or in a
+ * Javadoc `#member(...)` list: annotations, `final`, type arguments, package
+ * and outer-type qualifiers and a trailing parameter name are dropped,
+ * `...` becomes `[]`, array brackets stay. "?" when nothing is left. Writes a
+ * NUL-terminated string into `out` (truncated at cap) and returns its
+ * length. */
+size_t cbm_doclink_java_norm_type(const char *in, size_t len, char *out, size_t cap);
+
+/* Java and Kotlin files share one scope tag: one resolver indexes both. */
+#define CBM_DOCLINK_JVM_SCOPE_TAG "jvm1"
+
+/* The longest reference a Java or Kotlin token may carry: a longer one is cut
+ * just past this length at extraction and reported as unparseable. */
+#define CBM_DOCLINK_JVM_REF_MAX 1000
 
 #endif /* CBM_DOCLINK_H */

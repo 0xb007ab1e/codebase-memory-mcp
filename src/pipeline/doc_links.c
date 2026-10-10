@@ -47,6 +47,7 @@ const char *cbm_doclink_reason_name(int reason) {
 static const cbm_doclink_resolver_t *const DOCLINK_RESOLVERS[] = {
     &cbm_doclink_cs_resolver,  &cbm_doclink_md_resolver,   &cbm_doclink_pdf_resolver,
     &cbm_doclink_rst_resolver, &cbm_doclink_adoc_resolver, &cbm_doclink_go_resolver,
+    &cbm_doclink_jvm_resolver,
 };
 
 enum { DOCLINK_RESOLVER_COUNT = sizeof(DOCLINK_RESOLVERS) / sizeof(DOCLINK_RESOLVERS[0]) };

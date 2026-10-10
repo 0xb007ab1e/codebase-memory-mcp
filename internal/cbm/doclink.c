@@ -190,6 +190,16 @@ static const doclink_lang_t DOCLINK_LANGS[] = {
      .scan_scope = cbm_doclink_gomod_scan_scope,
      .scope_tag = CBM_DOCLINK_GO_SCOPE_TAG,
      .portable_scope = cbm_doclink_go_portable_scope},
+    {.lang = CBM_LANG_JAVA,
+     .parse_doc = cbm_doclink_java_parse_doc,
+     .scan_scope = cbm_doclink_java_scan_scope,
+     .scope_tag = CBM_DOCLINK_JVM_SCOPE_TAG,
+     .portable_scope = cbm_doclink_jvm_portable_scope},
+    {.lang = CBM_LANG_KOTLIN,
+     .parse_doc = cbm_doclink_kotlin_parse_doc,
+     .scan_scope = cbm_doclink_kotlin_scan_scope,
+     .scope_tag = CBM_DOCLINK_JVM_SCOPE_TAG,
+     .portable_scope = cbm_doclink_jvm_portable_scope},
 };
 
 static const doclink_lang_t *doclink_lang(CBMLanguage lang) {
