@@ -144,7 +144,8 @@ static void ts_write_repo(const char *repo) {
                                                   "function internal() {}\n");
     th_write_file(TH_PATH(repo, "src/def.ts"), "export default class Def {}\n");
     th_write_file(TH_PATH(repo, "src/barrel/index.ts"),
-                  "export * from \"../helper\";\nexport * from \"./more\";\n");
+                  "export * from \"../helper\";\nexport * from \"./more\";\n"
+                  "export function inBarrel() {}\n");
     th_write_file(TH_PATH(repo, "src/barrel/more.ts"), "export function extra() {}\n");
     th_write_file(TH_PATH(repo, "src/dup1.ts"), "export function twin() {}\n");
     th_write_file(TH_PATH(repo, "src/dup2.ts"), "export function twin() {}\n");
@@ -164,7 +165,17 @@ static void ts_write_repo(const char *repo) {
                   "}\n");
     /* a script: no import, no export, so its names are global */
     th_write_file(TH_PATH(repo, "src/global.js"), "function legacyGlobal() {}\n");
+    /* a tsconfig path alias and a workspace package */
+    th_write_file(TH_PATH(repo, "tsconfig.json"),
+                  "{ \"compilerOptions\": { \"paths\": { \"@lib/*\": [\"src/lib/*\"] } } }\n");
+    th_write_file(TH_PATH(repo, "src/lib/aliased.ts"), "export function aliased() {}\n");
+    th_write_file(TH_PATH(repo, "packages/util/package.json"),
+                  "{ \"name\": \"@acme/util\", \"main\": \"src/index.ts\" }\n");
+    th_write_file(TH_PATH(repo, "packages/util/src/index.ts"), "export function utilFn() {}\n");
     th_write_file(TH_PATH(repo, "src/widget.ts"),
+                  "import { aliased } from \"@lib/aliased\";\n"
+                  "import { utilFn } from \"@acme/util\";\n"
+                  "import { inBarrel } from \"./barrel\";\n"
                   "import { Helper, gadget as g } from \"./helper\";\n"
                   "import * as ns from \"./helper\";\n"
                   "import Def from \"./def\";\n"
@@ -177,7 +188,8 @@ static void ts_write_repo(const char *repo) {
                   " * Links: {@link Helper}, {@link Helper.run}, {@link g}, {@link ns.gadget},\n"
                   " * {@link Def}, {@link extra}, {@link twin}, {@link Thing}, {@link Gone},\n"
                   " * {@link Promise}, {@link legacyGlobal}, {@link Nope}, {@link spin},\n"
-                  " * {@link Space.Inner.deep}, {@link Helper#missingMember}.\n"
+                  " * {@link Space.Inner.deep}, {@link Helper#missingMember}, {@link aliased},\n"
+                  " * {@link utilFn}, {@link inBarrel}.\n"
                   " */\n"
                   "export class Widget {\n"
                   "  spin(): void {}\n"
@@ -247,6 +259,11 @@ TEST(doc_mentions_ts_resolution) {
     ASSERT_TRUE(ts_edge(db, w, "src.widget.Space.Inner.deep"));
     /* a class member without a node of its own */
     ASSERT_TRUE(ts_row(db, "Helper#missingMember", "graph_gap"));
+    /* a tsconfig path alias; a workspace package's entry module */
+    ASSERT_TRUE(ts_edge(db, w, "src.lib.aliased.aliased"));
+    ASSERT_TRUE(ts_edge(db, w, "packages.util.src.utilFn"));
+    /* a declaration of an index file (its QN has no `index`) */
+    ASSERT_TRUE(ts_edge(db, w, "src.barrel.inBarrel"));
     /* this. is the container's; a namespace's own names first */
     ASSERT_TRUE(ts_edge(db, "src.widget.Widget.turn", "src.widget.Widget.spin"));
     ASSERT_TRUE(ts_edge(db, "src.widget.Space.Inner.deep", "src.widget.Space.Inner.deep2"));

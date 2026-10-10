@@ -14,8 +14,12 @@
  *      through `export { a as b }`, `export ... from` and `export *` barrels
  *      (a cycle guard and a depth bound; two barrels that answer differently
  *      are ambiguous); a relative specifier resolves with the usual extension
- *      and index rules, every bare one is external (package.json and
- *      tsconfig.json are not indexed);
+ *      and index rules; a bare one through the nearest tsconfig/jsconfig
+ *      `paths` (the first target, as TypeScript tries it first) or
+ *      `baseUrl`, else, when it is the `name` of a workspace package (the
+ *      pipeline's package map), to that package's entry module (`exports`,
+ *      `main`, `module`) when the repository indexes it; every other bare
+ *      specifier, a package's subpath included, is external;
  *   5. the standard library's global names: external;
  *   6. the top-level declarations of the repository's script files (files
  *      without an import or an export are global): one binds, several are
@@ -29,7 +33,8 @@
  * declares or imports, unique otherwise.
  */
 #include "pipeline/doc_links.h"
-#include "pipeline/pipeline_internal.h" /* cbm_pipeline_file_node */
+#include "pipeline/path_alias.h"
+#include "pipeline/pipeline_internal.h" /* cbm_pipeline_file_node, cbm_pipeline_get_pkgmap */
 #include "cbm.h"
 #include "doclink.h"
 #include "helpers.h" /* cbm_fqn_module_source_lang, cbm_is_test_file */
@@ -83,6 +88,8 @@ typedef struct {
 typedef struct {
     const char *path;
     const char *module_qn;
+    const char *sym_qn; /* what its declarations' QNs start with: an index file's
+                         * module QN without `.index` (fqn.c, strip_init_or_index) */
     bool test;
     bool module_syntax;
     tr_rec_t *imps; /* I */
@@ -110,8 +117,11 @@ typedef struct {
     int nfiles;
     int *run_to_file;
     int run_count;
-    CBMHashTable *by_path; /* rel_path -> (file index + 1) as a pointer */
-    CBMHashTable *globals; /* name -> tr_global_t */
+    CBMHashTable *by_path;                      /* rel_path -> (file index + 1) as a pointer */
+    CBMHashTable *globals;                      /* name -> tr_global_t */
+    CBMHashTable *by_module;                    /* module QN -> (first file index + 1) */
+    const cbm_path_alias_collection_t *aliases; /* the pipeline's, borrowed */
+    CBMHashTable *pkgmap;                       /* the pipeline's, borrowed */
     bool oom;
 } tr_index_t;
 
@@ -266,6 +276,7 @@ static void tr_destroy(void *index) {
     }
     cbm_ht_free(ix->by_path);
     cbm_ht_free(ix->globals);
+    cbm_ht_free(ix->by_module);
     cbm_free(CBM_MEM_CLASS_OTHER, ix->run_to_file);
     cbm_arena_destroy(&ix->arena);
     cbm_free(CBM_MEM_CLASS_OTHER, ix);
@@ -298,6 +309,18 @@ static bool tr_add_globals(tr_index_t *ix) {
     return true;
 }
 
+/* The QN prefix of a file's declarations: an index module's QN loses its
+ * last segment, as a symbol QN does in fqn.c. */
+static const char *tr_symbol_prefix(tr_index_t *ix, const char *module_qn) {
+    static const char suffix[] = ".index";
+    size_t sl = sizeof(suffix) - SKIP_ONE;
+    size_t n = module_qn ? strlen(module_qn) : 0;
+    if (n <= sl || strcmp(module_qn + n - sl, suffix) != 0) {
+        return module_qn;
+    }
+    return tr_copy(ix, module_qn, n - sl);
+}
+
 static void *tr_build(const cbm_doclink_build_in_t *in) {
     tr_index_t *ix = (tr_index_t *)cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*ix));
     if (!ix) {
@@ -326,6 +349,7 @@ static void *tr_build(const cbm_doclink_build_in_t *in) {
             cbm_fqn_module_source_lang(&ix->arena, ix->project, src->rel_path, CBM_LANG_TYPESCRIPT);
         f->test = cbm_is_test_file(src->rel_path, tr_lang(src->rel_path));
         ix->oom = ix->oom || !f->module_qn;
+        f->sym_qn = tr_symbol_prefix(ix, f->module_qn);
         cbm_ht_set(ix->by_path, src->rel_path, (void *)(uintptr_t)(i + SKIP_ONE));
         if (src->run_file >= 0 && src->run_file < in->run_file_count) {
             ix->run_to_file[src->run_file] = i;
@@ -335,6 +359,16 @@ static void *tr_build(const cbm_doclink_build_in_t *in) {
         }
     }
     ok = ok && !ix->oom && tr_add_globals(ix);
+    ix->aliases = in->ctx->path_aliases;
+    ix->pkgmap = cbm_pipeline_get_pkgmap();
+    ix->by_module =
+        ok ? cbm_ht_create_in(CBM_MEM_CLASS_OTHER, (uint32_t)(ix->nfiles + SKIP_ONE)) : NULL;
+    ok = ok && ix->by_module;
+    for (int i = ix->nfiles - SKIP_ONE; ok && i >= 0; i--) {
+        if (ix->files[i].module_qn) {
+            cbm_ht_set(ix->by_module, ix->files[i].module_qn, (void *)(uintptr_t)(i + SKIP_ONE));
+        }
+    }
     if (!ok) {
         cbm_log_error("doc_links.ts.error", "step", "index", "reason", "alloc");
         tr_destroy(ix);
@@ -410,7 +444,7 @@ static const tr_rec_t *tr_decl(const tr_file_t *f, const char *name) {
 /* A top-level declaration of file f: its node, or a graph gap. */
 static tr_res_t tr_decl_res(const tr_ctx_t *c, const tr_file_t *f, const char *name) {
     char qn[TR_QN_MAX];
-    if (!tr_join(qn, sizeof(qn), f->module_qn, name, NULL)) {
+    if (!tr_join(qn, sizeof(qn), f->sym_qn, name, NULL)) {
         return tr_mk(TR_GAP);
     }
     const cbm_gbuf_node_t *n = tr_node(c, qn, f);
@@ -461,22 +495,9 @@ static bool tr_norm(const char *dir, size_t dl, const char *rel, char *out, size
     return w > 0;
 }
 
-/* The file a module specifier written in file `from` names: -1 with
- * *external for a bare specifier (a package). */
-static int tr_spec_file(const tr_index_t *ix, int from, const char *spec, bool *external) {
-    *external = false;
-    if (!(spec[0] == '.' &&
-          (spec[SKIP_ONE] == '/' || spec[SKIP_ONE] == '\0' ||
-           (spec[SKIP_ONE] == '.' && (spec[PAIR_LEN] == '/' || spec[PAIR_LEN] == '\0'))))) {
-        *external = true;
-        return CBM_NOT_FOUND;
-    }
-    const char *path = ix->files[from].path;
-    const char *slash = strrchr(path, '/');
-    char base[TR_PATH_MAX];
-    if (!tr_norm(path, slash ? (size_t)(slash - path) : 0, spec, base, sizeof(base))) {
-        return CBM_NOT_FOUND;
-    }
+/* The file a repository-relative module path names: the path itself, the
+ * path with a module extension, or its index file. */
+static int tr_path_file(const tr_index_t *ix, const char *base) {
     static const char *const strip[] = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", NULL};
     static const char *const exts[] = {".ts", ".tsx", ".d.ts", ".mts", ".cts",
                                        ".js", ".jsx", ".mjs",  ".cjs", NULL};
@@ -506,6 +527,58 @@ static int tr_spec_file(const tr_index_t *ix, int from, const char *spec, bool *
         hit = tr_file_at(ix, cand);
     }
     return hit;
+}
+
+/* The workspace package a bare specifier names (`name` or `@scope/name`, no
+ * subpath): the file of its entry module, as the pipeline's package map
+ * holds it. */
+static int tr_package_file(const tr_index_t *ix, const char *spec) {
+    const char *slash = strchr(spec, '/');
+    if (spec[0] == '@' && slash) {
+        slash = strchr(slash + SKIP_ONE, '/');
+    }
+    if (slash || !ix->pkgmap || !ix->by_module) {
+        return CBM_NOT_FOUND;
+    }
+    const char *qn = (const char *)cbm_ht_get(ix->pkgmap, spec);
+    void *v = qn ? cbm_ht_get(ix->by_module, qn) : NULL;
+    return v ? (int)((uintptr_t)v - SKIP_ONE) : CBM_NOT_FOUND;
+}
+
+/* A bare specifier the repository answers itself: the nearest
+ * tsconfig/jsconfig `paths` or `baseUrl`, else a workspace package. */
+static int tr_bare_file(const tr_index_t *ix, int from, const char *spec) {
+    const cbm_path_alias_map_t *map =
+        ix->aliases ? cbm_path_alias_find_for_file(ix->aliases, ix->files[from].path) : NULL;
+    char aliased[TR_PATH_MAX];
+    if (map && cbm_path_alias_resolve_into(map, spec, aliased, sizeof(aliased))) {
+        int hit = tr_path_file(ix, aliased);
+        if (hit >= 0) {
+            return hit;
+        }
+    }
+    return tr_package_file(ix, spec);
+}
+
+/* The file a module specifier written in file `from` names: -1 with
+ * *external for a bare specifier the repository does not answer (a
+ * package). */
+static int tr_spec_file(const tr_index_t *ix, int from, const char *spec, bool *external) {
+    *external = false;
+    if (!(spec[0] == '.' &&
+          (spec[SKIP_ONE] == '/' || spec[SKIP_ONE] == '\0' ||
+           (spec[SKIP_ONE] == '.' && (spec[PAIR_LEN] == '/' || spec[PAIR_LEN] == '\0'))))) {
+        int hit = tr_bare_file(ix, from, spec);
+        *external = hit < 0;
+        return hit;
+    }
+    const char *path = ix->files[from].path;
+    const char *slash = strrchr(path, '/');
+    char base[TR_PATH_MAX];
+    if (!tr_norm(path, slash ? (size_t)(slash - path) : 0, spec, base, sizeof(base))) {
+        return CBM_NOT_FOUND;
+    }
+    return tr_path_file(ix, base);
 }
 
 static tr_res_t tr_export_of(tr_ctx_t *c, int file, const char *name, int depth);
@@ -833,9 +906,8 @@ static tr_res_t tr_head(tr_ctx_t *c, const CBMDocLink *link, const char *name) {
     }
     for (int k = nb - SKIP_ONE; k >= 0; k--) { /* nested ones come later in the blob */
         char qn[TR_QN_MAX];
-        const cbm_gbuf_node_t *n = tr_join(qn, sizeof(qn), src->module_qn, best[k]->path, name)
-                                       ? tr_node(c, qn, src)
-                                       : NULL;
+        const cbm_gbuf_node_t *n =
+            tr_join(qn, sizeof(qn), src->sym_qn, best[k]->path, name) ? tr_node(c, qn, src) : NULL;
         if (n) {
             tr_res_t r = tr_mk(TR_NODE);
             r.node = n;
