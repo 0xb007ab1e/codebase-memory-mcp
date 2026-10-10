@@ -512,6 +512,85 @@ TEST(probe_kustomize_imports_after_leading_comment) {
     PASS();
 }
 
+/* kustomize also reads an extensionless file named `Kustomization`
+ * (kubermatic's addons use it); it was never discovered as a kustomization. */
+TEST(probe_kustomize_extensionless_file) {
+    static const GpfFile files[] = {
+        {"Kustomization",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+         "kind: Kustomization\n"
+         "resources:\n"
+         "  - namespace.yaml\n"},
+        {"namespace.yaml",
+         "apiVersion: v1\n"
+         "kind: Namespace\n"
+         "metadata:\n"
+         "  name: addons\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 2);
+    ASSERT_TRUE(m.ok);
+    ASSERT_TRUE(m.modules >= 1);
+    ASSERT_TRUE(m.imports >= 1);
+    PASS();
+}
+
+/* A remote base is outside the repository. The import resolver's symbol-name
+ * guess walked its URL segments and linked kubermatic's gcp addon to the
+ * `deploy` function of hack/ci/deploy.sh. A kustomize entry is a path,
+ * never a symbol. */
+TEST(probe_kustomize_remote_base_names_no_symbol) {
+    static const GpfFile files[] = {
+        {"kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+         "kind: Kustomization\n"
+         "resources:\n"
+         "  - https://github.com/example/csi-driver.git/deploy/kubernetes/base\n"},
+        {"hack/deploy.sh",
+         "#!/usr/bin/env bash\n"
+         "deploy() {\n"
+         "  echo deploying\n"
+         "}\n"},
+        /* Same name as the URL's last segment: the sibling lookup's basename
+         * candidate must not bind a remote base to it either. */
+        {"base.yaml",
+         "apiVersion: v1\n"
+         "kind: ConfigMap\n"
+         "metadata:\n"
+         "  name: local\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 3);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.imports, 0);
+    PASS();
+}
+
+/* Entries are relative to the kustomization's own directory; in a nested
+ * overlay they resolve through the sibling lookup, not the repo root. */
+TEST(probe_kustomize_nested_sibling_entries) {
+    static const GpfFile files[] = {
+        {"apps/base/podinfo/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+         "kind: Kustomization\n"
+         "resources:\n"
+         "  - namespace.yaml\n"
+         "  - release.yaml\n"},
+        {"apps/base/podinfo/namespace.yaml",
+         "apiVersion: v1\n"
+         "kind: Namespace\n"
+         "metadata:\n"
+         "  name: podinfo\n"},
+        {"apps/base/podinfo/release.yaml",
+         "apiVersion: helm.toolkit.fluxcd.io/v2\n"
+         "kind: HelmRelease\n"
+         "metadata:\n"
+         "  name: podinfo\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 3);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.imports, 2);
+    PASS();
+}
+
 /* The label scan stopped at a leading `---`, so a Service written that way
  * had no selector and linked to nothing. The workload's name differs from the
  * selector value, so only the pod-template label can match. */
@@ -1643,6 +1722,9 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_manifest_after_leading_comment);
     RUN_TEST(probe_kustomize_imports_after_leading_comment);
     RUN_TEST(probe_k8s_selector_after_leading_separator);
+    RUN_TEST(probe_kustomize_extensionless_file);
+    RUN_TEST(probe_kustomize_remote_base_names_no_symbol);
+    RUN_TEST(probe_kustomize_nested_sibling_entries);
 
     /* Nix */
     RUN_TEST(probe_nix_attrset_node);

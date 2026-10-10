@@ -2213,6 +2213,63 @@ cbm_psr4_member_t cbm_pipeline_psr4_member_qn(const cbm_gbuf_t *gbuf, const char
     return *out_qn ? CBM_PSR4_MEMBER_RESOLVED : CBM_PSR4_MEMBER_UNRESOLVED;
 }
 
+/* A kustomization entry naming a remote base -- a URL, a go-getter host path,
+ * an ssh remote or a `?ref=` pin -- lies outside the repository. */
+static bool kustomize_remote_entry(const char *entry) {
+    static const char *const hosts[] = {"github.com/", "gitlab.com/", "bitbucket.org/", "git@",
+                                        NULL};
+    if (strstr(entry, "://") || strstr(entry, "?ref=") || strstr(entry, ".git/")) {
+        return true;
+    }
+    for (int i = 0; hosts[i]; i++) {
+        if (strncmp(entry, hosts[i], strlen(hosts[i])) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool kustomize_file_label(const char *label) {
+    return label && (strcmp(label, "Module") == 0 || strcmp(label, "File") == 0);
+}
+
+/* A kustomization entry is a path relative to the kustomization's own
+ * directory -- a manifest file or a directory -- or a remote base; it never
+ * names a symbol. Resolve it exactly or not at all: the name-guess strategies
+ * bound a remote base's URL segment `deploy` to a shell function, component
+ * paths to Go structs, and an entry's basename to a same-named file beside
+ * the importer. */
+static const cbm_gbuf_node_t *resolve_kustomize_entry(const cbm_pipeline_ctx_t *ctx,
+                                                      const char *source_rel, const char *entry) {
+    if (!entry[0] || kustomize_remote_entry(entry)) {
+        return NULL;
+    }
+    /* "x.yaml" and "./x.yaml" name the same file; make every entry relative. */
+    bool dotted = entry[0] == '.' && (entry[1] == '/' || (entry[1] == '.' && entry[2] == '/'));
+    char rel[PKGMAP_PATH_BUF];
+    snprintf(rel, sizeof(rel), "%s%s", dotted ? "" : "./", entry);
+    char *path = cbm_pipeline_resolve_relative_import(source_rel, rel);
+    if (!path) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *found = NULL;
+    char *qn = cbm_pipeline_fqn_module(ctx->project_name, path);
+    const cbm_gbuf_node_t *n = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+    free(qn);
+    if (n && kustomize_file_label(n->label)) {
+        found = n;
+    } else {
+        char *fqn = cbm_pipeline_fqn_folder(ctx->project_name, path);
+        n = fqn ? cbm_gbuf_find_by_qn(ctx->gbuf, fqn) : NULL;
+        free(fqn);
+        if (n && n->label && strcmp(n->label, "Folder") == 0) {
+            found = n;
+        }
+    }
+    free(path);
+    return found;
+}
+
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
@@ -2220,6 +2277,18 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                                                         CBMHashTable *namespace_map) {
     if (!ctx || !imp || !imp->module_path) {
         return NULL;
+    }
+
+    /* The importing file's language gates the strategies below. */
+    const char *src_base = source_rel ? source_rel : "";
+    for (const char *pb = src_base; *pb; pb++) {
+        if (*pb == '/' || *pb == '\\') {
+            src_base = pb + SKIP_ONE;
+        }
+    }
+    const CBMLanguage src_lang = cbm_language_for_filename(src_base);
+    if (src_lang == CBM_LANG_KUSTOMIZE) {
+        return resolve_kustomize_entry(ctx, source_rel, imp->module_path);
     }
 
     /* Prefer exact header-file nodes for C/C++ includes so same-stem source or
@@ -2283,13 +2352,6 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     /* Name-guess fallbacks below (Strategy 1b sibling-file, Strategy 3
      * symbol-name) are gated per importing-file language — see
      * cbm_import_symbol_fallback_allowed (#1934). */
-    const char *src_base = source_rel ? source_rel : "";
-    for (const char *pb = src_base; *pb; pb++) {
-        if (*pb == '/' || *pb == '\\') {
-            src_base = pb + SKIP_ONE;
-        }
-    }
-    const CBMLanguage src_lang = cbm_language_for_filename(src_base);
     const bool symbol_fallback_allowed = cbm_import_symbol_fallback_allowed(src_lang);
 
     /* Strategy 1b: sibling-file resolution for build/markup grammars whose
