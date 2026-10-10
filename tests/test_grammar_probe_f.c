@@ -351,9 +351,10 @@ TEST(probe_k8s_two_manifests) {
     PASS();
 }
 
-/* K8s: cross-manifest reference via INFRA_MAPS.
- * RED: the single-path pipeline does not emit INFRA_MAPS edges for k8s refs;
- *      pass_k8s only emits Resource nodes (no ref-resolution between manifests). */
+/* K8s: a Service routes to the workload whose pod template carries every
+ * label of its selector (INFRA_MAPS Service -> workload). The fixture had no
+ * pod labels and linked only through a "selector value == workload name"
+ * guess that Kubernetes does not make. */
 TEST(probe_k8s_infra_maps_edge) {
     static const GpfFile files[] = {
         {"deploy.yaml",
@@ -363,6 +364,9 @@ TEST(probe_k8s_infra_maps_edge) {
          "  name: frontend\n"
          "spec:\n"
          "  template:\n"
+         "    metadata:\n"
+         "      labels:\n"
+         "        app: frontend\n"
          "    spec:\n"
          "      containers:\n"
          "      - name: frontend\n"
@@ -378,8 +382,211 @@ TEST(probe_k8s_infra_maps_edge) {
     };
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: inter-manifest INFRA_MAPS edges not modeled by the current k8s pass. */
-    ASSERT_TRUE(m.infra_maps >= 1); /* expected RED — no k8s selector → INFRA_MAPS */
+    ASSERT_EQ(m.infra_maps, 1);
+    PASS();
+}
+
+/* A selector is the AND of its pairs: `tier: back` pods are not selected by a
+ * `{app: web, tier: front}` Service. */
+TEST(probe_k8s_selector_requires_all_pairs) {
+    static const GpfFile files[] = {
+        {"front.yaml",
+         "apiVersion: apps/v1\n"
+         "kind: Deployment\n"
+         "metadata:\n"
+         "  name: web-front\n"
+         "spec:\n"
+         "  template:\n"
+         "    metadata:\n"
+         "      labels:\n"
+         "        app: web\n"
+         "        tier: front\n"},
+        {"back.yaml",
+         "apiVersion: apps/v1\n"
+         "kind: Deployment\n"
+         "metadata:\n"
+         "  name: web-back\n"
+         "spec:\n"
+         "  template:\n"
+         "    metadata:\n"
+         "      labels:\n"
+         "        app: web\n"
+         "        tier: back\n"},
+        {"service.yaml",
+         "apiVersion: v1\n"
+         "kind: Service\n"
+         "metadata:\n"
+         "  name: web\n"
+         "spec:\n"
+         "  selector:\n"
+         "    app: web\n"
+         "    tier: front\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 3);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.infra_maps, 1);
+    PASS();
+}
+
+/* Only the pod template's labels are selectable; the workload's own
+ * metadata.labels are not. */
+TEST(probe_k8s_selector_ignores_workload_metadata_labels) {
+    static const GpfFile files[] = {
+        {"deploy.yaml",
+         "apiVersion: apps/v1\n"
+         "kind: Deployment\n"
+         "metadata:\n"
+         "  name: api\n"
+         "  labels:\n"
+         "    app: web\n"
+         "spec:\n"
+         "  template:\n"
+         "    metadata:\n"
+         "      labels:\n"
+         "        app: api\n"},
+        {"service.yaml",
+         "apiVersion: v1\n"
+         "kind: Service\n"
+         "metadata:\n"
+         "  name: web\n"
+         "spec:\n"
+         "  selector:\n"
+         "    app: web\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 2);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.infra_maps, 0);
+    PASS();
+}
+
+/* A workload whose NAME equals a selector value is not selected by it. */
+TEST(probe_k8s_selector_no_name_guess) {
+    static const GpfFile files[] = {
+        {"deploy.yaml",
+         "apiVersion: apps/v1\n"
+         "kind: Deployment\n"
+         "metadata:\n"
+         "  name: frontend\n"
+         "spec:\n"
+         "  template:\n"
+         "    metadata:\n"
+         "      labels:\n"
+         "        app: fe\n"},
+        {"service.yaml",
+         "apiVersion: v1\n"
+         "kind: Service\n"
+         "metadata:\n"
+         "  name: frontend\n"
+         "spec:\n"
+         "  selector:\n"
+         "    app: frontend\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 2);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.infra_maps, 0);
+    PASS();
+}
+
+/* `component: web` does not select pods labelled `app: web`. */
+TEST(probe_k8s_selector_key_matters) {
+    static const GpfFile files[] = {
+        {"deploy.yaml",
+         "apiVersion: apps/v1\n"
+         "kind: Deployment\n"
+         "metadata:\n"
+         "  name: api\n"
+         "spec:\n"
+         "  template:\n"
+         "    metadata:\n"
+         "      labels:\n"
+         "        app: web\n"},
+        {"service.yaml",
+         "apiVersion: v1\n"
+         "kind: Service\n"
+         "metadata:\n"
+         "  name: web\n"
+         "spec:\n"
+         "  selector:\n"
+         "    component: web\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 2);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.infra_maps, 0);
+    PASS();
+}
+
+/* A Service selects pods of its own namespace only. */
+TEST(probe_k8s_selector_namespace_scoped) {
+    static const GpfFile files[] = {
+        {"deploy.yaml",
+         "apiVersion: apps/v1\n"
+         "kind: Deployment\n"
+         "metadata:\n"
+         "  name: web\n"
+         "  namespace: team-b\n"
+         "spec:\n"
+         "  template:\n"
+         "    metadata:\n"
+         "      labels:\n"
+         "        app: web\n"},
+        {"service.yaml",
+         "apiVersion: v1\n"
+         "kind: Service\n"
+         "metadata:\n"
+         "  name: web\n"
+         "  namespace: team-a\n"
+         "spec:\n"
+         "  selector:\n"
+         "    app: web\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 2);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.infra_maps, 0);
+    PASS();
+}
+
+/* Selector linking recorded at most 512 manifests; a Service and workload
+ * indexed after that limit (deckhouse has 2,003 manifest files) were never
+ * linked. No count of manifests may decide graph content. */
+TEST(probe_k8s_selector_beyond_512_manifests) {
+    enum { FILLER = 600 };
+    GpfFile *files = calloc(FILLER + 2, sizeof(*files));
+    char (*names)[32] = calloc(FILLER, sizeof(*names));
+    ASSERT_NOT_NULL(files);
+    ASSERT_NOT_NULL(names);
+    for (int i = 0; i < FILLER; i++) {
+        snprintf(names[i], sizeof(names[i]), "a/cm-%03d.yaml", i);
+        files[i].name = names[i];
+        files[i].content = "apiVersion: v1\n"
+                           "kind: ConfigMap\n"
+                           "metadata:\n"
+                           "  name: filler\n"
+                           "data:\n"
+                           "  k: v\n";
+    }
+    files[FILLER].name = "z/deploy.yaml";
+    files[FILLER].content = "apiVersion: apps/v1\n"
+                            "kind: Deployment\n"
+                            "metadata:\n"
+                            "  name: late\n"
+                            "spec:\n"
+                            "  template:\n"
+                            "    metadata:\n"
+                            "      labels:\n"
+                            "        app: late\n";
+    files[FILLER + 1].name = "z/service.yaml";
+    files[FILLER + 1].content = "apiVersion: v1\n"
+                                "kind: Service\n"
+                                "metadata:\n"
+                                "  name: late\n"
+                                "spec:\n"
+                                "  selector:\n"
+                                "    app: late\n";
+    GpfMetrics m = gpf_metrics_files(files, FILLER + 2);
+    free(names);
+    free(files);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.infra_maps, 1);
     PASS();
 }
 
@@ -1728,6 +1935,12 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_deployment_resource_node);
     RUN_TEST(probe_k8s_two_manifests);
     RUN_TEST(probe_k8s_infra_maps_edge);
+    RUN_TEST(probe_k8s_selector_requires_all_pairs);
+    RUN_TEST(probe_k8s_selector_ignores_workload_metadata_labels);
+    RUN_TEST(probe_k8s_selector_no_name_guess);
+    RUN_TEST(probe_k8s_selector_key_matters);
+    RUN_TEST(probe_k8s_selector_namespace_scoped);
+    RUN_TEST(probe_k8s_selector_beyond_512_manifests);
 
     /* Kustomize */
     RUN_TEST(probe_kustomize_module_node);
