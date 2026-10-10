@@ -915,6 +915,193 @@ TEST(probe_tfvars_values_mint_no_route) {
     PASS();
 }
 
+/* ── Object references (Phase 1, PHASE1.md) ────────────────────────── */
+
+/* Edges of `type` between two Resources whose properties carry `prop`
+ * (e.g. "\"ref\":\"volume\""); -1 when indexing failed. */
+static int gpf_resource_edges(const GpfFile *files, int nfiles, const char *type,
+                              const char *prop) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    int n = -1;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql = "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                          "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type=?2 "
+                          "AND s.label='Resource' AND t.label='Resource' AND instr(e.properties,?3)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 2, type, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 3, prop, -1, SQLITE_STATIC);
+            n = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return n;
+}
+
+static const char k_pod_refs_app[] =
+    "apiVersion: apps/v1\n"
+    "kind: Deployment\n"
+    "metadata:\n"
+    "  name: web\n"
+    "spec:\n"
+    "  template:\n"
+    "    spec:\n"
+    "      serviceAccountName: web-sa\n"
+    "      imagePullSecrets:\n"
+    "        - name: registry-creds\n"
+    "      volumes:\n"
+    "        - name: cfg\n"
+    "          configMap:\n"
+    "            name: web-config\n"
+    "        - name: data\n"
+    "          persistentVolumeClaim:\n"
+    "            claimName: web-data\n"
+    "      containers:\n"
+    "        - name: web\n"
+    "          env:\n"
+    "            - name: DB_PASSWORD\n"
+    "              valueFrom:\n"
+    "                secretKeyRef:\n"
+    "                  name: web-db\n"
+    "                  key: password\n"
+    "          envFrom:\n"
+    "            - configMapRef:\n"
+    "                name: web-env\n"
+    "---\n"
+    "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: web-sa\n"
+    "---\n"
+    "apiVersion: v1\nkind: Secret\nmetadata:\n  name: registry-creds\n"
+    "---\n"
+    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web-config\n"
+    "---\n"
+    "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: web-data\n"
+    "---\n"
+    "apiVersion: v1\nkind: Secret\nmetadata:\n  name: web-db\n"
+    "---\n"
+    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web-env\n";
+
+/* A workload's pod spec names the objects it runs with: its service
+ * account, pull secret, mounted ConfigMap and claim, env sources. */
+TEST(probe_k8s_pod_spec_references) {
+    static const GpfFile files[] = {{"app.yaml", k_pod_refs_app}};
+    ASSERT_EQ(gpf_resource_edges(files, 1, "USAGE", "\"ref\":\"serviceAccountName\""), 1);
+    ASSERT_EQ(gpf_resource_edges(files, 1, "USAGE", "\"ref\":\"imagePullSecrets\""), 1);
+    ASSERT_EQ(gpf_resource_edges(files, 1, "USAGE", "\"ref\":\"volume\""), 2);
+    ASSERT_EQ(gpf_resource_edges(files, 1, "USAGE", "\"ref\":\"env\""), 1);
+    ASSERT_EQ(gpf_resource_edges(files, 1, "USAGE", "\"ref\":\"envFrom\""), 1);
+    PASS();
+}
+
+/* RBAC: a binding uses the role it names and the service accounts it
+ * grants; an Ingress routes to its backend Service; an HPA scales its
+ * target; a webhook configuration calls its Service. */
+TEST(probe_k8s_rbac_ingress_hpa_webhook_references) {
+    static const GpfFile files[] = {
+        {"rbac.yaml",
+         "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: reader\n"
+         "---\n"
+         "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: web-sa\n  namespace: prod\n"
+         "---\n"
+         "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\n"
+         "metadata:\n  name: web-reader\n"
+         "roleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n  name: reader\n"
+         "subjects:\n  - kind: ServiceAccount\n    name: web-sa\n    namespace: prod\n"},
+        {"web.yaml",
+         "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: prod\n"
+         "---\n"
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: prod\n"
+         "---\n"
+         "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: web\n"
+         "  namespace: prod\nspec:\n  rules:\n    - host: web.example.com\n      http:\n"
+         "        paths:\n          - path: /\n            pathType: Prefix\n"
+         "            backend:\n              service:\n                name: web\n"
+         "                port:\n                  number: 80\n"
+         "---\n"
+         "apiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: web\n"
+         "  namespace: prod\nspec:\n  scaleTargetRef:\n    apiVersion: apps/v1\n"
+         "    kind: Deployment\n    name: web\n"
+         "---\n"
+         "apiVersion: admissionregistration.k8s.io/v1\nkind: ValidatingWebhookConfiguration\n"
+         "metadata:\n  name: web-hook\nwebhooks:\n  - name: validate.web.example.com\n"
+         "    clientConfig:\n      service:\n        name: web\n        namespace: prod\n"}};
+    ASSERT_EQ(gpf_resource_edges(files, 2, "USAGE", "\"ref\":\"roleRef\""), 1);
+    ASSERT_EQ(gpf_resource_edges(files, 2, "USAGE", "\"ref\":\"subject\""), 1);
+    ASSERT_EQ(gpf_resource_edges(files, 2, "INFRA_MAPS", "\"kind\":\"ingress\""), 1);
+    ASSERT_EQ(gpf_resource_edges(files, 2, "USAGE", "\"ref\":\"scaleTarget\""), 1);
+    ASSERT_EQ(gpf_resource_edges(files, 2, "INFRA_MAPS", "\"kind\":\"webhook\""), 1);
+    PASS();
+}
+
+/* A custom resource is an instance of the CRD that declares its group and
+ * kind; a reference to an object that is not in the repo draws nothing. */
+TEST(probe_k8s_cr_uses_its_crd_and_unresolved_draws_nothing) {
+    static const GpfFile files[] = {
+        {"crd.yaml",
+         "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\n"
+         "metadata:\n  name: widgets.example.com\nspec:\n  group: example.com\n"
+         "  names:\n    kind: Widget\n    plural: widgets\n  scope: Namespaced\n"},
+        {"widget.yaml",
+         "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: w1\n"
+         "---\n"
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: lonely\nspec:\n"
+         "  template:\n    spec:\n      serviceAccountName: not-in-repo\n"}};
+    ASSERT_EQ(gpf_resource_edges(files, 2, "USAGE", "\"ref\":\"crd\""), 1);
+    ASSERT_EQ(gpf_resource_edges(files, 2, "USAGE", "\"ref\":\"serviceAccountName\""), 0);
+    PASS();
+}
+
+/* References resolve inside the bundle: a ConfigMap of the same name in
+ * another directory (another app's copy) is not the one mounted. */
+TEST(probe_k8s_reference_stays_in_bundle) {
+    static const GpfFile files[] = {
+        {"a/app.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n"
+         "    spec:\n      volumes:\n        - name: cfg\n          configMap:\n"
+         "            name: web-config\n"
+         "---\n"
+         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web-config\n"},
+        {"b/cm.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web-config\n"}};
+    ASSERT_EQ(gpf_resource_edges(files, 2, "USAGE", "\"ref\":\"volume\""), 1);
+    PASS();
+}
+
+/* A name is one object per kind and namespace: two declarations of it in
+ * one bundle are alternatives (kubermatic keeps canal_v3.21 ... v3.31 side
+ * by side; one is applied). A reference means the declaration in its own
+ * file when there is one. */
+TEST(probe_k8s_reference_prefers_its_own_file) {
+    static const char v1[] =
+        "apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: canal\nspec:\n  template:\n"
+        "    spec:\n      volumes:\n        - name: cfg\n          configMap:\n"
+        "            name: canal-config\n"
+        "---\n"
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: canal-config\n";
+    static const GpfFile files[] = {{"canal/canal_v1.yaml", v1}, {"canal/canal_v2.yaml", v1}};
+    ASSERT_EQ(gpf_resource_edges(files, 2, "USAGE", "\"ref\":\"volume\""), 2);
+    PASS();
+}
+
+/* A CRD vendored twice (gardener: example/seed-crds and a chart): a custom
+ * resource is an instance of the copy deployed with it; only when no copy
+ * shares its bundle does it stand for all of them. */
+TEST(probe_k8s_cr_prefers_the_crd_in_its_bundle) {
+    static const char crd[] =
+        "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\n"
+        "metadata:\n  name: widgets.example.com\nspec:\n  group: example.com\n"
+        "  names:\n    kind: Widget\n    plural: widgets\n  scope: Namespaced\n";
+    static const char cr[] = "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: w1\n";
+    static const GpfFile files[] = {{"app/crd.yaml", crd},
+                                    {"app/widget.yaml", cr},
+                                    {"vendor-chart/crds/crd.yaml", crd},
+                                    {"other/widget.yaml", cr}};
+    /* app/widget -> app/crd only; other/widget (no copy beside it) -> both */
+    ASSERT_EQ(gpf_resource_edges(files, 4, "USAGE", "\"ref\":\"crd\""), 3);
+    PASS();
+}
+
 /* ── Bundles: a Service selects inside what is deployed together ───── */
 
 #define GPF_DEPLOY(name, label)                                                                  \
@@ -2489,6 +2676,12 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_secret_stringdata_mints_no_route);
     RUN_TEST(probe_endpoint_url_loses_credentials);
     RUN_TEST(probe_tfvars_values_mint_no_route);
+    RUN_TEST(probe_k8s_pod_spec_references);
+    RUN_TEST(probe_k8s_rbac_ingress_hpa_webhook_references);
+    RUN_TEST(probe_k8s_cr_uses_its_crd_and_unresolved_draws_nothing);
+    RUN_TEST(probe_k8s_reference_stays_in_bundle);
+    RUN_TEST(probe_k8s_reference_prefers_its_own_file);
+    RUN_TEST(probe_k8s_cr_prefers_the_crd_in_its_bundle);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
     RUN_TEST(probe_k8s_selector_within_kustomize_build);
     RUN_TEST(probe_k8s_kustomize_namespace_is_effective);

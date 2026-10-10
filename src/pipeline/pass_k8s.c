@@ -1069,6 +1069,265 @@ static void k8s_apply_effective_namespaces(cbm_pipeline_ctx_t *ctx, k8s_bundles_
     }
 }
 
+/* ── Object references (PHASE1.md) ───────────────────────────────── */
+
+/* A reference fact of a manifest, kept past its file's extraction. */
+typedef struct {
+    int64_t src;      /* the referencing Resource */
+    char *kind;       /* target kind */
+    char *ns;         /* explicit target namespace, NULL = the source's */
+    char *name;       /* target metadata.name */
+    const char *via;  /* static: the extractor's table */
+    const char *edge; /* static: "USAGE" or "INFRA_MAPS" */
+} k8s_ref_t;
+
+/* A CRD and the group/kind it declares. */
+typedef struct {
+    int64_t node;
+    char *group;
+    char *kind;
+} k8s_crd_t;
+
+typedef struct {
+    k8s_ref_t *refs;
+    int ref_n;
+    int ref_cap;
+    k8s_crd_t *crds;
+    int crd_n;
+    int crd_cap;
+} k8s_facts_t;
+
+static void k8s_facts_free(k8s_facts_t *f) {
+    for (int i = 0; i < f->ref_n; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, f->refs[i].kind);
+        cbm_free(CBM_MEM_CLASS_OTHER, f->refs[i].ns);
+        cbm_free(CBM_MEM_CLASS_OTHER, f->refs[i].name);
+    }
+    for (int i = 0; i < f->crd_n; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, f->crds[i].group);
+        cbm_free(CBM_MEM_CLASS_OTHER, f->crds[i].kind);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, f->refs);
+    cbm_free(CBM_MEM_CLASS_OTHER, f->crds);
+    *f = (k8s_facts_t){0};
+}
+
+/* Keep a file's facts, its def indices mapped to the Resource nodes. */
+static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64_t *node_of) {
+    for (int i = 0; i < res->k8s_facts.count; i++) {
+        const CBMK8sFact *x = &res->k8s_facts.items[i];
+        if (x->def_index < 0 || x->def_index >= res->defs.count || node_of[x->def_index] <= 0) {
+            continue;
+        }
+        int64_t node = node_of[x->def_index];
+        if (x->fact == CBM_K8S_FACT_CRD) {
+            if (k8s_grow((void **)&f->crds, &f->crd_cap, f->crd_n, sizeof(*f->crds))) {
+                f->crds[f->crd_n++] =
+                    (k8s_crd_t){node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name),
+                                cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->kind)};
+            }
+        } else if (k8s_grow((void **)&f->refs, &f->ref_cap, f->ref_n, sizeof(*f->refs))) {
+            f->refs[f->ref_n++] =
+                (k8s_ref_t){.src = node,
+                            .kind = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->kind),
+                            .ns = x->ns ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->ns) : NULL,
+                            .name = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name),
+                            .via = x->via,
+                            .edge = x->edge};
+        }
+    }
+}
+
+/* Does the target at `tgt` answer `ref` from `src`: one bundle, and the
+ * namespace the reference asks for (explicit, else the source's own there)
+ * agrees with the target's there? A cluster-scoped kind has no namespace. */
+static bool k8s_ref_meets(k8s_bundles_t *b, const k8s_ref_t *ref, const cbm_gbuf_node_t *src,
+                          const cbm_gbuf_node_t *tgt) {
+    k8s_member_t one_s[SKIP_ONE];
+    k8s_member_t one_t[SKIP_ONE];
+    k8s_members_t single_s = {.items = one_s, .cap = SKIP_ONE};
+    k8s_members_t single_t = {.items = one_t, .cap = SKIP_ONE};
+    const k8s_members_t *ms = k8s_bundles_of(b, src->file_path, &single_s);
+    const k8s_members_t *mt = k8s_bundles_of(b, tgt->file_path, &single_t);
+    char src_ns[K8S_LABEL_LEN];
+    char tgt_ns[K8S_LABEL_LEN];
+    k8s_declared_ns(src->qualified_name, src_ns, sizeof(src_ns));
+    k8s_declared_ns(tgt->qualified_name, tgt_ns, sizeof(tgt_ns));
+    bool cluster = k8s_cluster_scoped(ref->kind);
+    for (int i = 0; i < ms->count; i++) {
+        for (int j = 0; j < mt->count; j++) {
+            if (ms->items[i].bundle != mt->items[j].bundle) {
+                continue;
+            }
+            const char *want = ref->ns ? ref->ns : ms->items[i].ns ? ms->items[i].ns : src_ns;
+            const char *have = mt->items[j].ns ? mt->items[j].ns : tgt_ns;
+            if (cluster || !want[0] || !have[0] || strcmp(want, have) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Draw every reference to the object(s) it names inside its bundle;
+ * an unresolved reference draws nothing. */
+static void k8s_resolve_refs(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8s_facts_t *f) {
+    int edges = 0;
+    int unresolved = 0;
+    for (int i = 0; i < f->ref_n; i++) {
+        const k8s_ref_t *ref = &f->refs[i];
+        const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(ctx->gbuf, ref->src);
+        char name[CBM_SZ_1K];
+        snprintf(name, sizeof(name), "%s/%s", ref->kind, ref->name);
+        const cbm_gbuf_node_t **cands = NULL;
+        int n = 0;
+        if (!src || !src->file_path || cbm_gbuf_find_by_name(ctx->gbuf, name, &cands, &n) != 0) {
+            n = 0;
+        }
+        char props[CBM_SZ_256];
+        snprintf(props, sizeof(props), "{\"%s\":\"%s\"}",
+                 strcmp(ref->edge, "INFRA_MAPS") == 0 ? "kind" : "ref", ref->via);
+        /* A name is one object per kind and namespace, so two declarations
+         * of it in one bundle are alternatives (versioned manifests side by
+         * side): the declaration in the reference's own file, when there is
+         * one, is the one it means. */
+        bool own_file = false;
+        for (int c = 0; c < n && !own_file; c++) {
+            const cbm_gbuf_node_t *t = cands[c];
+            own_file = t != src && t->label && strcmp(t->label, "Resource") == 0 && t->file_path &&
+                       strcmp(t->file_path, src->file_path) == 0 && k8s_ref_meets(b, ref, src, t);
+        }
+        int hits = 0;
+        for (int c = 0; c < n; c++) {
+            const cbm_gbuf_node_t *t = cands[c];
+            if (t == src || !t->label || strcmp(t->label, "Resource") != 0 || !t->file_path ||
+                (own_file && strcmp(t->file_path, src->file_path) != 0) ||
+                !k8s_ref_meets(b, ref, src, t)) {
+                continue;
+            }
+            cbm_gbuf_insert_edge(ctx->gbuf, src->id, t->id, ref->edge, props);
+            hits++;
+        }
+        edges += hits;
+        unresolved += hits == 0;
+    }
+    if (f->ref_n > 0) {
+        cbm_log_info("pass.k8s.refs", "refs", itoa_k8s(f->ref_n), "edges", itoa_k8s(edges),
+                     "unresolved", itoa_k8s(unresolved));
+    }
+}
+
+/* A CRD's group/kind, for grouping the CRDs of one type. */
+typedef struct {
+    char key[CBM_SZ_512];
+    int crd;
+} k8s_crd_key_t;
+
+static int k8s_cmp_crd_key(const void *a, const void *b) {
+    const k8s_crd_key_t *x = a;
+    const k8s_crd_key_t *y = b;
+    int c = strcmp(x->key, y->key);
+    return c ? c : (x->crd > y->crd) - (x->crd < y->crd);
+}
+
+/* Do the files at `a` and `b` share a bundle? */
+static bool k8s_same_bundle(k8s_bundles_t *b, const char *a, const char *c) {
+    k8s_member_t one_a[SKIP_ONE];
+    k8s_member_t one_c[SKIP_ONE];
+    k8s_members_t single_a = {.items = one_a, .cap = SKIP_ONE};
+    k8s_members_t single_c = {.items = one_c, .cap = SKIP_ONE};
+    const k8s_members_t *ma = k8s_bundles_of(b, a, &single_a);
+    const k8s_members_t *mc = k8s_bundles_of(b, c, &single_c);
+    for (int i = 0; i < ma->count; i++) {
+        for (int j = 0; j < mc->count; j++) {
+            if (ma->items[i].bundle == mc->items[j].bundle) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* A custom resource is an instance of the CRD declaring its group and
+ * kind. A CRD vendored in several places: the copy deployed with the
+ * resource (one bundle) is the one; with no copy beside it, the resource
+ * stands for all of them. */
+static void k8s_link_crds(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8s_facts_t *f) {
+    if (f->crd_n == 0) {
+        return;
+    }
+    /* group/kind -> the run of its CRDs in `order` (sorted by group/kind), so
+     * each resource visits only the CRDs of its own type. */
+    k8s_crd_key_t *order = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)f->crd_n * sizeof(*order));
+    CBMHashTable *by_type = cbm_ht_create(0);
+    if (!order || !by_type) {
+        cbm_free(CBM_MEM_CLASS_OTHER, order);
+        if (by_type) {
+            cbm_ht_free(by_type);
+        }
+        return;
+    }
+    for (int i = 0; i < f->crd_n; i++) {
+        snprintf(order[i].key, sizeof(order[i].key), "%s/%s", f->crds[i].group, f->crds[i].kind);
+        order[i].crd = i;
+    }
+    qsort(order, (size_t)f->crd_n, sizeof(*order), k8s_cmp_crd_key);
+    for (int i = f->crd_n - SKIP_ONE; i >= 0; i--) {
+        cbm_ht_set(by_type, order[i].key, (void *)(intptr_t)(i + SKIP_ONE)); /* first of run */
+    }
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    int edges = 0;
+    if (cbm_gbuf_find_by_label(ctx->gbuf, "Resource", &nodes, &count) == 0) {
+        for (int i = 0; i < count; i++) {
+            const char *key =
+                nodes[i]->qualified_name ? strstr(nodes[i]->qualified_name, "::") : NULL;
+            if (!key || !nodes[i]->file_path) {
+                continue;
+            }
+            key += K8S_SLEN("::");
+            const char *kind_end = strchr(key, '/');
+            kind_end = kind_end ? strchr(kind_end + SKIP_ONE, '/') : NULL;
+            if (!kind_end) {
+                continue;
+            }
+            char type[CBM_SZ_512];
+            snprintf(type, sizeof(type), "%.*s", (int)(kind_end - key), key);
+            int first = (int)(intptr_t)cbm_ht_get(by_type, type) - SKIP_ONE;
+            if (first < 0) {
+                continue;
+            }
+            int end = first;
+            while (end < f->crd_n && strcmp(order[end].key, type) == 0) {
+                end++;
+            }
+            bool beside = false;
+            for (int r = first; r < end && !beside; r++) {
+                const cbm_gbuf_node_t *crd =
+                    cbm_gbuf_find_by_id(ctx->gbuf, f->crds[order[r].crd].node);
+                beside = crd && crd->file_path &&
+                         k8s_same_bundle(b, nodes[i]->file_path, crd->file_path);
+            }
+            for (int r = first; r < end; r++) {
+                int64_t crd_id = f->crds[order[r].crd].node;
+                const cbm_gbuf_node_t *crd = cbm_gbuf_find_by_id(ctx->gbuf, crd_id);
+                if (crd_id == nodes[i]->id ||
+                    (beside && (!crd || !crd->file_path ||
+                                !k8s_same_bundle(b, nodes[i]->file_path, crd->file_path)))) {
+                    continue;
+                }
+                cbm_gbuf_insert_edge(ctx->gbuf, nodes[i]->id, crd_id, "USAGE", "{\"ref\":\"crd\"}");
+                edges++;
+            }
+        }
+    }
+    cbm_ht_free(by_type);
+    cbm_free(CBM_MEM_CLASS_OTHER, order);
+    if (edges > 0) {
+        cbm_log_info("pass.k8s.crds", "instances", itoa_k8s(edges));
+    }
+}
+
 /* Connect each Service to the workloads its selector targets via an INFRA_MAPS
  * edge (Service Resource → workload Resource), inside a shared bundle. */
 static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t *recs,
@@ -1132,7 +1391,8 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
  * must free after this call returns). Every Resource's own document is
  * recorded in `recs` for cross-manifest selector matching. */
 static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, const char *source,
-                                const CBMFileResult *res, k8s_record_array_t *recs) {
+                                const CBMFileResult *res, k8s_record_array_t *recs,
+                                k8s_facts_t *facts) {
     int resource_count = 0;
 
     if (!res) {
@@ -1144,6 +1404,9 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, c
     const cbm_gbuf_node_t *file_node = file_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, file_qn) : NULL;
     free(file_qn);
 
+    int64_t *node_of =
+        cbm_calloc(CBM_MEM_CLASS_OTHER,
+                   (size_t)(res->defs.count ? res->defs.count : SKIP_ONE) * sizeof(int64_t));
     for (int d = 0; d < res->defs.count; d++) {
         CBMDefinition *def = &res->defs.items[d];
         if (!def->label || strcmp(def->label, "Resource") != 0) {
@@ -1168,8 +1431,15 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, c
         if (node_id > 0 && source) {
             k8s_record_document(recs, node_id, source, (int)def->start_line, (int)def->end_line);
         }
+        if (node_of) {
+            node_of[d] = node_id;
+        }
 
         resource_count++;
+    }
+    if (node_of) {
+        k8s_facts_keep(facts, res, node_of);
+        cbm_free(CBM_MEM_CLASS_OTHER, node_of);
     }
 
     cbm_log_info("pass.k8s.manifest", "file", rel_path, "resources", itoa_k8s(resource_count));
@@ -1580,6 +1850,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_local_deps_t local_deps = {0};
     k8s_kusts_t kusts = {0};
     k8s_bundles_t bundles = {.charts = cbm_ht_create(0)};
+    k8s_facts_t facts = {0};
 
     k8s_prep_t *prep = cbm_calloc(CBM_MEM_CLASS_OTHER, K8S_CHUNK * sizeof(*prep));
     if (!prep) {
@@ -1596,6 +1867,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
             k8s_local_deps_free(&local_deps);
             k8s_kusts_free(&kusts);
             k8s_bundles_free(&bundles);
+            k8s_facts_free(&facts);
             return CBM_NOT_FOUND;
         }
         memset(prep, 0, (size_t)K8S_CHUNK * sizeof(*prep));
@@ -1628,7 +1900,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                     k8s_kusts_push(&kusts, rel, k8s_kustomize_namespace(p->source));
                     break;
                 case K8S_MANIFEST:
-                    handle_k8s_manifest(ctx, rel, p->source, p->res, &recs);
+                    handle_k8s_manifest(ctx, rel, p->source, p->res, &recs, &facts);
                     manifest_count++;
                     break;
                 case K8S_SKIP:
@@ -1647,6 +1919,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
             k8s_local_deps_free(&local_deps);
             k8s_kusts_free(&kusts);
             k8s_bundles_free(&bundles);
+            k8s_facts_free(&facts);
             return CBM_NOT_FOUND;
         }
     }
@@ -1657,6 +1930,9 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_bundles_build(ctx, &kusts, &bundles);
     k8s_apply_effective_namespaces(ctx, &bundles);
     k8s_link_selectors(ctx, &recs, &bundles);
+    k8s_resolve_refs(ctx, &bundles, &facts);
+    k8s_link_crds(ctx, &bundles, &facts);
+    k8s_facts_free(&facts);
     k8s_records_free(&recs);
     k8s_bundles_free(&bundles);
     k8s_kusts_free(&kusts);

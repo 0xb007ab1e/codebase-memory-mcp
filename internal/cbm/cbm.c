@@ -262,6 +262,11 @@ void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBindi
     arr->items[arr->count++] = ib;
 }
 
+void cbm_k8sfact_push(CBMK8sFactArray *arr, CBMArena *a, CBMK8sFact f) {
+    GROW_ARRAY(arr, a);
+    arr->items[arr->count++] = f;
+}
+
 void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = it;

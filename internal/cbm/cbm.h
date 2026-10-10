@@ -600,6 +600,29 @@ typedef struct {
     int cap;
 } CBMInfraBindingArray;
 
+/* A fact a Kubernetes manifest states about other objects (extract_k8s.c),
+ * resolved by the K8s pass against the objects of the source's bundle.
+ *   CBM_K8S_FACT_REF: object def_index names a kind/ns/name object at a
+ *     reference path (via), drawn as edge (USAGE or INFRA_MAPS); ns NULL =
+ *     the source's own namespace.
+ *   CBM_K8S_FACT_CRD: the CRD def_index declares kind `kind` in group `name`. */
+typedef enum { CBM_K8S_FACT_REF = 0, CBM_K8S_FACT_CRD } CBMK8sFactKind;
+typedef struct {
+    CBMK8sFactKind fact;
+    int def_index;
+    const char *kind;
+    const char *ns;
+    const char *name;
+    const char *via;
+    const char *edge;
+} CBMK8sFact;
+
+typedef struct {
+    CBMK8sFact *items;
+    int count;
+    int cap;
+} CBMK8sFactArray;
+
 typedef struct {
     CBMImplTrait *items;
     int count;
@@ -660,6 +683,7 @@ typedef struct CBMFileResult {
     CBMResolvedCallArray resolved_calls; // LSP-resolved invocations/references (high confidence)
     CBMStringRefArray string_refs;       // URL/config string literals from AST
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
+    CBMK8sFactArray k8s_facts;           // Kubernetes references and CRD declarations
     CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
     CBMFieldTypeArray field_types;       // Python: annotated instance fields (#1277)
 
@@ -1119,6 +1143,7 @@ void cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta)
 void cbm_fieldtype_push(CBMFieldTypeArray *arr, CBMArena *a, CBMFieldType ft);
 void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
 void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);
+void cbm_k8sfact_push(CBMK8sFactArray *arr, CBMArena *a, CBMK8sFact f);
 void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
 void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
 void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);

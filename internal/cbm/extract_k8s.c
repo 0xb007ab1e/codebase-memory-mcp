@@ -331,6 +331,312 @@ static void extract_k8s_scalars(CBMExtractCtx *ctx, TSNode mapping, k8s_doc_id_t
     }
 }
 
+// ---------------------------------------------------------------------------
+// Object references (PHASE1.md): facts the K8s pass resolves per bundle
+// ---------------------------------------------------------------------------
+
+// A reference held by a scalar at a path, relative to the pod spec, to a
+// container, or (kinds) to the whole object.
+typedef struct {
+    const char *path;
+    const char *kind;
+    const char *via;
+} k8s_leaf_ref_t;
+
+typedef struct {
+    const char *kinds; // "|A|B|" of the source kinds
+    const char *path;
+    const char *kind;
+    const char *via;
+    const char *edge;
+} k8s_object_ref_t;
+
+// A reference held by a mapping's kind/name/namespace fields.
+typedef struct {
+    const char *kinds;   // "|A|B|" of the source kinds
+    const char *path;    // the mapping's path
+    const char *kind;    // the target kind; NULL = the mapping's own `kind` field
+    const char *allowed; // with kind NULL: "|A|" of the kinds that are objects
+    const char *dflt;    // with kind NULL: the kind when the field is absent
+    const char *via;
+    const char *edge;
+} k8s_mapping_ref_t;
+
+static const k8s_leaf_ref_t k8s_pod_refs[] = {
+    {"serviceAccountName", "ServiceAccount", "serviceAccountName"},
+    {"serviceAccount", "ServiceAccount", "serviceAccountName"},
+    {"priorityClassName", "PriorityClass", "priorityClassName"},
+    {"imagePullSecrets[].name", "Secret", "imagePullSecrets"},
+    {"volumes[].configMap.name", "ConfigMap", "volume"},
+    {"volumes[].secret.secretName", "Secret", "volume"},
+    {"volumes[].persistentVolumeClaim.claimName", "PersistentVolumeClaim", "volume"},
+    {"volumes[].projected.sources[].configMap.name", "ConfigMap", "volume"},
+    {"volumes[].projected.sources[].secret.name", "Secret", "volume"},
+};
+
+static const k8s_leaf_ref_t k8s_container_refs[] = {
+    {"env[].valueFrom.configMapKeyRef.name", "ConfigMap", "env"},
+    {"env[].valueFrom.secretKeyRef.name", "Secret", "env"},
+    {"envFrom[].configMapRef.name", "ConfigMap", "envFrom"},
+    {"envFrom[].secretRef.name", "Secret", "envFrom"},
+};
+
+static const k8s_object_ref_t k8s_object_refs[] = {
+    {"|Ingress|", "spec.rules[].http.paths[].backend.service.name", "Service", "ingress",
+     "INFRA_MAPS"},
+    {"|Ingress|", "spec.defaultBackend.service.name", "Service", "ingress", "INFRA_MAPS"},
+    {"|Ingress|", "spec.tls[].secretName", "Secret", "tls", "USAGE"},
+    {"|Ingress|", "spec.ingressClassName", "IngressClass", "ingressClassName", "USAGE"},
+    {"|StatefulSet|", "spec.serviceName", "Service", "serviceName", "USAGE"},
+    {"|PersistentVolumeClaim|", "spec.storageClassName", "StorageClass", "storageClassName",
+     "USAGE"},
+};
+
+static const k8s_mapping_ref_t k8s_mapping_refs[] = {
+    {"|RoleBinding|ClusterRoleBinding|", "roleRef", NULL, "|Role|ClusterRole|", NULL, "roleRef",
+     "USAGE"},
+    {"|RoleBinding|ClusterRoleBinding|", "subjects[]", NULL, "|ServiceAccount|", NULL, "subject",
+     "USAGE"},
+    {"|HorizontalPodAutoscaler|", "spec.scaleTargetRef", NULL, NULL, NULL, "scaleTarget", "USAGE"},
+    {"|ValidatingWebhookConfiguration|MutatingWebhookConfiguration|",
+     "webhooks[].clientConfig.service", "Service", NULL, NULL, "webhook", "INFRA_MAPS"},
+    {"|APIService|", "spec.service", "Service", NULL, NULL, "apiservice", "INFRA_MAPS"},
+    {"|HTTPRoute|GRPCRoute|TCPRoute|TLSRoute|UDPRoute|", "spec.rules[].backendRefs[]", NULL, NULL,
+     "Service", "route", "INFRA_MAPS"},
+    {"|HTTPRoute|GRPCRoute|TCPRoute|TLSRoute|UDPRoute|", "spec.parentRefs[]", NULL, NULL, "Gateway",
+     "parentRef", "USAGE"},
+};
+
+// Is `kind` one of the "|A|B|" list?
+static bool k8s_kind_in(const char *list, const char *kind) {
+    if (!list || !kind[0]) {
+        return false;
+    }
+    size_t n = strlen(kind);
+    for (const char *p = strstr(list, kind); p; p = strstr(p + SKIP_ONE, kind)) {
+        if (p[-SKIP_ONE] == '|' && p[n] == '|') {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Where a kind keeps its pod spec, "" for none.
+static const char *k8s_pod_prefix(const char *kind) {
+    if (strcmp(kind, "Pod") == 0) {
+        return "spec";
+    }
+    if (strcmp(kind, "CronJob") == 0) {
+        return "spec.jobTemplate.spec.template.spec";
+    }
+    if (k8s_kind_in("|Deployment|StatefulSet|DaemonSet|ReplicaSet|ReplicationController|Job|",
+                    kind)) {
+        return "spec.template.spec";
+    }
+    return "";
+}
+
+typedef struct {
+    CBMExtractCtx *ctx;
+    const char *kind; // the document's kind
+    int def_index;
+    char crd_group[K8S_BUF_SIZE];
+    char crd_kind[K8S_BUF_SIZE];
+} k8s_walk_t;
+
+static void k8s_emit_ref(k8s_walk_t *w, const char *kind, const char *ns, const char *name,
+                         const char *via, const char *edge) {
+    if (!kind || !kind[0] || !name || !name[0] || strstr(name, "{{") || strstr(kind, "{{")) {
+        return;
+    }
+    CBMArena *a = w->ctx->arena;
+    CBMK8sFact f = {.fact = CBM_K8S_FACT_REF,
+                    .def_index = w->def_index,
+                    .kind = cbm_arena_strdup(a, kind),
+                    .ns = ns && ns[0] && !strstr(ns, "{{") ? cbm_arena_strdup(a, ns) : NULL,
+                    .name = cbm_arena_strdup(a, name),
+                    .via = via,
+                    .edge = edge};
+    cbm_k8sfact_push(&w->ctx->result->k8s_facts, a, f);
+}
+
+// A scalar at `path`: a leaf reference, or a CRD's group / kind.
+static void k8s_leaf(k8s_walk_t *w, const char *path, const char *value) {
+    const char *pod = k8s_pod_prefix(w->kind);
+    size_t pl = strlen(pod);
+    if (pl && strncmp(path, pod, pl) == 0 && path[pl] == '.') {
+        const char *rel = path + pl + SKIP_ONE;
+        for (size_t i = 0; i < sizeof(k8s_pod_refs) / sizeof(k8s_pod_refs[0]); i++) {
+            if (strcmp(rel, k8s_pod_refs[i].path) == 0) {
+                k8s_emit_ref(w, k8s_pod_refs[i].kind, NULL, value, k8s_pod_refs[i].via, "USAGE");
+            }
+        }
+        static const char *const holders[] = {"containers[].", "initContainers[].",
+                                              "ephemeralContainers[]."};
+        for (size_t h = 0; h < sizeof(holders) / sizeof(holders[0]); h++) {
+            size_t hl = strlen(holders[h]);
+            if (strncmp(rel, holders[h], hl) != 0) {
+                continue;
+            }
+            for (size_t i = 0; i < sizeof(k8s_container_refs) / sizeof(k8s_container_refs[0]);
+                 i++) {
+                if (strcmp(rel + hl, k8s_container_refs[i].path) == 0) {
+                    k8s_emit_ref(w, k8s_container_refs[i].kind, NULL, value,
+                                 k8s_container_refs[i].via, "USAGE");
+                }
+            }
+        }
+    }
+    for (size_t i = 0; i < sizeof(k8s_object_refs) / sizeof(k8s_object_refs[0]); i++) {
+        const k8s_object_ref_t *r = &k8s_object_refs[i];
+        if (k8s_kind_in(r->kinds, w->kind) && strcmp(path, r->path) == 0) {
+            k8s_emit_ref(w, r->kind, NULL, value, r->via, r->edge);
+        }
+    }
+    if (strcmp(w->kind, "CustomResourceDefinition") == 0) {
+        if (strcmp(path, "spec.group") == 0) {
+            snprintf(w->crd_group, sizeof(w->crd_group), "%s", value);
+        } else if (strcmp(path, "spec.names.kind") == 0) {
+            snprintf(w->crd_kind, sizeof(w->crd_kind), "%s", value);
+        }
+    }
+}
+
+// Through block_node / flow_node wrappers to the content node.
+static TSNode k8s_unwrap(TSNode node) {
+    for (int i = 0; i < PAIR_LEN && !ts_node_is_null(node); i++) {
+        const char *t = ts_node_type(node);
+        if (strcmp(t, "block_node") == 0) {
+            node = first_content_child(node);
+        } else if (strcmp(t, "flow_node") == 0) {
+            node = flow_node_value(node);
+        } else {
+            break;
+        }
+    }
+    return node;
+}
+
+static bool k8s_is_mapping(TSNode n) {
+    const char *t = ts_node_type(n);
+    return strcmp(t, "block_mapping") == 0 || strcmp(t, "flow_mapping") == 0;
+}
+
+static bool k8s_is_pair(TSNode n) {
+    const char *t = ts_node_type(n);
+    return strcmp(t, "block_mapping_pair") == 0 || strcmp(t, "flow_pair") == 0;
+}
+
+// The scalar value of `field` in a mapping, or NULL.
+static const char *k8s_field(k8s_walk_t *w, TSNode mapping, const char *field) {
+    uint32_t n = ts_node_named_child_count(mapping);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode pair = ts_node_named_child(mapping, i);
+        if (!k8s_is_pair(pair)) {
+            continue;
+        }
+        TSNode key = ts_node_named_child(pair, 0);
+        const char *k =
+            ts_node_is_null(key) ? NULL : get_scalar_text(w->ctx->arena, key, w->ctx->source);
+        if (k && strcmp(k, field) == 0) {
+            TSNode v = unwrap_pair_value(pair);
+            return ts_node_is_null(v) ? NULL : get_scalar_text(w->ctx->arena, v, w->ctx->source);
+        }
+    }
+    return NULL;
+}
+
+// A mapping at `path` that holds a reference in its kind/name/namespace.
+static void k8s_mapping(k8s_walk_t *w, const char *path, TSNode mapping) {
+    for (size_t i = 0; i < sizeof(k8s_mapping_refs) / sizeof(k8s_mapping_refs[0]); i++) {
+        const k8s_mapping_ref_t *r = &k8s_mapping_refs[i];
+        if (!k8s_kind_in(r->kinds, w->kind) || strcmp(path, r->path) != 0) {
+            continue;
+        }
+        const char *kind = r->kind;
+        if (!kind) {
+            kind = k8s_field(w, mapping, "kind");
+            kind = kind ? kind : r->dflt;
+            if (!kind || (r->allowed && !k8s_kind_in(r->allowed, kind))) {
+                continue;
+            }
+        }
+        k8s_emit_ref(w, kind, k8s_field(w, mapping, "namespace"), k8s_field(w, mapping, "name"),
+                     r->via, r->edge);
+    }
+}
+
+// Walk `node` (reached at `path`) for references.
+static void k8s_walk(k8s_walk_t *w, TSNode node, char *path, size_t len, size_t cap) {
+    node = k8s_unwrap(node);
+    if (ts_node_is_null(node)) {
+        return;
+    }
+    const char *type = ts_node_type(node);
+    if (k8s_is_mapping(node)) {
+        k8s_mapping(w, path, node);
+        uint32_t n = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode pair = ts_node_named_child(node, i);
+            if (!k8s_is_pair(pair)) {
+                continue;
+            }
+            TSNode key = ts_node_named_child(pair, 0);
+            const char *k =
+                ts_node_is_null(key) ? NULL : get_scalar_text(w->ctx->arena, key, w->ctx->source);
+            int add = k ? snprintf(path + len, cap - len, "%s%s", len ? "." : "", k) : -1;
+            if (add <= 0 || len + (size_t)add >= cap) {
+                path[len] = '\0'; // a path too long for any reference path: not one
+                continue;
+            }
+            TSNode value = unwrap_pair_value(pair);
+            TSNode inner = k8s_unwrap(value);
+            const char *scalar = ts_node_is_null(inner)
+                                     ? NULL
+                                     : get_scalar_text(w->ctx->arena, inner, w->ctx->source);
+            if (scalar) {
+                k8s_leaf(w, path, scalar);
+            } else if (!ts_node_is_null(value)) {
+                k8s_walk(w, value, path, len + (size_t)add, cap);
+            }
+            path[len] = '\0';
+        }
+        return;
+    }
+    if (strcmp(type, "block_sequence") == 0 || strcmp(type, "flow_sequence") == 0) {
+        int add = snprintf(path + len, cap - len, "[]");
+        if (add <= 0 || len + (size_t)add >= cap) {
+            path[len] = '\0';
+            return;
+        }
+        uint32_t n = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode item = ts_node_named_child(node, i);
+            if (strcmp(ts_node_type(item), "block_sequence_item") == 0) {
+                item = first_content_child(item);
+            }
+            if (!ts_node_is_null(item) && strcmp(ts_node_type(item), "comment") != 0) {
+                k8s_walk(w, item, path, len + (size_t)add, cap);
+            }
+        }
+        path[len] = '\0';
+    }
+}
+
+// The references and CRD declaration of document def `def_index`.
+static void k8s_emit_facts(CBMExtractCtx *ctx, TSNode mapping, const char *kind, int def_index) {
+    k8s_walk_t w = {.ctx = ctx, .kind = kind, .def_index = def_index};
+    char path[CBM_SZ_512] = "";
+    k8s_walk(&w, mapping, path, 0, sizeof(path));
+    if (w.crd_group[0] && w.crd_kind[0]) {
+        CBMK8sFact f = {.fact = CBM_K8S_FACT_CRD,
+                        .def_index = def_index,
+                        .kind = cbm_arena_strdup(ctx->arena, w.crd_kind),
+                        .name = cbm_arena_strdup(ctx->arena, w.crd_group)};
+        cbm_k8sfact_push(&ctx->result->k8s_facts, ctx->arena, f);
+    }
+}
+
 // "<project>.<rel_path segments>" with the extension kept: the File node's QN
 // without ".__file__" (IDENTITY.md). Unique per file, unlike the module QN,
 // which drops the extension (`a.yaml` / `a.yml`, `x/` / `x.yaml`).
@@ -420,6 +726,7 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         def.start_line = ts_node_start_point(mapping).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(mapping).row + TS_LINE_OFFSET;
         cbm_defs_push(&ctx->result->defs, a, def);
+        k8s_emit_facts(ctx, mapping, id.kind, ctx->result->defs.count - SKIP_ONE);
     }
 }
 
