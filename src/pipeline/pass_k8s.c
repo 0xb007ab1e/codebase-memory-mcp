@@ -23,12 +23,15 @@
 #include "helpers.h"               /* cbm_kind_in_set_free_cache */
 #include "foundation/slab_alloc.h" /* cbm_slab_destroy_thread */
 #include "foundation/platform.h"   /* cbm_default_worker_count */
+#include "foundation/str_util.h"   /* cbm_json_escape */
 #include "pipeline/worker_pool.h"
 
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+#define K8S_SLEN(s) (sizeof(s) - 1)
 
 /* ── Internal helpers ────────────────────────────────────────────── */
 
@@ -594,17 +597,125 @@ static bool is_helm_chart_file(const char *base) {
     return strcmp(base, "Chart.yaml") == 0 || strcmp(base, "Chart.yml") == 0;
 }
 
-/* Emit a Chart node for a Chart.yaml and a DEPENDS_ON edge to a (shared,
- * deduplicated) Chart node per declared dependency (#338). */
-static void handle_helm_chart(cbm_pipeline_ctx_t *ctx, const char *rel_path, const char *source) {
+/* A chart's `file://` dependency: the chart in that directory of this
+ * repository. Linked once every Chart.yaml has been read, so a dependency
+ * indexed after its dependent still resolves. One that names no chart of this
+ * repository (an absolute build-container path, a directory without a chart)
+ * stays a declared dependency on the external node, like a remote one. */
+typedef struct {
+    int64_t chart_id;
+    char name[CBM_HELM_NAME_MAX]; /* dependency name, for the external fallback */
+    char *chart_rel;              /* the depending Chart.yaml */
+    char *target_qn;              /* QN of the depended-on Chart node; NULL = unresolvable */
+    char *props;                  /* edge properties */
+} k8s_local_dep_t;
+
+typedef struct {
+    k8s_local_dep_t *items;
+    int count;
+    int cap;
+} k8s_local_deps_t;
+
+static bool k8s_is_file_repository(const char *repository) {
+    return strncmp(repository, "file://", K8S_SLEN("file://")) == 0;
+}
+
+static char *k8s_dep_props(const char *repository) {
+    char escaped[CBM_HELM_REPO_MAX * 2];
+    cbm_json_escape(escaped, (int)sizeof(escaped), repository);
+    size_t n = strlen(escaped) + sizeof("{\"repository\":\"\"}");
+    char *props = cbm_alloc(CBM_MEM_CLASS_OTHER, n);
+    if (props) {
+        snprintf(props, n, "{\"repository\":\"%s\"}", escaped);
+    }
+    return props;
+}
+
+/* DEPENDS_ON from `chart_id` to the shared external Chart node of `name`
+ * (one per name and project, so charts depending on the same chart meet). */
+static bool k8s_external_dep(cbm_pipeline_ctx_t *ctx, int64_t chart_id, const char *name,
+                             const char *chart_rel, const char *props) {
+    char dep_qn[CBM_SZ_512];
+    snprintf(dep_qn, sizeof(dep_qn), "%s.__helm_dep__.%s", ctx->project_name, name);
+    int64_t dep_id = cbm_gbuf_upsert_node(ctx->gbuf, "Chart", name, dep_qn, chart_rel, SKIP_ONE, 0,
+                                          "{\"source\":\"helm\",\"external\":true}");
+    if (dep_id <= 0) {
+        return false;
+    }
+    cbm_gbuf_insert_edge(ctx->gbuf, chart_id, dep_id, "DEPENDS_ON", props ? props : "{}");
+    return true;
+}
+
+static void k8s_local_deps_push(k8s_local_deps_t *deps, int64_t chart_id, const char *chart_rel,
+                                const char *project, const cbm_helm_dep_t *dep) {
+    const char *dir = dep->repository + K8S_SLEN("file://");
+    char *target_qn = NULL;
+    if (dir[0] && dir[0] != '/') { /* an absolute path names the build host, not this repo */
+        char rel[CBM_HELM_REPO_MAX + K8S_SLEN("./") + K8S_SLEN("/Chart.yaml")];
+        snprintf(rel, sizeof(rel), "%s%s/Chart.yaml", strncmp(dir, "../", 3) == 0 ? "" : "./", dir);
+        char *path = cbm_pipeline_resolve_relative_import(chart_rel, rel);
+        target_qn = path ? cbm_infra_qn(project, path, "helm-chart", NULL) : NULL;
+        free(path);
+    }
+    if (deps->count == deps->cap) {
+        int cap = deps->cap ? deps->cap * 2 : K8S_GROW_MIN;
+        k8s_local_dep_t *grown =
+            cbm_realloc(CBM_MEM_CLASS_OTHER, deps->items, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            free(target_qn);
+            return;
+        }
+        deps->items = grown;
+        deps->cap = cap;
+    }
+    k8s_local_dep_t *d = &deps->items[deps->count++];
+    *d = (k8s_local_dep_t){.chart_id = chart_id, .target_qn = target_qn};
+    snprintf(d->name, sizeof(d->name), "%s", dep->name);
+    d->chart_rel = strdup(chart_rel);
+    d->props = k8s_dep_props(dep->repository);
+}
+
+static void k8s_local_deps_free(k8s_local_deps_t *deps) {
+    for (int i = 0; i < deps->count; i++) {
+        free(deps->items[i].target_qn);
+        free(deps->items[i].chart_rel);
+        cbm_free(CBM_MEM_CLASS_OTHER, deps->items[i].props);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, deps->items);
+    *deps = (k8s_local_deps_t){0};
+}
+
+static void k8s_link_local_deps(cbm_pipeline_ctx_t *ctx, k8s_local_deps_t *deps) {
+    for (int i = 0; i < deps->count; i++) {
+        const k8s_local_dep_t *d = &deps->items[i];
+        const cbm_gbuf_node_t *target =
+            d->target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, d->target_qn) : NULL;
+        if (target && target->label && strcmp(target->label, "Chart") == 0 &&
+            target->id != d->chart_id) {
+            cbm_gbuf_insert_edge(ctx->gbuf, d->chart_id, target->id, "DEPENDS_ON", d->props);
+        } else if (d->chart_rel) {
+            (void)k8s_external_dep(ctx, d->chart_id, d->name, d->chart_rel, d->props);
+        }
+    }
+    k8s_local_deps_free(deps);
+}
+
+/* Emit a Chart node for a Chart.yaml and a DEPENDS_ON edge per declared
+ * dependency (#338): to the chart in this repository for a resolvable
+ * `file://` dependency (once all charts are read), otherwise to a shared
+ * external Chart node per dependency name, the repository on the edge. */
+static void handle_helm_chart(cbm_pipeline_ctx_t *ctx, const char *rel_path, const char *source,
+                              k8s_local_deps_t *local_deps) {
     cbm_helm_chart_t hc;
     if (cbm_parse_helm_chart(source, &hc) != 0) {
+        cbm_helm_chart_free(&hc);
         return;
     }
 
     const char *cname = hc.chart_name[0] ? hc.chart_name : k8s_basename(rel_path);
     char *chart_qn = cbm_infra_qn(ctx->project_name, rel_path, "helm-chart", NULL);
     if (!chart_qn) {
+        cbm_helm_chart_free(&hc);
         return;
     }
     int64_t chart_id = cbm_gbuf_upsert_node(ctx->gbuf, "Chart", cname, chart_qn, rel_path, SKIP_ONE,
@@ -620,18 +731,16 @@ static void handle_helm_chart(cbm_pipeline_ctx_t *ctx, const char *rel_path, con
 
     int dep_edges = 0;
     for (int i = 0; i < hc.dep_count && chart_id > 0; i++) {
-        /* Stable per-project QN so multiple charts depending on the same chart
-         * link to one shared dependency node. */
-        char dep_qn[CBM_SZ_512];
-        snprintf(dep_qn, sizeof(dep_qn), "%s.__helm_dep__.%s", ctx->project_name, hc.deps[i]);
-        int64_t dep_id =
-            cbm_gbuf_upsert_node(ctx->gbuf, "Chart", hc.deps[i], dep_qn, rel_path, SKIP_ONE, 0,
-                                 "{\"source\":\"helm\",\"external\":true}");
-        if (dep_id > 0) {
-            cbm_gbuf_insert_edge(ctx->gbuf, chart_id, dep_id, "DEPENDS_ON", "{}");
-            dep_edges++;
+        const cbm_helm_dep_t *dep = &hc.deps[i];
+        if (k8s_is_file_repository(dep->repository)) {
+            k8s_local_deps_push(local_deps, chart_id, rel_path, ctx->project_name, dep);
+            continue;
         }
+        char *props = dep->repository[0] ? k8s_dep_props(dep->repository) : NULL;
+        dep_edges += k8s_external_dep(ctx, chart_id, dep->name, rel_path, props);
+        cbm_free(CBM_MEM_CLASS_OTHER, props);
     }
+    cbm_helm_chart_free(&hc);
     cbm_log_info("pass.k8s.helm", "file", rel_path, "deps", itoa_k8s(dep_edges));
 }
 
@@ -872,6 +981,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
 
     /* Collect per-manifest selector/label records for cross-manifest matching. */
     k8s_record_array_t recs = {0};
+    k8s_local_deps_t local_deps = {0};
 
     k8s_prep_t *prep = cbm_calloc(CBM_MEM_CLASS_OTHER, K8S_CHUNK * sizeof(*prep));
     if (!prep) {
@@ -884,6 +994,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
         if (cbm_pipeline_check_cancel(ctx)) {
             cbm_free(CBM_MEM_CLASS_OTHER, prep);
             k8s_records_free(&recs);
+            k8s_local_deps_free(&local_deps);
             return CBM_NOT_FOUND;
         }
         memset(prep, 0, (size_t)K8S_CHUNK * sizeof(*prep));
@@ -908,7 +1019,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                         is_requirements_file(base) ? "pypi" : "gomod");
                     break;
                 case K8S_HELM:
-                    handle_helm_chart(ctx, rel, p->source);
+                    handle_helm_chart(ctx, rel, p->source, &local_deps);
                     helm_count++;
                     break;
                 case K8S_MANIFEST:
@@ -928,6 +1039,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
         if (cancelled) {
             cbm_free(CBM_MEM_CLASS_OTHER, prep);
             k8s_records_free(&recs);
+            k8s_local_deps_free(&local_deps);
             return CBM_NOT_FOUND;
         }
     }
@@ -936,6 +1048,8 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     /* Connect Services to the workloads their selectors target (INFRA_MAPS). */
     k8s_link_selectors(ctx, &recs);
     k8s_records_free(&recs);
+    /* Link `file://` chart dependencies now that every Chart.yaml is read. */
+    k8s_link_local_deps(ctx, &local_deps);
 
     cbm_log_info("pass.done", "pass", "k8s", "manifests", itoa_k8s(manifest_count));
     (void)helm_count;

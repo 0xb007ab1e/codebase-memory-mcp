@@ -138,6 +138,7 @@ typedef struct {
     int modules;     /* Module label */
     int classes;     /* Class label */
     int resources;   /* Resource label (k8s) */
+    int charts;      /* Chart label (helm) */
     int imports;     /* IMPORTS edges */
     int depends_on;  /* DEPENDS_ON edges */
     int infra_maps;  /* INFRA_MAPS edges */
@@ -154,6 +155,7 @@ static GpfMetrics gpf_metrics_files(const GpfFile *files, int nfiles) {
         m.modules     = gpf_count_label(store, lp.project, "Module");
         m.classes     = gpf_count_label(store, lp.project, "Class");
         m.resources   = gpf_count_label(store, lp.project, "Resource");
+        m.charts      = gpf_count_label(store, lp.project, "Chart");
         m.imports     = cbm_store_count_edges_by_type(store, lp.project, "IMPORTS");
         m.depends_on  = cbm_store_count_edges_by_type(store, lp.project, "DEPENDS_ON");
         m.infra_maps  = cbm_store_count_edges_by_type(store, lp.project, "INFRA_MAPS");
@@ -738,6 +740,52 @@ TEST(probe_kustomize_extensionless_file) {
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.modules >= 1);
     ASSERT_TRUE(m.imports >= 1);
+    PASS();
+}
+
+/* A `file://` dependency is the chart in that directory of this repository,
+ * not a published one: `app` depends on the local `common`, and no external
+ * Chart node stands in for it. `common` is read after `app`. */
+TEST(probe_helm_file_dependency_links_local_chart) {
+    static const GpfFile files[] = {
+        {"charts/app/Chart.yaml",
+         "apiVersion: v2\n"
+         "name: app\n"
+         "version: 1.0.0\n"
+         "dependencies:\n"
+         "  - name: common\n"
+         "    repository: file://../common\n"
+         "    version: 1.x\n"},
+        {"charts/common/Chart.yaml",
+         "apiVersion: v2\n"
+         "name: common\n"
+         "type: library\n"
+         "version: 1.2.0\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 2);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.charts, 2);
+    ASSERT_EQ(m.depends_on, 1);
+    PASS();
+}
+
+/* A `file://` path this repository cannot resolve (deckhouse names its build
+ * container's `/deckhouse/...`) still declares a dependency: it stays the
+ * external Chart node, the repository on its edge, rather than vanishing. */
+TEST(probe_helm_unresolved_file_dependency_stays_external) {
+    static const GpfFile files[] = {
+        {"modules/policy/Chart.yaml",
+         "apiVersion: v2\n"
+         "name: policy\n"
+         "version: 1.0.0\n"
+         "dependencies:\n"
+         "  - name: constraint-templates\n"
+         "    repository: \"file:///deckhouse/modules/policy/charts/constraint_templates\"\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 1);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.charts, 2);
+    ASSERT_EQ(m.depends_on, 1);
     PASS();
 }
 
@@ -1951,6 +1999,8 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_selector_after_leading_separator);
     RUN_TEST(probe_kustomize_extensionless_file);
     RUN_TEST(probe_kustomize_remote_base_names_no_symbol);
+    RUN_TEST(probe_helm_file_dependency_links_local_chart);
+    RUN_TEST(probe_helm_unresolved_file_dependency_stays_external);
     RUN_TEST(probe_kustomize_nested_sibling_entries);
     RUN_TEST(probe_kustomize_single_module);
 

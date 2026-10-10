@@ -1272,14 +1272,51 @@ static const char *helm_match_key(const char *content, const char *eol, const ch
     return content + kl + 1;
 }
 
+/* Append an empty dependency entry; returns it, or NULL when out of memory. */
+static cbm_helm_dep_t *helm_push_dep(cbm_helm_chart_t *out) {
+    if (out->dep_count == out->dep_cap) {
+        enum { HELM_DEPS_MIN = 8 };
+        int cap = out->dep_cap ? out->dep_cap * 2 : HELM_DEPS_MIN;
+        cbm_helm_dep_t *grown =
+            cbm_realloc(CBM_MEM_CLASS_OTHER, out->deps, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return NULL;
+        }
+        out->deps = grown;
+        out->dep_cap = cap;
+    }
+    cbm_helm_dep_t *dep = &out->deps[out->dep_count++];
+    dep->name[0] = '\0';
+    dep->repository[0] = '\0';
+    return dep;
+}
+
+void cbm_helm_chart_free(cbm_helm_chart_t *hc) {
+    if (!hc) {
+        return;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, hc->deps);
+    hc->deps = NULL;
+    hc->dep_count = 0;
+    hc->dep_cap = 0;
+}
+
 int cbm_parse_helm_chart(const char *source, cbm_helm_chart_t *out) {
-    if (!source || !out) {
+    if (!out) {
         return -1;
     }
     out->chart_name[0] = '\0';
+    out->deps = NULL;
     out->dep_count = 0;
+    out->dep_cap = 0;
+    if (!source) {
+        return -1;
+    }
 
     bool in_deps = false;
+    cbm_helm_dep_t *cur = NULL; /* the dependency entry being read */
+    int item_indent = -1;       /* indent of the entries' "- " */
+    int key_col = -1;           /* column of an entry's keys */
     const char *p = source;
     while (*p) {
         const char *eol = strchr(p, '\n');
@@ -1296,26 +1333,35 @@ int cbm_parse_helm_chart(const char *source, cbm_helm_chart_t *out) {
             if (indent == 0) {
                 /* New top-level key ends any dependencies block. */
                 in_deps = (helm_match_key(content, eol, "dependencies") != NULL);
+                cur = NULL;
+                item_indent = -1;
+                key_col = -1;
                 const char *nv = helm_match_key(content, eol, "name");
                 if (!in_deps && nv && out->chart_name[0] == '\0') {
                     helm_copy_scalar(nv, eol, out->chart_name, CBM_HELM_NAME_MAX);
                 }
             } else if (in_deps) {
-                /* List item: optional leading "- ", then look for name:. */
+                /* A list item ("- ") at the entries' indent opens an entry; its
+                 * keys share the dash line or follow at the same key column.
+                 * Deeper lines (import-values, tags) belong to the entry. */
                 const char *q = content;
-                if (*q == '-') {
+                bool opens = *q == '-' && (item_indent < 0 || indent == item_indent);
+                if (opens) {
+                    item_indent = indent;
                     q++;
                     while (q < eol && *q == ' ') {
                         q++;
                     }
+                    key_col = indent + (int)(q - content);
+                    cur = helm_push_dep(out);
                 }
-                const char *nv = helm_match_key(q, eol, "name");
-                if (nv && out->dep_count < CBM_HELM_MAX_DEPS) {
-                    char buf[CBM_HELM_NAME_MAX];
-                    helm_copy_scalar(nv, eol, buf, CBM_HELM_NAME_MAX);
-                    if (buf[0]) {
-                        memcpy(out->deps[out->dep_count], buf, CBM_HELM_NAME_MAX);
-                        out->dep_count++;
+                if (cur && (opens || indent == key_col)) {
+                    const char *nv = helm_match_key(q, eol, "name");
+                    const char *rv = helm_match_key(q, eol, "repository");
+                    if (nv) {
+                        helm_copy_scalar(nv, eol, cur->name, CBM_HELM_NAME_MAX);
+                    } else if (rv) {
+                        helm_copy_scalar(rv, eol, cur->repository, CBM_HELM_REPO_MAX);
                     }
                 }
             }
@@ -1325,5 +1371,13 @@ int cbm_parse_helm_chart(const char *source, cbm_helm_chart_t *out) {
         }
         p = eol + 1;
     }
+    /* Keep only named entries (a dependency without a name names nothing). */
+    int kept = 0;
+    for (int i = 0; i < out->dep_count; i++) {
+        if (out->deps[i].name[0]) {
+            out->deps[kept++] = out->deps[i];
+        }
+    }
+    out->dep_count = kept;
     return (out->chart_name[0] || out->dep_count > 0) ? 0 : -1;
 }

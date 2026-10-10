@@ -14165,8 +14165,11 @@ TEST(helm_parse_chart_dependencies_issue338) {
     ASSERT_EQ(cbm_parse_helm_chart(src, &hc), 0);
     ASSERT_STR_EQ(hc.chart_name, "mychart");
     ASSERT_EQ(hc.dep_count, 2);
-    ASSERT_STR_EQ(hc.deps[0], "postgresql");
-    ASSERT_STR_EQ(hc.deps[1], "redis");
+    ASSERT_STR_EQ(hc.deps[0].name, "postgresql");
+    ASSERT_STR_EQ(hc.deps[0].repository, "https://charts.bitnami.com/bitnami");
+    ASSERT_STR_EQ(hc.deps[1].name, "redis");
+    ASSERT_STR_EQ(hc.deps[1].repository, "https://charts.bitnami.com/bitnami");
+    cbm_helm_chart_free(&hc);
     PASS();
 }
 
@@ -14175,6 +14178,50 @@ TEST(helm_parse_chart_no_deps_issue338) {
     ASSERT_EQ(cbm_parse_helm_chart("name: solo\nversion: 0.1.0\n", &hc), 0);
     ASSERT_STR_EQ(hc.chart_name, "solo");
     ASSERT_EQ(hc.dep_count, 0);
+    cbm_helm_chart_free(&hc);
+    PASS();
+}
+
+/* An entry's keys come in any order; lists nested in an entry
+ * (import-values, tags) belong to it and name no dependency of their own. */
+TEST(helm_parse_chart_dependency_entries) {
+    const char *src = "name: app\n"
+                      "dependencies:\n"
+                      "  - repository: file://../common\n"
+                      "    name: common\n"
+                      "    import-values:\n"
+                      "      - child: default.data\n"
+                      "        parent: imported\n"
+                      "      - name: not-a-dependency\n"
+                      "  - name: redis\n"
+                      "    tags:\n"
+                      "      - cache\n";
+    cbm_helm_chart_t hc;
+    ASSERT_EQ(cbm_parse_helm_chart(src, &hc), 0);
+    ASSERT_EQ(hc.dep_count, 2);
+    ASSERT_STR_EQ(hc.deps[0].name, "common");
+    ASSERT_STR_EQ(hc.deps[0].repository, "file://../common");
+    ASSERT_STR_EQ(hc.deps[1].name, "redis");
+    ASSERT_STR_EQ(hc.deps[1].repository, "");
+    cbm_helm_chart_free(&hc);
+    PASS();
+}
+
+/* No dependency count decides what is read: the parser kept 128. */
+TEST(helm_parse_chart_many_dependencies) {
+    enum { DEPS = 130 };
+    char *src = malloc(DEPS * 32 + 64);
+    ASSERT_NOT_NULL(src);
+    int n = snprintf(src, 64, "name: umbrella\ndependencies:\n");
+    for (int i = 0; i < DEPS; i++) {
+        n += snprintf(src + n, 32, "  - name: dep-%03d\n", i);
+    }
+    cbm_helm_chart_t hc;
+    ASSERT_EQ(cbm_parse_helm_chart(src, &hc), 0);
+    free(src);
+    ASSERT_EQ(hc.dep_count, DEPS);
+    ASSERT_STR_EQ(hc.deps[DEPS - 1].name, "dep-129");
+    cbm_helm_chart_free(&hc);
     PASS();
 }
 
@@ -19702,6 +19749,8 @@ SUITE(pipeline) {
     RUN_TEST(infra_parse_terraform_empty);
     RUN_TEST(helm_parse_chart_dependencies_issue338);
     RUN_TEST(helm_parse_chart_no_deps_issue338);
+    RUN_TEST(helm_parse_chart_dependency_entries);
+    RUN_TEST(helm_parse_chart_many_dependencies);
     /* Infrascan: QN helper */
     RUN_TEST(infra_qn_helper);
     /* Infrascan: pipeline integration */
