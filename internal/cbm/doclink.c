@@ -251,7 +251,8 @@ static const doclink_lang_t DOCLINK_LANGS[] = {
      .parse_doc = cbm_doclink_php_parse_doc,
      .scan_scope = cbm_doclink_php_scan_scope,
      .scope_tag = CBM_DOCLINK_PHP_SCOPE_TAG,
-     .portable_scope = cbm_doclink_php_portable_scope},
+     .portable_scope = cbm_doclink_php_portable_scope,
+     .loose_docs = cbm_doclink_php_loose_docs},
 };
 
 static const doclink_lang_t *doclink_lang(CBMLanguage lang) {
@@ -480,10 +481,11 @@ static bool doclink_taken(const CBMExtractCtx *ctx, uint32_t first, uint32_t las
     return false;
 }
 
-/* The file's own doc, then the language's loose docs: their references belong
- * to the file. The parser gets a definition-shaped stand-in for the file; what
- * it pushes is marked, and the resolving half takes the File node as the
- * source. No qualified name for that node is computed on this side. */
+/* The file's own doc, then the language's loose docs. The parser gets a
+ * definition-shaped stand-in for the file; what it pushes with the stand-in
+ * is marked, and the resolving half takes the File node as the source (a
+ * loose-doc hook may push with a definition of the file instead). No qualified
+ * name for that node is computed on this side. */
 static void doclink_file_pass(CBMExtractCtx *ctx, const doclink_lang_t *L) {
     const char *file_doc = ctx->result->module_doc;
     bool has_doc = file_doc && file_doc[0];
@@ -513,7 +515,9 @@ static void doclink_file_pass(CBMExtractCtx *ctx, const doclink_lang_t *L) {
         L->loose_docs(ctx, &file_def, doclink_taken);
     }
     for (int i = first; i < arr->count; i++) {
-        arr->items[i].flags |= CBM_DOCLINK_FLAG_FILE;
+        if (arr->items[i].source_qn == file_def.qualified_name) {
+            arr->items[i].flags |= CBM_DOCLINK_FLAG_FILE; /* not a definition's */
+        }
     }
 }
 

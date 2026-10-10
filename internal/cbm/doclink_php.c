@@ -37,6 +37,10 @@
  *                          flags as for T
  * "At the top level" includes the branches of a top-level conditional
  * (`if (!function_exists('f')) { function f() {} }`), never a function body.
+ * Doc blocks on properties, class constants and enum cases, which have no
+ * node, go through cbm_doclink_php_loose_docs: their references belong to
+ * the type around them.
+ *
  * The persisted blob (cbm_doclink_php_portable_scope) drops the lines of N
  * and T and the U records: other files read names only, and every name a
  * supertype record holds is already qualified.
@@ -908,6 +912,111 @@ const char *cbm_doclink_php_scan_scope(CBMExtractCtx *ctx) {
     php_walk_blocks(&w, kids, n, ts_node_end_point(ctx->root).row + SKIP_ONE);
     cbm_ht_free(w.names);
     return sb.oom ? NULL : sb.buf;
+}
+
+/* ── Loose docs ──────────────────────────────────────────────────── */
+
+/* The definition of a type declaration: its name, at its line. */
+static const CBMDefinition *php_type_def(const CBMExtractCtx *ctx, TSNode decl) {
+    TSNode name = ts_node_child_by_field_name(decl, TS_FIELD("name"));
+    if (ts_node_is_null(name)) {
+        return NULL;
+    }
+    uint32_t b = ts_node_start_byte(name);
+    size_t n = ts_node_end_byte(name) - b;
+    uint32_t line = ts_node_start_point(decl).row + SKIP_ONE;
+    const CBMDefArray *defs = &ctx->result->defs;
+    for (int i = 0; i < defs->count; i++) {
+        const CBMDefinition *d = &defs->items[i];
+        if (d->name && d->qualified_name && d->start_line == line && strlen(d->name) == n &&
+            memcmp(d->name, ctx->source + b, n) == 0) {
+            return d;
+        }
+    }
+    return NULL;
+}
+
+static bool php_member_decl(TSNode n) {
+    return php_kind(n, "property_declaration") || php_kind(n, "const_declaration") ||
+           php_kind(n, "enum_case");
+}
+
+static bool php_doc_comment(const CBMExtractCtx *ctx, TSNode n) {
+    if (!php_kind(n, "comment")) {
+        return false;
+    }
+    uint32_t b = ts_node_start_byte(n);
+    size_t len = ts_node_end_byte(n) - b;
+    return len > PHP_PREFIX_LEN + SKIP_ONE && memcmp(ctx->source + b, "/**", PHP_PREFIX_LEN) == 0 &&
+           ctx->source[b + PHP_PREFIX_LEN] != '*';
+}
+
+/* The doc blocks right above a type's properties, constants and cases. */
+static void php_loose_type(CBMExtractCtx *ctx, TSNode decl, cbm_doclink_taken_fn taken) {
+    const CBMDefinition *def = php_type_def(ctx, decl);
+    TSNode body = ts_node_child_by_field_name(decl, TS_FIELD("body"));
+    if (!def || ts_node_is_null(body)) {
+        return;
+    }
+    TSNode doc = {0};
+    TSTreeCursor cur = ts_tree_cursor_new(body);
+    for (bool more = ts_tree_cursor_goto_first_child(&cur); more;
+         more = ts_tree_cursor_goto_next_sibling(&cur)) {
+        TSNode c = ts_tree_cursor_current_node(&cur);
+        if (!ts_node_is_named(c)) {
+            continue;
+        }
+        if (php_doc_comment(ctx, c)) {
+            doc = c;
+            continue;
+        }
+        uint32_t first = ts_node_is_null(doc) ? 0 : ts_node_start_point(doc).row + SKIP_ONE;
+        uint32_t last = ts_node_is_null(doc) ? 0 : ts_node_end_point(doc).row + SKIP_ONE;
+        if (first && php_member_decl(c) &&
+            ts_node_start_point(c).row + SKIP_ONE <= last + SKIP_ONE && !taken(ctx, first, last)) {
+            CBMArena *a = ctx->scratch ? ctx->scratch : ctx->arena;
+            uint32_t b = ts_node_start_byte(doc);
+            char *text = cbm_arena_strndup(a, ctx->source + b, ts_node_end_byte(doc) - b);
+            if (text) {
+                cbm_doclink_php_parse_doc(ctx, def, text, first);
+            }
+        }
+        doc = (TSNode){0};
+    }
+    ts_tree_cursor_delete(&cur);
+}
+
+/* The types of the file: top level, namespace bodies, top-level conditionals. */
+static void php_loose_walk(CBMExtractCtx *ctx, TSNode parent, int depth,
+                           cbm_doclink_taken_fn taken) {
+    if (depth > PHP_COND_DEPTH) {
+        return;
+    }
+    TSTreeCursor cur = ts_tree_cursor_new(parent);
+    for (bool more = ts_tree_cursor_goto_first_child(&cur); more;
+         more = ts_tree_cursor_goto_next_sibling(&cur)) {
+        TSNode c = ts_tree_cursor_current_node(&cur);
+        if (php_is_type_decl(c)) {
+            php_loose_type(ctx, c, taken);
+        } else if (php_kind(c, "namespace_definition")) {
+            TSNode body = ts_node_child_by_field_name(c, TS_FIELD("body"));
+            if (!ts_node_is_null(body)) {
+                php_loose_walk(ctx, body, depth + SKIP_ONE, taken);
+            }
+        } else if (php_is_branch(c)) {
+            php_loose_walk(ctx, c, depth + SKIP_ONE, taken);
+        }
+    }
+    ts_tree_cursor_delete(&cur);
+}
+
+void cbm_doclink_php_loose_docs(CBMExtractCtx *ctx, const CBMDefinition *file_def,
+                                cbm_doclink_taken_fn taken) {
+    (void)file_def; /* a member's doc belongs to its type, never to the file */
+    if (!ctx || !ctx->result || !taken || ts_node_is_null(ctx->root)) {
+        return;
+    }
+    php_loose_walk(ctx, ctx->root, 0, taken);
 }
 
 /* The blob without lines and imports: "N blk name first last" -> "N blk

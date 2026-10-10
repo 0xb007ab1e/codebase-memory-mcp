@@ -193,13 +193,16 @@ static void php_write_repo(const char *repo) {
                   "class Numbers { const MAX = 9; }\n"
                   "trait Loud { public function shout() {} }\n"
                   "function clamp($v) { return $v; }\n");
-    th_write_file(TH_PATH(repo, "src/Model/Base.php"), "<?php\n"
-                                                       "namespace App\\Model;\n"
-                                                       "\n"
-                                                       "abstract class Base {\n"
-                                                       "    public function boot() {}\n"
-                                                       "    public function mixedCase() {}\n"
-                                                       "}\n");
+    th_write_file(TH_PATH(repo, "src/Model/Base.php"),
+                  "<?php\n"
+                  "namespace App\\Model;\n"
+                  "\n"
+                  "abstract class Base {\n"
+                  "    /** The hook, {@see \\App\\Util\\Strings}. */\n"
+                  "    protected $hook;\n"
+                  "    public function boot() {}\n"
+                  "    public function mixedCase() {}\n"
+                  "}\n");
     th_write_file(TH_PATH(repo, "src/Dup.php"), "<?php\n"
                                                 "namespace App\\One;\n"
                                                 "class Same {}\n"
@@ -323,6 +326,8 @@ TEST(doc_mentions_php_resolution) {
     ASSERT_TRUE(php_row(db, "\\App\\Twin\\Twin", "ambiguous"));
     ASSERT_TRUE(php_row(db, "\\App\\One\\Same", "graph_gap"));
     ASSERT_TRUE(php_row(db, "\\App\\One\\same()", "graph_gap"));
+    /* a property's doc block belongs to its class */
+    ASSERT_TRUE(php_edge(db, "src.Model.Base.Base", "src.Util.Helper.Strings"));
     /* aliases and method names compare without case */
     ASSERT_TRUE(php_edge(db, "src.Model.User.User.other", "src.Util.Helper.Helper.format"));
     PASS();

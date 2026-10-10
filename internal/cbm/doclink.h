@@ -23,9 +23,11 @@
  *       scope_tag,      the blob's tag line and its persisted form (line
  *       portable_scope  numbers dropped). Optional.
  *       loose_docs      after the definitions and the file's own doc: the
- *                       file's other doc comments (C: a prototype's doc,
- *                       which the graph keeps no node for); what it pushes
- *                       belongs to the file. Optional.
+ *                       file's other doc comments, which the graph keeps no
+ *                       node for. What it pushes with the file stand-in
+ *                       belongs to the file (C: a prototype's doc); it may push
+ *                       with a definition of the file instead (PHP: a
+ *                       property's doc belongs to its class). Optional.
  *       scan_file       instead of parse_doc, for a DOCUMENT language whose
  *                       text is the documentation (Markdown): one pass over
  *                       the file's bytes pushes every reference, with the
@@ -564,12 +566,20 @@ char *cbm_doclink_ts_portable_scope(const char *scope);
  * this length and the resolver reports it as unparseable. */
 enum { CBM_DOCLINK_TS_REF_MAX = 512 };
 
+/* Asked by a loose_docs hook for a doc comment on lines [first, last]: true
+ * when a definition's doc or the file's own doc there was already taken. */
+typedef bool (*cbm_doclink_taken_fn)(const CBMExtractCtx *ctx, uint32_t first, uint32_t last);
+
 /* ── PHP (doclink_php.c) ───────────────────────────────────────────── */
 
 void cbm_doclink_php_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
                                uint32_t doc_line);
 const char *cbm_doclink_php_scan_scope(CBMExtractCtx *ctx);
 char *cbm_doclink_php_portable_scope(const char *scope);
+/* Doc blocks on properties, class constants and enum cases (they have no
+ * node): their references belong to the type around them. */
+void cbm_doclink_php_loose_docs(CBMExtractCtx *ctx, const CBMDefinition *file_def,
+                                cbm_doclink_taken_fn taken);
 
 #define CBM_DOCLINK_PHP_SCOPE_TAG "php1"
 
@@ -599,10 +609,6 @@ size_t cbm_doclink_php_qualify(char *out, size_t cap, const char *ns, size_t ns_
                                size_t n);
 
 /* ── C (doclink_c.c) ───────────────────────────────────────────────── */
-
-/* Asked by a loose_docs hook for a doc comment on lines [first, last]: true
- * when a definition's doc or the file's own doc there was already taken. */
-typedef bool (*cbm_doclink_taken_fn)(const CBMExtractCtx *ctx, uint32_t first, uint32_t last);
 
 void cbm_doclink_c_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
                              uint32_t doc_line);
