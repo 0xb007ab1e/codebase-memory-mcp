@@ -2601,6 +2601,395 @@ static void k8s_prep_worker(int worker_id, void *arg) {
     cbm_kind_in_set_free_cache();
 }
 
+/* ── Helm includes (PHASE 2 P2.1) ──────────────────────────────────── */
+
+/* A chart template's `include "name"` / `template "name"` calls a named
+ * template (`define "name"`, a Function of a .tpl file). Helm loads a chart's
+ * templates with those of every chart below it into one namespace, so the
+ * name resolves among the defines of the chart family -- the outermost
+ * enclosing chart and the charts below it -- and of the families its members
+ * depend on locally (file://). A dynamic name draws nothing. */
+
+/* The nearest chart dir enclosing file `path` ("" for a root chart). */
+static bool k8s_chart_of(k8s_bundles_t *b, const char *path, char *out, size_t out_sz) {
+    char dir[CBM_SZ_1K];
+    k8s_dirname(path, dir, sizeof(dir));
+    for (;;) {
+        if (cbm_ht_get(b->charts, dir)) {
+            snprintf(out, out_sz, "%s", dir);
+            return true;
+        }
+        if (!dir[0]) {
+            return false;
+        }
+        char parent[CBM_SZ_1K];
+        k8s_dirname(dir, parent, sizeof(parent));
+        snprintf(dir, sizeof(dir), "%s", parent);
+    }
+}
+
+/* The outermost chart dir enclosing chart dir `chart` (itself when none). */
+static void k8s_chart_family(k8s_bundles_t *b, const char *chart, char *out, size_t out_sz) {
+    snprintf(out, out_sz, "%s", chart);
+    char dir[CBM_SZ_1K];
+    snprintf(dir, sizeof(dir), "%s", chart);
+    while (dir[0]) {
+        char parent[CBM_SZ_1K];
+        k8s_dirname(dir, parent, sizeof(parent));
+        snprintf(dir, sizeof(dir), "%s", parent);
+        if (cbm_ht_get(b->charts, dir)) {
+            snprintf(out, out_sz, "%s", dir);
+        }
+    }
+}
+
+static bool k8s_has_suffix(const char *s, const char *suffix) {
+    size_t n = strlen(s);
+    size_t m = strlen(suffix);
+    return n >= m && strcmp(s + n - m, suffix) == 0;
+}
+
+static bool k8s_ident_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+typedef struct {
+    cbm_pipeline_ctx_t *ctx;
+    k8s_bundles_t *b;
+    CBMHashTable *defines;    /* "<family>\x1f<name>" -> define Functions */
+    CBMHashTable *deps;       /* "<family>" -> Chart nodes its members depend on */
+    CBMHashTable *resources;  /* file -> its Resource nodes */
+    CBMHashTable *file_nodes; /* file -> its File node */
+    CBMHashTable *yaml_defs;  /* template file -> the defines written in it */
+    CBMArena arena;           /* define QNs */
+    const char *file;
+    const char *family;
+    k8s_ids_t found;
+    int edges;
+    int unresolved;
+} k8s_inc_t;
+
+/* The node a call on `line` of the file leaves from: the innermost document
+ * (Resource) spanning it, else the File. */
+static int64_t k8s_inc_source(k8s_inc_t *s, int line) {
+    const cbm_gbuf_node_t *best = NULL;
+    for (int pass = 0; pass < PAIR_LEN && !best; pass++) {
+        const k8s_ids_t *res = cbm_ht_get(pass == 0 ? s->yaml_defs : s->resources, s->file);
+        for (int i = 0; res && i < res->count; i++) {
+            const cbm_gbuf_node_t *n = cbm_gbuf_find_by_id(s->ctx->gbuf, res->items[i]);
+            if (n && n->start_line <= line && line <= n->end_line &&
+                (!best || n->end_line - n->start_line < best->end_line - best->start_line)) {
+                best = n;
+            }
+        }
+    }
+    if (best) {
+        return best->id;
+    }
+    const k8s_ids_t *f = cbm_ht_get(s->file_nodes, s->file);
+    return f && f->count > 0 ? f->items[0] : 0;
+}
+
+static void k8s_inc_lookup(k8s_inc_t *s, const char *family, const char *name) {
+    char key[CBM_SZ_1K];
+    snprintf(key, sizeof(key), "%s\x1f%s", family, name);
+    const k8s_ids_t *v = cbm_ht_get(s->defines, key);
+    for (int i = 0; v && i < v->count; i++) {
+        k8s_ids_push(&s->found, v->items[i]);
+    }
+}
+
+/* One `include "name"` / `template "name"` call on `line`. */
+static void k8s_inc_call(k8s_inc_t *s, const char *name, int line, const char *via) {
+    s->found.count = 0;
+    k8s_inc_lookup(s, s->family, name);
+    const k8s_ids_t *deps = cbm_ht_get(s->deps, s->family);
+    for (int d = 0; deps && d < deps->count; d++) {
+        const cbm_gbuf_node_t *dep = cbm_gbuf_find_by_id(s->ctx->gbuf, deps->items[d]);
+        char chart[CBM_SZ_1K];
+        char family[CBM_SZ_1K];
+        if (dep && dep->file_path) {
+            k8s_dirname(dep->file_path, chart, sizeof(chart));
+            k8s_chart_family(s->b, chart, family, sizeof(family));
+            k8s_inc_lookup(s, family, name);
+        }
+    }
+    k8s_ids_sort_unique(&s->found);
+    atomic_fetch_add_explicit(&g_k8s_candidates, (uint64_t)s->found.count, memory_order_relaxed);
+    int64_t src = s->found.count > 0 ? k8s_inc_source(s, line) : 0;
+    if (src <= 0) {
+        s->unresolved++;
+        return;
+    }
+    char esc[CBM_SZ_512];
+    cbm_json_escape(esc, (int)sizeof(esc), name);
+    char props[CBM_SZ_1K];
+    snprintf(props, sizeof(props),
+             "{\"callee\":\"%s\",\"strategy\":\"helm_include\",\"via\":\"%s\"}", esc, via);
+    for (int i = 0; i < s->found.count; i++) {
+        if (s->found.items[i] != src) {
+            cbm_gbuf_insert_edge(s->ctx->gbuf, src, s->found.items[i], "CALLS", props);
+            s->edges++;
+        }
+    }
+}
+
+/* Every literal `include "name"` / `template "name"` inside the `{{ }}`
+ * actions of a template's text, with its line. */
+static void k8s_scan_includes(k8s_inc_t *s, const char *src) {
+    int line = SKIP_ONE;
+    const char *at = src;
+    for (const char *p = strstr(src, "{{"); p;) {
+        const char *e = strstr(p + PAIR_LEN, "}}");
+        if (!e) {
+            break;
+        }
+        for (const char *q = p + PAIR_LEN; q < e; q++) {
+            const char *via = strncmp(q, "include", K8S_SLEN("include")) == 0     ? "include"
+                              : strncmp(q, "template", K8S_SLEN("template")) == 0 ? "template"
+                                                                                  : NULL;
+            if (!via || k8s_ident_char(q[-SKIP_ONE]) || q[-SKIP_ONE] == '.' ||
+                q[-SKIP_ONE] == '$') {
+                continue;
+            }
+            const char *r = q + strlen(via);
+            if (r >= e || (*r != ' ' && *r != '\t' && *r != '\n' && *r != '\r')) {
+                continue;
+            }
+            while (r < e && (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r')) {
+                r++;
+            }
+            const char *ne =
+                r < e && *r == '"' ? memchr(r + SKIP_ONE, '"', (size_t)(e - r - SKIP_ONE)) : NULL;
+            if (!ne || ne == r + SKIP_ONE) {
+                continue;
+            }
+            for (; at < q; at++) {
+                line += *at == '\n';
+            }
+            char name[CBM_SZ_256];
+            snprintf(name, sizeof(name), "%.*s", (int)(ne - r - SKIP_ONE), r + SKIP_ONE);
+            k8s_inc_call(s, name, line, via);
+            q = ne;
+        }
+        p = strstr(e + PAIR_LEN, "{{");
+    }
+}
+
+static CBMHashTable *k8s_index_by_file(cbm_pipeline_ctx_t *ctx, const char *label) {
+    CBMHashTable *ix = cbm_ht_create(0);
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (!ix || cbm_gbuf_find_by_label(ctx->gbuf, label, &nodes, &count) != 0) {
+        return ix;
+    }
+    for (int i = 0; i < count; i++) {
+        if (nodes[i]->file_path) {
+            k8s_index_add(ix, nodes[i]->file_path, nodes[i]->id);
+        }
+    }
+    return ix;
+}
+
+static void k8s_free_index(CBMHashTable *ix) {
+    if (ix) {
+        cbm_ht_foreach(ix, k8s_free_ids_entry, NULL);
+        cbm_ht_free(ix);
+    }
+}
+
+/* Does the action text at `q` start with keyword `kw`? */
+static bool k8s_action_is(const char *q, const char *kw) {
+    size_t n = strlen(kw);
+    return strncmp(q, kw, n) == 0 && !k8s_ident_char(q[n]);
+}
+
+/* A `define "name"` written in a template (outside a .tpl file the grammar
+ * reads): a Function like a .tpl define, spanning to its matching `end`. */
+static void k8s_yaml_define(k8s_inc_t *s, const char *name, int start, int end) {
+    char *qn = cbm_fqn_compute(&s->arena, s->ctx->project_name, s->file, name);
+    if (!qn) {
+        return;
+    }
+    int64_t id = cbm_gbuf_upsert_node(s->ctx->gbuf, "Function", name, qn, s->file, start, end,
+                                      "{\"source\":\"helm_template\"}");
+    if (id <= 0) {
+        return;
+    }
+    const k8s_ids_t *f = cbm_ht_get(s->file_nodes, s->file);
+    if (f && f->count > 0) {
+        cbm_gbuf_insert_edge(s->ctx->gbuf, f->items[0], id, "DEFINES", "{}");
+    }
+    char key[CBM_SZ_1K];
+    snprintf(key, sizeof(key), "%s\x1f%s", s->family, name);
+    k8s_index_add(s->defines, key, id);
+    k8s_index_add(s->yaml_defs, s->file, id);
+}
+
+/* Every `define "name"` ... `end` of a template's text: block actions (if,
+ * range, with, block, define) nest until their `end`. */
+static void k8s_scan_defines(k8s_inc_t *s, const char *src) {
+    int line = SKIP_ONE;
+    const char *at = src;
+    int depth = 0;
+    int start = 0;
+    char name[CBM_SZ_256] = "";
+    for (const char *p = strstr(src, "{{"); p;) {
+        const char *e = strstr(p + PAIR_LEN, "}}");
+        if (!e) {
+            break;
+        }
+        for (; at < p; at++) {
+            line += *at == '\n';
+        }
+        const char *q = p + PAIR_LEN;
+        q += *q == '-';
+        while (q < e && (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')) {
+            q++;
+        }
+        if (depth == 0 && k8s_action_is(q, "define")) {
+            const char *r = q + K8S_SLEN("define");
+            while (r < e && (*r == ' ' || *r == '\t')) {
+                r++;
+            }
+            const char *ne =
+                r < e && *r == '"' ? memchr(r + SKIP_ONE, '"', (size_t)(e - r - SKIP_ONE)) : NULL;
+            if (ne && ne > r + SKIP_ONE) {
+                snprintf(name, sizeof(name), "%.*s", (int)(ne - r - SKIP_ONE), r + SKIP_ONE);
+                depth = SKIP_ONE;
+                start = line;
+            }
+        } else if (depth > 0 && (k8s_action_is(q, "if") || k8s_action_is(q, "range") ||
+                                 k8s_action_is(q, "with") || k8s_action_is(q, "block") ||
+                                 k8s_action_is(q, "define"))) {
+            depth++;
+        } else if (depth > 0 && k8s_action_is(q, "end")) {
+            depth--;
+            if (depth == 0) {
+                for (; at < e; at++) {
+                    line += *at == '\n';
+                }
+                k8s_yaml_define(s, name, start, line);
+            }
+        }
+        p = strstr(e + PAIR_LEN, "{{");
+    }
+}
+
+/* A chart template file: .yaml / .yml / .json under a chart's templates/;
+ * fills its chart's family. */
+static bool k8s_template_family(k8s_bundles_t *b, const char *rel, char *family, size_t sz) {
+    char chart[CBM_SZ_1K];
+    if (!rel ||
+        !(k8s_has_suffix(rel, ".yaml") || k8s_has_suffix(rel, ".yml") ||
+          k8s_has_suffix(rel, ".json")) ||
+        !k8s_chart_of(b, rel, chart, sizeof(chart))) {
+        return false;
+    }
+    size_t cl = strlen(chart);
+    const char *sub = cl ? rel + cl + SKIP_ONE : rel;
+    if (strncmp(sub, "templates/", K8S_SLEN("templates/")) != 0) {
+        return false;
+    }
+    k8s_chart_family(b, chart, family, sz);
+    return true;
+}
+
+/* Index the defines and dependencies, then scan every template of a chart. */
+static void k8s_includes_run(k8s_inc_t *s, const cbm_file_info_t *files, int file_count) {
+    /* defines by chart family: Functions of the charts' Go template files */
+    const cbm_gbuf_node_t **fns = NULL;
+    int fn_n = 0;
+    if (cbm_gbuf_find_by_label(s->ctx->gbuf, "Function", &fns, &fn_n) == 0) {
+        for (int i = 0; i < fn_n; i++) {
+            char chart[CBM_SZ_1K];
+            char family[CBM_SZ_1K];
+            char key[CBM_SZ_1K];
+            const char *fp = fns[i]->file_path;
+            if (!fp || !fns[i]->name ||
+                !(k8s_has_suffix(fp, ".tpl") || k8s_has_suffix(fp, ".gotmpl")) ||
+                !k8s_chart_of(s->b, fp, chart, sizeof(chart))) {
+                continue;
+            }
+            k8s_chart_family(s->b, chart, family, sizeof(family));
+            snprintf(key, sizeof(key), "%s\x1f%s", family, fns[i]->name);
+            k8s_index_add(s->defines, key, fns[i]->id);
+        }
+    }
+    /* local dependencies: Chart -DEPENDS_ON-> Chart, by the source's family */
+    const cbm_gbuf_edge_t **deps = NULL;
+    int dep_n = 0;
+    if (cbm_gbuf_find_edges_by_type(s->ctx->gbuf, "DEPENDS_ON", &deps, &dep_n) == 0) {
+        for (int i = 0; i < dep_n; i++) {
+            const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(s->ctx->gbuf, deps[i]->source_id);
+            const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_id(s->ctx->gbuf, deps[i]->target_id);
+            if (!src || !tgt || !src->label || !tgt->label || strcmp(src->label, "Chart") != 0 ||
+                strcmp(tgt->label, "Chart") != 0 || !src->file_path || !tgt->file_path) {
+                continue;
+            }
+            char chart[CBM_SZ_1K];
+            char family[CBM_SZ_1K];
+            k8s_dirname(src->file_path, chart, sizeof(chart));
+            k8s_chart_family(s->b, chart, family, sizeof(family));
+            k8s_index_add(s->deps, family, tgt->id);
+        }
+    }
+    /* every template of a chart: its own defines, then its includes */
+    for (int pass = 0; pass < PAIR_LEN; pass++) {
+        for (int i = 0; i < file_count; i++) {
+            const char *rel = files[i].rel_path;
+            char family[CBM_SZ_1K];
+            if (!k8s_template_family(s->b, rel, family, sizeof(family))) {
+                continue;
+            }
+            char path[CBM_SZ_4K];
+            snprintf(path, sizeof(path), "%s/%s", s->ctx->repo_path, rel);
+            int len = 0;
+            char *src = k8s_read_file(path, &len);
+            if (!src) {
+                continue;
+            }
+            s->file = rel;
+            s->family = family;
+            if (pass == 0) {
+                k8s_scan_defines(s, src);
+            } else {
+                k8s_scan_includes(s, src);
+            }
+            cbm_free(CBM_MEM_CLASS_OTHER, src);
+        }
+    }
+}
+
+static void k8s_link_includes(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b,
+                              const cbm_file_info_t *files, int file_count) {
+    if (!b->charts || !ctx->repo_path) {
+        return;
+    }
+    k8s_inc_t s = {.ctx = ctx,
+                   .b = b,
+                   .defines = cbm_ht_create(0),
+                   .deps = cbm_ht_create(0),
+                   .resources = k8s_index_by_file(ctx, "Resource"),
+                   .file_nodes = k8s_index_by_file(ctx, "File"),
+                   .yaml_defs = cbm_ht_create(0)};
+    cbm_arena_init(&s.arena);
+    if (s.defines && s.deps && s.resources && s.file_nodes && s.yaml_defs) {
+        k8s_includes_run(&s, files, file_count);
+    }
+    cbm_arena_destroy(&s.arena);
+    cbm_free(CBM_MEM_CLASS_OTHER, s.found.items);
+    k8s_free_index(s.defines);
+    k8s_free_index(s.deps);
+    k8s_free_index(s.resources);
+    k8s_free_index(s.file_nodes);
+    k8s_free_index(s.yaml_defs);
+    if (s.edges + s.unresolved > 0) {
+        cbm_log_info("pass.k8s.includes", "edges", itoa_k8s(s.edges), "unresolved",
+                     itoa_k8s(s.unresolved));
+    }
+}
+
 int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count) {
     cbm_log_info("pass.start", "pass", "k8s", "files", itoa_k8s(file_count));
 
@@ -2699,10 +3088,12 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_link_crds(ctx, &bundles, &facts);
     k8s_facts_free(&facts);
     k8s_records_free(&recs);
+    /* Link `file://` chart dependencies now that every Chart.yaml is read,
+     * then the templates' includes, which see those dependencies' defines. */
+    k8s_link_local_deps(ctx, &local_deps);
+    k8s_link_includes(ctx, &bundles, files, file_count);
     k8s_bundles_free(&bundles);
     k8s_kusts_free(&kusts);
-    /* Link `file://` chart dependencies now that every Chart.yaml is read. */
-    k8s_link_local_deps(ctx, &local_deps);
 
     cbm_log_info("pass.done", "pass", "k8s", "manifests", itoa_k8s(manifest_count));
     (void)helm_count;

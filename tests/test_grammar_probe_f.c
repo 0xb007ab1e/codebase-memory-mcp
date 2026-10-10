@@ -1655,6 +1655,39 @@ TEST(probe_mcp_trace_topology) {
     PASS();
 }
 
+/* ── Helm symbolic (Phase 2) ────────────────────────────────────────── */
+
+/* A template's `include "name"` calls the define of that name in its chart
+ * family -- the chart and its subcharts share one template namespace -- never
+ * a same-named define of an unrelated chart; a define may also be written in
+ * the template itself (deckhouse, gardener). */
+TEST(probe_helm_include_resolves_in_the_chart_family) {
+    static const GpfFile files[] = {
+        {"app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 0.1.0\n"},
+        {"app/templates/_helpers.tpl",
+         "{{- define \"app.fullname\" -}}app{{- end }}\n"
+         "{{- define \"app.labels\" -}}tier: web{{- end }}\n"},
+        {"app/templates/deployment.yaml",
+         "{{- define \"web.resources\" }}\ncpu: 1\n{{- if .Values.big }}\nmemory: 2Gi\n{{- end }}\n"
+         "{{- end }}\n---\n"
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  labels:\n"
+         "    {{- include \"app.labels\" . | nindent 4 }}\n"
+         "    owner: {{ include \"app.fullname\" . }}\n"
+         "    sub: {{ template \"sub.name\" . }}\n"
+         "    dyn: {{ include (printf \"%s.x\" .Chart.Name) . }}\n"
+         "spec:\n  resources: {{ include \"web.resources\" . | nindent 4 }}\n"},
+        {"app/charts/sub/Chart.yaml", "apiVersion: v2\nname: sub\nversion: 0.1.0\n"},
+        {"app/charts/sub/templates/_helpers.tpl", "{{- define \"sub.name\" -}}sub{{- end }}\n"},
+        {"other/Chart.yaml", "apiVersion: v2\nname: other\nversion: 0.1.0\n"},
+        {"other/templates/_helpers.tpl", "{{- define \"app.fullname\" -}}other{{- end }}\n"}};
+    ASSERT_EQ(gpf_edges_into_file(files, 7, "CALLS", "app/templates/_helpers.tpl"), 2);
+    ASSERT_EQ(gpf_edges_into_file(files, 7, "CALLS", "app/charts/sub/templates/_helpers.tpl"), 1);
+    ASSERT_EQ(gpf_edges_into_file(files, 7, "CALLS", "other/templates/_helpers.tpl"), 0);
+    /* a define written in the template itself */
+    ASSERT_EQ(gpf_edges_into_file(files, 7, "CALLS", "app/templates/deployment.yaml"), 1);
+    PASS();
+}
+
 /* A CRD vendored twice (gardener: example/seed-crds and a chart): a custom
  * resource is an instance of the copy deployed with it; only when no copy
  * shares its bundle does it stand for all of them. */
@@ -3268,6 +3301,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_ingress_and_httproute_expose_routes);
     RUN_TEST(probe_mcp_search_filters_kind_and_namespace);
     RUN_TEST(probe_mcp_trace_topology);
+    RUN_TEST(probe_helm_include_resolves_in_the_chart_family);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
     RUN_TEST(probe_k8s_selector_within_kustomize_build);
     RUN_TEST(probe_k8s_kustomize_namespace_is_effective);
