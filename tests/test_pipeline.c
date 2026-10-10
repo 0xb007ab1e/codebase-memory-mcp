@@ -3347,6 +3347,81 @@ TEST(pipeline_staged_publish_commits_below_full_sync_issue1419) {
     PASS();
 }
 
+/* Kubernetes inputs reach past their own file: a Service selects a workload
+ * in another file of its bundle, and a kustomization decides the namespace
+ * of every object it builds. The closure repair re-runs the K8s pass over
+ * its plan only, so editing either must still leave the graph a fresh index
+ * builds. */
+static int k8s_inc_index(const char *repo, const char *db) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
+    if (!p) {
+        return -1;
+    }
+    (void)cbm_pipeline_set_project_name(p, "k8sinc");
+    cbm_pipeline_set_persistence(p, false);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+static int k8s_inc_count(const char *db_path, const char *sql) {
+    sqlite3 *db = NULL;
+    int n = -1;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
+            sqlite3_step(stmt) == SQLITE_ROW) {
+            n = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(db);
+    return n;
+}
+
+TEST(incremental_k8s_edits_reach_other_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_k8sinc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "kustomization.yaml", "resources:\n  - svc.yaml\n  - deploy.yaml\n");
+    write_temp_file(tmp, "svc.yaml",
+                    "apiVersion: v1\nkind: Service\nmetadata:\n  name: db\nspec:\n"
+                    "  selector:\n    app: db\n");
+    write_temp_file(tmp, "deploy.yaml",
+                    "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: db\nspec:\n"
+                    "  template:\n    metadata:\n      labels:\n        app: db\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/k8sinc.db", tmp);
+    static const char links[] = "SELECT COUNT(*) FROM edges WHERE type='INFRA_MAPS'";
+    static const char shop[] = "SELECT COUNT(*) FROM nodes WHERE label='Resource' AND "
+                               "json_extract(properties,'$.obj_key')='apps/Deployment/shop/db'";
+
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int links_full = k8s_inc_count(db_path, links);
+    /* the Service's file changes, the Deployment's does not */
+    write_temp_file(tmp, "svc.yaml",
+                    "apiVersion: v1\nkind: Service\nmetadata:\n  name: db\nspec:\n"
+                    "  selector:\n    app: db\n# edited\n");
+    int rc_svc = k8s_inc_index(tmp, db_path);
+    int links_after_svc = k8s_inc_count(db_path, links);
+    /* the build gains a namespace: deploy.yaml's object lives in it now */
+    write_temp_file(tmp, "kustomization.yaml",
+                    "namespace: shop\nresources:\n  - svc.yaml\n  - deploy.yaml\n");
+    int rc_kust = k8s_inc_index(tmp, db_path);
+    int shop_after_kust = k8s_inc_count(db_path, shop);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(links_full, 1);
+    ASSERT_EQ(rc_svc, 0);
+    ASSERT_EQ(links_after_svc, 1);
+    ASSERT_EQ(rc_kust, 0);
+    ASSERT_EQ(shop_after_kust, 1);
+    PASS();
+}
+
 /* SQL DDL becomes first-class Table/View nodes wired into FROM/JOIN lineage,
  * while the shared name registry must NOT leak those relations into other
  * languages' textual resolution: a Python call or identifier sharing the
@@ -18970,6 +19045,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_downgrade_preserves_scope_and_artifact_across_change_noop_delete);
     RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
     RUN_TEST(pipeline_staged_publish_commits_below_full_sync_issue1419);
+    RUN_TEST(incremental_k8s_edits_reach_other_files);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);

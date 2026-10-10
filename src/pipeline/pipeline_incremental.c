@@ -2343,6 +2343,59 @@ static const char *closure_add_variant_partners(cbm_store_t *store, const char *
     return decline;
 }
 
+/* Kubernetes inputs reach past their own file (pass_k8s.c): a kustomization
+ * decides which manifests deploy together and in which namespace, a
+ * Chart.yaml links other charts, and a manifest's Services select workloads
+ * in other files of its bundle. The repair re-runs the K8s pass over its plan
+ * only, so a delta touching any of them -- a file that held objects, or holds
+ * them now -- declines to the full rebuild. Returns the reason, or NULL. */
+static const char *closure_k8s_decline(cbm_store_t *store, const char *project,
+                                       const char *repo_path, char **paths, int n_changed,
+                                       int n_deleted) {
+    for (int i = 0; i < n_changed + n_deleted; i++) {
+        const char *rel = paths[i];
+        const char *slash = strrchr(rel, '/');
+        const char *base = slash ? slash + SKIP_ONE : rel;
+        if (cbm_is_kustomize_file(base) || strcmp(base, "Kustomization") == 0) {
+            return "k8s_bundle_input_changed";
+        }
+        if (strcmp(base, "Chart.yaml") == 0 || strcmp(base, "Chart.yml") == 0) {
+            return "helm_chart_changed";
+        }
+        cbm_node_t *nodes = NULL;
+        int count = 0;
+        if (cbm_store_find_nodes_by_file(store, project, rel, &nodes, &count) != CBM_STORE_OK) {
+            return "k8s_lookup_failed";
+        }
+        bool held = false;
+        for (int j = 0; j < count && !held; j++) {
+            held = nodes[j].label && strcmp(nodes[j].label, "Resource") == 0;
+        }
+        cbm_store_free_nodes(nodes, count);
+        if (held) {
+            return "k8s_manifest_changed";
+        }
+        const char *ext = strrchr(base, '.');
+        if (i < n_changed && ext && (strcmp(ext, ".yaml") == 0 || strcmp(ext, ".yml") == 0)) {
+            enum { K8S_PEEK = 4096 };
+            char path[CBM_SZ_4K];
+            snprintf(path, sizeof(path), "%s/%s", repo_path, rel);
+            char head[K8S_PEEK + SKIP_ONE];
+            size_t n = 0;
+            FILE *f = cbm_fopen(path, "rb");
+            if (f) {
+                n = fread(head, SKIP_ONE, K8S_PEEK, f);
+                (void)fclose(f);
+            }
+            head[n] = '\0';
+            if (cbm_is_k8s_manifest(base, head)) {
+                return "k8s_manifest_changed";
+            }
+        }
+    }
+    return NULL;
+}
+
 /* Decide whether this manifest delta is closure-repairable, and if so build
  * the plan. Returns 1 with *plan filled, or 0 (decline → FULL) with the
  * reason logged. Every early exit declines; nothing here mutates state. */
@@ -2464,6 +2517,11 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             decline = "doc_scope_input_changed";
             goto done;
         }
+    }
+    decline = closure_k8s_decline(store, project, cbm_pipeline_repo_path(p), changed_paths,
+                                  n_changed, n_deleted);
+    if (decline) {
+        goto done;
     }
 
     /* Load the previous generation's surfaces and probe the changed files'
