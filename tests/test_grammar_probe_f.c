@@ -276,6 +276,53 @@ TEST(probe_hcl_no_spurious_imports) {
     PASS();
 }
 
+/* Only a top-level block (resource, data, module, variable, output, ...) is an
+ * entity; blocks nested in it (lifecycle, dynamic, content, the resource's own
+ * argument blocks) are part of it. cloud-foundation-fabric minted 1,342
+ * `dynamic` and 205 `content` Classes next to 898 resources. */
+TEST(probe_hcl_nested_blocks_are_not_classes) {
+    GpfMetrics m = gpf_metrics("main.tf",
+        "resource \"google_container_cluster\" \"main\" {\n"
+        "  name = \"main\"\n"
+        "  addons_config {\n"
+        "    http_load_balancing { disabled = false }\n"
+        "  }\n"
+        "  dynamic \"node_pool\" {\n"
+        "    for_each = var.pools\n"
+        "    content {\n"
+        "      name = node_pool.value.name\n"
+        "    }\n"
+        "  }\n"
+        "  lifecycle {\n"
+        "    ignore_changes = [node_pool]\n"
+        "  }\n"
+        "}\n");
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.classes, 1);
+    PASS();
+}
+
+/* OpenTofu configuration (.tofu) is indexed like .tf. */
+TEST(probe_tofu_file_indexed) {
+    GpfMetrics m = gpf_metrics("main.tofu",
+        "resource \"aws_s3_bucket\" \"logs\" {\n"
+        "  bucket = \"logs\"\n"
+        "}\n");
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.classes, 1);
+    PASS();
+}
+
+/* A variable file's assignments are its content. */
+TEST(probe_tfvars_file_indexed) {
+    GpfMetrics m = gpf_metrics("prod.tfvars",
+        "region       = \"europe-west1\"\n"
+        "node_count   = 3\n");
+    ASSERT_TRUE(m.ok);
+    ASSERT_TRUE(m.variables >= 2);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  * GROUP 2 — Kubernetes manifests (.yaml with apiVersion:)
  *
@@ -2011,6 +2058,9 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_hcl_module_block_node);
     RUN_TEST(probe_hcl_infra_maps_edge);
     RUN_TEST(probe_hcl_no_spurious_imports);
+    RUN_TEST(probe_hcl_nested_blocks_are_not_classes);
+    RUN_TEST(probe_tofu_file_indexed);
+    RUN_TEST(probe_tfvars_file_indexed);
 
     /* Kubernetes manifests */
     RUN_TEST(probe_k8s_pod_resource_node);

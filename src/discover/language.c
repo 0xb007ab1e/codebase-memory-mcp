@@ -152,9 +152,11 @@ static const ext_entry_t EXT_TABLE[] = {
     /* Haskell */
     {".hs", CBM_LANG_HASKELL},
 
-    /* HCL / Terraform */
+    /* HCL / Terraform / OpenTofu */
     {".hcl", CBM_LANG_HCL},
     {".tf", CBM_LANG_HCL},
+    {".tofu", CBM_LANG_HCL},
+    {".tfvars", CBM_LANG_HCL},
 
     /* HTML */
     {".htm", CBM_LANG_HTML},

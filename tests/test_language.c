@@ -386,6 +386,14 @@ TEST(lang_ext_hcl2) {
     ASSERT_EQ(cbm_language_for_extension(".hcl"), CBM_LANG_HCL);
     PASS();
 }
+/* OpenTofu's own configuration files and Terraform/OpenTofu variable files
+ * are HCL too; neither was indexed (cloud-foundation-fabric: 104 .tofu,
+ * 208 .tfvars). */
+TEST(lang_ext_tofu_tfvars) {
+    ASSERT_EQ(cbm_language_for_extension(".tofu"), CBM_LANG_HCL);
+    ASSERT_EQ(cbm_language_for_extension(".tfvars"), CBM_LANG_HCL);
+    PASS();
+}
 TEST(lang_ext_sql) {
     ASSERT_EQ(cbm_language_for_extension(".sql"), CBM_LANG_SQL);
     PASS();
@@ -1588,6 +1596,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_toml);
     RUN_TEST(lang_ext_hcl);
     RUN_TEST(lang_ext_hcl2);
+    RUN_TEST(lang_ext_tofu_tfvars);
     RUN_TEST(lang_ext_sql);
     RUN_TEST(lang_ext_dockerfile);
     RUN_TEST(lang_ext_json);
