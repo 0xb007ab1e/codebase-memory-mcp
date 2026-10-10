@@ -4,9 +4,11 @@
 // matches "resources", "bases", "patches", "components", or
 // "patchesStrategicMerge", then emits one CBMImport per block_sequence item.
 //
-// For CBM_LANG_K8S: finds apiVersion, kind, and metadata.name scalars in the
-// first document's block_mapping and emits one CBMDefinition with label
-// "Resource" and name "Kind/metadata-name".
+// For CBM_LANG_K8S: reads apiVersion, kind, metadata.name and
+// metadata.namespace of EVERY document and emits one CBMDefinition per object:
+// label "Resource", name "Kind/metadata-name", QN
+// "<file-base>::<group>/<Kind>/<declared namespace or ->/<name>" (identity
+// spec: the file base keeps the extension, so it is unique per file).
 
 #include "cbm.h"
 #include "arena.h"
@@ -20,24 +22,39 @@
 /* Local constants. */
 enum {
     K8S_BUF_SIZE = 256,
-    RESULT_BUF_SIZE = 512,
 };
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+// The value inside a flow_node: its first named child that is not an anchor
+// (`&name`), a tag (`!!str`) or a comment, all of which precede the value.
+static TSNode flow_node_value(TSNode node) {
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode child = ts_node_named_child(node, i);
+        const char *type = ts_node_type(child);
+        if (strcmp(type, "anchor") != 0 && strcmp(type, "tag") != 0 &&
+            strcmp(type, "comment") != 0) {
+            return child;
+        }
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
 // Return the raw source text for a scalar node (plain, single-quoted, or
 // double-quoted). Surrounding quote characters are stripped for quoted forms.
-// Handles flow_node wrappers transparently by descending into the first named
-// child (the tree-sitter YAML grammar often wraps scalars in flow_node).
+// Handles flow_node wrappers transparently by descending into the value they
+// wrap (the tree-sitter YAML grammar often wraps scalars in flow_node).
 // Returns NULL for non-scalar node types.
 static const char *get_scalar_text(CBMArena *a, TSNode node, const char *source) {
     enum { MAX_UNWRAP = 4 };
     for (int depth = 0; depth < MAX_UNWRAP; depth++) {
         const char *type = ts_node_type(node);
         if (strcmp(type, "flow_node") == 0) {
-            TSNode inner = ts_node_named_child(node, 0);
+            TSNode inner = flow_node_value(node);
             if (ts_node_is_null(inner)) {
                 return NULL;
             }
@@ -241,9 +258,17 @@ static void extract_kustomize(CBMExtractCtx *ctx) {
 // K8s manifest extraction
 // ---------------------------------------------------------------------------
 
-// Extract the "name" scalar from a metadata block_mapping.
-static void extract_metadata_name(CBMArena *a, TSNode meta_mapping, const char *source,
-                                  char *meta_name_buf, size_t meta_sz) {
+// The identity scalars of one manifest document.
+typedef struct {
+    char api_version[K8S_BUF_SIZE];
+    char kind[K8S_BUF_SIZE];
+    char name[K8S_BUF_SIZE];
+    char ns[K8S_BUF_SIZE];
+} k8s_doc_id_t;
+
+// Read metadata.name and metadata.namespace from a metadata block_mapping.
+static void extract_metadata(CBMArena *a, TSNode meta_mapping, const char *source,
+                             k8s_doc_id_t *id) {
     if (ts_node_is_null(meta_mapping) || strcmp(ts_node_type(meta_mapping), "block_mapping") != 0) {
         return;
     }
@@ -258,28 +283,22 @@ static void extract_metadata_name(CBMArena *a, TSNode meta_mapping, const char *
             continue;
         }
         const char *mkey_text = get_scalar_text(a, mkey, source);
-        if (!mkey_text || strcmp(mkey_text, "name") != 0) {
+        bool is_name = mkey_text && strcmp(mkey_text, "name") == 0;
+        bool is_ns = mkey_text && strcmp(mkey_text, "namespace") == 0;
+        if (!is_name && !is_ns) {
             continue;
         }
         TSNode mval = unwrap_pair_value(mpair);
-        if (ts_node_is_null(mval)) {
-            continue;
-        }
-        const char *meta_name = get_scalar_text(a, mval, source);
-        if (meta_name) {
-            snprintf(meta_name_buf, meta_sz, "%s", meta_name);
+        const char *text = ts_node_is_null(mval) ? NULL : get_scalar_text(a, mval, source);
+        if (text) {
+            snprintf(is_name ? id->name : id->ns, K8S_BUF_SIZE, "%s", text);
         }
     }
 }
 
-// Descend into the first block_mapping of a document and extract
-// kind and metadata.name. Returns void; fills kind_buf and meta_name_buf.
-static void extract_k8s_scalars(CBMExtractCtx *ctx, TSNode mapping, char *kind_buf, size_t kind_sz,
-                                char *meta_name_buf, size_t meta_sz) {
+// Read apiVersion, kind and metadata from a document's top-level mapping.
+static void extract_k8s_scalars(CBMExtractCtx *ctx, TSNode mapping, k8s_doc_id_t *id) {
     CBMArena *a = ctx->arena;
-    kind_buf[0] = '\0';
-    meta_name_buf[0] = '\0';
-
     uint32_t n = ts_node_child_count(mapping);
     for (uint32_t i = 0; i < n; i++) {
         TSNode pair = ts_node_child(mapping, i);
@@ -294,25 +313,75 @@ static void extract_k8s_scalars(CBMExtractCtx *ctx, TSNode mapping, char *kind_b
         if (!key) {
             continue;
         }
-
         TSNode val_node = unwrap_pair_value(pair);
         if (ts_node_is_null(val_node)) {
             continue;
         }
-
-        if (strcmp(key, "kind") == 0) {
-            const char *v = get_scalar_text(a, val_node, ctx->source);
-            if (v) {
-                snprintf(kind_buf, kind_sz, "%s", v);
-            }
-        } else if (strcmp(key, "metadata") == 0) {
-            extract_metadata_name(a, val_node, ctx->source, meta_name_buf, meta_sz);
+        if (strcmp(key, "metadata") == 0) {
+            extract_metadata(a, val_node, ctx->source, id);
+            continue;
+        }
+        char *dst = strcmp(key, "kind") == 0         ? id->kind
+                    : strcmp(key, "apiVersion") == 0 ? id->api_version
+                                                     : NULL;
+        const char *v = dst ? get_scalar_text(a, val_node, ctx->source) : NULL;
+        if (v) {
+            snprintf(dst, K8S_BUF_SIZE, "%s", v);
         }
     }
 }
 
+// "<project>.<rel_path segments>" with the extension kept: the File node's QN
+// without ".__file__" (IDENTITY.md). Unique per file, unlike the module QN,
+// which drops the extension (`a.yaml` / `a.yml`, `x/` / `x.yaml`).
+static const char *k8s_file_base(CBMArena *a, const char *project, const char *rel_path) {
+    project = project ? project : "";
+    rel_path = rel_path ? rel_path : "";
+    size_t plen = strlen(project);
+    char *buf = cbm_arena_alloc(a, plen + strlen(rel_path) + PAIR_LEN);
+    if (!buf) {
+        return NULL;
+    }
+    char *o = buf;
+    memcpy(o, project, plen);
+    o += plen;
+    bool seg_start = true;
+    for (const char *p = rel_path; *p; p++) {
+        char c = *p == '\\' ? '/' : *p;
+        if (c == '/') {
+            seg_start = true;
+            continue;
+        }
+        if (seg_start) {
+            *o++ = '.';
+            seg_start = false;
+        }
+        *o++ = c;
+    }
+    *o = '\0';
+    return buf;
+}
+
+// The API group of an apiVersion: the part before '/', "core" for the core
+// group ("v1"), "?" when the document names none. The version is not part of
+// an object's identity.
+static void k8s_api_group(const char *api_version, char *out, size_t out_sz) {
+    const char *slash = strchr(api_version, '/');
+    if (slash) {
+        snprintf(out, out_sz, "%.*s", (int)(slash - api_version), api_version);
+    } else {
+        snprintf(out, out_sz, "%s", api_version[0] ? "core" : "?");
+    }
+}
+
+// One Resource def per document: `Kind/name`, QN
+// `<file-base>::<group>/<Kind>/<declared namespace or ->/<name>` (IDENTITY.md).
 static void extract_k8s_manifest(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
+    const char *base = k8s_file_base(a, ctx->project, ctx->rel_path);
+    if (!base) {
+        return;
+    }
 
     TSNode root = ctx->root;
     uint32_t root_n = ts_node_child_count(root);
@@ -327,22 +396,22 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
             continue;
         }
 
-        char kind_buf[K8S_BUF_SIZE] = {0};
-        char meta_name_buf[K8S_BUF_SIZE] = {0};
-        extract_k8s_scalars(ctx, mapping, kind_buf, sizeof(kind_buf), meta_name_buf,
-                            sizeof(meta_name_buf));
+        k8s_doc_id_t id;
+        memset(&id, 0, sizeof(id));
+        extract_k8s_scalars(ctx, mapping, &id);
 
         // Skip malformed manifests (no kind or no metadata.name)
-        if (kind_buf[0] == '\0' || meta_name_buf[0] == '\0') {
+        if (id.kind[0] == '\0' || id.name[0] == '\0') {
             continue;
         }
 
-        char def_name[RESULT_BUF_SIZE];
-        snprintf(def_name, sizeof(def_name), "%s/%s", kind_buf, meta_name_buf);
+        char group[K8S_BUF_SIZE];
+        k8s_api_group(id.api_version, group, sizeof(group));
 
         CBMDefinition def = {0};
-        def.name = cbm_arena_strdup(a, def_name);
-        def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->module_qn, def_name);
+        def.name = cbm_arena_sprintf(a, "%s/%s", id.kind, id.name);
+        def.qualified_name = cbm_arena_sprintf(a, "%s::%s/%s/%s/%s", base, group, id.kind,
+                                               id.ns[0] ? id.ns : "-", id.name);
         // "Resource" is the canonical def label for a K8s resource kind. It is a
         // valid graph label and is what the K8s pipeline pass (pass_k8s.c) filters
         // on to upsert Resource nodes and emit INFRA_MAPS edges.
@@ -351,8 +420,6 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         def.start_line = ts_node_start_point(mapping).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(mapping).row + TS_LINE_OFFSET;
         cbm_defs_push(&ctx->result->defs, a, def);
-
-        break; // Only the first document per file
     }
 }
 

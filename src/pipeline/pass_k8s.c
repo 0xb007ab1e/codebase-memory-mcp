@@ -284,7 +284,47 @@ static void k8s_parent_path(char *out, size_t out_sz, const char (*keys)[64], in
     }
 }
 
-/* Scan a single-document k8s manifest's text for its name, namespace, kind and
+/* `key: { a: b, c: d }` — a flow-style map is the same label map written on
+ * one line. One the line buffer cut short (no closing brace) is skipped
+ * whole: a selector missing pairs would select too much. */
+static void k8s_scan_flow_map(k8s_scanned_t *out, const char (*keys)[64], int depth,
+                              const char *key, const char *val) {
+    size_t n = strlen(val);
+    if (n < PAIR_LEN || val[0] != '{' || val[n - SKIP_ONE] != '}') {
+        return;
+    }
+    char path[CBM_SZ_512];
+    k8s_parent_path(path, sizeof(path), keys, depth);
+    size_t w = strlen(path);
+    snprintf(path + w, sizeof(path) - w, "%s%s", w ? "." : "", key);
+    k8s_pair_block_t block = k8s_pair_block(path);
+    if (block == K8S_PAIR_NONE) {
+        return;
+    }
+    char inner[CBM_SZ_512];
+    snprintf(inner, sizeof(inner), "%.*s", (int)(n - PAIR_LEN), val + SKIP_ONE);
+    for (char *item = inner; item;) {
+        char *comma = strchr(item, ',');
+        if (comma) {
+            *comma = '\0';
+        }
+        while (*item == ' ') {
+            item++;
+        }
+        char k[64];
+        char v[K8S_LABEL_LEN];
+        if (k8s_split_kv(item, k, sizeof(k), v, sizeof(v)) && v[0]) {
+            size_t kl = strlen(k);
+            while (kl > 0 && k[kl - SKIP_ONE] == ' ') {
+                k[--kl] = '\0';
+            }
+            k8s_scanned_push(out, block, k, v);
+        }
+        item = comma ? comma + SKIP_ONE : NULL;
+    }
+}
+
+/* Scan ONE manifest document's text for its name, namespace, kind and
  * label pairs into `rec` / `out`. A small indentation path-stack gives every
  * leaf its parent path, which tells spec.selector from the pod template's
  * labels and from the object's own metadata.labels. */
@@ -305,7 +345,7 @@ static void k8s_scan_labels(const char *source, k8s_record_t *rec, k8s_scanned_t
         memcpy(line, p, cp);
         line[cp] = '\0';
 
-        /* End of first YAML document — stop (one Resource per file). */
+        /* End of the document — stop (the caller hands over one document). */
         const char *trimmed = line;
         while (*trimmed == ' ') {
             trimmed++;
@@ -329,7 +369,7 @@ static void k8s_scan_labels(const char *source, k8s_record_t *rec, k8s_scanned_t
                 depth--;
             }
             char key[64];
-            char val[K8S_LABEL_LEN];
+            char val[CBM_SZ_512]; /* a whole flow map fits: the line is the limit */
             if (k8s_split_kv(trimmed, key, sizeof(key), val, sizeof(val))) {
                 if (val[0] == '\0') {
                     /* Block-opening key: push onto the path stack. */
@@ -340,6 +380,8 @@ static void k8s_scan_labels(const char *source, k8s_record_t *rec, k8s_scanned_t
                     }
                 } else if (ind == 0 && strcmp(key, "kind") == 0) {
                     rec->kind = k8s_rec_kind(val);
+                } else if (val[0] == '{') {
+                    k8s_scan_flow_map(out, (const char (*)[64])keys, depth, key, val);
                 } else if (depth == 1 && strcmp(keys[0], "metadata") == 0) {
                     if (!got_name && strcmp(key, "name") == 0) {
                         snprintf(rec->name, sizeof(rec->name), "%s", val);
@@ -417,6 +459,115 @@ static void k8s_record_manifest(k8s_record_array_t *recs, int64_t node_id, const
         cbm_free(CBM_MEM_CLASS_OTHER, scanned.items[i].kv);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, scanned.items);
+}
+
+/* Record the document at lines [start_line, end_line] (1-based, inclusive) of
+ * a multi-document manifest: every object's selector or pod labels come from
+ * its own document. */
+static void k8s_record_document(k8s_record_array_t *recs, int64_t node_id, const char *source,
+                                int start_line, int end_line) {
+    const char *begin = source;
+    for (int line = 1; begin && line < start_line; line++) {
+        begin = strchr(begin, '\n');
+        begin = begin ? begin + SKIP_ONE : NULL;
+    }
+    if (!begin) {
+        return;
+    }
+    const char *end = begin;
+    for (int line = start_line; *end && line <= end_line; line++) {
+        const char *eol = strchr(end, '\n');
+        end = eol ? eol + SKIP_ONE : end + strlen(end);
+    }
+    size_t n = (size_t)(end - begin);
+    char *doc = cbm_alloc(CBM_MEM_CLASS_OTHER, n + SKIP_ONE);
+    if (!doc) {
+        return;
+    }
+    memcpy(doc, begin, n);
+    doc[n] = '\0';
+    k8s_record_manifest(recs, node_id, doc);
+    cbm_free(CBM_MEM_CLASS_OTHER, doc);
+}
+
+/* Built-in kinds that live outside any namespace (IDENTITY.md). A CRD's own
+ * scope (spec.scope) is the curated / generated table's job. */
+static bool k8s_cluster_scoped(const char *kind) {
+    static const char *const kinds[] = {"Namespace",
+                                        "Node",
+                                        "PersistentVolume",
+                                        "ClusterRole",
+                                        "ClusterRoleBinding",
+                                        "CustomResourceDefinition",
+                                        "StorageClass",
+                                        "PriorityClass",
+                                        "ValidatingWebhookConfiguration",
+                                        "MutatingWebhookConfiguration",
+                                        "APIService",
+                                        "CSIDriver",
+                                        "CSINode",
+                                        "IngressClass",
+                                        "RuntimeClass",
+                                        "VolumeAttachment",
+                                        "ValidatingAdmissionPolicy",
+                                        "ValidatingAdmissionPolicyBinding",
+                                        "ClusterIssuer"};
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        if (strcmp(kind, kinds[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A Resource's properties from its identity key, the part of its QN after
+ * "::": `<group>/<Kind>/<declared namespace or ->/<name>` (IDENTITY.md).
+ * `obj_key` is the logical identity: the namespace it lives in, `_` for a
+ * cluster-scoped kind, `?` when the deploy decides. NULL for a QN without a
+ * well-formed key (the caller keeps the plain source tag). */
+static char *k8s_resource_props(const char *qn) {
+    enum { K8S_KEY_PARTS = 4, K8S_ESC = 6 * K8S_LABEL_LEN };
+    const char *key = qn ? strstr(qn, "::") : NULL;
+    if (!key) {
+        return NULL;
+    }
+    key += K8S_SLEN("::");
+    char part[K8S_KEY_PARTS][K8S_LABEL_LEN];
+    int parts = 0;
+    for (const char *p = key; parts < K8S_KEY_PARTS; parts++) {
+        const char *slash = parts < K8S_KEY_PARTS - SKIP_ONE ? strchr(p, '/') : NULL;
+        size_t len = slash ? (size_t)(slash - p) : strlen(p);
+        if (len == 0 || len >= K8S_LABEL_LEN || (!slash && parts < K8S_KEY_PARTS - SKIP_ONE)) {
+            return NULL;
+        }
+        memcpy(part[parts], p, len);
+        part[parts][len] = '\0';
+        p = slash ? slash + SKIP_ONE : p + len;
+    }
+    const char *group = part[0];
+    const char *kind = part[1];
+    const char *ns = strcmp(part[2], "-") == 0 ? "" : part[2];
+    const char *name = part[3];
+    const char *effective = k8s_cluster_scoped(kind) ? "_" : ns[0] ? ns : "?";
+    char esc[K8S_KEY_PARTS + SKIP_ONE][K8S_ESC];
+    cbm_json_escape(esc[0], K8S_ESC, group);
+    cbm_json_escape(esc[1], K8S_ESC, kind);
+    cbm_json_escape(esc[2], K8S_ESC, ns);
+    cbm_json_escape(esc[3], K8S_ESC, name);
+    cbm_json_escape(esc[4], K8S_ESC, effective);
+    size_t n = K8S_KEY_PARTS * K8S_ESC + K8S_ESC + CBM_SZ_256;
+    char *props = cbm_alloc(CBM_MEM_CLASS_OTHER, n);
+    if (!props) {
+        return NULL;
+    }
+    int w =
+        snprintf(props, n, "{\"source\":\"k8s\",\"group\":\"%s\",\"kind\":\"%s\"", esc[0], esc[1]);
+    if (ns[0]) {
+        w += snprintf(props + w, n - (size_t)w, ",\"namespace\":\"%s\"", esc[2]);
+    }
+    snprintf(props + w, n - (size_t)w, ",\"obj_key\":\"%s/%s/%s/%s\"}", esc[0], esc[1], esc[4],
+             esc[3]);
+    return props;
 }
 
 static void k8s_records_free(k8s_record_array_t *recs) {
@@ -541,12 +692,11 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
 /* ── K8s manifest handler ────────────────────────────────────────── */
 
 /* source/src_len are the already-read file bytes (caller retains ownership and
- * must free after this call returns). The first Resource's manifest is
+ * must free after this call returns). Every Resource's own document is
  * recorded in `recs` for cross-manifest selector matching. */
 static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, const char *source,
                                 const CBMFileResult *res, k8s_record_array_t *recs) {
     int resource_count = 0;
-    int64_t first_node_id = 0;
 
     if (!res) {
         return;
@@ -566,26 +716,23 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, c
             continue;
         }
 
-        int64_t node_id =
-            cbm_gbuf_upsert_node(ctx->gbuf, "Resource", def->name, def->qualified_name, rel_path,
-                                 (int)def->start_line, (int)def->end_line, "{\"source\":\"k8s\"}");
+        char *props = k8s_resource_props(def->qualified_name);
+        int64_t node_id = cbm_gbuf_upsert_node(
+            ctx->gbuf, "Resource", def->name, def->qualified_name, rel_path, (int)def->start_line,
+            (int)def->end_line, props ? props : "{\"source\":\"k8s\"}");
+        cbm_free(CBM_MEM_CLASS_OTHER, props);
 
         /* DEFINES edge: File → Resource */
         if (file_node && node_id > 0) {
             cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, node_id, "DEFINES", "{}");
         }
 
-        /* Capture the first Resource for cross-manifest selector matching. */
-        if (first_node_id <= 0 && node_id > 0) {
-            first_node_id = node_id;
+        /* Record its selector / pod-label pairs for Service → workload linking. */
+        if (node_id > 0 && source) {
+            k8s_record_document(recs, node_id, source, (int)def->start_line, (int)def->end_line);
         }
 
         resource_count++;
-    }
-
-    /* Record selector / pod-label pairs for later Service → workload linking. */
-    if (first_node_id > 0 && source) {
-        k8s_record_manifest(recs, first_node_id, source);
     }
 
     cbm_log_info("pass.k8s.manifest", "file", rel_path, "resources", itoa_k8s(resource_count));

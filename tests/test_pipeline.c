@@ -14274,15 +14274,8 @@ TEST(k8s_extract_manifest_no_name) {
 }
 
 TEST(k8s_extract_manifest_multidoc) {
-    /* Two-document YAML separated by "---".
-     * extract_k8s_manifest contains a "break" after the first successful push,
-     * so it processes only the first document that has both kind and
-     * metadata.name.  This test pins that behaviour: the first document's
-     * resource must be present and no crash must occur.
-     *
-     * Note: with some tree-sitter YAML grammar versions the root stream may
-     * expose both documents as siblings; the break still fires after the first
-     * successful def push, so defs.count must be exactly 1. */
+    /* Two-document YAML separated by "---": every document is an object, with
+     * the identity QN <file-base>::<group>/<Kind>/<declared ns or ->/<name>. */
     const char *src = "apiVersion: apps/v1\n"
                       "kind: Deployment\n"
                       "metadata:\n"
@@ -14296,17 +14289,24 @@ TEST(k8s_extract_manifest_multidoc) {
                                         "k8s/multi.yaml", 0, NULL, NULL);
     ASSERT(r != NULL);
     ASSERT(!r->has_error);
-    /* First document's resource must be present */
-    int found = 0;
+    int deploy = 0;
+    int svc = 0;
     for (int i = 0; i < r->defs.count; i++) {
-        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Resource") == 0 &&
-            r->defs.items[i].name && strcmp(r->defs.items[i].name, "Deployment/my-app") == 0) {
-            found = 1;
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->label || strcmp(d->label, "Resource") != 0 || !d->name || !d->qualified_name) {
+            continue;
+        }
+        if (strcmp(d->name, "Deployment/my-app") == 0 &&
+            strcmp(d->qualified_name, "myproj.k8s.multi.yaml::apps/Deployment/-/my-app") == 0) {
+            deploy++;
+        }
+        if (strcmp(d->name, "Service/my-svc") == 0 &&
+            strcmp(d->qualified_name, "myproj.k8s.multi.yaml::core/Service/-/my-svc") == 0) {
+            svc++;
         }
     }
-    ASSERT(found);
-    /* At least one def, no more than one (only first document processed) */
-    ASSERT(r->defs.count >= 1);
+    ASSERT_EQ(deploy, 1);
+    ASSERT_EQ(svc, 1);
     cbm_free_result(r);
     PASS();
 }

@@ -762,6 +762,204 @@ TEST(probe_k8s_manifest_metadata_after_key_line_comment) {
     PASS();
 }
 
+/* ── Identity: every document is an object (IDENTITY.md) ──────────── */
+
+/* The QN and properties of the Resource named `name` after indexing `files`;
+ * false when there is no such node or it is not unique. */
+static bool gpf_resource(const GpfFile *files, int nfiles, const char *name, char *qn,
+                         size_t qn_sz, char *props, size_t props_sz) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    bool found = false;
+    int hits = 0;
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (store &&
+        cbm_store_find_nodes_by_label(store, lp.project, "Resource", &nodes, &count) ==
+            CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            if (nodes[i].name && strcmp(nodes[i].name, name) == 0) {
+                hits++;
+                const char *q = nodes[i].qualified_name ? nodes[i].qualified_name : "";
+                const char *sep = strstr(q, "::");
+                snprintf(qn, qn_sz, "%s", sep ? sep : q); /* the part after the file base */
+                snprintf(props, props_sz, "%s",
+                         nodes[i].properties_json ? nodes[i].properties_json : "{}");
+            }
+        }
+        cbm_store_free_nodes(nodes, count);
+        found = hits == 1;
+    }
+    gpf_cleanup(&lp, store);
+    return found;
+}
+
+/* A multi-document manifest is a list of objects: kubernetes-sigs and
+ * microservices-demo ship a Deployment and its Service in one file, and
+ * 3,139 objects of the 17 infra corpora sat behind a file's first `---`. */
+TEST(probe_k8s_every_document_is_an_object) {
+    GpfMetrics m = gpf_metrics("app.yaml",
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: web\n"
+        "---\n"
+        "apiVersion: v1\n"
+        "kind: Service\n"
+        "metadata:\n"
+        "  name: web\n"
+        "---\n"
+        "apiVersion: v1\n"
+        "kind: ConfigMap\n"
+        "metadata:\n"
+        "  name: web-config\n");
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.resources, 3);
+    PASS();
+}
+
+/* ...and the Service in the second document selects the Deployment in the
+ * first. */
+TEST(probe_k8s_selector_across_documents) {
+    GpfMetrics m = gpf_metrics("app.yaml",
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: web\n"
+        "spec:\n"
+        "  template:\n"
+        "    metadata:\n"
+        "      labels:\n"
+        "        app: web\n"
+        "---\n"
+        "apiVersion: v1\n"
+        "kind: Service\n"
+        "metadata:\n"
+        "  name: web\n"
+        "spec:\n"
+        "  selector:\n"
+        "    app: web\n");
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.resources, 2);
+    ASSERT_EQ(m.infra_maps, 1);
+    PASS();
+}
+
+/* Flow-style label maps (`labels: { app: kdc }`, deckhouse's kerberos demo)
+ * are label maps; a selector given that way selects just the same. */
+TEST(probe_k8s_selector_flow_mapping) {
+    GpfMetrics m = gpf_metrics("kdc.yaml",
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: kdc\n"
+        "spec:\n"
+        "  template:\n"
+        "    metadata:\n"
+        "      labels: { app: kdc, tier: \"auth\" }\n"
+        "---\n"
+        "apiVersion: v1\n"
+        "kind: Service\n"
+        "metadata:\n"
+        "  name: kdc\n"
+        "spec:\n"
+        "  selector: { app: kdc }\n"
+        "---\n"
+        "apiVersion: v1\n"
+        "kind: Service\n"
+        "metadata:\n"
+        "  name: other\n"
+        "spec:\n"
+        "  selector: {app: kdc, tier: web}\n");
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.resources, 3);
+    ASSERT_EQ(m.infra_maps, 1); /* `other` needs tier=web, which kdc lacks */
+    PASS();
+}
+
+/* An anchored name (`name: &name app`, onedr0p/home-ops reuses it in the
+ * chart values) is still the object's name; so is a tagged one. */
+TEST(probe_k8s_anchored_and_tagged_names) {
+    GpfMetrics m = gpf_metrics("release.yaml",
+        "apiVersion: helm.toolkit.fluxcd.io/v2\n"
+        "kind: HelmRelease\n"
+        "metadata:\n"
+        "  name: &name actions-runner-controller\n"
+        "spec:\n"
+        "  releaseName: *name\n"
+        "---\n"
+        "apiVersion: v1\n"
+        "kind: ConfigMap\n"
+        "metadata:\n"
+        "  name: !!str settings\n");
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.resources, 2);
+    PASS();
+}
+
+/* One name in two namespaces is two objects. */
+TEST(probe_k8s_same_name_two_namespaces) {
+    GpfMetrics m = gpf_metrics("app.yaml",
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: web\n"
+        "  namespace: staging\n"
+        "---\n"
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: web\n"
+        "  namespace: prod\n");
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.resources, 2);
+    PASS();
+}
+
+/* The node QN carries group, kind, declared namespace and name after the
+ * file; `obj_key` is the logical identity (effective namespace, `?` when the
+ * deploy decides it). */
+TEST(probe_k8s_identity_key) {
+    static const GpfFile files[] = {{"app.yaml",
+                                     "apiVersion: apps/v1\n"
+                                     "kind: Deployment\n"
+                                     "metadata:\n"
+                                     "  name: web\n"}};
+    char qn[256];
+    char props[512];
+    ASSERT_TRUE(gpf_resource(files, 1, "Deployment/web", qn, sizeof(qn), props, sizeof(props)));
+    ASSERT_STR_EQ(qn, "::apps/Deployment/-/web");
+    ASSERT_NOT_NULL(strstr(props, "\"obj_key\":\"apps/Deployment/?/web\""));
+    ASSERT_NOT_NULL(strstr(props, "\"kind\":\"Deployment\""));
+    ASSERT_NOT_NULL(strstr(props, "\"group\":\"apps\""));
+    PASS();
+}
+
+/* Core-group objects say `core`; a declared namespace is part of the QN; a
+ * cluster-scoped kind's logical key has no namespace (`_`). */
+TEST(probe_k8s_identity_core_namespaced_and_cluster_scoped) {
+    static const GpfFile svc[] = {{"svc.yaml",
+                                   "apiVersion: v1\n"
+                                   "kind: Service\n"
+                                   "metadata:\n"
+                                   "  name: web\n"
+                                   "  namespace: prod\n"}};
+    static const GpfFile ns[] = {{"ns.yaml",
+                                  "apiVersion: v1\n"
+                                  "kind: Namespace\n"
+                                  "metadata:\n"
+                                  "  name: prod\n"}};
+    char qn[256];
+    char props[512];
+    ASSERT_TRUE(gpf_resource(svc, 1, "Service/web", qn, sizeof(qn), props, sizeof(props)));
+    ASSERT_STR_EQ(qn, "::core/Service/prod/web");
+    ASSERT_NOT_NULL(strstr(props, "\"obj_key\":\"core/Service/prod/web\""));
+    ASSERT_NOT_NULL(strstr(props, "\"namespace\":\"prod\""));
+    ASSERT_TRUE(gpf_resource(ns, 1, "Namespace/prod", qn, sizeof(qn), props, sizeof(props)));
+    ASSERT_NOT_NULL(strstr(props, "\"obj_key\":\"core/Namespace/_/prod\""));
+    PASS();
+}
+
 /* The same comment in front of a kustomization hid its resource list:
  * home-ops resolved 1 of 348 entries. */
 TEST(probe_kustomize_imports_after_leading_comment) {
@@ -2156,6 +2354,13 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_kustomize_entries_after_commented_out_entry);
     RUN_TEST(probe_kustomize_entries_after_key_line_comment);
     RUN_TEST(probe_k8s_manifest_metadata_after_key_line_comment);
+    RUN_TEST(probe_k8s_every_document_is_an_object);
+    RUN_TEST(probe_k8s_selector_across_documents);
+    RUN_TEST(probe_k8s_same_name_two_namespaces);
+    RUN_TEST(probe_k8s_identity_key);
+    RUN_TEST(probe_k8s_identity_core_namespaced_and_cluster_scoped);
+    RUN_TEST(probe_k8s_anchored_and_tagged_names);
+    RUN_TEST(probe_k8s_selector_flow_mapping);
 
     /* Nix */
     RUN_TEST(probe_nix_attrset_node);
