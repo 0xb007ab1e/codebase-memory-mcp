@@ -2545,7 +2545,144 @@ typedef struct {
     _Atomic int next;
 } k8s_prep_job_t;
 
-enum { K8S_CHUNK = 1024 };
+enum { K8S_CHUNK = 1024, K8S_TS_PAD = 16 };
+
+/* ── Templated manifests (PHASE 2 P2.3) ────────────────────────────── */
+
+/* A Helm chart template or Go-template addon is YAML only once rendered:
+ * `{{- if .Values.x }}` opens the document, `name: {{ include "app.fullname"
+ * . }}` is a flow mapping to a YAML parser. The skeleton is the text with
+ * every action rewritten, line for line (document lines stay exact): a line
+ * holding nothing but actions is blanked; an action inside text becomes a
+ * symbolic scalar -- `<app.fullname>` for an include/template call, the
+ * first `.`/`$` path otherwise (`<.Values.image.tag>`), else `<tpl>`. Objects
+ * then get the chart-scoped symbolic names IDENTITY.md describes, and a
+ * reference written with the same expression meets them in the chart. */
+
+static bool k8s_tpl_ident(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+/* Does the action text at q (before e) call a named template: `include` /
+ * `template` then a quoted name? Fills `out` with `<name>`. */
+static bool k8s_action_call(const char *a, const char *q, const char *e, char *out, size_t out_sz) {
+    size_t kl = strncmp(q, "include", K8S_SLEN("include")) == 0     ? K8S_SLEN("include")
+                : strncmp(q, "template", K8S_SLEN("template")) == 0 ? K8S_SLEN("template")
+                                                                    : 0;
+    if (!kl || q + kl >= e || q[kl] != ' ' || (q > a && k8s_tpl_ident(q[-SKIP_ONE]))) {
+        return false;
+    }
+    const char *r = q + kl;
+    while (r < e && *r == ' ') {
+        r++;
+    }
+    const char *ne =
+        r < e && *r == '"' ? memchr(r + SKIP_ONE, '"', (size_t)(e - r - SKIP_ONE)) : NULL;
+    if (!ne || ne == r + SKIP_ONE) {
+        return false;
+    }
+    snprintf(out, out_sz, "<%.*s>", (int)(ne - r - SKIP_ONE), r + SKIP_ONE);
+    return true;
+}
+
+/* The symbolic token of the action text [a, e) into out (NUL-terminated). */
+static void k8s_action_token(const char *a, const char *e, char *out, size_t out_sz) {
+    for (const char *q = a; q < e; q++) {
+        if (k8s_action_call(a, q, e, out, out_sz)) {
+            return;
+        }
+    }
+    for (const char *q = a; q < e; q++) {
+        if ((*q == '.' || *q == '$') && (q == a || q[-SKIP_ONE] == ' ' || q[-SKIP_ONE] == '(')) {
+            const char *r = q + SKIP_ONE;
+            while (r < e && (k8s_tpl_ident(*r) || *r == '.' || *r == '$')) {
+                r++;
+            }
+            if (r > q + SKIP_ONE || *q == '$') {
+                snprintf(out, out_sz, "<%.*s>", (int)(r - q), q);
+                return;
+            }
+        }
+    }
+    snprintf(out, out_sz, "<tpl>");
+}
+
+/* The end of the logical line starting at ls: its newline, or -- when an
+ * action starting on it spans lines -- the newline after that action. Sets
+ * *only_actions when the line holds actions and nothing else but blanks. */
+static const char *k8s_logical_line(const char *ls, const char *end, bool *only_actions) {
+    const char *le = memchr(ls, '\n', (size_t)(end - ls));
+    le = le ? le : end;
+    bool blank = true;
+    bool any = false;
+    for (const char *p = ls; p < le;) {
+        if (p + SKIP_ONE < le && p[0] == '{' && p[SKIP_ONE] == '{') {
+            const char *ae = strstr(p + PAIR_LEN, "}}");
+            if (!ae || ae >= end) {
+                blank = false;
+                break;
+            }
+            any = true;
+            p = ae + PAIR_LEN;
+            if (p > le) {
+                const char *nl = memchr(p, '\n', (size_t)(end - p));
+                le = nl ? nl : end;
+            }
+            continue;
+        }
+        blank = blank && (*p == ' ' || *p == '\t' || *p == '\r');
+        p++;
+    }
+    *only_actions = any && blank;
+    return le;
+}
+
+/* The skeleton of templated text (cbm_alloc'd, *out_len set); NULL on OOM. */
+static char *k8s_skeleton(const char *src, int len, int *out_len) {
+    size_t cap = (size_t)len * PAIR_LEN + CBM_SZ_64 + K8S_TS_PAD;
+    char *out = cbm_alloc(CBM_MEM_CLASS_OTHER, cap);
+    if (!out) {
+        return NULL;
+    }
+    size_t w = 0;
+    const char *end = src + len;
+    for (const char *ls = src; ls < end;) {
+        bool only_actions = false;
+        const char *le = k8s_logical_line(ls, end, &only_actions);
+        for (const char *p = ls; p < le;) {
+            const char *ae = p + SKIP_ONE < le && p[0] == '{' && p[SKIP_ONE] == '{'
+                                 ? strstr(p + PAIR_LEN, "}}")
+                                 : NULL;
+            if (!ae || ae >= end) {
+                if (!only_actions) {
+                    out[w++] = *p;
+                }
+                p++;
+                continue;
+            }
+            if (!only_actions) {
+                char tok[CBM_SZ_256];
+                k8s_action_token(p + PAIR_LEN, ae, tok, sizeof(tok));
+                size_t tl = strlen(tok);
+                memcpy(out + w, tok, tl);
+                w += tl;
+            }
+            for (const char *q = p; q < ae; q++) { /* the action's own newlines stay */
+                if (*q == '\n') {
+                    out[w++] = '\n';
+                }
+            }
+            p = ae + PAIR_LEN;
+        }
+        if (le < end) {
+            out[w++] = '\n';
+        }
+        ls = le < end ? le + SKIP_ONE : end;
+    }
+    memset(out + w, 0, K8S_TS_PAD); /* lexer lookahead, as k8s_read_file pads */
+    *out_len = (int)w;
+    return out;
+}
 
 static void k8s_prep_file(const k8s_prep_job_t *job, int i, k8s_prep_t *out) {
     cbm_pipeline_ctx_t *ctx = job->ctx;
@@ -2574,6 +2711,15 @@ static void k8s_prep_file(const k8s_prep_job_t *job, int i, k8s_prep_t *out) {
              * result: cached results were produced during the parallel YAML
              * pass and contain no "Resource" definitions. */
             out->kind = K8S_MANIFEST;
+            if (strstr(out->source, "{{")) {
+                int sk_len = 0;
+                char *sk = k8s_skeleton(out->source, out->src_len, &sk_len);
+                if (sk) {
+                    cbm_free(CBM_MEM_CLASS_OTHER, out->source);
+                    out->source = sk;
+                    out->src_len = sk_len;
+                }
+            }
             out->res = cbm_extract_file(out->source, out->src_len, CBM_LANG_K8S, ctx->project_name,
                                         rel, CBM_EXTRACT_BUDGET, NULL, NULL);
         } else {

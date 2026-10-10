@@ -1657,6 +1657,30 @@ TEST(probe_mcp_trace_topology) {
 
 /* ── Helm symbolic (Phase 2) ────────────────────────────────────────── */
 
+/* A chart template is YAML only once rendered: a document opened by
+ * `{{- if }}`, with a name built by `include`. Its objects are Resources with
+ * the chart-scoped symbolic name (`<app.fullname>-config`), and a reference
+ * written with the same expression meets them; a templated namespace is the
+ * deploy's. */
+TEST(probe_helm_templated_objects_are_resources) {
+    static const GpfFile files[] = {
+        {"chart/Chart.yaml", "apiVersion: v2\nname: app\nversion: 0.1.0\n"},
+        {"chart/templates/_helpers.tpl", "{{- define \"app.fullname\" -}}app{{- end }}\n"},
+        {"chart/templates/configmap.yaml",
+         "{{- if .Values.enabled }}\napiVersion: v1\nkind: ConfigMap\nmetadata:\n"
+         "  name: {{ include \"app.fullname\" . }}-config\n"
+         "  namespace: {{ .Release.Namespace }}\n  labels:\n"
+         "    {{- include \"app.labels\" . | nindent 4 }}\n"
+         "data:\n  key: {{ .Values.value | quote }}\n{{- end }}\n"},
+        {"chart/templates/deployment.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n"
+         "  name: {{ include \"app.fullname\" . }}\nspec:\n  template:\n    spec:\n"
+         "      volumes:\n        - name: cfg\n          configMap:\n"
+         "            name: {{ include \"app.fullname\" . }}-config\n"}};
+    ASSERT_EQ(gpf_typed_edges(files, 4, "USAGE", "Resource", "Resource", "\"ref\":\"volume\""), 1);
+    PASS();
+}
+
 /* A template's `include "name"` calls the define of that name in its chart
  * family -- the chart and its subcharts share one template namespace -- never
  * a same-named define of an unrelated chart; a define may also be written in
@@ -3301,6 +3325,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_ingress_and_httproute_expose_routes);
     RUN_TEST(probe_mcp_search_filters_kind_and_namespace);
     RUN_TEST(probe_mcp_trace_topology);
+    RUN_TEST(probe_helm_templated_objects_are_resources);
     RUN_TEST(probe_helm_include_resolves_in_the_chart_family);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
     RUN_TEST(probe_k8s_selector_within_kustomize_build);

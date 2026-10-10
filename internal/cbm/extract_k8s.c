@@ -744,7 +744,8 @@ static void k8s_emit_ref(k8s_walk_t *w, const char *kind, const char *ns, const 
     CBMK8sFact f = {.fact = CBM_K8S_FACT_REF,
                     .def_index = w->def_index,
                     .kind = cbm_arena_strdup(a, kind),
-                    .ns = ns && ns[0] && !strstr(ns, "{{") ? cbm_arena_strdup(a, ns) : NULL,
+                    .ns = ns && ns[0] && ns[0] != '<' && !strstr(ns, "{{") ? cbm_arena_strdup(a, ns)
+                                                                           : NULL,
                     .name = cbm_arena_strdup(a, name),
                     .via = via,
                     .edge = edge};
@@ -912,7 +913,8 @@ static void k8s_emit_route(k8s_walk_t *w, const char *host, const char *path, co
     CBMK8sFact f = {.fact = CBM_K8S_FACT_ROUTE,
                     .def_index = w->def_index,
                     .kind = name ? "Service" : NULL,
-                    .ns = ns && ns[0] && !strstr(ns, "{{") ? cbm_arena_strdup(a, ns) : NULL,
+                    .ns = ns && ns[0] && ns[0] != '<' && !strstr(ns, "{{") ? cbm_arena_strdup(a, ns)
+                                                                           : NULL,
                     .name = name && !strstr(name, "{{") ? cbm_arena_strdup(a, name) : NULL,
                     .via = via,
                     .edge = "INFRA_MAPS",
@@ -1134,6 +1136,10 @@ static const char *k8s_file_base(CBMArena *a, const char *project, const char *r
 // group ("v1"), "?" when the document names none. The version is not part of
 // an object's identity.
 static void k8s_api_group(const char *api_version, char *out, size_t out_sz) {
+    if (api_version[0] == '<') { // templated (a skeleton's symbolic `<...>`)
+        snprintf(out, out_sz, "?");
+        return;
+    }
     const char *slash = strchr(api_version, '/');
     if (slash) {
         snprintf(out, out_sz, "%.*s", (int)(slash - api_version), api_version);
@@ -1167,9 +1173,14 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         memset(&id, 0, sizeof(id));
         extract_k8s_scalars(ctx, mapping, &id);
 
-        // Skip malformed manifests (no kind or no metadata.name)
-        if (id.kind[0] == '\0' || id.name[0] == '\0') {
+        // Skip malformed manifests (no kind or no metadata.name), and a
+        // templated kind (a skeleton's symbolic `<...>`): unidentifiable.
+        if (id.kind[0] == '\0' || id.name[0] == '\0' || id.kind[0] == '<') {
             continue;
+        }
+        // A templated namespace (`<.Release.Namespace>`) is the deploy's.
+        if (id.ns[0] == '<') {
+            id.ns[0] = '\0';
         }
 
         char group[K8S_BUF_SIZE];
