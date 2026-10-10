@@ -676,6 +676,7 @@ typedef struct {
     CBMHashTable *names;   /* bundle name -> itself (owned key) */
     CBMHashTable *members; /* manifest path -> k8s_members_t* */
     CBMHashTable *charts;  /* Helm chart directory -> itself (owned key) */
+    CBMHashTable *deploys; /* manifest path -> k8s_members_t* of its deploy scopes */
 } k8s_bundles_t;
 
 static bool k8s_grow(void **items, int *cap, int count, size_t elem) {
@@ -818,14 +819,15 @@ static const char *k8s_bundle_name(k8s_bundles_t *b, const char *kind, const cha
     return owned;
 }
 
-static void k8s_member_add(k8s_bundles_t *b, const char *file, const char *bundle, const char *ns) {
-    k8s_members_t *m = cbm_ht_get(b->members, file);
+static void k8s_member_add(CBMHashTable *table, const char *file, const char *bundle,
+                           const char *ns) {
+    k8s_members_t *m = cbm_ht_get(table, file);
     if (!m) {
         m = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*m));
         if (!m) {
             return;
         }
-        cbm_ht_set(b->members, file, m);
+        cbm_ht_set(table, file, m);
     }
     for (int i = 0; i < m->count; i++) {
         if (m->items[i].bundle == bundle) {
@@ -867,7 +869,7 @@ static void k8s_bundles_from_kusts(k8s_bundles_t *b, k8s_kusts_t *ks) {
             seen[f.kust] = r + SKIP_ONE;
             const k8s_kust_t *k = &ks->items[f.kust];
             for (int i = 0; i < k->file_n; i++) {
-                k8s_member_add(b, k->files[i], bundle, f.ns);
+                k8s_member_add(b->members, k->files[i], bundle, f.ns);
             }
             for (int i = k->kid_n - SKIP_ONE; i >= 0; i--) {
                 if (k8s_grow((void **)&stack, &cap, depth, sizeof(*stack))) {
@@ -937,6 +939,10 @@ static void k8s_bundles_free(k8s_bundles_t *b) {
     if (b->members) {
         cbm_ht_foreach(b->members, k8s_free_members, NULL);
         cbm_ht_free(b->members);
+    }
+    if (b->deploys) {
+        cbm_ht_foreach(b->deploys, k8s_free_members, NULL);
+        cbm_ht_free(b->deploys);
     }
     if (b->names) {
         cbm_ht_foreach(b->names, k8s_free_owned_key, NULL);
@@ -1078,7 +1084,7 @@ typedef struct {
     char *ns;         /* explicit target namespace, NULL = the source's */
     char *name;       /* target metadata.name */
     const char *via;  /* static: the extractor's table */
-    const char *edge; /* static: "USAGE" or "INFRA_MAPS" */
+    const char *edge; /* static: "USAGE", "INFRA_MAPS" or "DEPENDS_ON" */
 } k8s_ref_t;
 
 /* A CRD and the group/kind it declares. */
@@ -1088,6 +1094,14 @@ typedef struct {
     char *kind;
 } k8s_crd_t;
 
+/* An object that deploys a repository directory (Flux Kustomization, Argo
+ * Application). */
+typedef struct {
+    int64_t node;
+    char *dir; /* normalised, "" = the repository root */
+    char *ns;  /* the namespace it deploys into, NULL = the objects' own */
+} k8s_deploy_t;
+
 typedef struct {
     k8s_ref_t *refs;
     int ref_n;
@@ -1095,6 +1109,9 @@ typedef struct {
     k8s_crd_t *crds;
     int crd_n;
     int crd_cap;
+    k8s_deploy_t *deploys;
+    int dep_n;
+    int dep_cap;
 } k8s_facts_t;
 
 static void k8s_facts_free(k8s_facts_t *f) {
@@ -1107,9 +1124,58 @@ static void k8s_facts_free(k8s_facts_t *f) {
         cbm_free(CBM_MEM_CLASS_OTHER, f->crds[i].group);
         cbm_free(CBM_MEM_CLASS_OTHER, f->crds[i].kind);
     }
+    for (int i = 0; i < f->dep_n; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, f->deploys[i].dir);
+        cbm_free(CBM_MEM_CLASS_OTHER, f->deploys[i].ns);
+    }
     cbm_free(CBM_MEM_CLASS_OTHER, f->refs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->crds);
+    cbm_free(CBM_MEM_CLASS_OTHER, f->deploys);
     *f = (k8s_facts_t){0};
+}
+
+/* A deploy path as a repository directory: "./a//b/" -> "a/b", "." -> "";
+ * false for URLs, templates, variables and paths leaving the repository. */
+static bool k8s_norm_dir(const char *in, char *out, size_t out_sz) {
+    if (!in || strstr(in, "://") || strstr(in, "{{") || strchr(in, '$') || out_sz == 0) {
+        return false;
+    }
+    size_t n = 0;
+    out[0] = '\0';
+    for (const char *p = in; *p;) {
+        while (*p == '/') {
+            p++;
+        }
+        size_t sl = strcspn(p, "/");
+        if (sl == 0) {
+            break;
+        }
+        if (sl == SKIP_ONE && p[0] == '.') {
+            p += sl;
+            continue;
+        }
+        if (sl == PAIR_LEN && p[0] == '.' && p[SKIP_ONE] == '.') {
+            if (n == 0) {
+                return false;
+            }
+            char *slash = strrchr(out, '/');
+            n = slash ? (size_t)(slash - out) : 0;
+            out[n] = '\0';
+            p += sl;
+            continue;
+        }
+        if (n + SKIP_ONE + sl >= out_sz) {
+            return false;
+        }
+        if (n) {
+            out[n++] = '/';
+        }
+        memcpy(out + n, p, sl);
+        n += sl;
+        out[n] = '\0';
+        p += sl;
+    }
+    return true;
 }
 
 /* Keep a file's facts, its def indices mapped to the Resource nodes. */
@@ -1120,7 +1186,15 @@ static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64
             continue;
         }
         int64_t node = node_of[x->def_index];
-        if (x->fact == CBM_K8S_FACT_CRD) {
+        if (x->fact == CBM_K8S_FACT_DEPLOY) {
+            char dir[CBM_SZ_1K];
+            if (k8s_norm_dir(x->name, dir, sizeof(dir)) &&
+                k8s_grow((void **)&f->deploys, &f->dep_cap, f->dep_n, sizeof(*f->deploys))) {
+                f->deploys[f->dep_n++] =
+                    (k8s_deploy_t){node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, dir),
+                                   x->ns ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->ns) : NULL};
+            }
+        } else if (x->fact == CBM_K8S_FACT_CRD) {
             if (k8s_grow((void **)&f->crds, &f->crd_cap, f->crd_n, sizeof(*f->crds))) {
                 f->crds[f->crd_n++] =
                     (k8s_crd_t){node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name),
@@ -1135,6 +1209,300 @@ static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64
                             .via = x->via,
                             .edge = x->edge};
         }
+    }
+}
+
+/* ── Deploy scopes (PHASE1 P1.3) ───────────────────────────────────── */
+
+/* A Flux Kustomization or Argo Application deploys a repository directory:
+ * the build of a kustomization there, else every manifest below it, a
+ * sub-directory's kustomization by its build (as Flux generates one). The
+ * objects a root deploy reaches through such directories -- and the deploys
+ * among them, transitively -- form one deploy scope, a cluster: references
+ * meet across kustomize roots inside it (a Kustomization's dependsOn, a
+ * Certificate's ClusterIssuer). A path that names no directory of the
+ * repository (another source's layout) deploys nothing. */
+
+typedef struct {
+    const char **items; /* graph-owned paths */
+    int count;
+    int cap;
+} k8s_paths_t;
+
+static void k8s_paths_push(k8s_paths_t *v, const char *p) {
+    if (k8s_grow((void **)&v->items, &v->cap, v->count, sizeof(*v->items))) {
+        v->items[v->count++] = p;
+    }
+}
+
+static void k8s_paths_sort_unique(k8s_paths_t *v) {
+    if (v->count == 0) {
+        return;
+    }
+    qsort((void *)v->items, (size_t)v->count, sizeof(*v->items), k8s_cmp_str);
+    int w = SKIP_ONE;
+    for (int i = SKIP_ONE; i < v->count; i++) {
+        if (strcmp(v->items[w - SKIP_ONE], v->items[i]) != 0) {
+            v->items[w++] = v->items[i];
+        }
+    }
+    v->count = w;
+}
+
+/* The manifests the build of kustomization `root` reaches; `seen` marks the
+ * kustomizations visited under `mark`. */
+static void k8s_kust_closure(const k8s_kusts_t *ks, int root, int *seen, int mark,
+                             k8s_paths_t *out) {
+    int *stack = NULL;
+    int depth = 0;
+    int cap = 0;
+    if (!k8s_grow((void **)&stack, &cap, depth, sizeof(int))) {
+        return;
+    }
+    stack[depth++] = root;
+    while (depth > 0) {
+        int k = stack[--depth];
+        if (seen[k] == mark) {
+            continue;
+        }
+        seen[k] = mark;
+        for (int i = 0; i < ks->items[k].file_n; i++) {
+            k8s_paths_push(out, ks->items[k].files[i]);
+        }
+        for (int i = 0; i < ks->items[k].kid_n; i++) {
+            if (k8s_grow((void **)&stack, &cap, depth, sizeof(int))) {
+                stack[depth++] = ks->items[k].kids[i];
+            }
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, stack);
+}
+
+/* The manifests a deploy of directory `dir` applies; `manifests` is every
+ * manifest path, sorted (a directory's are one range). */
+static void k8s_dir_members(const k8s_kusts_t *ks, CBMHashTable *by_path,
+                            const k8s_paths_t *manifests, const char *dir, int *seen, int mark,
+                            k8s_paths_t *out) {
+    size_t dl = strlen(dir);
+    int lo = 0;
+    int hi = dl ? manifests->count : 0;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / PAIR_LEN;
+        int c = strncmp(manifests->items[mid], dir, dl);
+        if (c < 0 || (c == 0 && manifests->items[mid][dl] < '/')) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    for (int i = lo; i < manifests->count; i++) {
+        const char *file = manifests->items[i];
+        if (dl && (strncmp(file, dir, dl) != 0 || file[dl] != '/')) {
+            break;
+        }
+        /* the outermost kustomization between `dir` and the file applies it */
+        char up[CBM_SZ_1K];
+        k8s_dirname(file, up, sizeof(up));
+        int top = 0;
+        for (;;) {
+            int k = k8s_kust_in_dir(by_path, up);
+            top = k ? k : top;
+            if (strlen(up) <= dl) {
+                break;
+            }
+            char parent[CBM_SZ_1K];
+            k8s_dirname(up, parent, sizeof(parent));
+            snprintf(up, sizeof(up), "%s", parent);
+        }
+        if (!top) {
+            k8s_paths_push(out, file);
+        } else if (seen[top - SKIP_ONE] != mark) {
+            k8s_kust_closure(ks, top - SKIP_ONE, seen, mark, out);
+        }
+    }
+    k8s_paths_sort_unique(out);
+}
+
+/* A deploy's sort key: where it is declared, then which one. */
+typedef struct {
+    const char *file;
+    const char *qn;
+    const char *dir;
+    int deploy;
+} k8s_deploy_key_t;
+
+static int k8s_cmp_deploy_key(const void *a, const void *b) {
+    const k8s_deploy_key_t *x = a;
+    const k8s_deploy_key_t *y = b;
+    int c = strcmp(x->file, y->file);
+    c = c ? c : strcmp(x->qn, y->qn);
+    c = c ? c : strcmp(x->dir, y->dir);
+    return c ? c : (x->deploy > y->deploy) - (x->deploy < y->deploy);
+}
+
+/* The deploys declared in `file`: a range of `keys` (sorted by file). */
+static int k8s_deploys_in(const k8s_deploy_key_t *keys, int n, const char *file, int *first) {
+    int lo = 0;
+    int hi = n;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / PAIR_LEN;
+        if (strcmp(keys[mid].file, file) < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    int end = lo;
+    while (end < n && strcmp(keys[end].file, file) == 0) {
+        end++;
+    }
+    *first = lo;
+    return end - lo;
+}
+
+typedef struct {
+    int *items;
+    int count;
+    int cap;
+} k8s_ints_t;
+
+/* Build the deploy scopes (after the kustomize bundles). */
+static void k8s_deploys_build(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundles_t *b,
+                              const k8s_facts_t *f) {
+    int n = f->dep_n;
+    const cbm_gbuf_node_t **res = NULL;
+    int rn = 0;
+    if (n == 0 || !b->names || cbm_gbuf_find_by_label(ctx->gbuf, "Resource", &res, &rn) != 0) {
+        return;
+    }
+    b->deploys = cbm_ht_create(0);
+    k8s_paths_t manifests = {0};
+    for (int i = 0; i < rn; i++) {
+        if (res[i]->file_path) {
+            k8s_paths_push(&manifests, res[i]->file_path);
+        }
+    }
+    k8s_paths_sort_unique(&manifests);
+    CBMHashTable *by_path = cbm_ht_create(0);
+    for (int i = 0; by_path && i < ks->count; i++) {
+        cbm_ht_set(by_path, ks->items[i].path, (void *)(intptr_t)(i + SKIP_ONE));
+    }
+    size_t un = (size_t)n;
+    k8s_paths_t *members = cbm_calloc(CBM_MEM_CLASS_OTHER, un * sizeof(*members));
+    k8s_ints_t *adj = cbm_calloc(CBM_MEM_CLASS_OTHER, un * sizeof(*adj));
+    const cbm_gbuf_node_t **node = cbm_calloc(CBM_MEM_CLASS_OTHER, un * sizeof(*node));
+    k8s_deploy_key_t *keys = cbm_calloc(CBM_MEM_CLASS_OTHER, un * sizeof(*keys));
+    int *indeg = cbm_calloc(CBM_MEM_CLASS_OTHER, un * sizeof(int));
+    int *reached = cbm_calloc(CBM_MEM_CLASS_OTHER, un * sizeof(int));
+    int *visit = cbm_calloc(CBM_MEM_CLASS_OTHER, un * sizeof(int));
+    int *queue = cbm_calloc(CBM_MEM_CLASS_OTHER, un * sizeof(int));
+    int *seen =
+        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)(ks->count ? ks->count : SKIP_ONE) * sizeof(int));
+    int roots = 0;
+    if (b->deploys && by_path && members && adj && node && keys && indeg && reached && visit &&
+        queue && seen) {
+        for (int d = 0; d < n; d++) {
+            node[d] = cbm_gbuf_find_by_id(ctx->gbuf, f->deploys[d].node);
+            keys[d] = (k8s_deploy_key_t){
+                node[d] && node[d]->file_path ? node[d]->file_path : "",
+                node[d] && node[d]->qualified_name ? node[d]->qualified_name : "",
+                f->deploys[d].dir, d};
+            k8s_dir_members(ks, by_path, &manifests, f->deploys[d].dir, seen, d + SKIP_ONE,
+                            &members[d]);
+        }
+        qsort(keys, un, sizeof(*keys), k8s_cmp_deploy_key);
+        /* deploy d reaches deploy e when e sits in a manifest d applies */
+        for (int d = 0; d < n; d++) {
+            for (int i = 0; i < members[d].count; i++) {
+                int first = 0;
+                int cnt = k8s_deploys_in(keys, n, members[d].items[i], &first);
+                for (int j = first; j < first + cnt; j++) {
+                    int e = keys[j].deploy;
+                    if (e != d &&
+                        k8s_grow((void **)&adj[d].items, &adj[d].cap, adj[d].count, sizeof(int))) {
+                        adj[d].items[adj[d].count++] = e;
+                        indeg[e]++;
+                    }
+                }
+            }
+        }
+        /* roots: deploys no other reaches; then, in order, any a cycle hides */
+        for (int pass = 0; pass < PAIR_LEN; pass++) {
+            for (int oi = 0; oi < n; oi++) {
+                int r = keys[oi].deploy;
+                if (reached[r] || (pass == 0 && indeg[r] != 0)) {
+                    continue;
+                }
+                const char *bundle = k8s_bundle_name(
+                    b, "deploy", node[r] ? node[r]->qualified_name : f->deploys[r].dir);
+                if (!bundle) {
+                    continue;
+                }
+                roots++;
+                int mark = pass * n + oi + SKIP_ONE;
+                int qh = 0;
+                int qt = 0;
+                queue[qt++] = r;
+                visit[r] = mark;
+                while (qh < qt) {
+                    int d = queue[qh++];
+                    reached[d] = SKIP_ONE;
+                    if (node[d] && node[d]->file_path) {
+                        k8s_member_add(b->deploys, node[d]->file_path, bundle, NULL);
+                    }
+                    for (int i = 0; i < members[d].count; i++) {
+                        k8s_member_add(b->deploys, members[d].items[i], bundle, f->deploys[d].ns);
+                    }
+                    for (int i = 0; i < adj[d].count; i++) {
+                        int e = adj[d].items[i];
+                        if (visit[e] != mark) {
+                            visit[e] = mark;
+                            queue[qt++] = e;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (int d = 0; members && d < n; d++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)members[d].items);
+    }
+    for (int d = 0; adj && d < n; d++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, adj[d].items);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, members);
+    cbm_free(CBM_MEM_CLASS_OTHER, adj);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)node);
+    cbm_free(CBM_MEM_CLASS_OTHER, keys);
+    cbm_free(CBM_MEM_CLASS_OTHER, indeg);
+    cbm_free(CBM_MEM_CLASS_OTHER, reached);
+    cbm_free(CBM_MEM_CLASS_OTHER, visit);
+    cbm_free(CBM_MEM_CLASS_OTHER, queue);
+    cbm_free(CBM_MEM_CLASS_OTHER, seen);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)manifests.items);
+    if (by_path) {
+        cbm_ht_free(by_path);
+    }
+    cbm_log_info("pass.k8s.deploys", "deploys", itoa_k8s(n), "roots", itoa_k8s(roots));
+}
+
+/* The namespace of a Resource's logical key ("" when unknown `?` or
+ * cluster-scoped `_`), else its declared one. */
+static void k8s_effective_ns(const cbm_gbuf_node_t *n, char *out, size_t out_sz) {
+    out[0] = '\0';
+    const char *k = n->properties_json ? strstr(n->properties_json, "\"obj_key\":\"") : NULL;
+    if (!k) {
+        k8s_declared_ns(n->qualified_name, out, out_sz);
+        return;
+    }
+    k += K8S_SLEN("\"obj_key\":\"");
+    for (int part = 0; k && part < PAIR_LEN; part++) { /* past group and kind */
+        k = strchr(k, '/');
+        k = k ? k + SKIP_ONE : NULL;
+    }
+    const char *end = k ? strchr(k, '/') : NULL;
+    if (end && !(end - k == SKIP_ONE && (k[0] == '?' || k[0] == '_'))) {
+        snprintf(out, out_sz, "%.*s", (int)(end - k), k);
     }
 }
 
@@ -1166,6 +1534,26 @@ static bool k8s_ref_meets(k8s_bundles_t *b, const k8s_ref_t *ref, const cbm_gbuf
             }
         }
     }
+    /* or one deploy scope: the cluster a Flux / Argo root deploys */
+    const k8s_members_t *ds = b->deploys ? cbm_ht_get(b->deploys, src->file_path) : NULL;
+    const k8s_members_t *dt = ds ? cbm_ht_get(b->deploys, tgt->file_path) : NULL;
+    if (!dt) {
+        return false;
+    }
+    k8s_effective_ns(src, src_ns, sizeof(src_ns));
+    k8s_effective_ns(tgt, tgt_ns, sizeof(tgt_ns));
+    for (int i = 0; i < ds->count; i++) {
+        for (int j = 0; j < dt->count; j++) {
+            if (ds->items[i].bundle != dt->items[j].bundle) {
+                continue;
+            }
+            const char *want = ref->ns ? ref->ns : ds->items[i].ns ? ds->items[i].ns : src_ns;
+            const char *have = dt->items[j].ns ? dt->items[j].ns : tgt_ns;
+            if (cluster || !want[0] || !have[0] || strcmp(want, have) == 0) {
+                return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -1186,7 +1574,10 @@ static void k8s_resolve_refs(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8
         }
         char props[CBM_SZ_256];
         snprintf(props, sizeof(props), "{\"%s\":\"%s\"}",
-                 strcmp(ref->edge, "INFRA_MAPS") == 0 ? "kind" : "ref", ref->via);
+                 strcmp(ref->edge, "INFRA_MAPS") == 0   ? "kind"
+                 : strcmp(ref->edge, "DEPENDS_ON") == 0 ? "via"
+                                                        : "ref",
+                 ref->via);
         /* A name is one object per kind and namespace, so two declarations
          * of it in one bundle are alternatives (versioned manifests side by
          * side): the declaration in the reference's own file, when there is
@@ -1954,6 +2345,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     /* Connect Services to the workloads their selectors target (INFRA_MAPS),
      * inside the bundles that deploy them together. */
     k8s_bundles_build(ctx, &kusts, &bundles);
+    k8s_deploys_build(ctx, &kusts, &bundles, &facts);
     k8s_apply_effective_namespaces(ctx, &bundles);
     k8s_link_selectors(ctx, &recs, &bundles);
     k8s_resolve_refs(ctx, &bundles, &facts);

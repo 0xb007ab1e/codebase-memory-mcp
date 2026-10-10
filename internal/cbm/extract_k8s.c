@@ -407,6 +407,220 @@ static const k8s_mapping_ref_t k8s_mapping_refs[] = {
      "parentRef", "USAGE"},
 };
 
+// The curated second table: the CRDs of Flux, Argo, Cluster API,
+// cert-manager and Kubermatic, written from their API types. Source kinds
+// are qualified by API group ("|g|" list), and a path may use `*`, which
+// matches within one segment (`spec.cloud.*.credentialsReference`).
+typedef struct {
+    const char *groups;
+    const char *kinds;
+    const char *path;
+    const char *kind;
+    const char *via;
+    const char *edge;
+} k8s_crd_leaf_ref_t;
+
+typedef struct {
+    const char *groups;
+    const char *kinds;
+    const char *path;
+    const char *kind;    // the target kind; NULL = the mapping's own `kind` field
+    const char *allowed; // with kind NULL: "|A|" of the kinds that are objects (NULL: any)
+    const char *dflt;    // with kind NULL: the kind when the field is absent
+    const char *via;
+    const char *edge;
+} k8s_crd_mapping_ref_t;
+
+#define K8S_FLUX_KS "|kustomize.toolkit.fluxcd.io|"
+#define K8S_FLUX_HELM "|helm.toolkit.fluxcd.io|"
+#define K8S_FLUX_SRC "|source.toolkit.fluxcd.io|"
+#define K8S_FLUX_NOTE "|notification.toolkit.fluxcd.io|"
+#define K8S_FLUX_IMAGE "|image.toolkit.fluxcd.io|"
+#define K8S_ARGO "|argoproj.io|"
+#define K8S_CAPI "|cluster.x-k8s.io|"
+#define K8S_CAPI_BOOT "|bootstrap.cluster.x-k8s.io|"
+#define K8S_CAPI_CP "|controlplane.cluster.x-k8s.io|"
+#define K8S_CAPI_ADDONS "|addons.cluster.x-k8s.io|"
+#define K8S_CM "|cert-manager.io|"
+#define K8S_KKP "|kubermatic.k8c.io|"
+#define K8S_KKP_APPS "|apps.kubermatic.k8c.io|"
+#define K8S_FLUX_SOURCES "|GitRepository|OCIRepository|HelmRepository|Bucket|"
+#define K8S_ISSUERS "|Issuer|ClusterIssuer|"
+
+static const k8s_crd_leaf_ref_t k8s_crd_leaf_refs[] = {
+    {K8S_FLUX_KS, "|Kustomization|", "spec.decryption.secretRef.name", "Secret", "secretRef",
+     "USAGE"},
+    {K8S_FLUX_KS "helm.toolkit.fluxcd.io|", "|Kustomization|HelmRelease|",
+     "spec.kubeConfig.secretRef.name", "Secret", "secretRef", "USAGE"},
+    {K8S_FLUX_KS "helm.toolkit.fluxcd.io|", "|Kustomization|HelmRelease|",
+     "spec.serviceAccountName", "ServiceAccount", "serviceAccountName", "USAGE"},
+    {K8S_FLUX_SRC, K8S_FLUX_SOURCES, "spec.secretRef.name", "Secret", "secretRef", "USAGE"},
+    {K8S_FLUX_SRC, K8S_FLUX_SOURCES, "spec.certSecretRef.name", "Secret", "secretRef", "USAGE"},
+    {K8S_FLUX_SRC, K8S_FLUX_SOURCES, "spec.proxySecretRef.name", "Secret", "secretRef", "USAGE"},
+    {K8S_FLUX_SRC, "|GitRepository|OCIRepository|", "spec.verify.secretRef.name", "Secret",
+     "secretRef", "USAGE"},
+    {K8S_FLUX_SRC, "|OCIRepository|HelmRepository|", "spec.serviceAccountName", "ServiceAccount",
+     "serviceAccountName", "USAGE"},
+    {K8S_FLUX_NOTE, "|Alert|", "spec.providerRef.name", "Provider", "providerRef", "USAGE"},
+    {K8S_FLUX_NOTE, "|Provider|Receiver|", "spec.secretRef.name", "Secret", "secretRef", "USAGE"},
+    {K8S_FLUX_NOTE, "|Provider|", "spec.certSecretRef.name", "Secret", "secretRef", "USAGE"},
+    {K8S_FLUX_IMAGE, "|ImagePolicy|", "spec.imageRepositoryRef.name", "ImageRepository",
+     "imageRepositoryRef", "USAGE"},
+    {K8S_FLUX_IMAGE, "|ImageRepository|", "spec.secretRef.name", "Secret", "secretRef", "USAGE"},
+    {K8S_FLUX_IMAGE, "|ImageRepository|", "spec.certSecretRef.name", "Secret", "secretRef",
+     "USAGE"},
+    {K8S_FLUX_IMAGE, "|ImageRepository|", "spec.serviceAccountName", "ServiceAccount",
+     "serviceAccountName", "USAGE"},
+    {K8S_ARGO, "|Application|", "spec.project", "AppProject", "project", "USAGE"},
+    {K8S_ARGO, "|ApplicationSet|", "spec.template.spec.project", "AppProject", "project", "USAGE"},
+    {K8S_ARGO, "|Rollout|", "spec.strategy.canary.canaryService", "Service", "rolloutService",
+     "USAGE"},
+    {K8S_ARGO, "|Rollout|", "spec.strategy.canary.stableService", "Service", "rolloutService",
+     "USAGE"},
+    {K8S_ARGO, "|Rollout|", "spec.strategy.blueGreen.activeService", "Service", "rolloutService",
+     "USAGE"},
+    {K8S_ARGO, "|Rollout|", "spec.strategy.blueGreen.previewService", "Service", "rolloutService",
+     "USAGE"},
+    {K8S_ARGO, "|Rollout|", "spec.strategy.canary.analysis.templates[].templateName",
+     "AnalysisTemplate", "analysis", "USAGE"},
+    {K8S_ARGO, "|Rollout|", "spec.strategy.canary.steps[].analysis.templates[].templateName",
+     "AnalysisTemplate", "analysis", "USAGE"},
+    {K8S_ARGO, "|Workflow|", "spec.workflowTemplateRef.name", "WorkflowTemplate",
+     "workflowTemplateRef", "USAGE"},
+    {K8S_ARGO, "|CronWorkflow|", "spec.workflowSpec.workflowTemplateRef.name", "WorkflowTemplate",
+     "workflowTemplateRef", "USAGE"},
+    {K8S_ARGO, "|Workflow|WorkflowTemplate|", "spec.templates[].steps[][].templateRef.name",
+     "WorkflowTemplate", "templateRef", "USAGE"},
+    {K8S_ARGO, "|Workflow|WorkflowTemplate|", "spec.templates[].dag.tasks[].templateRef.name",
+     "WorkflowTemplate", "templateRef", "USAGE"},
+    {K8S_CAPI, "|Cluster|", "spec.topology.class", "ClusterClass", "topologyClass", "USAGE"},
+    {K8S_CAPI, "|Machine|MachineDeployment|MachineSet|MachinePool|MachineHealthCheck|",
+     "spec.clusterName", "Cluster", "clusterName", "USAGE"},
+    {K8S_CAPI, "|Machine|", "spec.bootstrap.dataSecretName", "Secret", "dataSecretName", "USAGE"},
+    {K8S_CAPI, "|MachineDeployment|MachineSet|MachinePool|",
+     "spec.template.spec.bootstrap.dataSecretName", "Secret", "dataSecretName", "USAGE"},
+    {K8S_CAPI_BOOT, "|KubeadmConfig|", "spec.files[].contentFrom.secret.name", "Secret", "files",
+     "USAGE"},
+    {K8S_CAPI_BOOT, "|KubeadmConfigTemplate|", "spec.template.spec.files[].contentFrom.secret.name",
+     "Secret", "files", "USAGE"},
+    {K8S_CAPI_CP, "|KubeadmControlPlane|", "spec.kubeadmConfigSpec.files[].contentFrom.secret.name",
+     "Secret", "files", "USAGE"},
+    {K8S_CAPI_CP, "|KubeadmControlPlaneTemplate|",
+     "spec.template.spec.kubeadmConfigSpec.files[].contentFrom.secret.name", "Secret", "files",
+     "USAGE"},
+    {K8S_CM, "|Certificate|", "spec.secretName", "Secret", "secretName", "USAGE"},
+    {K8S_CM, K8S_ISSUERS, "spec.ca.secretName", "Secret", "secretRef", "USAGE"},
+    {K8S_CM, K8S_ISSUERS, "spec.acme.privateKeySecretRef.name", "Secret", "secretRef", "USAGE"},
+    {K8S_CM, K8S_ISSUERS, "spec.acme.externalAccountBinding.keySecretRef.name", "Secret",
+     "secretRef", "USAGE"},
+    {K8S_CM, K8S_ISSUERS, "spec.acme.solvers[].dns01.*.*SecretRef.name", "Secret", "secretRef",
+     "USAGE"},
+    {K8S_CM, K8S_ISSUERS, "spec.vault.auth.tokenSecretRef.name", "Secret", "secretRef", "USAGE"},
+    {K8S_CM, K8S_ISSUERS, "spec.vault.auth.*.secretRef.name", "Secret", "secretRef", "USAGE"},
+    {K8S_CM, K8S_ISSUERS, "spec.vault.caBundleSecretRef.name", "Secret", "secretRef", "USAGE"},
+    {K8S_CM, K8S_ISSUERS, "spec.venafi.*.*Ref.name", "Secret", "secretRef", "USAGE"},
+    {"|networking.k8s.io|extensions|gateway.networking.k8s.io|", "|Ingress|Gateway|",
+     "metadata.annotations.cert-manager.io/cluster-issuer", "ClusterIssuer", "issuer", "USAGE"},
+    {"|networking.k8s.io|extensions|gateway.networking.k8s.io|", "|Ingress|Gateway|",
+     "metadata.annotations.cert-manager.io/issuer", "Issuer", "issuer", "USAGE"},
+    {K8S_KKP_APPS, "|ApplicationInstallation|", "spec.applicationRef.name", "ApplicationDefinition",
+     "applicationRef", "USAGE"},
+    {K8S_KKP_APPS, "|ApplicationDefinition|",
+     "spec.versions[].template.source.*.credentials.*.name", "Secret", "credentials", "USAGE"},
+};
+
+static const k8s_crd_mapping_ref_t k8s_crd_mapping_refs[] = {
+    {K8S_FLUX_KS, "|Kustomization|", "spec.sourceRef", NULL, NULL, NULL, "sourceRef", "USAGE"},
+    {K8S_FLUX_KS, "|Kustomization|", "spec.dependsOn[]", "Kustomization", NULL, NULL, "dependsOn",
+     "DEPENDS_ON"},
+    {K8S_FLUX_KS, "|Kustomization|", "spec.postBuild.substituteFrom[]", NULL, "|ConfigMap|Secret|",
+     NULL, "substituteFrom", "USAGE"},
+    {K8S_FLUX_KS, "|Kustomization|", "spec.healthChecks[]", NULL, NULL, NULL, "healthCheck",
+     "USAGE"},
+    {K8S_FLUX_HELM, "|HelmRelease|", "spec.chart.spec.sourceRef", NULL, NULL, NULL, "sourceRef",
+     "USAGE"},
+    {K8S_FLUX_HELM, "|HelmRelease|", "spec.chartRef", NULL, NULL, NULL, "chartRef", "USAGE"},
+    {K8S_FLUX_HELM, "|HelmRelease|", "spec.dependsOn[]", "HelmRelease", NULL, NULL, "dependsOn",
+     "DEPENDS_ON"},
+    {K8S_FLUX_HELM, "|HelmRelease|", "spec.valuesFrom[]", NULL, "|ConfigMap|Secret|", NULL,
+     "valuesFrom", "USAGE"},
+    {K8S_FLUX_SRC, "|HelmChart|", "spec.sourceRef", NULL, NULL, NULL, "sourceRef", "USAGE"},
+    {K8S_FLUX_SRC, "|GitRepository|", "spec.include[].repository", "GitRepository", NULL, NULL,
+     "include", "USAGE"},
+    {K8S_FLUX_NOTE, "|Alert|", "spec.eventSources[]", NULL, NULL, NULL, "eventSource", "USAGE"},
+    {K8S_FLUX_NOTE, "|Receiver|", "spec.resources[]", NULL, NULL, NULL, "resource", "USAGE"},
+    {K8S_FLUX_IMAGE, "|ImageUpdateAutomation|", "spec.sourceRef", NULL, NULL, "GitRepository",
+     "sourceRef", "USAGE"},
+    {K8S_ARGO, "|Rollout|", "spec.workloadRef", NULL, NULL, NULL, "workloadRef", "USAGE"},
+    {K8S_CAPI, "|Cluster|", "spec.infrastructureRef", NULL, NULL, NULL, "infrastructureRef",
+     "USAGE"},
+    {K8S_CAPI, "|Cluster|", "spec.controlPlaneRef", NULL, NULL, NULL, "controlPlaneRef", "USAGE"},
+    {K8S_CAPI, "|Cluster|", "spec.topology.classRef", "ClusterClass", NULL, NULL, "topologyClass",
+     "USAGE"},
+    {K8S_CAPI, "|Machine|", "spec.bootstrap.configRef", NULL, NULL, NULL, "bootstrap", "USAGE"},
+    {K8S_CAPI, "|Machine|", "spec.infrastructureRef", NULL, NULL, NULL, "infrastructureRef",
+     "USAGE"},
+    {K8S_CAPI, "|MachineDeployment|MachineSet|MachinePool|",
+     "spec.template.spec.bootstrap.configRef", NULL, NULL, NULL, "bootstrap", "USAGE"},
+    {K8S_CAPI, "|MachineDeployment|MachineSet|MachinePool|", "spec.template.spec.infrastructureRef",
+     NULL, NULL, NULL, "infrastructureRef", "USAGE"},
+    {K8S_CAPI_CP, "|KubeadmControlPlane|", "spec.machineTemplate.infrastructureRef", NULL, NULL,
+     NULL, "infrastructureRef", "USAGE"},
+    {K8S_CAPI_CP, "|KubeadmControlPlane|", "spec.machineTemplate.spec.infrastructureRef", NULL,
+     NULL, NULL, "infrastructureRef", "USAGE"},
+    {K8S_CAPI, "|ClusterClass|", "spec.infrastructure.ref", NULL, NULL, NULL, "template", "USAGE"},
+    {K8S_CAPI, "|ClusterClass|", "spec.infrastructure.templateRef", NULL, NULL, NULL, "template",
+     "USAGE"},
+    {K8S_CAPI, "|ClusterClass|", "spec.controlPlane.ref", NULL, NULL, NULL, "template", "USAGE"},
+    {K8S_CAPI, "|ClusterClass|", "spec.controlPlane.templateRef", NULL, NULL, NULL, "template",
+     "USAGE"},
+    {K8S_CAPI, "|ClusterClass|", "spec.controlPlane.machineInfrastructure.ref", NULL, NULL, NULL,
+     "template", "USAGE"},
+    {K8S_CAPI, "|ClusterClass|", "spec.controlPlane.machineInfrastructure.templateRef", NULL, NULL,
+     NULL, "template", "USAGE"},
+    {K8S_CAPI, "|ClusterClass|", "spec.workers.*[].template.*.ref", NULL, NULL, NULL, "template",
+     "USAGE"},
+    {K8S_CAPI, "|ClusterClass|", "spec.workers.*[].*.templateRef", NULL, NULL, NULL, "template",
+     "USAGE"},
+    {K8S_CAPI_ADDONS, "|ClusterResourceSet|", "spec.resources[]", NULL, "|ConfigMap|Secret|", NULL,
+     "resources", "USAGE"},
+    {K8S_CM, "|Certificate|CertificateRequest|", "spec.issuerRef", NULL, NULL, "Issuer",
+     "issuerRef", "USAGE"},
+    {K8S_KKP, "|KubermaticConfiguration|", "spec.ingress.certificateIssuer", NULL, NULL, NULL,
+     "certificateIssuer", "USAGE"},
+    {K8S_KKP, "|Seed|", "spec.kubeconfig", "Secret", NULL, NULL, "kubeconfig", "USAGE"},
+    {K8S_KKP, "|Seed|", "spec.etcdBackupRestore.destinations.*.credentials", "Secret", NULL, NULL,
+     "credentials", "USAGE"},
+    {K8S_KKP, "|Cluster|", "spec.cloud.*.credentialsReference", "Secret", NULL, NULL, "credentials",
+     "USAGE"},
+    {K8S_KKP, "|Addon|EtcdBackupConfig|EtcdRestore|", "spec.cluster", "Cluster", NULL, NULL,
+     "cluster", "USAGE"},
+};
+
+// Does `path` match `pat`, where `*` matches any run within one segment?
+static bool k8s_path_match(const char *pat, const char *path) {
+    const char *star = NULL;
+    const char *mark = NULL;
+    while (*path) {
+        if (*pat == '*') {
+            star = pat++;
+            mark = path;
+        } else if (*pat && *pat == *path) {
+            pat++;
+            path++;
+        } else if (star && *mark != '.') {
+            pat = star + SKIP_ONE;
+            path = ++mark;
+        } else {
+            return false;
+        }
+    }
+    while (*pat == '*') {
+        pat++;
+    }
+    return *pat == '\0';
+}
+
 // Is `kind` one of the "|A|B|" list?
 static bool k8s_kind_in(const char *list, const char *kind) {
     if (!list || !kind[0]) {
@@ -429,8 +643,9 @@ static const char *k8s_pod_prefix(const char *kind) {
     if (strcmp(kind, "CronJob") == 0) {
         return "spec.jobTemplate.spec.template.spec";
     }
-    if (k8s_kind_in("|Deployment|StatefulSet|DaemonSet|ReplicaSet|ReplicationController|Job|",
-                    kind)) {
+    if (k8s_kind_in(
+            "|Deployment|StatefulSet|DaemonSet|ReplicaSet|ReplicationController|Job|Rollout|",
+            kind)) {
         return "spec.template.spec";
     }
     return "";
@@ -438,11 +653,41 @@ static const char *k8s_pod_prefix(const char *kind) {
 
 typedef struct {
     CBMExtractCtx *ctx;
-    const char *kind; // the document's kind
+    const char *group; // the document's API group
+    const char *kind;  // the document's kind
     int def_index;
     char crd_group[K8S_BUF_SIZE];
     char crd_kind[K8S_BUF_SIZE];
+    const char *deploy_ns; // a deploying object's target namespace
 } k8s_walk_t;
+
+// Is the document of a source kind in group list `groups`?
+static bool k8s_source_is(const k8s_walk_t *w, const char *groups, const char *kinds) {
+    return k8s_kind_in(groups, w->group) && k8s_kind_in(kinds, w->kind);
+}
+
+// A Flux Kustomization / Argo Application deploys a repository directory.
+static void k8s_deploy_leaf(k8s_walk_t *w, const char *path, const char *value) {
+    bool flux = k8s_source_is(w, K8S_FLUX_KS, "|Kustomization|");
+    bool argo = k8s_source_is(w, K8S_ARGO, "|Application|");
+    if ((flux && strcmp(path, "spec.targetNamespace") == 0) ||
+        (argo && strcmp(path, "spec.destination.namespace") == 0)) {
+        w->deploy_ns = strstr(value, "{{") ? NULL : value;
+        return;
+    }
+    if ((flux && strcmp(path, "spec.path") == 0) ||
+        (argo &&
+         (strcmp(path, "spec.source.path") == 0 || strcmp(path, "spec.sources[].path") == 0))) {
+        if (strstr(value, "{{")) {
+            return;
+        }
+        CBMK8sFact f = {.fact = CBM_K8S_FACT_DEPLOY,
+                        .def_index = w->def_index,
+                        .name = cbm_arena_strdup(w->ctx->arena, value),
+                        .via = flux ? "flux" : "argo"};
+        cbm_k8sfact_push(&w->ctx->result->k8s_facts, w->ctx->arena, f);
+    }
+}
 
 static void k8s_emit_ref(k8s_walk_t *w, const char *kind, const char *ns, const char *name,
                          const char *via, const char *edge) {
@@ -493,6 +738,13 @@ static void k8s_leaf(k8s_walk_t *w, const char *path, const char *value) {
             k8s_emit_ref(w, r->kind, NULL, value, r->via, r->edge);
         }
     }
+    for (size_t i = 0; i < sizeof(k8s_crd_leaf_refs) / sizeof(k8s_crd_leaf_refs[0]); i++) {
+        const k8s_crd_leaf_ref_t *r = &k8s_crd_leaf_refs[i];
+        if (k8s_source_is(w, r->groups, r->kinds) && k8s_path_match(r->path, path)) {
+            k8s_emit_ref(w, r->kind, NULL, value, r->via, r->edge);
+        }
+    }
+    k8s_deploy_leaf(w, path, value);
     if (strcmp(w->kind, "CustomResourceDefinition") == 0) {
         if (strcmp(path, "spec.group") == 0) {
             snprintf(w->crd_group, sizeof(w->crd_group), "%s", value);
@@ -546,23 +798,35 @@ static const char *k8s_field(k8s_walk_t *w, TSNode mapping, const char *field) {
     return NULL;
 }
 
+// The reference a mapping holds in its kind/name/namespace: to `kind`, or
+// (NULL) to its own `kind` field, one of `allowed` (NULL: any), `dflt`
+// when absent.
+static void k8s_mapping_ref(k8s_walk_t *w, TSNode mapping, const char *kind, const char *allowed,
+                            const char *dflt, const char *via, const char *edge) {
+    if (!kind) {
+        kind = k8s_field(w, mapping, "kind");
+        kind = kind ? kind : dflt;
+        if (!kind || (allowed && !k8s_kind_in(allowed, kind))) {
+            return;
+        }
+    }
+    k8s_emit_ref(w, kind, k8s_field(w, mapping, "namespace"), k8s_field(w, mapping, "name"), via,
+                 edge);
+}
+
 // A mapping at `path` that holds a reference in its kind/name/namespace.
 static void k8s_mapping(k8s_walk_t *w, const char *path, TSNode mapping) {
     for (size_t i = 0; i < sizeof(k8s_mapping_refs) / sizeof(k8s_mapping_refs[0]); i++) {
         const k8s_mapping_ref_t *r = &k8s_mapping_refs[i];
-        if (!k8s_kind_in(r->kinds, w->kind) || strcmp(path, r->path) != 0) {
-            continue;
+        if (k8s_kind_in(r->kinds, w->kind) && strcmp(path, r->path) == 0) {
+            k8s_mapping_ref(w, mapping, r->kind, r->allowed, r->dflt, r->via, r->edge);
         }
-        const char *kind = r->kind;
-        if (!kind) {
-            kind = k8s_field(w, mapping, "kind");
-            kind = kind ? kind : r->dflt;
-            if (!kind || (r->allowed && !k8s_kind_in(r->allowed, kind))) {
-                continue;
-            }
+    }
+    for (size_t i = 0; i < sizeof(k8s_crd_mapping_refs) / sizeof(k8s_crd_mapping_refs[0]); i++) {
+        const k8s_crd_mapping_ref_t *r = &k8s_crd_mapping_refs[i];
+        if (k8s_source_is(w, r->groups, r->kinds) && k8s_path_match(r->path, path)) {
+            k8s_mapping_ref(w, mapping, r->kind, r->allowed, r->dflt, r->via, r->edge);
         }
-        k8s_emit_ref(w, kind, k8s_field(w, mapping, "namespace"), k8s_field(w, mapping, "name"),
-                     r->via, r->edge);
     }
 }
 
@@ -623,11 +887,20 @@ static void k8s_walk(k8s_walk_t *w, TSNode node, char *path, size_t len, size_t 
     }
 }
 
-// The references and CRD declaration of document def `def_index`.
-static void k8s_emit_facts(CBMExtractCtx *ctx, TSNode mapping, const char *kind, int def_index) {
-    k8s_walk_t w = {.ctx = ctx, .kind = kind, .def_index = def_index};
+// The references, deploys and CRD declaration of document def `def_index`.
+static void k8s_emit_facts(CBMExtractCtx *ctx, TSNode mapping, const char *group, const char *kind,
+                           int def_index) {
+    k8s_walk_t w = {.ctx = ctx, .group = group, .kind = kind, .def_index = def_index};
     char path[CBM_SZ_512] = "";
+    int first = ctx->result->k8s_facts.count;
     k8s_walk(&w, mapping, path, 0, sizeof(path));
+    /* the target namespace may follow the path in the document */
+    for (int i = first; w.deploy_ns && i < ctx->result->k8s_facts.count; i++) {
+        CBMK8sFact *f = &ctx->result->k8s_facts.items[i];
+        if (f->fact == CBM_K8S_FACT_DEPLOY) {
+            f->ns = cbm_arena_strdup(ctx->arena, w.deploy_ns);
+        }
+    }
     if (w.crd_group[0] && w.crd_kind[0]) {
         CBMK8sFact f = {.fact = CBM_K8S_FACT_CRD,
                         .def_index = def_index,
@@ -726,7 +999,7 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         def.start_line = ts_node_start_point(mapping).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(mapping).row + TS_LINE_OFFSET;
         cbm_defs_push(&ctx->result->defs, a, def);
-        k8s_emit_facts(ctx, mapping, id.kind, ctx->result->defs.count - SKIP_ONE);
+        k8s_emit_facts(ctx, mapping, group, id.kind, ctx->result->defs.count - SKIP_ONE);
     }
 }
 

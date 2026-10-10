@@ -1275,6 +1275,213 @@ TEST(probe_go_controller_methods_sharing_a_node) {
     PASS();
 }
 
+/* ── Curated CRD references + deploy scopes (P1.3) ──────────────────── */
+
+/* A Flux bootstrap: the flux-system Kustomization deploys ./clusters/prod,
+ * whose Kustomizations deploy ./infra and ./apps/prod. Each is its own
+ * kustomize root, so the references between them -- a Kustomization's
+ * sourceRef to the flux-system GitRepository, a HelmRelease's dependsOn in
+ * another namespace, a Certificate's ClusterIssuer -- meet only in the
+ * deploy scope the root reaches. */
+TEST(probe_flux_refs_meet_in_the_deploy_scope) {
+    static const GpfFile files[] = {
+        {"clusters/prod/flux-system/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
+         "resources:\n  - gotk-sync.yaml\n"},
+        {"clusters/prod/flux-system/gotk-sync.yaml",
+         "apiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\n"
+         "metadata:\n  name: flux-system\n  namespace: flux-system\n"
+         "spec:\n  url: ssh://git@example.com/fleet\n---\n"
+         "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\n"
+         "metadata:\n  name: flux-system\n  namespace: flux-system\n"
+         "spec:\n  path: ./clusters/prod\n  sourceRef:\n    kind: GitRepository\n"
+         "    name: flux-system\n"},
+        {"clusters/prod/apps.yaml",
+         "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\n"
+         "metadata:\n  name: infra\n  namespace: flux-system\n"
+         "spec:\n  path: ./infra\n  sourceRef:\n    kind: GitRepository\n"
+         "    name: flux-system\n---\n"
+         "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\n"
+         "metadata:\n  name: apps\n  namespace: flux-system\n"
+         "spec:\n  dependsOn:\n    - name: infra\n  path: ./apps/prod\n"
+         "  sourceRef:\n    kind: GitRepository\n    name: flux-system\n"},
+        {"infra/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
+         "resources:\n  - cert-manager.yaml\n"},
+        {"infra/cert-manager.yaml",
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\n"
+         "metadata:\n  name: cert-manager\n  namespace: cert-manager\n"
+         "spec:\n  interval: 1h\n---\n"
+         "apiVersion: cert-manager.io/v1\nkind: ClusterIssuer\n"
+         "metadata:\n  name: letsencrypt\nspec:\n  selfSigned: {}\n"},
+        {"apps/prod/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
+         "namespace: podinfo\nresources:\n  - ../base/podinfo\n"},
+        {"apps/base/podinfo/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
+         "resources:\n  - release.yaml\n  - repo.yaml\n"},
+        {"apps/base/podinfo/release.yaml",
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\n"
+         "metadata:\n  name: podinfo\nspec:\n  chart:\n    spec:\n      chart: podinfo\n"
+         "      sourceRef:\n        kind: HelmRepository\n        name: podinfo\n"
+         "  dependsOn:\n    - name: cert-manager\n      namespace: cert-manager\n"
+         "  valuesFrom:\n    - kind: ConfigMap\n      name: podinfo-values\n---\n"
+         "apiVersion: cert-manager.io/v1\nkind: Certificate\n"
+         "metadata:\n  name: podinfo-tls\nspec:\n  secretName: podinfo-tls\n"
+         "  issuerRef:\n    kind: ClusterIssuer\n    name: letsencrypt\n"},
+        {"apps/base/podinfo/repo.yaml",
+         "apiVersion: source.toolkit.fluxcd.io/v1\nkind: HelmRepository\n"
+         "metadata:\n  name: podinfo\nspec:\n  url: https://example.com/charts\n---\n"
+         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: podinfo-values\n"
+         "data:\n  replicaCount: \"2\"\n"}};
+    /* flux-system -> its GitRepository, infra and apps -> it, podinfo -> HelmRepository */
+    ASSERT_EQ(gpf_typed_edges(files, 9, "USAGE", "Resource", "Resource", "\"ref\":\"sourceRef\""),
+              4);
+    /* apps -> infra; podinfo -> cert-manager in another namespace and root */
+    ASSERT_EQ(gpf_typed_edges(files, 9, "DEPENDS_ON", "Resource", "Resource",
+                              "\"via\":\"dependsOn\""),
+              2);
+    ASSERT_EQ(gpf_typed_edges(files, 9, "USAGE", "Resource", "Resource", "\"ref\":\"issuerRef\""),
+              1);
+    ASSERT_EQ(gpf_typed_edges(files, 9, "USAGE", "Resource", "Resource",
+                              "\"ref\":\"valuesFrom\""),
+              1);
+    PASS();
+}
+
+/* Cluster API: a Cluster names its infrastructure, control plane and
+ * class; machines name their cluster, bootstrap config and templates. The
+ * source kind counts in its API group: a CloudNativePG `Cluster` with the
+ * same field is not a Cluster API one. */
+TEST(probe_capi_refs_follow_the_api_group) {
+    static const char tmpl[] =
+        "apiVersion: cluster.x-k8s.io/v1beta2\nkind: Cluster\nmetadata:\n  name: c1\n"
+        "spec:\n  infrastructureRef:\n    kind: DockerCluster\n    name: c1\n"
+        "  controlPlaneRef:\n    kind: KubeadmControlPlane\n    name: c1-cp\n"
+        "  topology:\n    classRef:\n      name: quick\n---\n"
+        "apiVersion: infrastructure.cluster.x-k8s.io/v1beta2\nkind: DockerCluster\n"
+        "metadata:\n  name: c1\n---\n"
+        "apiVersion: controlplane.cluster.x-k8s.io/v1beta2\nkind: KubeadmControlPlane\n"
+        "metadata:\n  name: c1-cp\nspec:\n  machineTemplate:\n    spec:\n"
+        "      infrastructureRef:\n        kind: DockerMachineTemplate\n        name: cp-infra\n---\n"
+        "apiVersion: infrastructure.cluster.x-k8s.io/v1beta2\nkind: DockerMachineTemplate\n"
+        "metadata:\n  name: cp-infra\n---\n"
+        "apiVersion: cluster.x-k8s.io/v1beta2\nkind: MachineDeployment\nmetadata:\n  name: md\n"
+        "spec:\n  clusterName: c1\n  template:\n    spec:\n      bootstrap:\n"
+        "        configRef:\n          kind: KubeadmConfigTemplate\n          name: md-boot\n"
+        "      infrastructureRef:\n        kind: DockerMachineTemplate\n        name: md-infra\n---\n"
+        "apiVersion: bootstrap.cluster.x-k8s.io/v1beta2\nkind: KubeadmConfigTemplate\n"
+        "metadata:\n  name: md-boot\n---\n"
+        "apiVersion: infrastructure.cluster.x-k8s.io/v1beta2\nkind: DockerMachineTemplate\n"
+        "metadata:\n  name: md-infra\n---\n"
+        "apiVersion: cluster.x-k8s.io/v1beta2\nkind: ClusterClass\nmetadata:\n  name: quick\n"
+        "spec:\n  infrastructure:\n    templateRef:\n      kind: DockerClusterTemplate\n"
+        "      name: quick-cluster\n  workers:\n    machineDeployments:\n      - class: w\n"
+        "        bootstrap:\n          templateRef:\n            kind: KubeadmConfigTemplate\n"
+        "            name: md-boot\n---\n"
+        "apiVersion: infrastructure.cluster.x-k8s.io/v1beta2\nkind: DockerClusterTemplate\n"
+        "metadata:\n  name: quick-cluster\n---\n"
+        "apiVersion: postgresql.cnpg.io/v1\nkind: Cluster\nmetadata:\n  name: pg\n"
+        "spec:\n  infrastructureRef:\n    kind: DockerCluster\n    name: c1\n";
+    static const GpfFile files[] = {{"templates/cluster.yaml", tmpl}};
+    /* Cluster, KubeadmControlPlane and MachineDeployment -- not the cnpg Cluster */
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource",
+                              "\"ref\":\"infrastructureRef\""),
+              3);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource",
+                              "\"ref\":\"controlPlaneRef\""),
+              1);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource",
+                              "\"ref\":\"topologyClass\""),
+              1);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource",
+                              "\"ref\":\"clusterName\""),
+              1);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource", "\"ref\":\"bootstrap\""),
+              1);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource", "\"ref\":\"template\""),
+              2);
+    PASS();
+}
+
+/* cert-manager and Kubermatic: a Certificate's issuer (Issuer when the
+ * kind is omitted) and Secret, an Ingress's cluster-issuer annotation, an
+ * issuer's CA and DNS-solver Secrets (`*SecretRef` of any provider), a KKP
+ * Seed's kubeconfig and a user cluster's provider credentials. */
+TEST(probe_cert_manager_and_kkp_refs) {
+    static const char doc[] =
+        "apiVersion: cert-manager.io/v1\nkind: Issuer\nmetadata:\n  name: ca\n"
+        "spec:\n  ca:\n    secretName: ca-key\n---\n"
+        "apiVersion: cert-manager.io/v1\nkind: ClusterIssuer\nmetadata:\n  name: letsencrypt\n"
+        "spec:\n  acme:\n    solvers:\n      - dns01:\n          cloudflare:\n"
+        "            apiTokenSecretRef:\n              name: cf-token\n              key: token\n"
+        "---\n"
+        "apiVersion: cert-manager.io/v1\nkind: Certificate\nmetadata:\n  name: web\n"
+        "spec:\n  secretName: web-tls\n  issuerRef:\n    name: ca\n---\n"
+        "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: web\n"
+        "  annotations:\n    cert-manager.io/cluster-issuer: letsencrypt\n---\n"
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: ca-key\n---\n"
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: cf-token\n---\n"
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: web-tls\n---\n"
+        "apiVersion: kubermatic.k8c.io/v1\nkind: Seed\nmetadata:\n  name: europe\n"
+        "  namespace: kubermatic\nspec:\n  kubeconfig:\n    name: seed-kubeconfig\n"
+        "    namespace: kubermatic\n---\n"
+        "apiVersion: kubermatic.k8c.io/v1\nkind: Cluster\nmetadata:\n  name: user1\n"
+        "spec:\n  cloud:\n    aws:\n      credentialsReference:\n        name: aws-creds\n"
+        "        namespace: kubermatic\n---\n"
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: seed-kubeconfig\n"
+        "  namespace: kubermatic\n---\n"
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: aws-creds\n  namespace: kubermatic\n";
+    static const GpfFile files[] = {{"pki/certs.yaml", doc}};
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource", "\"ref\":\"issuerRef\""),
+              1);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource",
+                              "\"ref\":\"secretName\""),
+              1);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource", "\"ref\":\"issuer\""), 1);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource", "\"ref\":\"secretRef\""),
+              2);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource",
+                              "\"ref\":\"kubeconfig\""),
+              1);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource",
+                              "\"ref\":\"credentials\""),
+              1);
+    PASS();
+}
+
+/* Argo: an Application's project, and a Rollout -- a workload with a pod
+ * template -- names its Services, analysis template and service account. */
+TEST(probe_argo_application_and_rollout_refs) {
+    static const char doc[] =
+        "apiVersion: argoproj.io/v1alpha1\nkind: AppProject\nmetadata:\n  name: team-a\n"
+        "  namespace: argocd\n---\n"
+        "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: web\n"
+        "  namespace: argocd\nspec:\n  project: team-a\n  source:\n    path: apps/web\n"
+        "  destination:\n    namespace: web\n---\n"
+        "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: web\n"
+        "spec:\n  strategy:\n    canary:\n      canaryService: web-canary\n"
+        "      stableService: web-stable\n      analysis:\n        templates:\n"
+        "          - templateName: success-rate\n  template:\n    spec:\n"
+        "      serviceAccountName: web\n---\n"
+        "apiVersion: v1\nkind: Service\nmetadata:\n  name: web-canary\n---\n"
+        "apiVersion: v1\nkind: Service\nmetadata:\n  name: web-stable\n---\n"
+        "apiVersion: argoproj.io/v1alpha1\nkind: AnalysisTemplate\nmetadata:\n"
+        "  name: success-rate\n---\n"
+        "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: web\n";
+    static const GpfFile files[] = {{"apps/web/rollout.yaml", doc}};
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource", "\"ref\":\"project\""), 1);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource",
+                              "\"ref\":\"rolloutService\""),
+              2);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource", "\"ref\":\"analysis\""),
+              1);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource",
+                              "\"ref\":\"serviceAccountName\""),
+              1);
+    PASS();
+}
+
 /* A CRD vendored twice (gardener: example/seed-crds and a chart): a custom
  * resource is an instance of the copy deployed with it; only when no copy
  * shares its bundle does it stand for all of them. */
@@ -2879,6 +3086,10 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_go_controller_import_follows_go_mod);
     RUN_TEST(probe_go_controller_chain_with_comment_lines);
     RUN_TEST(probe_go_controller_methods_sharing_a_node);
+    RUN_TEST(probe_flux_refs_meet_in_the_deploy_scope);
+    RUN_TEST(probe_capi_refs_follow_the_api_group);
+    RUN_TEST(probe_cert_manager_and_kkp_refs);
+    RUN_TEST(probe_argo_application_and_rollout_refs);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
     RUN_TEST(probe_k8s_selector_within_kustomize_build);
     RUN_TEST(probe_k8s_kustomize_namespace_is_effective);

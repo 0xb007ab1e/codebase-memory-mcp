@@ -603,10 +603,13 @@ typedef struct {
 /* A fact a Kubernetes manifest states about other objects (extract_k8s.c),
  * resolved by the K8s pass against the objects of the source's bundle.
  *   CBM_K8S_FACT_REF: object def_index names a kind/ns/name object at a
- *     reference path (via), drawn as edge (USAGE or INFRA_MAPS); ns NULL =
- *     the source's own namespace.
- *   CBM_K8S_FACT_CRD: the CRD def_index declares kind `kind` in group `name`. */
-typedef enum { CBM_K8S_FACT_REF = 0, CBM_K8S_FACT_CRD } CBMK8sFactKind;
+ *     reference path (via), drawn as edge (USAGE, INFRA_MAPS or DEPENDS_ON);
+ *     ns NULL = the source's own namespace.
+ *   CBM_K8S_FACT_CRD: the CRD def_index declares kind `kind` in group `name`.
+ *   CBM_K8S_FACT_DEPLOY: object def_index (a Flux Kustomization, an Argo
+ *     Application) deploys the repository directory `name` into namespace
+ *     `ns` (NULL: the objects' own); via "flux" / "argo". */
+typedef enum { CBM_K8S_FACT_REF = 0, CBM_K8S_FACT_CRD, CBM_K8S_FACT_DEPLOY } CBMK8sFactKind;
 typedef struct {
     CBMK8sFactKind fact;
     int def_index;
