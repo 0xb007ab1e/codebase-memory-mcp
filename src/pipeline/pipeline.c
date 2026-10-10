@@ -1640,21 +1640,32 @@ static bool is_ci_tooling_config(const char *fp) {
     return false;
 }
 
-/* True when a YAML key path denotes an UPSTREAM dependency, CONFIG value, or
- * HEALTHCHECK target rather than an endpoint this service exposes. Such URLs
- * (auth JWKS, downstream service base URLs, package-registry URLs, healthcheck
- * curl targets) are NOT routes the service serves and must not mint Route nodes
- * (#521). Exposed-endpoint keys (push_endpoint, post_url, callback, webhook)
- * are intentionally absent here so they still produce infra Route nodes. */
-static bool is_upstream_config_key(const char *key_path) {
+/* True when a config key names an endpoint THIS service exposes -- a URL other
+ * systems call on it: a push subscription's endpoint, a post/callback/webhook
+ * URL. Only such keys mint infra Route nodes. Every other config URL is a
+ * reference: an upstream dependency, a registry or repository, a docs or
+ * runbook link, a changelog's pull-request link, a kubeconfig server. A deny
+ * list of those (#521) could not keep up: in 17 infra repositories almost
+ * every infra Route came from such a key (deckhouse: 6,240 `pull_request`
+ * links). The leaf key decides, compared ignoring case, `_` and `-`. */
+static bool is_exposed_endpoint_key(const char *key_path) {
     if (!key_path) {
-        /* No key context (e.g. flat string) — keep prior behaviour and mint. */
         return false;
     }
-    static const char *const deny[] = {"jwks",     "registry",     "registries", "healthcheck",
-                                       "upstream", "_service_url", "auth",       NULL};
-    for (int i = 0; deny[i]; i++) {
-        if (strstr(key_path, deny[i]) != NULL) {
+    const char *leaf = strrchr(key_path, '.');
+    leaf = leaf ? leaf + SKIP_ONE : key_path;
+    char norm[CBM_SZ_64];
+    size_t n = 0;
+    for (const char *p = leaf; *p && n + 1 < sizeof(norm); p++) {
+        if (*p != '_' && *p != '-') {
+            norm[n++] = (char)tolower((unsigned char)*p);
+        }
+    }
+    norm[n] = '\0';
+    static const char *const endpoints[] = {"pushendpoint", "posturl",    "callback", "callbackurl",
+                                            "webhook",      "webhookurl", NULL};
+    for (int i = 0; endpoints[i]; i++) {
+        if (strcmp(norm, endpoints[i]) == 0) {
             return true;
         }
     }
@@ -1666,8 +1677,8 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
     if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://")) {
         return;
     }
-    /* Skip upstream/config/healthcheck URLs — they are not exposed routes (#521). */
-    if (is_upstream_config_key(sr->key_path)) {
+    /* Only an endpoint this service exposes is a route it serves (#521). */
+    if (!is_exposed_endpoint_key(sr->key_path)) {
         return;
     }
     char route_qn[CBM_ROUTE_QN_SIZE];
@@ -1685,8 +1696,8 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
 /* A URL string_ref that does NOT denote a route the service serves: a value
  * containing whitespace is a command/sentence with an embedded URL (e.g. a
  * Docker healthcheck `curl --fail http://... || exit 1`); a NULL key_path is a
- * context-less/duplicate ref; an upstream/config/healthcheck key is an external
- * dependency, not an exposed route. (#521) */
+ * context-less/duplicate ref; any key but an exposed-endpoint key is a
+ * reference, not an exposed route. (#521) */
 static bool route_sr_denied(const CBMStringRef *sr) {
     if (!sr->value || strchr(sr->value, ' ')) {
         return true;
@@ -1694,7 +1705,7 @@ static bool route_sr_denied(const CBMStringRef *sr) {
     if (!sr->key_path) {
         return true;
     }
-    return is_upstream_config_key(sr->key_path);
+    return !is_exposed_endpoint_key(sr->key_path);
 }
 
 static void cbm_pipeline_extract_infra_routes(const cbm_pipeline_ctx_t *ctx, cbm_gbuf_t *gbuf,
