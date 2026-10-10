@@ -35,6 +35,7 @@
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
+#include <sqlite3.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -143,6 +144,7 @@ typedef struct {
     int imports;     /* IMPORTS edges */
     int depends_on;  /* DEPENDS_ON edges */
     int infra_maps;  /* INFRA_MAPS edges */
+    int routes;      /* Route label */
 } GpfMetrics;
 
 static GpfMetrics gpf_metrics_files(const GpfFile *files, int nfiles) {
@@ -161,6 +163,7 @@ static GpfMetrics gpf_metrics_files(const GpfFile *files, int nfiles) {
         m.imports     = cbm_store_count_edges_by_type(store, lp.project, "IMPORTS");
         m.depends_on  = cbm_store_count_edges_by_type(store, lp.project, "DEPENDS_ON");
         m.infra_maps  = cbm_store_count_edges_by_type(store, lp.project, "INFRA_MAPS");
+        m.routes      = gpf_count_label(store, lp.project, "Route");
     }
     gpf_cleanup(&lp, store);
     return m;
@@ -842,6 +845,73 @@ TEST(probe_k8s_selector_across_documents) {
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.resources, 2);
     ASSERT_EQ(m.infra_maps, 1);
+    PASS();
+}
+
+/* ── Secret hygiene: config values that are secret material stay out ── */
+
+/* Does any node name / QN / properties or edge properties contain `needle`? */
+static int gpf_graph_mentions(const GpfFile *files, int nfiles, const char *needle) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    int hits = -1;
+    if (store) {
+        hits = 0;
+        static const char *const sql[] = {
+            "SELECT COUNT(*) FROM nodes WHERE project=?1 AND (instr(name,?2) OR "
+            "instr(qualified_name,?2) OR instr(properties,?2))",
+            "SELECT COUNT(*) FROM edges WHERE project=?1 AND instr(properties,?2)"};
+        for (size_t q = 0; q < sizeof(sql) / sizeof(sql[0]); q++) {
+            sqlite3_stmt *st = NULL;
+            if (sqlite3_prepare_v2(cbm_store_get_db(store), sql[q], -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+                sqlite3_bind_text(st, 2, needle, -1, SQLITE_STATIC);
+                if (sqlite3_step(st) == SQLITE_ROW) {
+                    hits += sqlite3_column_int(st, 0);
+                }
+            }
+            sqlite3_finalize(st);
+        }
+    }
+    gpf_cleanup(&lp, store);
+    return hits;
+}
+
+/* A Secret's stringData is secret material, whatever its keys are called. */
+TEST(probe_secret_stringdata_mints_no_route) {
+    static const GpfFile files[] = {{"alerting-secret.yaml",
+                                     "apiVersion: v1\n"
+                                     "kind: Secret\n"
+                                     "metadata:\n"
+                                     "  name: alerting\n"
+                                     "stringData:\n"
+                                     "  webhook_url: https://hooks.example.com/T0/B0/s3cr3tpath\n"}};
+    ASSERT_EQ(gpf_graph_mentions(files, 1, "s3cr3tpath"), 0);
+    PASS();
+}
+
+/* An endpoint keeps its path; the credentials and query riding on it stay
+ * out of the graph. */
+TEST(probe_endpoint_url_loses_credentials) {
+    static const GpfFile files[] = {{"subscription.yaml",
+                                     "subscription:\n"
+                                     "  push_endpoint: https://svc:hunter2@svc.example.com/push"
+                                     "?token=abc123\n"}};
+    GpfMetrics m = gpf_metrics_files(files, 1);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.routes, 1);
+    ASSERT_EQ(gpf_graph_mentions(files, 1, "hunter2"), 0);
+    ASSERT_EQ(gpf_graph_mentions(files, 1, "abc123"), 0);
+    ASSERT_TRUE(gpf_graph_mentions(files, 1, "https://svc.example.com/push") > 0);
+    PASS();
+}
+
+/* .tfvars assigns values -- a variable file is where secrets live; the
+ * declaration in the .tf is what the graph keeps. */
+TEST(probe_tfvars_values_mint_no_route) {
+    static const GpfFile files[] = {
+        {"prod.tfvars", "push_endpoint = \"https://svc.example.com/tfvars-only-path\"\n"}};
+    ASSERT_EQ(gpf_graph_mentions(files, 1, "tfvars-only-path"), 0);
     PASS();
 }
 
@@ -2416,6 +2486,9 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_identity_core_namespaced_and_cluster_scoped);
     RUN_TEST(probe_k8s_anchored_and_tagged_names);
     RUN_TEST(probe_k8s_selector_flow_mapping);
+    RUN_TEST(probe_secret_stringdata_mints_no_route);
+    RUN_TEST(probe_endpoint_url_loses_credentials);
+    RUN_TEST(probe_tfvars_values_mint_no_route);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
     RUN_TEST(probe_k8s_selector_within_kustomize_build);
     RUN_TEST(probe_k8s_kustomize_namespace_is_effective);

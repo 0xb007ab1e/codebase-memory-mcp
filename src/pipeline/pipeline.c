@@ -1522,6 +1522,53 @@ static void *gh_compute_thread_fn(void *arg) {
     return NULL;
 }
 
+/* ── Secret hygiene: config values that are secret material stay out ─── */
+
+#define INFRA_SLEN(lit) (sizeof(lit) - SKIP_ONE)
+
+/* A file of values, not declarations: .tfvars assigns Terraform variables,
+ * .env the process environment -- where deployments keep their secrets. */
+static bool infra_values_file(const char *fp) {
+    const char *slash = strrchr(fp, '/');
+    const char *base = slash ? slash + SKIP_ONE : fp;
+    size_t n = strlen(base);
+    static const char *const suffixes[] = {".tfvars", ".tfvars.json", ".env"};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        size_t s = strlen(suffixes[i]);
+        if (n >= s && strcmp(base + n - s, suffixes[i]) == 0) {
+            return true;
+        }
+    }
+    return strcmp(base, ".env") == 0 || strncmp(base, ".env.", INFRA_SLEN(".env.")) == 0;
+}
+
+/* A manifest's data / stringData / binaryData hold configuration payload
+ * (a Secret keeps its values there); a value under them never declares an
+ * endpoint the service exposes. */
+static bool infra_payload_key(const char *key_path) {
+    if (!key_path) {
+        return false;
+    }
+    size_t first = strcspn(key_path, ".");
+    return (first == INFRA_SLEN("data") && strncmp(key_path, "data", first) == 0) ||
+           (first == INFRA_SLEN("stringData") && strncmp(key_path, "stringData", first) == 0) ||
+           (first == INFRA_SLEN("binaryData") && strncmp(key_path, "binaryData", first) == 0);
+}
+
+/* `url` as a route: scheme, host and path. Userinfo (`user:pass@`), the query
+ * and the fragment are where credentials and tokens ride; none is part of
+ * the endpoint. */
+static void infra_url_route_form(const char *url, char *out, size_t out_sz) {
+    const char *scheme_end = strstr(url, "://");
+    const char *host = scheme_end ? scheme_end + INFRA_SLEN("://") : url;
+    const char *path = host + strcspn(host, "/?#");
+    const char *at = memchr(host, '@', (size_t)(path - host));
+    const char *host_start = at ? at + SKIP_ONE : host;
+    size_t path_len = strcspn(path, "?#");
+    snprintf(out, out_sz, "%.*s%.*s%.*s", (int)(host - url), url, (int)(path - host_start),
+             host_start, (int)path_len, path);
+}
+
 /* Extract Route nodes from URL strings found in config files (YAML, HCL, TOML).
  * These are infrastructure-defined endpoints (Cloud Scheduler, Terraform). */
 /* Process infra bindings: topic→URL pairs from IaC configs.
@@ -1530,10 +1577,17 @@ static void *gh_compute_thread_fn(void *arg) {
 /* Process one infra binding: create Route node + INFRA_MAPS edge. */
 static int process_one_infra_binding(cbm_gbuf_t *gbuf, const CBMInfraBinding *ib,
                                      const char *rel_path) {
+    /* Secret hygiene, as for config routes: a values file or a token-shaped
+     * URL mints nothing; a kept URL loses its credentials and query. */
+    if (infra_values_file(rel_path) || cbm_is_secret_value(ib->target_url)) {
+        return 0;
+    }
+    char url[CBM_ROUTE_QN_SIZE];
+    infra_url_route_form(ib->target_url, url, sizeof(url));
     char url_route_qn[CBM_ROUTE_QN_SIZE];
-    snprintf(url_route_qn, sizeof(url_route_qn), "__route__infra__%s", ib->target_url);
-    int64_t url_route_id = cbm_gbuf_upsert_node(gbuf, "Route", ib->target_url, url_route_qn,
-                                                rel_path, 0, 0, "{\"source\":\"infra\"}");
+    snprintf(url_route_qn, sizeof(url_route_qn), "__route__infra__%s", url);
+    int64_t url_route_id = cbm_gbuf_upsert_node(gbuf, "Route", url, url_route_qn, rel_path, 0, 0,
+                                                "{\"source\":\"infra\"}");
     char topic_route_qn[CBM_ROUTE_QN_SIZE];
     snprintf(topic_route_qn, sizeof(topic_route_qn), "__route__%s__%s",
              ib->broker ? ib->broker : "async", ib->source_name);
@@ -1554,7 +1608,7 @@ static int process_one_infra_binding(cbm_gbuf_t *gbuf, const CBMInfraBinding *ib
     }
     char props[CBM_SZ_512];
     snprintf(props, sizeof(props), "{\"broker\":\"%s\",\"topic\":\"%s\",\"endpoint\":\"%s\"}",
-             ib->broker ? ib->broker : "async", ib->source_name, ib->target_url);
+             ib->broker ? ib->broker : "async", ib->source_name, url);
     cbm_gbuf_insert_edge(gbuf, topic_route_id, url_route_id, "INFRA_MAPS", props);
     return SKIP_ONE;
 }
@@ -1681,8 +1735,10 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
     if (!is_exposed_endpoint_key(sr->key_path)) {
         return;
     }
+    char url[CBM_ROUTE_QN_SIZE];
+    infra_url_route_form(sr->value, url, sizeof(url));
     char route_qn[CBM_ROUTE_QN_SIZE];
-    snprintf(route_qn, sizeof(route_qn), "__route__infra__%s", sr->value);
+    snprintf(route_qn, sizeof(route_qn), "__route__infra__%s", url);
     char route_props[CBM_SZ_512];
     if (sr->key_path) {
         snprintf(route_props, sizeof(route_props), "{\"source\":\"infra\",\"key_path\":\"%s\"}",
@@ -1690,7 +1746,7 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
     } else {
         snprintf(route_props, sizeof(route_props), "{\"source\":\"infra\"}");
     }
-    cbm_gbuf_upsert_node(gbuf, "Route", sr->value, route_qn, fp, 0, 0, route_props);
+    cbm_gbuf_upsert_node(gbuf, "Route", url, route_qn, fp, 0, 0, route_props);
 }
 
 /* A URL string_ref that does NOT denote a route the service serves: a value
@@ -1703,6 +1759,11 @@ static bool route_sr_denied(const CBMStringRef *sr) {
         return true;
     }
     if (!sr->key_path) {
+        return true;
+    }
+    /* Secret hygiene: payload values and token-shaped values are denied by
+     * value, so no sibling ref of the same URL mints it either. */
+    if (infra_payload_key(sr->key_path) || cbm_is_secret_value(sr->value)) {
         return true;
     }
     return !is_exposed_endpoint_key(sr->key_path);
@@ -1726,7 +1787,8 @@ static void cbm_pipeline_extract_infra_routes(const cbm_pipeline_ctx_t *ctx, cbm
     CBMHashTable *denied = cbm_ht_create(16);
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < file_count; i++) {
-            if (!is_infra_file(files[i].rel_path) || is_ci_tooling_config(files[i].rel_path)) {
+            if (!is_infra_file(files[i].rel_path) || is_ci_tooling_config(files[i].rel_path) ||
+                infra_values_file(files[i].rel_path)) {
                 continue;
             }
             bool loaded = false;
