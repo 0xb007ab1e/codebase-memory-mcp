@@ -211,6 +211,12 @@ static const doclink_lang_t DOCLINK_LANGS[] = {
      .scan_scope = cbm_doclink_rs_manifest_scan_scope,
      .scope_tag = CBM_DOCLINK_RS_SCOPE_TAG,
      .portable_scope = cbm_doclink_rs_portable_scope},
+    /* Perl: POD L<> codes; the scope blob carries no lines, so it persists as
+     * it is */
+    {.lang = CBM_LANG_PERL,
+     .parse_doc = cbm_doclink_perl_parse_doc,
+     .scan_scope = cbm_doclink_perl_scan_scope,
+     .scope_tag = CBM_DOCLINK_PERL_SCOPE_TAG},
 };
 
 static const doclink_lang_t *doclink_lang(CBMLanguage lang) {

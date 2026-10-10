@@ -98,6 +98,8 @@
     /* rust (doclink_rs.c): intra-doc links; held until their audit passes */                  \
     X(CBM_DOCLINK_RS_INTRA_DOC, CBM_LANG_RUST, "intra_doc", false, false, "MENTIONS")          \
     X(CBM_DOCLINK_RS_LINK_DEF, CBM_LANG_RUST, "link_def", false, false, "MENTIONS")            \
+    /* perl (doclink_perl.c): POD L<> codes; held until their audit passes */                  \
+    X(CBM_DOCLINK_PERL_POD_L, CBM_LANG_PERL, "pod_L", false, false, "MENTIONS")                \
     /* markdown (doclink_md.c): what a document's text names explicitly */                     \
     X(CBM_DOCLINK_MD_LINK, CBM_LANG_MARKDOWN, "link", false, true, "MENTIONS")                 \
     X(CBM_DOCLINK_MD_PATH, CBM_LANG_MARKDOWN, "path", false, true, "MENTIONS")                 \
@@ -535,5 +537,47 @@ typedef enum {
  * are read. */
 CBMDocLinkRsPathStatus cbm_doclink_rs_parse_path(const char *raw, size_t len, bool lenient,
                                                  CBMDocLinkRsPath *out);
+/* ── Perl POD (doclink_perl.c) ─────────────────────────────────────── */
+
+void cbm_doclink_perl_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                                uint32_t doc_line);
+const char *cbm_doclink_perl_scan_scope(CBMExtractCtx *ctx);
+
+/* The Perl scope blob starts with this tag line. */
+#define CBM_DOCLINK_PERL_SCOPE_TAG "perl1"
+
+enum {
+    /* Longest L<> content kept as a token's raw text; a longer one is cut and
+     * marked malformed (its raw text then starts with `L<`). */
+    CBM_DOCLINK_PERL_RAW_MAX = 512,
+    /* Buffer for a page name, a section text or a heading key. */
+    CBM_DOCLINK_PERL_KEY_MAX = 256,
+};
+
+/* A POD text as it renders: formatting codes replaced by their content
+ * (X<> and Z<> by nothing, E<> by its character), white-space runs as one
+ * space, none at the ends. Headings and the section part of a link are
+ * compared in this form. Writes a NUL-terminated string into `out` (cut at
+ * cap - 1, never inside a UTF-8 character) and returns its length. */
+size_t cbm_doclink_perl_plain_text(const char *in, size_t len, char *out, size_t cap);
+
+typedef enum {
+    CBM_PERL_LINK_UNPARSEABLE = 0, /* malformed, nested L<>, or no page name */
+    CBM_PERL_LINK_PAGE,            /* L<Module::Name> or L<Module::Name/section> */
+    CBM_PERL_LINK_SECTION,         /* L</section>, L<"section">: the same page */
+    CBM_PERL_LINK_MAN,             /* L<name(3)>: a man page */
+} CBMPerlLinkKind;
+
+/* One pod_L token's raw text, split the way perlpodspec splits it. */
+typedef struct {
+    CBMPerlLinkKind kind;
+    char page[CBM_DOCLINK_PERL_KEY_MAX];    /* "" for a section of the same page */
+    char section[CBM_DOCLINK_PERL_KEY_MAX]; /* "" when only a page is named */
+} CBMPerlLink;
+
+/* Split a pod_L token's raw text: the first top-level `|` ends the link text,
+ * the first top-level `/` after it separates page and section, quotes around
+ * a section are dropped. False (kind UNPARSEABLE) for anything else. */
+bool cbm_doclink_perl_parse_link(const char *raw, CBMPerlLink *out);
 
 #endif /* CBM_DOCLINK_H */

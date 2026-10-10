@@ -1828,6 +1828,7 @@ extern void suite_doc_links_adoc(void);
 extern void suite_doc_mentions_go(void);
 extern void suite_doc_mentions_jvm(void);
 extern void suite_doc_mentions_rs(void);
+extern void suite_doc_mentions_perl(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
 extern void suite_agent_clients(void);
@@ -2302,6 +2303,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(doc_mentions_go);
     RUN_SELECTED_SUITE(doc_mentions_jvm);
     RUN_SELECTED_SUITE(doc_mentions_rs);
+    RUN_SELECTED_SUITE(doc_mentions_perl);
 
     /* Infrastructure scanning */
     RUN_SELECTED_SUITE(infrascan);
