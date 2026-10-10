@@ -596,6 +596,9 @@ int cbm_delta_patch(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf, i
     if (cbm_store_begin(store) != CBM_STORE_OK) {
         return CBM_NOT_FOUND;
     }
+    /* This writes the buffer's nodes itself: settle the collision spans first,
+     * as the buffer's own dump and flush do. */
+    cbm_gbuf_settle_variants(gbuf);
     delta_patch_ctx_t ctx = {.db = db, .project = project, .max_db_id = max_db_id};
     if (sqlite3_prepare_v2(db,
                            "SELECT id FROM nodes WHERE project = ?1"

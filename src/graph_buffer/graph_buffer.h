@@ -188,4 +188,10 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store);
  * (the old value is kept). */
 int cbm_gbuf_node_set_properties_json(cbm_gbuf_node_t *node, const char *json);
 
+/* Write the definition spans gathered from same-QN collisions into each
+ * surviving node's `variants` property. The dump, flush and merge entry
+ * points do it themselves; call it directly only to read a node's
+ * properties_json from the buffer after collisions. */
+void cbm_gbuf_settle_variants(cbm_gbuf_t *gb);
+
 #endif /* CBM_GRAPH_BUFFER_H */
