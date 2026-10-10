@@ -95,6 +95,9 @@
     X(CBM_DOCLINK_KT_SEE, CBM_LANG_KOTLIN, "see", false, false, "MENTIONS")                    \
     X(CBM_DOCLINK_KT_THROWS, CBM_LANG_KOTLIN, "throws", false, false, "MENTIONS")              \
     X(CBM_DOCLINK_KT_SAMPLE, CBM_LANG_KOTLIN, "sample", false, false, "MENTIONS")              \
+    /* rust (doclink_rs.c): intra-doc links; held until their audit passes */                  \
+    X(CBM_DOCLINK_RS_INTRA_DOC, CBM_LANG_RUST, "intra_doc", false, false, "MENTIONS")          \
+    X(CBM_DOCLINK_RS_LINK_DEF, CBM_LANG_RUST, "link_def", false, false, "MENTIONS")            \
     /* markdown (doclink_md.c): what a document's text names explicitly */                     \
     X(CBM_DOCLINK_MD_LINK, CBM_LANG_MARKDOWN, "link", false, true, "MENTIONS")                 \
     X(CBM_DOCLINK_MD_PATH, CBM_LANG_MARKDOWN, "path", false, true, "MENTIONS")                 \
@@ -461,5 +464,76 @@ size_t cbm_doclink_java_norm_type(const char *in, size_t len, char *out, size_t 
 /* The longest reference a Java or Kotlin token may carry: a longer one is cut
  * just past this length at extraction and reported as unparseable. */
 #define CBM_DOCLINK_JVM_REF_MAX 1000
+/* ── Rust (doclink_rs.c) ───────────────────────────────────────────── */
+
+void cbm_doclink_rs_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                              uint32_t doc_line);
+const char *cbm_doclink_rs_scan_scope(CBMExtractCtx *ctx);
+char *cbm_doclink_rs_portable_scope(const char *scope);
+
+/* A Cargo manifest is a TOML file the indexer extracts anyway: its scope blob
+ * (package, targets, dependencies) is what the Rust resolver knows of crates,
+ * so nothing is read from disk when references are resolved. Any other TOML
+ * file has no scope, and no TOML file has references. */
+void cbm_doclink_rs_manifest_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def,
+                                       const char *doc, uint32_t doc_line);
+const char *cbm_doclink_rs_manifest_scan_scope(CBMExtractCtx *ctx);
+
+/* The Rust scope blob (a source file's and a manifest's) starts with this tag
+ * line. */
+#define CBM_DOCLINK_RS_SCOPE_TAG "rs1"
+
+enum {
+    CBM_DOCLINK_RS_MAX_SEGS = 16, /* path segments of one reference */
+    CBM_DOCLINK_RS_SEG_CAP = 96,  /* bytes of one segment, NUL included */
+    CBM_DOCLINK_RS_RAW_CAP = 512, /* bytes of a reference as stored, NUL included */
+};
+
+/* What a rustdoc disambiguator (`struct@`, `fn@` ...) or suffix (`()`, `!`)
+ * asks of the entity a path names. */
+typedef enum {
+    CBM_DOCLINK_RS_DIS_NONE = 0,
+    CBM_DOCLINK_RS_DIS_STRUCT,
+    CBM_DOCLINK_RS_DIS_ENUM,
+    CBM_DOCLINK_RS_DIS_TRAIT,
+    CBM_DOCLINK_RS_DIS_UNION,
+    CBM_DOCLINK_RS_DIS_TYALIAS,
+    CBM_DOCLINK_RS_DIS_MOD,
+    CBM_DOCLINK_RS_DIS_CONST,
+    CBM_DOCLINK_RS_DIS_STATIC,
+    CBM_DOCLINK_RS_DIS_FN,         /* `fn@`, `function@`, `method@`, and the `()` suffix */
+    CBM_DOCLINK_RS_DIS_DERIVE,     /* a derive macro */
+    CBM_DOCLINK_RS_DIS_FIELD,      /* a struct or union field */
+    CBM_DOCLINK_RS_DIS_VARIANT,    /* an enum variant */
+    CBM_DOCLINK_RS_DIS_MACRO_BANG, /* the `!` suffix: a function-like macro */
+    CBM_DOCLINK_RS_DIS_TYPE_NS,    /* `type@`: anything of the type namespace */
+    CBM_DOCLINK_RS_DIS_VALUE_NS,   /* `value@` */
+    CBM_DOCLINK_RS_DIS_MACRO_NS,   /* `macro@` */
+    CBM_DOCLINK_RS_DIS_PRIM,       /* `prim@`, `primitive@` */
+} CBMDocLinkRsDis;
+
+/* One intra-doc link destination, taken apart. */
+typedef struct {
+    char segs[CBM_DOCLINK_RS_MAX_SEGS][CBM_DOCLINK_RS_SEG_CAP];
+    int nsegs;
+    bool global; /* a leading `::`: the first segment names a crate */
+    int dis;     /* CBMDocLinkRsDis */
+} CBMDocLinkRsPath;
+
+typedef enum {
+    CBM_DOCLINK_RS_PATH_OK = 0,
+    CBM_DOCLINK_RS_PATH_NOT_LINK, /* rustdoc does not treat this text as an intra-doc link */
+    CBM_DOCLINK_RS_PATH_MALFORMED /* a link rustdoc reports as broken syntax */
+} CBMDocLinkRsPathStatus;
+
+/* Take a link destination apart the way rustdoc's `preprocess_link` does
+ * (backticks and `#fragment` already removed): disambiguator or suffix,
+ * generics stripped, `::` segments. `lenient` is rustdoc's rule for text that
+ * may be an ordinary link or plain brackets (an inline or defined
+ * destination, or an undefined shortcut without backticks): there a character
+ * no path can hold means NOT_LINK instead of MALFORMED. `len` bytes of `raw`
+ * are read. */
+CBMDocLinkRsPathStatus cbm_doclink_rs_parse_path(const char *raw, size_t len, bool lenient,
+                                                 CBMDocLinkRsPath *out);
 
 #endif /* CBM_DOCLINK_H */

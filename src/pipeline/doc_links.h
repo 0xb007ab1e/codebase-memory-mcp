@@ -297,6 +297,7 @@ void cbm_doclink_cs_test_unit_memo(bool on);
 bool cbm_doclinks_binds_lines(CBMLanguage lang);
 extern const cbm_doclink_resolver_t cbm_doclink_go_resolver;
 extern const cbm_doclink_resolver_t cbm_doclink_jvm_resolver;
+extern const cbm_doclink_resolver_t cbm_doclink_rs_resolver;
 
 /* True when `rel_path` is a scope input of some language (scope_input). */
 bool cbm_doclinks_is_scope_input(const char *rel_path);

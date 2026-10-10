@@ -200,6 +200,17 @@ static const doclink_lang_t DOCLINK_LANGS[] = {
      .scan_scope = cbm_doclink_kotlin_scan_scope,
      .scope_tag = CBM_DOCLINK_JVM_SCOPE_TAG,
      .portable_scope = cbm_doclink_jvm_portable_scope},
+    {.lang = CBM_LANG_RUST,
+     .parse_doc = cbm_doclink_rs_parse_doc,
+     .scan_scope = cbm_doclink_rs_scan_scope,
+     .scope_tag = CBM_DOCLINK_RS_SCOPE_TAG,
+     .portable_scope = cbm_doclink_rs_portable_scope},
+    /* Cargo.toml: the Rust resolver's crate facts come from its scope blob */
+    {.lang = CBM_LANG_TOML,
+     .parse_doc = cbm_doclink_rs_manifest_parse_doc,
+     .scan_scope = cbm_doclink_rs_manifest_scan_scope,
+     .scope_tag = CBM_DOCLINK_RS_SCOPE_TAG,
+     .portable_scope = cbm_doclink_rs_portable_scope},
 };
 
 static const doclink_lang_t *doclink_lang(CBMLanguage lang) {
