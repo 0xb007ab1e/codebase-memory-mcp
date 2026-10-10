@@ -100,6 +100,10 @@
     X(CBM_DOCLINK_RS_LINK_DEF, CBM_LANG_RUST, "link_def", false, false, "MENTIONS")            \
     /* perl (doclink_perl.c): POD L<> codes; held until their audit passes */                  \
     X(CBM_DOCLINK_PERL_POD_L, CBM_LANG_PERL, "pod_L", false, false, "MENTIONS")                \
+    /* typescript and javascript (doclink_ts.c): JSDoc/TSDoc; held until their audit */        \
+    X(CBM_DOCLINK_TS_LINK, CBM_LANG_TYPESCRIPT, "link", false, false, "MENTIONS")              \
+    X(CBM_DOCLINK_TS_LINKCODE, CBM_LANG_TYPESCRIPT, "linkcode", false, false, "MENTIONS")      \
+    X(CBM_DOCLINK_TS_SEE, CBM_LANG_TYPESCRIPT, "see", false, false, "MENTIONS")                \
     /* markdown (doclink_md.c): what a document's text names explicitly */                     \
     X(CBM_DOCLINK_MD_LINK, CBM_LANG_MARKDOWN, "link", false, true, "MENTIONS")                 \
     X(CBM_DOCLINK_MD_PATH, CBM_LANG_MARKDOWN, "path", false, true, "MENTIONS")                 \
@@ -537,6 +541,20 @@ typedef enum {
  * are read. */
 CBMDocLinkRsPathStatus cbm_doclink_rs_parse_path(const char *raw, size_t len, bool lenient,
                                                  CBMDocLinkRsPath *out);
+/* ── TypeScript and JavaScript (doclink_ts.c) ──────────────────────── */
+
+void cbm_doclink_ts_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                              uint32_t doc_line);
+const char *cbm_doclink_ts_scan_scope(CBMExtractCtx *ctx);
+char *cbm_doclink_ts_portable_scope(const char *scope);
+
+/* TS, TSX and JS files share one scope tag: one resolver indexes them all. */
+#define CBM_DOCLINK_TS_SCOPE_TAG "ts1"
+
+/* The longest reference a TS/JS token keeps; a longer one is cut just past
+ * this length and the resolver reports it as unparseable. */
+enum { CBM_DOCLINK_TS_REF_MAX = 512 };
+
 /* ── Perl POD (doclink_perl.c) ─────────────────────────────────────── */
 
 void cbm_doclink_perl_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,

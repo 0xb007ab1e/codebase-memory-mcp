@@ -217,6 +217,23 @@ static const doclink_lang_t DOCLINK_LANGS[] = {
      .parse_doc = cbm_doclink_perl_parse_doc,
      .scan_scope = cbm_doclink_perl_scan_scope,
      .scope_tag = CBM_DOCLINK_PERL_SCOPE_TAG},
+    /* TypeScript, TSX and JavaScript: one scope, since their files import
+     * each other */
+    {.lang = CBM_LANG_TYPESCRIPT,
+     .parse_doc = cbm_doclink_ts_parse_doc,
+     .scan_scope = cbm_doclink_ts_scan_scope,
+     .scope_tag = CBM_DOCLINK_TS_SCOPE_TAG,
+     .portable_scope = cbm_doclink_ts_portable_scope},
+    {.lang = CBM_LANG_TSX,
+     .parse_doc = cbm_doclink_ts_parse_doc,
+     .scan_scope = cbm_doclink_ts_scan_scope,
+     .scope_tag = CBM_DOCLINK_TS_SCOPE_TAG,
+     .portable_scope = cbm_doclink_ts_portable_scope},
+    {.lang = CBM_LANG_JAVASCRIPT,
+     .parse_doc = cbm_doclink_ts_parse_doc,
+     .scan_scope = cbm_doclink_ts_scan_scope,
+     .scope_tag = CBM_DOCLINK_TS_SCOPE_TAG,
+     .portable_scope = cbm_doclink_ts_portable_scope},
 };
 
 static const doclink_lang_t *doclink_lang(CBMLanguage lang) {
