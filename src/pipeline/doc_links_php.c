@@ -14,10 +14,10 @@
  * go beyond that tool, as PHP itself has them: an unqualified function name
  * is taken from a `use function` import, else from the current namespace,
  * else from the global namespace; and `self` and `static` name the type the
- * doc sits in, `parent` that type's superclass. A bare `name()` that would
- * bind a function but is written in a type that declares or inherits a
- * method of that name is ambiguous: the method or the function, and the
- * reference does not say which. Type, function
+ * doc sits in, `parent` that type's superclass. Beyond both, as authors
+ * write it: a bare `name()` in the doc of a type (or of its members) that
+ * declares or inherits a method of that name is that method; a `use
+ * function` import of the name still wins. Type, function
  * and method names compare without case, properties and constants with it.
  * The global fallback cannot see a function a dependency declares in the
  * current namespace: a reference to one binds the global function of that
@@ -833,17 +833,6 @@ static pr_res_t pr_find_func(const pr_ctx_t *c, const char *fqn, size_t len) {
     return r;
 }
 
-/* True when the type the doc sits in declares or inherits a method named
- * like the reference. */
-static bool pr_type_has_method(const pr_ctx_t *c, const pr_ref_t *r) {
-    if (c->cur < 0) {
-        return false;
-    }
-    pr_search_t s = {
-        .c = c, .want = 'm', .name = r->cls, .len = r->cls_len, .owner = CBM_NOT_FOUND};
-    return pr_search(&s, c->cur, 0);
-}
-
 static pr_res_t pr_function(const pr_ctx_t *c, const pr_ref_t *r) {
     char fqn[PR_NAME_MAX];
     if (r->cls[0] == '\\' || memchr(r->cls, '\\', r->cls_len)) {
@@ -868,6 +857,14 @@ static pr_res_t pr_function(const pr_ctx_t *c, const pr_ref_t *r) {
             return res;
         }
     }
+    if (c->cur >= 0) {
+        /* a method the documented type declares or inherits */
+        pr_search_t s = {
+            .c = c, .want = 'm', .name = r->cls, .len = r->cls_len, .owner = CBM_NOT_FOUND};
+        if (pr_search(&s, c->cur, 0)) {
+            return pr_member_node(c, &s);
+        }
+    }
     pr_res_t res = pr_mk(PR_NONE);
     if (c->ns_len) {
         int n = snprintf(fqn, sizeof(fqn), "%.*s\\%.*s", (int)c->ns_len, c->ns, (int)r->cls_len,
@@ -877,15 +874,7 @@ static pr_res_t pr_function(const pr_ctx_t *c, const pr_ref_t *r) {
     if (res.kind == PR_NONE) {
         res = pr_find_func(c, r->cls, r->cls_len); /* PHP's global fallback */
     }
-    if (res.kind == PR_NONE) {
-        return pr_mk(PR_EXTERNAL); /* a built-in function */
-    }
-    if ((res.kind == PR_NODE || res.kind == PR_GAP) && pr_type_has_method(c, r)) {
-        /* written in a type that has a method of that name: the method or
-         * this function, and the reference does not pick one */
-        return pr_mk(PR_AMBIGUOUS);
-    }
-    return res;
+    return res.kind == PR_NONE ? pr_mk(PR_EXTERNAL) : res; /* none: a built-in */
 }
 
 /* ── Outcomes ────────────────────────────────────────────────────── */

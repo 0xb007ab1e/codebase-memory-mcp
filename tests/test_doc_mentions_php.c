@@ -216,6 +216,7 @@ static void php_write_repo(const char *repo) {
                                                    "function global_helper() {}\n"
                                                    "function shadowed() {}\n"
                                                    "function other() {}\n"
+                                                   "function size() {}\n"
                                                    "class GlobalThing {}\n");
     th_write_file(
         TH_PATH(repo, "src/Model/User.php"),
@@ -342,10 +343,6 @@ TEST(doc_mentions_php_global_fallback) {
     ASSERT_TRUE(php_edge(db, o, "src.Model.User.shadowed"));
     ASSERT_TRUE(php_edge(db, o, "src.global.global_helper"));
     ASSERT_TRUE(php_edge(db, o, "src.Model.User.helper_here"));
-    /* a function named like a method of the documented type: two readings;
-     * no such function: PHP's built-ins */
-    ASSERT_TRUE(php_row(db, "other()", "ambiguous"));
-    ASSERT_TRUE(php_row(db, "size()", "external"));
     char props[512];
     int n = 0;
     dm_edge(db, o, "src.global.shadowed", props, sizeof(props), &n);
@@ -366,6 +363,24 @@ TEST(doc_mentions_php_self_parent) {
     ASSERT_TRUE(php_row(db, "static::LIMIT", "graph_gap"));
     ASSERT_TRUE(php_row(db, "self::$name", "graph_gap"));
     ASSERT_TRUE(php_row(db, "parent::gone()", "missing"));
+    PASS();
+}
+
+/* A bare name() in a type's doc: the type's own method first, though a
+ * global function has the name too. */
+TEST(doc_mentions_php_current_class) {
+    ASSERT_TRUE(php_indexed());
+    const char *db = g_php_db;
+    const char *o = "src.Model.User.User.other";
+    ASSERT_TRUE(php_edge(db, o, "src.Model.User.User.size"));
+    char props[512];
+    int n = 0;
+    dm_edge(db, o, "src.global.size", props, sizeof(props), &n);
+    ASSERT_EQ(n, 0);
+    /* the documented method itself: a self-mention, neither edge nor row */
+    ASSERT_TRUE(php_row(db, "other()", ""));
+    dm_edge(db, o, "src.global.other", props, sizeof(props), &n);
+    ASSERT_EQ(n, 0);
     PASS();
 }
 
@@ -463,6 +478,7 @@ SUITE(doc_mentions_php) {
     RUN_TEST(doc_mentions_php_resolution);
     RUN_TEST(doc_mentions_php_global_fallback);
     RUN_TEST(doc_mentions_php_self_parent);
+    RUN_TEST(doc_mentions_php_current_class);
     php_indexed_cleanup();
     RUN_TEST(doc_mentions_php_incremental_equals_full);
     RUN_TEST(doc_mentions_php_workers_agree);
