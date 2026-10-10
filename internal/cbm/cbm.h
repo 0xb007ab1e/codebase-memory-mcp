@@ -608,8 +608,16 @@ typedef struct {
  *   CBM_K8S_FACT_CRD: the CRD def_index declares kind `kind` in group `name`.
  *   CBM_K8S_FACT_DEPLOY: object def_index (a Flux Kustomization, an Argo
  *     Application) deploys the repository directory `name` into namespace
- *     `ns` (NULL: the objects' own); via "flux" / "argo". */
-typedef enum { CBM_K8S_FACT_REF = 0, CBM_K8S_FACT_CRD, CBM_K8S_FACT_DEPLOY } CBMK8sFactKind;
+ *     `ns` (NULL: the objects' own); via "flux" / "argo".
+ *   CBM_K8S_FACT_ROUTE: object def_index (an Ingress, an HTTPRoute) exposes
+ *     `route` ("<host or *><path>") and sends it to the kind/ns/name backend
+ *     (name NULL: none); via "ingress" / "httproute". */
+typedef enum {
+    CBM_K8S_FACT_REF = 0,
+    CBM_K8S_FACT_CRD,
+    CBM_K8S_FACT_DEPLOY,
+    CBM_K8S_FACT_ROUTE
+} CBMK8sFactKind;
 typedef struct {
     CBMK8sFactKind fact;
     int def_index;
@@ -618,6 +626,7 @@ typedef struct {
     const char *name;
     const char *via;
     const char *edge;
+    const char *route;
 } CBMK8sFact;
 
 typedef struct {

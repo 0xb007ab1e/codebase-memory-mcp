@@ -346,7 +346,7 @@ static bool is_broker_route(const char *qn) {
     static const char *const prefixes[] = {
         "__route__infra__", "__route__pubsub__",          "__route__cloud_tasks__",
         "__route__async__", "__route__cloud_scheduler__", "__route__kafka__",
-        "__route__sqs__"};
+        "__route__sqs__",   "__route__ingress__"};
     if (!qn) {
         return false;
     }

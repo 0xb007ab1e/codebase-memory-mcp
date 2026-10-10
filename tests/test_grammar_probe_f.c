@@ -1482,6 +1482,85 @@ TEST(probe_argo_application_and_rollout_refs) {
     PASS();
 }
 
+/* ── Exposed routes + policy selectors (P1.4) ───────────────────────── */
+
+/* A PodDisruptionBudget's selector and a NetworkPolicy's podSelector pick
+ * workloads by their pod labels; an empty podSelector (every pod of the
+ * namespace) and a selector with matchExpressions draw nothing. */
+TEST(probe_k8s_pdb_and_networkpolicy_select_workloads) {
+    static const char doc[] =
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n"
+        "    metadata:\n      labels:\n        app: web\n---\n"
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  template:\n"
+        "    metadata:\n      labels:\n        app: api\n---\n"
+        "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: web\nspec:\n"
+        "  minAvailable: 1\n  selector:\n    matchLabels:\n      app: web\n---\n"
+        "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: narrowed\nspec:\n"
+        "  selector:\n    matchLabels:\n      app: web\n    matchExpressions:\n"
+        "      - key: track\n        operator: In\n        values: [canary]\n---\n"
+        "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: api\nspec:\n"
+        "  podSelector:\n    matchLabels:\n      app: api\n---\n"
+        "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: deny-all\n"
+        "spec:\n  podSelector: {}\n";
+    static const GpfFile files[] = {{"k8s/app.yaml", doc}};
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource", "\"ref\":\"selector\""),
+              1);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "USAGE", "Resource", "Resource",
+                              "\"ref\":\"podSelector\""),
+              1);
+    PASS();
+}
+
+/* Versioned manifests side by side (kubermatic addons/canal/canal_v3.2x):
+ * each declares the same Deployment; a selector picks the copy in its own
+ * file, not every version's. */
+TEST(probe_k8s_selectors_pick_their_own_version) {
+    static const char v1[] =
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: kube-controllers\nspec:\n"
+        "  template:\n    metadata:\n      labels:\n        app: kube-controllers\n---\n"
+        "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n"
+        "  name: kube-controllers\nspec:\n  selector:\n    matchLabels:\n"
+        "      app: kube-controllers\n---\n"
+        "apiVersion: v1\nkind: Service\nmetadata:\n  name: metrics\nspec:\n  selector:\n"
+        "    app: kube-controllers\n";
+    static const GpfFile files[] = {{"addons/canal/canal_v1.yaml", v1},
+                                    {"addons/canal/canal_v2.yaml", v1}};
+    ASSERT_EQ(gpf_typed_edges(files, 2, "USAGE", "Resource", "Resource", "\"ref\":\"selector\""),
+              2);
+    ASSERT_EQ(gpf_typed_edges(files, 2, "INFRA_MAPS", "Resource", "Resource",
+                              "\"kind\":\"selector\""),
+              2);
+    PASS();
+}
+
+/* An Ingress rule's host and paths and an HTTPRoute's hostnames and path
+ * matches are routes the cluster exposes: the object DEFINES each, and the
+ * route maps to the Service it is sent to. */
+TEST(probe_k8s_ingress_and_httproute_expose_routes) {
+    static const char doc[] =
+        "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: shop\nspec:\n"
+        "  rules:\n    - host: shop.example.com\n      http:\n        paths:\n"
+        "          - path: /api\n            pathType: Prefix\n            backend:\n"
+        "              service:\n                name: api\n                port:\n"
+        "                  number: 80\n"
+        "          - path: /\n            pathType: Prefix\n            backend:\n"
+        "              service:\n                name: web\n                port:\n"
+        "                  number: 80\n---\n"
+        "apiVersion: gateway.networking.k8s.io/v1\nkind: HTTPRoute\nmetadata:\n  name: api\n"
+        "spec:\n  hostnames:\n    - api.example.com\n  rules:\n    - matches:\n"
+        "        - path:\n            type: PathPrefix\n            value: /v1\n"
+        "      backendRefs:\n        - name: api\n          port: 80\n---\n"
+        "apiVersion: v1\nkind: Service\nmetadata:\n  name: api\n---\n"
+        "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n";
+    static const GpfFile files[] = {{"k8s/edge.yaml", doc}};
+    ASSERT_EQ(gpf_typed_edges(files, 1, "DEFINES", "Resource", "Route", "{"), 3);
+    ASSERT_EQ(gpf_typed_edges(files, 1, "INFRA_MAPS", "Route", "Resource", "\"kind\":\"ingress\""),
+              2);
+    ASSERT_EQ(
+        gpf_typed_edges(files, 1, "INFRA_MAPS", "Route", "Resource", "\"kind\":\"httproute\""), 1);
+    PASS();
+}
+
 /* A CRD vendored twice (gardener: example/seed-crds and a chart): a custom
  * resource is an instance of the copy deployed with it; only when no copy
  * shares its bundle does it stand for all of them. */
@@ -3090,6 +3169,9 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_capi_refs_follow_the_api_group);
     RUN_TEST(probe_cert_manager_and_kkp_refs);
     RUN_TEST(probe_argo_application_and_rollout_refs);
+    RUN_TEST(probe_k8s_pdb_and_networkpolicy_select_workloads);
+    RUN_TEST(probe_k8s_selectors_pick_their_own_version);
+    RUN_TEST(probe_k8s_ingress_and_httproute_expose_routes);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
     RUN_TEST(probe_k8s_selector_within_kustomize_build);
     RUN_TEST(probe_k8s_kustomize_namespace_is_effective);

@@ -104,6 +104,8 @@ typedef enum {
     K8S_REC_SERVICE,  /* pairs = spec.selector */
     K8S_REC_WORKLOAD, /* pairs = pod-template labels */
     K8S_REC_POD,      /* pairs = metadata.labels */
+    K8S_REC_PDB,      /* pairs = spec.selector.matchLabels */
+    K8S_REC_NETPOL,   /* pairs = spec.podSelector.matchLabels */
 } k8s_rec_kind_t;
 
 typedef struct {
@@ -113,6 +115,7 @@ typedef struct {
     k8s_rec_kind_t kind;
     int pair_off; /* this record's pairs: pairs[pair_off .. pair_off + pair_n) */
     int pair_n;
+    bool has_expr; /* its label selector also has matchExpressions */
 } k8s_record_t;
 
 typedef struct {
@@ -179,11 +182,19 @@ typedef enum {
     K8S_PAIR_SELECTOR,       /* spec.selector (a Service's selector is a flat map) */
     K8S_PAIR_TEMPLATE_LABEL, /* spec.template.metadata.labels, also under a CronJob's jobTemplate */
     K8S_PAIR_META_LABEL,     /* metadata.labels */
+    K8S_PAIR_MATCH_LABELS,   /* spec.selector.matchLabels (a PodDisruptionBudget's) */
+    K8S_PAIR_POD_SELECTOR,   /* spec.podSelector.matchLabels (a NetworkPolicy's) */
 } k8s_pair_block_t;
 
 static k8s_pair_block_t k8s_pair_block(const char *parent_path) {
     if (strcmp(parent_path, "spec.selector") == 0) {
         return K8S_PAIR_SELECTOR;
+    }
+    if (strcmp(parent_path, "spec.selector.matchLabels") == 0) {
+        return K8S_PAIR_MATCH_LABELS;
+    }
+    if (strcmp(parent_path, "spec.podSelector.matchLabels") == 0) {
+        return K8S_PAIR_POD_SELECTOR;
     }
     if (strcmp(parent_path, "spec.template.metadata.labels") == 0 ||
         strcmp(parent_path, "spec.jobTemplate.spec.template.metadata.labels") == 0) {
@@ -198,9 +209,15 @@ static k8s_pair_block_t k8s_pair_block(const char *parent_path) {
 static k8s_rec_kind_t k8s_rec_kind(const char *kind) {
     static const char *const workloads[] = {
         "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController",
-        "Job",        "CronJob",     NULL};
+        "Job",        "CronJob",     "Rollout",   NULL};
     if (strcmp(kind, "Service") == 0) {
         return K8S_REC_SERVICE;
+    }
+    if (strcmp(kind, "PodDisruptionBudget") == 0) {
+        return K8S_REC_PDB;
+    }
+    if (strcmp(kind, "NetworkPolicy") == 0) {
+        return K8S_REC_NETPOL;
     }
     if (strcmp(kind, "Pod") == 0) {
         return K8S_REC_POD;
@@ -222,6 +239,10 @@ static k8s_pair_block_t k8s_kind_block(k8s_rec_kind_t kind) {
         return K8S_PAIR_TEMPLATE_LABEL;
     case K8S_REC_POD:
         return K8S_PAIR_META_LABEL;
+    case K8S_REC_PDB:
+        return K8S_PAIR_MATCH_LABELS;
+    case K8S_REC_NETPOL:
+        return K8S_PAIR_POD_SELECTOR;
     case K8S_REC_OTHER:
     default:
         return K8S_PAIR_NONE;
@@ -371,6 +392,12 @@ static void k8s_scan_labels(const char *source, k8s_record_t *rec, k8s_scanned_t
             char key[64];
             char val[CBM_SZ_512]; /* a whole flow map fits: the line is the limit */
             if (k8s_split_kv(trimmed, key, sizeof(key), val, sizeof(val))) {
+                if (strcmp(key, "matchExpressions") == 0) {
+                    char parent[CBM_SZ_512];
+                    k8s_parent_path(parent, sizeof(parent), (const char (*)[64])keys, depth);
+                    rec->has_expr = rec->has_expr || strcmp(parent, "spec.selector") == 0 ||
+                                    strcmp(parent, "spec.podSelector") == 0;
+                }
                 if (val[0] == '\0') {
                     /* Block-opening key: push onto the path stack. */
                     if (depth < K8S_PATH_DEPTH) {
@@ -1085,6 +1112,7 @@ typedef struct {
     char *name;       /* target metadata.name */
     const char *via;  /* static: the extractor's table */
     const char *edge; /* static: "USAGE", "INFRA_MAPS" or "DEPENDS_ON" */
+    char *route;      /* an exposed route "<host><path>" the edge leaves from, NULL = src */
 } k8s_ref_t;
 
 /* A CRD and the group/kind it declares. */
@@ -1119,6 +1147,7 @@ static void k8s_facts_free(k8s_facts_t *f) {
         cbm_free(CBM_MEM_CLASS_OTHER, f->refs[i].kind);
         cbm_free(CBM_MEM_CLASS_OTHER, f->refs[i].ns);
         cbm_free(CBM_MEM_CLASS_OTHER, f->refs[i].name);
+        cbm_free(CBM_MEM_CLASS_OTHER, f->refs[i].route);
     }
     for (int i = 0; i < f->crd_n; i++) {
         cbm_free(CBM_MEM_CLASS_OTHER, f->crds[i].group);
@@ -1201,13 +1230,15 @@ static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64
                                 cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->kind)};
             }
         } else if (k8s_grow((void **)&f->refs, &f->ref_cap, f->ref_n, sizeof(*f->refs))) {
+            bool route = x->fact == CBM_K8S_FACT_ROUTE && x->route;
             f->refs[f->ref_n++] =
                 (k8s_ref_t){.src = node,
-                            .kind = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->kind),
+                            .kind = x->kind ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->kind) : NULL,
                             .ns = x->ns ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->ns) : NULL,
-                            .name = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name),
+                            .name = x->name ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name) : NULL,
                             .via = x->via,
-                            .edge = x->edge};
+                            .edge = x->edge,
+                            .route = route ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->route) : NULL};
         }
     }
 }
@@ -1557,14 +1588,52 @@ static bool k8s_ref_meets(k8s_bundles_t *b, const k8s_ref_t *ref, const cbm_gbuf
     return false;
 }
 
+/* The Route node of a route `src` (an Ingress, an HTTPRoute) exposes, which
+ * `src` DEFINES; 0 on failure. Its QN is the route itself, so every object
+ * exposing one host and path shares it. */
+static int64_t k8s_route_node(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *src,
+                              const k8s_ref_t *ref) {
+    enum { K8S_ROUTE_ESC = 6 * CBM_SZ_256 };
+    const char *slash = strchr(ref->route, '/');
+    if (!slash) {
+        return 0;
+    }
+    char qn[CBM_SZ_1K];
+    char host[CBM_SZ_256];
+    char esc_host[K8S_ROUTE_ESC];
+    char esc_path[K8S_ROUTE_ESC];
+    snprintf(qn, sizeof(qn), "__route__ingress__%s", ref->route);
+    snprintf(host, sizeof(host), "%.*s", (int)(slash - ref->route), ref->route);
+    cbm_json_escape(esc_host, sizeof(esc_host), host);
+    cbm_json_escape(esc_path, sizeof(esc_path), slash);
+    char props[2 * K8S_ROUTE_ESC + CBM_SZ_256];
+    snprintf(props, sizeof(props),
+             "{\"source\":\"k8s\",\"via\":\"%s\",\"host\":\"%s\",\"path\":\"%s\"}", ref->via,
+             esc_host, esc_path);
+    int64_t id = cbm_gbuf_upsert_node(ctx->gbuf, "Route", ref->route, qn, src->file_path,
+                                      src->start_line, src->end_line, props);
+    if (id > 0) {
+        cbm_gbuf_insert_edge(ctx->gbuf, src->id, id, "DEFINES", "{}");
+    }
+    return id;
+}
+
 /* Draw every reference to the object(s) it names inside its bundle;
- * an unresolved reference draws nothing. */
+ * an unresolved reference draws nothing. An exposed route's reference
+ * leaves from its Route node. */
 static void k8s_resolve_refs(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8s_facts_t *f) {
     int edges = 0;
     int unresolved = 0;
     for (int i = 0; i < f->ref_n; i++) {
         const k8s_ref_t *ref = &f->refs[i];
         const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(ctx->gbuf, ref->src);
+        int64_t from = src ? src->id : 0;
+        if (ref->route) {
+            from = src && src->file_path ? k8s_route_node(ctx, src, ref) : 0;
+            if (from <= 0 || !ref->kind || !ref->name) {
+                continue;
+            }
+        }
         char name[CBM_SZ_1K];
         snprintf(name, sizeof(name), "%s/%s", ref->kind, ref->name);
         const cbm_gbuf_node_t **cands = NULL;
@@ -1596,7 +1665,7 @@ static void k8s_resolve_refs(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8
                 !k8s_ref_meets(b, ref, src, t)) {
                 continue;
             }
-            cbm_gbuf_insert_edge(ctx->gbuf, src->id, t->id, ref->edge, props);
+            cbm_gbuf_insert_edge(ctx->gbuf, from, t->id, ref->edge, props);
             hits++;
         }
         edges += hits;
@@ -1745,14 +1814,72 @@ static void k8s_link_crds(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8s_f
     }
 }
 
+/* A workload a selector matched: its object name, declaring file and
+ * whether that is the selector's file. */
+typedef struct {
+    const char *name; /* "Kind/name" (graph-owned) */
+    const char *ns;
+    bool own;
+    int rec;
+} k8s_match_t;
+
+static int k8s_cmp_match(const void *a, const void *b) {
+    const k8s_match_t *x = a;
+    const k8s_match_t *y = b;
+    int c = strcmp(x->name, y->name);
+    c = c ? c : strcmp(x->ns, y->ns);
+    return c ? c : (x->rec > y->rec) - (x->rec < y->rec);
+}
+
+/* Draw the selector's edge to each match. A name is one object per kind and
+ * namespace, so matches declaring one name in several files are alternatives
+ * (versioned manifests side by side): the one in the selector's file, when
+ * there is one, is the one it selects. */
+static int k8s_draw_matches(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t *recs,
+                            const k8s_record_t *svc, k8s_match_t *m, int n) {
+    qsort(m, (size_t)n, sizeof(*m), k8s_cmp_match);
+    int edges = 0;
+    for (int g = 0; g < n;) {
+        int end = g;
+        bool own = false;
+        while (end < n && strcmp(m[end].name, m[g].name) == 0 && strcmp(m[end].ns, m[g].ns) == 0) {
+            own = own || m[end].own;
+            end++;
+        }
+        for (int i = g; i < end; i++) {
+            if (own && !m[i].own) {
+                continue;
+            }
+            const k8s_record_t *wl = &recs->items[m[i].rec];
+            if (svc->kind == K8S_REC_SERVICE) {
+                char props[CBM_SZ_256];
+                snprintf(props, sizeof(props),
+                         "{\"kind\":\"selector\",\"service\":\"%s\",\"workload\":\"%s\"}",
+                         svc->name, wl->name);
+                cbm_gbuf_insert_edge(ctx->gbuf, svc->node_id, wl->node_id, "INFRA_MAPS", props);
+            } else {
+                cbm_gbuf_insert_edge(ctx->gbuf, svc->node_id, wl->node_id, "USAGE",
+                                     svc->kind == K8S_REC_PDB ? "{\"ref\":\"selector\"}"
+                                                              : "{\"ref\":\"podSelector\"}");
+            }
+            edges++;
+        }
+        g = end;
+    }
+    return edges;
+}
+
 /* Connect each Service to the workloads its selector targets via an INFRA_MAPS
- * edge (Service Resource → workload Resource), inside a shared bundle. */
+ * edge (Service Resource → workload Resource), inside a shared bundle; a
+ * PodDisruptionBudget or NetworkPolicy to the workloads it selects (USAGE). */
 static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t *recs,
                                k8s_bundles_t *bundles) {
     CBMHashTable *index = cbm_ht_create(0);
     if (!index) {
         return;
     }
+    k8s_match_t *matches = NULL;
+    int match_cap = 0;
     for (int i = 0; i < recs->count; i++) {
         const k8s_record_t *wl = &recs->items[i];
         if (wl->kind == K8S_REC_WORKLOAD || wl->kind == K8S_REC_POD) {
@@ -1763,8 +1890,13 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
     }
     int edges = 0;
     for (int i = 0; i < recs->count; i++) {
+        /* a Service, PodDisruptionBudget or NetworkPolicy selector; one with
+         * matchExpressions selects fewer pods than its matchLabels, and an
+         * empty one every pod of the namespace: neither is drawn */
         const k8s_record_t *svc = &recs->items[i];
-        if (svc->kind != K8S_REC_SERVICE || svc->pair_n == 0) {
+        if ((svc->kind != K8S_REC_SERVICE && svc->kind != K8S_REC_PDB &&
+             svc->kind != K8S_REC_NETPOL) ||
+            svc->pair_n == 0 || svc->has_expr) {
             continue;
         }
         /* Candidates: the workloads carrying the Service's rarest pair. */
@@ -1779,22 +1911,25 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
                 rarest = posting;
             }
         }
-        for (int c = 0; rarest && c < rarest->count; c++) {
+        const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_id(ctx->gbuf, svc->node_id);
+        int n = 0;
+        for (int c = 0; sn && rarest && c < rarest->count; c++) {
             const k8s_record_t *wl = &recs->items[rarest->items[c]];
             bool all = k8s_share_bundle(bundles, ctx, svc, wl);
             for (int p = 0; all && p < svc->pair_n; p++) {
                 all = k8s_has_pair(recs, wl, recs->pairs[svc->pair_off + p]);
             }
-            if (all) {
-                char props[CBM_SZ_256];
-                snprintf(props, sizeof(props),
-                         "{\"kind\":\"selector\",\"service\":\"%s\",\"workload\":\"%s\"}",
-                         svc->name, wl->name);
-                cbm_gbuf_insert_edge(ctx->gbuf, svc->node_id, wl->node_id, "INFRA_MAPS", props);
-                edges++;
+            const cbm_gbuf_node_t *wn = all ? cbm_gbuf_find_by_id(ctx->gbuf, wl->node_id) : NULL;
+            if (wn && wn->name && wn->file_path &&
+                k8s_grow((void **)&matches, &match_cap, n, sizeof(*matches))) {
+                matches[n++] = (k8s_match_t){
+                    wn->name, wl->ns, sn->file_path && strcmp(wn->file_path, sn->file_path) == 0,
+                    rarest->items[c]};
             }
         }
+        edges += k8s_draw_matches(ctx, recs, svc, matches, n);
     }
+    cbm_free(CBM_MEM_CLASS_OTHER, matches);
     cbm_ht_foreach(index, k8s_posting_free, NULL);
     cbm_ht_free(index);
     if (edges > 0) {

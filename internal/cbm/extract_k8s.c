@@ -798,6 +798,144 @@ static const char *k8s_field(k8s_walk_t *w, TSNode mapping, const char *field) {
     return NULL;
 }
 
+// The content node of `field` in a mapping (null when absent or not a mapping).
+static TSNode k8s_child(k8s_walk_t *w, TSNode mapping, const char *field) {
+    TSNode none = {0};
+    if (ts_node_is_null(mapping) || !k8s_is_mapping(mapping)) {
+        return none;
+    }
+    uint32_t n = ts_node_named_child_count(mapping);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode pair = ts_node_named_child(mapping, i);
+        if (!k8s_is_pair(pair)) {
+            continue;
+        }
+        TSNode key = ts_node_named_child(pair, 0);
+        const char *k =
+            ts_node_is_null(key) ? NULL : get_scalar_text(w->ctx->arena, key, w->ctx->source);
+        if (k && strcmp(k, field) == 0) {
+            TSNode v = unwrap_pair_value(pair);
+            return ts_node_is_null(v) ? none : k8s_unwrap(v);
+        }
+    }
+    return none;
+}
+
+// The items of a sequence node, unwrapped, comments skipped.
+typedef struct {
+    TSNode seq;
+    uint32_t i;
+    uint32_t n;
+} k8s_iter_t;
+
+static k8s_iter_t k8s_iter(TSNode seq) {
+    k8s_iter_t it = {.seq = seq};
+    if (!ts_node_is_null(seq) && (strcmp(ts_node_type(seq), "block_sequence") == 0 ||
+                                  strcmp(ts_node_type(seq), "flow_sequence") == 0)) {
+        it.n = ts_node_named_child_count(seq);
+    }
+    return it;
+}
+
+static bool k8s_next(k8s_iter_t *it, TSNode *out) {
+    while (it->i < it->n) {
+        TSNode item = ts_node_named_child(it->seq, it->i++);
+        if (strcmp(ts_node_type(item), "block_sequence_item") == 0) {
+            item = first_content_child(item);
+        }
+        if (!ts_node_is_null(item) && strcmp(ts_node_type(item), "comment") != 0) {
+            *out = k8s_unwrap(item);
+            return true;
+        }
+    }
+    return false;
+}
+
+// A scalar field of a node (NULL unless a mapping holding a scalar there).
+static const char *k8s_text(k8s_walk_t *w, TSNode mapping, const char *field) {
+    TSNode v = k8s_child(w, mapping, field);
+    return ts_node_is_null(v) ? NULL : get_scalar_text(w->ctx->arena, v, w->ctx->source);
+}
+
+// An exposed route "<host or *><path>" to backend `name` (NULL: none).
+static void k8s_emit_route(k8s_walk_t *w, const char *host, const char *path, const char *ns,
+                           const char *name, const char *via) {
+    host = host && host[0] ? host : "*";
+    path = path && path[0] ? path : "/";
+    if (strstr(host, "{{") || strstr(path, "{{") || strchr(host, '/')) {
+        return;
+    }
+    CBMArena *a = w->ctx->arena;
+    CBMK8sFact f = {.fact = CBM_K8S_FACT_ROUTE,
+                    .def_index = w->def_index,
+                    .kind = name ? "Service" : NULL,
+                    .ns = ns && ns[0] && !strstr(ns, "{{") ? cbm_arena_strdup(a, ns) : NULL,
+                    .name = name && !strstr(name, "{{") ? cbm_arena_strdup(a, name) : NULL,
+                    .via = via,
+                    .edge = "INFRA_MAPS",
+                    .route = cbm_arena_sprintf(a, "%s%s%s", host, path[0] == '/' ? "" : "/", path)};
+    cbm_k8sfact_push(&w->ctx->result->k8s_facts, a, f);
+}
+
+// The routes an Ingress rule (spec.rules[] item) exposes: its host and each
+// http path, sent to the path's backend Service.
+static void k8s_ingress_rule(k8s_walk_t *w, TSNode rule) {
+    const char *host = k8s_text(w, rule, "host");
+    k8s_iter_t paths = k8s_iter(k8s_child(w, k8s_child(w, rule, "http"), "paths"));
+    TSNode p;
+    while (k8s_next(&paths, &p)) {
+        TSNode backend = k8s_child(w, p, "backend");
+        const char *svc = k8s_text(w, k8s_child(w, backend, "service"), "name");
+        svc = svc ? svc : k8s_text(w, backend, "serviceName");
+        k8s_emit_route(w, host, k8s_text(w, p, "path"), NULL, svc, "ingress");
+    }
+}
+
+// One HTTPRoute host x path: to each Service backend of the rule, else none.
+static void k8s_httproute_target(k8s_walk_t *w, TSNode rule, const char *host, const char *path) {
+    k8s_iter_t backs = k8s_iter(k8s_child(w, rule, "backendRefs"));
+    TSNode b;
+    bool any = false;
+    while (k8s_next(&backs, &b)) {
+        const char *kind = k8s_text(w, b, "kind");
+        if (kind && strcmp(kind, "Service") != 0) {
+            continue;
+        }
+        k8s_emit_route(w, host, path, k8s_text(w, b, "namespace"), k8s_text(w, b, "name"),
+                       "httproute");
+        any = true;
+    }
+    if (!any) {
+        k8s_emit_route(w, host, path, NULL, NULL, "httproute");
+    }
+}
+
+// The routes an HTTPRoute spec exposes: every hostname (else any) with
+// every path match of a rule (else `/`), sent to the rule's Service backends.
+static void k8s_httproute_spec(k8s_walk_t *w, TSNode spec) {
+    TSNode hostnames = k8s_child(w, spec, "hostnames");
+    k8s_iter_t rules = k8s_iter(k8s_child(w, spec, "rules"));
+    TSNode rule;
+    while (k8s_next(&rules, &rule)) {
+        k8s_iter_t hosts = k8s_iter(hostnames);
+        TSNode h;
+        bool any_host = k8s_next(&hosts, &h);
+        do {
+            const char *host = any_host ? get_scalar_text(w->ctx->arena, h, w->ctx->source) : NULL;
+            k8s_iter_t matches = k8s_iter(k8s_child(w, rule, "matches"));
+            TSNode m;
+            bool any_match = false;
+            while (k8s_next(&matches, &m)) {
+                k8s_httproute_target(w, rule, host, k8s_text(w, k8s_child(w, m, "path"), "value"));
+                any_match = true;
+            }
+            if (!any_match) {
+                k8s_httproute_target(w, rule, host, NULL);
+            }
+        } while (any_host && k8s_next(&hosts, &h));
+    }
+}
+
 // The reference a mapping holds in its kind/name/namespace: to `kind`, or
 // (NULL) to its own `kind` field, one of `allowed` (NULL: any), `dflt`
 // when absent.
@@ -827,6 +965,14 @@ static void k8s_mapping(k8s_walk_t *w, const char *path, TSNode mapping) {
         if (k8s_source_is(w, r->groups, r->kinds) && k8s_path_match(r->path, path)) {
             k8s_mapping_ref(w, mapping, r->kind, r->allowed, r->dflt, r->via, r->edge);
         }
+    }
+    if (k8s_source_is(w, "|networking.k8s.io|extensions|", "|Ingress|") &&
+        strcmp(path, "spec.rules[]") == 0) {
+        k8s_ingress_rule(w, mapping);
+    }
+    if (k8s_source_is(w, "|gateway.networking.k8s.io|", "|HTTPRoute|") &&
+        strcmp(path, "spec") == 0) {
+        k8s_httproute_spec(w, mapping);
     }
 }
 
