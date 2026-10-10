@@ -139,6 +139,7 @@ typedef struct {
     int classes;     /* Class label */
     int resources;   /* Resource label (k8s) */
     int charts;      /* Chart label (helm) */
+    int variables;   /* Variable label */
     int imports;     /* IMPORTS edges */
     int depends_on;  /* DEPENDS_ON edges */
     int infra_maps;  /* INFRA_MAPS edges */
@@ -156,6 +157,7 @@ static GpfMetrics gpf_metrics_files(const GpfFile *files, int nfiles) {
         m.classes     = gpf_count_label(store, lp.project, "Class");
         m.resources   = gpf_count_label(store, lp.project, "Resource");
         m.charts      = gpf_count_label(store, lp.project, "Chart");
+        m.variables   = gpf_count_label(store, lp.project, "Variable");
         m.imports     = cbm_store_count_edges_by_type(store, lp.project, "IMPORTS");
         m.depends_on  = cbm_store_count_edges_by_type(store, lp.project, "DEPENDS_ON");
         m.infra_maps  = cbm_store_count_edges_by_type(store, lp.project, "INFRA_MAPS");
@@ -740,6 +742,38 @@ TEST(probe_kustomize_extensionless_file) {
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.modules >= 1);
     ASSERT_TRUE(m.imports >= 1);
+    PASS();
+}
+
+/* A K8s object's top-level keys (apiVersion, kind, metadata, spec, status) are
+ * its envelope, carried by its Resource node; as Variables they repeated per
+ * manifest (deckhouse: `kind` 1,358, `apiVersion` 1,347, `metadata` 1,336)
+ * and fed name-similarity config links. */
+TEST(probe_k8s_manifest_mints_no_envelope_variables) {
+    GpfMetrics m = gpf_metrics("deploy.yaml",
+        "# a manifest\n"
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: web\n"
+        "spec:\n"
+        "  replicas: 2\n"
+        "status: {}\n");
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.resources, 1);
+    ASSERT_EQ(m.variables, 0);
+    PASS();
+}
+
+/* A plain config YAML keeps its top-level keys as Variables. */
+TEST(probe_yaml_config_keeps_variables) {
+    GpfMetrics m = gpf_metrics("config.yaml",
+        "server:\n"
+        "  port: 8080\n"
+        "kind: production\n"
+        "replicas: 3\n");
+    ASSERT_TRUE(m.ok);
+    ASSERT_TRUE(m.variables >= 3);
     PASS();
 }
 
@@ -2000,6 +2034,8 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_kustomize_extensionless_file);
     RUN_TEST(probe_kustomize_remote_base_names_no_symbol);
     RUN_TEST(probe_helm_file_dependency_links_local_chart);
+    RUN_TEST(probe_k8s_manifest_mints_no_envelope_variables);
+    RUN_TEST(probe_yaml_config_keeps_variables);
     RUN_TEST(probe_helm_unresolved_file_dependency_stays_external);
     RUN_TEST(probe_kustomize_nested_sibling_entries);
     RUN_TEST(probe_kustomize_single_module);

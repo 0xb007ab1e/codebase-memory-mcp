@@ -9961,6 +9961,31 @@ static void extract_yaml_toplevel_keys(CBMExtractCtx *ctx, TSNode root) {
     }
 }
 
+// True when the YAML document's top level holds both `apiVersion` and `kind`:
+// a Kubernetes object, whose top-level keys are its envelope.
+static bool yaml_is_k8s_object(CBMExtractCtx *ctx, TSNode root) {
+    TSNode bm = find_yaml_toplevel_mapping(root);
+    if (ts_node_is_null(bm)) {
+        return false;
+    }
+    bool api_version = false;
+    bool kind = false;
+    uint32_t n = ts_node_named_child_count(bm);
+    for (uint32_t i = 0; i < n && !(api_version && kind); i++) {
+        TSNode pair = ts_node_named_child(bm, i);
+        if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
+            continue;
+        }
+        TSNode key = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+        const char *k = ts_node_is_null(key) ? NULL : cbm_node_text(ctx->arena, key, ctx->source);
+        if (k) {
+            api_version = api_version || strcmp(k, "apiVersion") == 0;
+            kind = kind || strcmp(k, "kind") == 0;
+        }
+    }
+    return api_version && kind;
+}
+
 static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     if (!spec->variable_node_types || !spec->variable_node_types[0]) {
         return;
@@ -9969,6 +9994,13 @@ static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec
     // Helm values.yaml: only top-level keys, not the per-leaf flood.
     if (ctx->language == CBM_LANG_YAML && is_helm_values_file(ctx->rel_path)) {
         extract_yaml_toplevel_keys(ctx, root);
+        return;
+    }
+
+    // A Kubernetes object's top-level keys (apiVersion, kind, metadata, spec,
+    // status) are its envelope, which its Resource node carries; as Variables
+    // they repeated in every manifest and fed name-similarity config links.
+    if (ctx->language == CBM_LANG_YAML && yaml_is_k8s_object(ctx, root)) {
         return;
     }
 
