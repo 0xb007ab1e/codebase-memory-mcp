@@ -646,39 +646,47 @@ static bool k8s_external_dep(cbm_pipeline_ctx_t *ctx, int64_t chart_id, const ch
     return true;
 }
 
+/* QN of the chart a relative `file://` directory names, core-owned; NULL for
+ * an absolute path (it names the build host, not this repo). */
+static char *k8s_local_chart_qn(const char *project, const char *chart_rel, const char *dir) {
+    if (!dir[0] || dir[0] == '/') {
+        return NULL;
+    }
+    char rel[CBM_HELM_REPO_MAX + K8S_SLEN("./") + K8S_SLEN("/Chart.yaml")];
+    snprintf(rel, sizeof(rel), "%s%s/Chart.yaml", strncmp(dir, "../", 3) == 0 ? "" : "./", dir);
+    /* fqn.c hands out libc-allocated strings: copy into the core, release them. */
+    char *path = cbm_pipeline_resolve_relative_import(chart_rel, rel);
+    char *qn = path ? cbm_infra_qn(project, path, "helm-chart", NULL) : NULL;
+    free(path);
+    char *owned = qn ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, qn) : NULL;
+    free(qn);
+    return owned;
+}
+
 static void k8s_local_deps_push(k8s_local_deps_t *deps, int64_t chart_id, const char *chart_rel,
                                 const char *project, const cbm_helm_dep_t *dep) {
-    const char *dir = dep->repository + K8S_SLEN("file://");
-    char *target_qn = NULL;
-    if (dir[0] && dir[0] != '/') { /* an absolute path names the build host, not this repo */
-        char rel[CBM_HELM_REPO_MAX + K8S_SLEN("./") + K8S_SLEN("/Chart.yaml")];
-        snprintf(rel, sizeof(rel), "%s%s/Chart.yaml", strncmp(dir, "../", 3) == 0 ? "" : "./", dir);
-        char *path = cbm_pipeline_resolve_relative_import(chart_rel, rel);
-        target_qn = path ? cbm_infra_qn(project, path, "helm-chart", NULL) : NULL;
-        free(path);
-    }
     if (deps->count == deps->cap) {
         int cap = deps->cap ? deps->cap * 2 : K8S_GROW_MIN;
         k8s_local_dep_t *grown =
             cbm_realloc(CBM_MEM_CLASS_OTHER, deps->items, (size_t)cap * sizeof(*grown));
         if (!grown) {
-            free(target_qn);
             return;
         }
         deps->items = grown;
         deps->cap = cap;
     }
     k8s_local_dep_t *d = &deps->items[deps->count++];
-    *d = (k8s_local_dep_t){.chart_id = chart_id, .target_qn = target_qn};
+    *d = (k8s_local_dep_t){.chart_id = chart_id};
+    d->target_qn = k8s_local_chart_qn(project, chart_rel, dep->repository + K8S_SLEN("file://"));
     snprintf(d->name, sizeof(d->name), "%s", dep->name);
-    d->chart_rel = strdup(chart_rel);
+    d->chart_rel = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, chart_rel);
     d->props = k8s_dep_props(dep->repository);
 }
 
 static void k8s_local_deps_free(k8s_local_deps_t *deps) {
     for (int i = 0; i < deps->count; i++) {
-        free(deps->items[i].target_qn);
-        free(deps->items[i].chart_rel);
+        cbm_free(CBM_MEM_CLASS_OTHER, deps->items[i].target_qn);
+        cbm_free(CBM_MEM_CLASS_OTHER, deps->items[i].chart_rel);
         cbm_free(CBM_MEM_CLASS_OTHER, deps->items[i].props);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, deps->items);

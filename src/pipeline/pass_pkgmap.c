@@ -31,7 +31,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
-/* Read an entire file into a malloc'd buffer. Returns NULL on failure. */
+/* Read an entire file into a core-owned buffer (class extract; release with
+ * cbm_free(CBM_MEM_CLASS_EXTRACT, ...)). Returns NULL on failure. */
 static char *pkgmap_read_file(const char *path, int *out_len) {
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
@@ -44,7 +45,7 @@ static char *pkgmap_read_file(const char *path, int *out_len) {
         (void)fclose(f);
         return NULL;
     }
-    char *buf = (char *)malloc((size_t)size + SKIP_ONE);
+    char *buf = (char *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)size + SKIP_ONE);
     if (!buf) {
         (void)fclose(f);
         return NULL;
@@ -1201,7 +1202,7 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         if (cbm_pkgmap_try_parse(name, rel_path, source, source_len, entries)) {
             parsed++;
         }
-        free(source);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     }
     cbm_closedir(dir);
     return parsed;
@@ -1247,7 +1248,7 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
             continue;
         }
         cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries);
-        free(source);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     }
 
     CBMHashTable *map = cbm_pkgmap_build(&entries, SKIP_ONE, project_name);
@@ -1282,7 +1283,7 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
             continue;
         }
         cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries);
-        free(source);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     }
 
     int from_walk = cbm_pkgmap_scan_repo(repo_path, &entries, excluded_dirs, excluded_count);
