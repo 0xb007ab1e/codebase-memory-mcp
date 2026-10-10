@@ -470,6 +470,79 @@ TEST(probe_kustomize_with_patches) {
     PASS();
 }
 
+/* A comment between `---` and the mapping (the `# yaml-language-server:
+ * $schema=...` line editors add) is the document's first named child; the
+ * manifest behind it is still a manifest. onedr0p/home-ops opens 428 of its
+ * manifests this way and got a Resource for 26 of 390 objects. */
+TEST(probe_k8s_manifest_after_leading_comment) {
+    GpfMetrics m = gpf_metrics("helmrelease.yaml",
+        "---\n"
+        "# yaml-language-server: $schema=https://example.com/helmrelease.json\n"
+        "apiVersion: helm.toolkit.fluxcd.io/v2\n"
+        "kind: HelmRelease\n"
+        "metadata:\n"
+        "  name: echo\n"
+        "spec:\n"
+        "  interval: 1h\n");
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.resources, 1);
+    PASS();
+}
+
+/* The same comment in front of a kustomization hid its resource list:
+ * home-ops resolved 1 of 348 entries. */
+TEST(probe_kustomize_imports_after_leading_comment) {
+    static const GpfFile files[] = {
+        {"kustomization.yaml",
+         "---\n"
+         "# yaml-language-server: $schema=https://json.schemastore.org/kustomization\n"
+         "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+         "kind: Kustomization\n"
+         "resources:\n"
+         "  - namespace.yaml\n"},
+        {"namespace.yaml",
+         "apiVersion: v1\n"
+         "kind: Namespace\n"
+         "metadata:\n"
+         "  name: network\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 2);
+    ASSERT_TRUE(m.ok);
+    ASSERT_TRUE(m.imports >= 1);
+    PASS();
+}
+
+/* The label scan stopped at a leading `---`, so a Service written that way
+ * had no selector and linked to nothing. The workload's name differs from the
+ * selector value, so only the pod-template label can match. */
+TEST(probe_k8s_selector_after_leading_separator) {
+    static const GpfFile files[] = {
+        {"service.yaml",
+         "---\n"
+         "apiVersion: v1\n"
+         "kind: Service\n"
+         "metadata:\n"
+         "  name: web\n"
+         "spec:\n"
+         "  selector:\n"
+         "    app: web-pods\n"},
+        {"deploy.yaml",
+         "apiVersion: apps/v1\n"
+         "kind: Deployment\n"
+         "metadata:\n"
+         "  name: web-deploy\n"
+         "spec:\n"
+         "  template:\n"
+         "    metadata:\n"
+         "      labels:\n"
+         "        app: web-pods\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 2);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.infra_maps, 1);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  * GROUP 4 — Nix (.nix)
  *
@@ -1567,6 +1640,9 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_kustomize_module_node);
     RUN_TEST(probe_kustomize_imports_edges);
     RUN_TEST(probe_kustomize_with_patches);
+    RUN_TEST(probe_k8s_manifest_after_leading_comment);
+    RUN_TEST(probe_kustomize_imports_after_leading_comment);
+    RUN_TEST(probe_k8s_selector_after_leading_separator);
 
     /* Nix */
     RUN_TEST(probe_nix_attrset_node);

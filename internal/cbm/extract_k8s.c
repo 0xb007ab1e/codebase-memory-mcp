@@ -102,15 +102,30 @@ static void emit_kustomize_sequence(CBMExtractCtx *ctx, TSNode seq_node, const c
     }
 }
 
+// First named child that is not a comment. A comment between `---` and the
+// mapping (the `# yaml-language-server: $schema=...` line editors add) is the
+// document's first named child; the content follows it.
+static TSNode first_content_child(TSNode node) {
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode child = ts_node_named_child(node, i);
+        if (strcmp(ts_node_type(child), "comment") != 0) {
+            return child;
+        }
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
 // Unwrap a YAML node through optional block_node wrapper to get block_mapping.
 // Returns null node if not a block_mapping.
 static TSNode unwrap_block_mapping(TSNode doc_child) {
-    TSNode mapping = ts_node_named_child(doc_child, 0);
+    TSNode mapping = first_content_child(doc_child);
     if (ts_node_is_null(mapping)) {
         return mapping;
     }
     if (strcmp(ts_node_type(mapping), "block_node") == 0) {
-        mapping = ts_node_named_child(mapping, 0);
+        mapping = first_content_child(mapping);
     }
     if (ts_node_is_null(mapping) || strcmp(ts_node_type(mapping), "block_mapping") != 0) {
         TSNode null_node = {0};
@@ -307,14 +322,8 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
             continue;
         }
 
-        TSNode mapping = ts_node_named_child(stream_child, 0);
+        TSNode mapping = unwrap_block_mapping(stream_child);
         if (ts_node_is_null(mapping)) {
-            continue;
-        }
-        if (strcmp(ts_node_type(mapping), "block_node") == 0) {
-            mapping = ts_node_named_child(mapping, 0);
-        }
-        if (ts_node_is_null(mapping) || strcmp(ts_node_type(mapping), "block_mapping") != 0) {
             continue;
         }
 

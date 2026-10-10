@@ -239,6 +239,7 @@ static void k8s_scan_labels(const char *source, k8s_record_t *rec) {
     } stack[K8S_PATH_DEPTH];
     int depth = 0;
     bool got_name = false;
+    bool seen_key = false;
 
     const char *p = source;
     while (p && *p) {
@@ -254,11 +255,20 @@ static void k8s_scan_labels(const char *source, k8s_record_t *rec) {
         while (*trimmed == ' ') {
             trimmed++;
         }
+        /* A `---` before any key opens the first document; it does not end it. */
         if (strncmp(trimmed, "---", 3) == 0 && line == trimmed) {
-            break;
+            if (seen_key) {
+                break;
+            }
+            if (!eol) {
+                break;
+            }
+            p = eol + 1;
+            continue;
         }
 
         if (trimmed[0] && trimmed[0] != '#') {
+            seen_key = true;
             int ind = k8s_indent(line);
             while (depth > 0 && stack[depth - 1].indent >= ind) {
                 depth--;
