@@ -747,6 +747,21 @@ TEST(probe_k8s_manifest_after_leading_comment) {
     PASS();
 }
 
+/* A comment between a key and its block (`metadata: # owned by ...`) sits
+ * ahead of the value; the object still has its name. */
+TEST(probe_k8s_manifest_metadata_after_key_line_comment) {
+    GpfMetrics m = gpf_metrics("deploy.yaml",
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata: # owned by the platform team\n"
+        "  name: web\n"
+        "spec:\n"
+        "  replicas: 1\n");
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.resources, 1);
+    PASS();
+}
+
 /* The same comment in front of a kustomization hid its resource list:
  * home-ops resolved 1 of 348 entries. */
 TEST(probe_kustomize_imports_after_leading_comment) {
@@ -767,6 +782,55 @@ TEST(probe_kustomize_imports_after_leading_comment) {
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.imports >= 1);
+    PASS();
+}
+
+/* A commented-out entry above the first item (kubernetes/k8s.io's
+ * kubernetes/apps: `# - argocd.yaml ...`) is a comment ahead of the list;
+ * the entries below it are still the list. */
+TEST(probe_kustomize_entries_after_commented_out_entry) {
+    static const GpfFile files[] = {
+        {"kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+         "kind: Kustomization\n"
+         "resources:\n"
+         "  # - argocd.yaml applied by hand\n"
+         "  - atlantis.yaml\n"
+         "  - datadog.yaml\n"},
+        {"atlantis.yaml",
+         "apiVersion: v1\n"
+         "kind: Namespace\n"
+         "metadata:\n"
+         "  name: atlantis\n"},
+        {"datadog.yaml",
+         "apiVersion: v1\n"
+         "kind: Namespace\n"
+         "metadata:\n"
+         "  name: datadog\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 3);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.imports, 2);
+    PASS();
+}
+
+/* Same with the comment trailing the key line. */
+TEST(probe_kustomize_entries_after_key_line_comment) {
+    static const GpfFile files[] = {
+        {"kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+         "kind: Kustomization\n"
+         "resources: # applied by Argo CD\n"
+         "  - atlantis.yaml\n"},
+        {"atlantis.yaml",
+         "apiVersion: v1\n"
+         "kind: Namespace\n"
+         "metadata:\n"
+         "  name: atlantis\n"}
+    };
+    GpfMetrics m = gpf_metrics_files(files, 2);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.imports, 1);
     PASS();
 }
 
@@ -2089,6 +2153,9 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_helm_unresolved_file_dependency_stays_external);
     RUN_TEST(probe_kustomize_nested_sibling_entries);
     RUN_TEST(probe_kustomize_single_module);
+    RUN_TEST(probe_kustomize_entries_after_commented_out_entry);
+    RUN_TEST(probe_kustomize_entries_after_key_line_comment);
+    RUN_TEST(probe_k8s_manifest_metadata_after_key_line_comment);
 
     /* Nix */
     RUN_TEST(probe_nix_attrset_node);

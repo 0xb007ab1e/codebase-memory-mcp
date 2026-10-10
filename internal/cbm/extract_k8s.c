@@ -134,6 +134,27 @@ static TSNode unwrap_block_mapping(TSNode doc_child) {
     return mapping;
 }
 
+// Unwrap a block_mapping_pair value through optional block_node. Comments are
+// skipped on both levels: one trailing the key line (`metadata: # note`) is a
+// named child of the pair ahead of its value, and a commented-out first entry
+// (`resources:` / `  # - a.yaml` / `  - b.yaml`) is the block_node's first
+// named child, ahead of the sequence.
+static TSNode unwrap_pair_value(TSNode pair) {
+    TSNode val_node = {0};
+    uint32_t n = ts_node_named_child_count(pair);
+    for (uint32_t i = SKIP_ONE; i < n; i++) {
+        TSNode child = ts_node_named_child(pair, i);
+        if (strcmp(ts_node_type(child), "comment") != 0) {
+            val_node = child;
+            break;
+        }
+    }
+    if (!ts_node_is_null(val_node) && strcmp(ts_node_type(val_node), "block_node") == 0) {
+        val_node = first_content_child(val_node);
+    }
+    return val_node;
+}
+
 // Process a single block_mapping_pair for kustomize list keys.
 static void process_kustomize_pair(CBMExtractCtx *ctx, TSNode pair) {
     if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
@@ -148,21 +169,12 @@ static void process_kustomize_pair(CBMExtractCtx *ctx, TSNode pair) {
         return;
     }
 
-    TSNode val_node = ts_node_named_child(pair, SKIP_ONE);
-    if (ts_node_is_null(val_node)) {
-        return;
-    }
-    if (strcmp(ts_node_type(val_node), "block_node") == 0) {
-        val_node = ts_node_named_child(val_node, 0);
-    }
+    TSNode val_node = unwrap_pair_value(pair);
     if (ts_node_is_null(val_node) || strcmp(ts_node_type(val_node), "block_sequence") != 0) {
         return;
     }
     emit_kustomize_sequence(ctx, val_node, key_text);
 }
-
-// Forward declaration: defined with the K8s-manifest helpers below.
-static TSNode unwrap_pair_value(TSNode pair);
 
 // Emit a "Class" def named after the document's `kind` scalar. A kustomization
 // file has no metadata.name, so the def name is the bare kind ("Kustomization").
@@ -249,7 +261,7 @@ static void extract_metadata_name(CBMArena *a, TSNode meta_mapping, const char *
         if (!mkey_text || strcmp(mkey_text, "name") != 0) {
             continue;
         }
-        TSNode mval = ts_node_named_child(mpair, SKIP_ONE);
+        TSNode mval = unwrap_pair_value(mpair);
         if (ts_node_is_null(mval)) {
             continue;
         }
@@ -258,18 +270,6 @@ static void extract_metadata_name(CBMArena *a, TSNode meta_mapping, const char *
             snprintf(meta_name_buf, meta_sz, "%s", meta_name);
         }
     }
-}
-
-// Unwrap a block_mapping_pair value through optional block_node.
-static TSNode unwrap_pair_value(TSNode pair) {
-    TSNode val_node = ts_node_named_child(pair, SKIP_ONE);
-    if (ts_node_is_null(val_node)) {
-        return val_node;
-    }
-    if (strcmp(ts_node_type(val_node), "block_node") == 0) {
-        val_node = ts_node_named_child(val_node, 0);
-    }
-    return val_node;
 }
 
 // Descend into the first block_mapping of a document and extract
