@@ -1084,6 +1084,197 @@ TEST(probe_k8s_reference_prefers_its_own_file) {
     PASS();
 }
 
+/* ── Go operator layer (P1.2) ───────────────────────────────────────── */
+
+/* Edges of `type` whose properties carry `prop`, between nodes of
+ * `src_label` and `tgt_label`; -1 when indexing failed. */
+static int gpf_typed_edges(const GpfFile *files, int nfiles, const char *type,
+                           const char *src_label, const char *tgt_label, const char *prop) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    int n = -1;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql = "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                          "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type=?2 "
+                          "AND s.label=?3 AND t.label=?4 AND instr(e.properties,?5)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 2, type, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 3, src_label, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 4, tgt_label, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 5, prop, -1, SQLITE_STATIC);
+            n = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return n;
+}
+
+static const GpfFile k_operator_repo[] = {
+    {"go.mod", "module example.com/proj\n\ngo 1.22\n"},
+    {"api/v1/doc.go", "// +groupName=example.com\npackage v1\n"},
+    {"api/v1/widget_types.go", "package v1\n\ntype Widget struct {\n\tName string\n}\n\n"
+                               "type Gadget struct {\n\tName string\n}\n"},
+    {"config/crd/widgets.yaml",
+     "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\n"
+     "metadata:\n  name: widgets.example.com\nspec:\n  group: example.com\n"
+     "  names:\n    kind: Widget\n    plural: widgets\n  scope: Namespaced\n"},
+    {"internal/controller/widget.go", "package controller\n\n"
+                                      "import (\n\texamplev1 \"example.com/proj/api/v1\"\n"
+                                      "\tctrl \"sigs.k8s.io/controller-runtime\"\n)\n\n"
+                                      "func SetupWithManager(mgr ctrl.Manager) error {\n"
+                                      "\treturn ctrl.NewControllerManagedBy(mgr).\n"
+                                      "\t\tFor(&examplev1.Widget{}).\n"
+                                      "\t\tOwns(&examplev1.Gadget{}).\n"
+                                      "\t\tComplete(nil)\n"
+                                      "}\n"},
+    {"config/embed.go",
+     "package config\n\nimport \"embed\"\n\n//go:embed crd/*\nvar CRDs embed.FS\n"}};
+
+/* A controller reconciles the kind it is built For, and the kinds it Owns. */
+TEST(probe_go_controller_handles_its_kinds) {
+    ASSERT_EQ(
+        gpf_typed_edges(k_operator_repo, 6, "HANDLES", "Function", "Struct", "\"role\":\"for\""),
+        1);
+    ASSERT_EQ(
+        gpf_typed_edges(k_operator_repo, 6, "HANDLES", "Function", "Struct", "\"role\":\"owns\""),
+        1);
+    PASS();
+}
+
+/* The CRD of group example.com / kind Widget is backed by `type Widget`
+ * in the package marked +groupName=example.com; a Go file embeds the CRD
+ * files its //go:embed names. */
+TEST(probe_go_crd_type_and_embed) {
+    ASSERT_EQ(
+        gpf_typed_edges(k_operator_repo, 6, "USAGE", "Resource", "Struct", "\"ref\":\"crd-type\""),
+        1);
+    ASSERT_EQ(gpf_typed_edges(k_operator_repo, 6, "REFERENCES_FILE", "File", "File",
+                              "\"via\":\"go:embed\""),
+              1);
+    PASS();
+}
+
+/* The kind a controller reconciles is the type of the package it imports:
+ * kubermatic has `Cluster` structs and a method `Cluster` elsewhere, and a
+ * name-only lookup handed `For(&kubermaticv1.Cluster{})` to the method. */
+TEST(probe_go_controller_kind_is_the_imported_type) {
+    static const GpfFile files[] = {
+        {"go.mod", "module example.com/proj\n\ngo 1.22\n"},
+        {"api/v1/types.go", "package v1\n\ntype Cluster struct {\n\tName string\n}\n"},
+        {"internal/legacy/types.go", "package legacy\n\ntype Cluster struct {\n\tID int\n}\n"},
+        {"pkg/resources/creds.go",
+         "package resources\n\ntype Creds struct{}\n\nfunc (c Creds) Cluster() string {\n"
+         "\treturn \"\"\n}\n"},
+        {"internal/controller/cluster.go",
+         "package controller\n\n"
+         "import (\n\tkubermaticv1 \"example.com/proj/api/v1\"\n"
+         "\tctrl \"sigs.k8s.io/controller-runtime\"\n)\n\n"
+         "func Add(mgr ctrl.Manager) error {\n"
+         "\treturn ctrl.NewControllerManagedBy(mgr).For(&kubermaticv1.Cluster{}).Complete(nil)\n"
+         "}\n"}};
+    ASSERT_EQ(gpf_typed_edges(files, 5, "HANDLES", "Function", "Struct", "\"role\":\"for\""), 1);
+    ASSERT_EQ(gpf_typed_edges(files, 5, "HANDLES", "Function", "Method", "\"role\":\"for\""), 0);
+    PASS();
+}
+
+/* Edges of `type` into nodes defined in `tgt_file`; -1 when indexing failed. */
+static int gpf_edges_into_file(const GpfFile *files, int nfiles, const char *type,
+                               const char *tgt_file) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    int n = -1;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql = "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id "
+                          "WHERE e.project=?1 AND e.type=?2 AND t.file_path=?3";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 2, type, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 3, tgt_file, -1, SQLITE_STATIC);
+            n = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return n;
+}
+
+/* An import path names the directory its go.mod roots: kubermatic's
+ * `k8c.io/kubermatic/sdk/v2/apis/...` lives in `sdk/apis/...`, which the
+ * path does not end with, while an unrelated `apis/v1` does. */
+TEST(probe_go_controller_import_follows_go_mod) {
+    static const GpfFile files[] = {
+        {"go.mod", "module example.com/proj\n\ngo 1.22\n"},
+        {"sdk/go.mod", "module example.com/proj/sdk/v2\n\ngo 1.22\n"},
+        {"sdk/apis/v1/types.go", "package v1\n\ntype Cluster struct {\n\tName string\n}\n"},
+        {"apis/v1/types.go", "package v1\n\ntype Cluster struct {\n\tID int\n}\n"},
+        {"pkg/controller/cluster.go",
+         "package controller\n\n"
+         "import (\n\tkubermaticv1 \"example.com/proj/sdk/v2/apis/v1\"\n"
+         "\tctrl \"sigs.k8s.io/controller-runtime\"\n)\n\n"
+         "func Add(mgr ctrl.Manager) error {\n"
+         "\treturn ctrl.NewControllerManagedBy(mgr).For(&kubermaticv1.Cluster{}).Complete(nil)\n"
+         "}\n"}};
+    ASSERT_EQ(gpf_edges_into_file(files, 5, "HANDLES", "sdk/apis/v1/types.go"), 1);
+    ASSERT_EQ(gpf_edges_into_file(files, 5, "HANDLES", "apis/v1/types.go"), 0);
+    PASS();
+}
+
+/* A comment line may sit between a chain's '.' and the call (kubermatic's
+ * seed-sync: `}).` / `// watch all seeds` / `For(&kubermaticv1.Seed{}, ...`),
+ * and a call written inside a comment builds nothing. */
+TEST(probe_go_controller_chain_with_comment_lines) {
+    static const GpfFile files[] = {
+        {"go.mod", "module example.com/proj\n\ngo 1.22\n"},
+        {"api/v1/widget.go", "package v1\n\ntype Widget struct {\n\tName string\n}\n"},
+        {"api/v1/gadget.go", "package v1\n\ntype Gadget struct {\n\tName string\n}\n"},
+        {"internal/controller/widget.go",
+         "package controller\n\n"
+         "import (\n\tv1 \"example.com/proj/api/v1\"\n"
+         "\tctrl \"sigs.k8s.io/controller-runtime\"\n)\n\n"
+         "func Add(mgr ctrl.Manager) error {\n"
+         "\t// gadgets would be b.Owns(&v1.Gadget{}) (not yet)\n"
+         "\treturn ctrl.NewControllerManagedBy(mgr).\n"
+         "\t\tNamed(\"widget\").\n"
+         "\t\t// watch all widgets\n"
+         "\t\tFor(&v1.Widget{}).\n"
+         "\t\tComplete(nil)\n"
+         "}\n"}};
+    ASSERT_EQ(gpf_edges_into_file(files, 4, "HANDLES", "api/v1/widget.go"), 1);
+    ASSERT_EQ(gpf_edges_into_file(files, 4, "HANDLES", "api/v1/gadget.go"), 0);
+    PASS();
+}
+
+/* Go method QNs carry no receiver, so every reconciler's SetupWithManager in
+ * one package is one node: each definition still handles its own kind. */
+TEST(probe_go_controller_methods_sharing_a_node) {
+    static const GpfFile files[] = {
+        {"go.mod", "module example.com/proj\n\ngo 1.22\n"},
+        {"api/v1/types.go", "package v1\n\ntype Widget struct {\n\tName string\n}\n\n"
+                            "type Gadget struct {\n\tName string\n}\n"},
+        {"internal/controller/widget.go",
+         "package controller\n\n"
+         "import (\n\tv1 \"example.com/proj/api/v1\"\n"
+         "\tctrl \"sigs.k8s.io/controller-runtime\"\n)\n\n"
+         "type WidgetReconciler struct{}\n\n"
+         "func (r *WidgetReconciler) SetupWithManager(mgr ctrl.Manager) error {\n"
+         "\treturn ctrl.NewControllerManagedBy(mgr).For(&v1.Widget{}).Complete(r)\n"
+         "}\n"},
+        {"internal/controller/gadget.go",
+         "package controller\n\n"
+         "import (\n\tv1 \"example.com/proj/api/v1\"\n"
+         "\tctrl \"sigs.k8s.io/controller-runtime\"\n)\n\n"
+         "type GadgetReconciler struct{}\n\n"
+         "func (r *GadgetReconciler) SetupWithManager(mgr ctrl.Manager) error {\n"
+         "\treturn ctrl.NewControllerManagedBy(mgr).For(&v1.Gadget{}).Complete(r)\n"
+         "}\n"}};
+    ASSERT_EQ(gpf_edges_into_file(files, 4, "HANDLES", "api/v1/types.go"), 2);
+    PASS();
+}
+
 /* A CRD vendored twice (gardener: example/seed-crds and a chart): a custom
  * resource is an instance of the copy deployed with it; only when no copy
  * shares its bundle does it stand for all of them. */
@@ -2682,6 +2873,12 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_reference_stays_in_bundle);
     RUN_TEST(probe_k8s_reference_prefers_its_own_file);
     RUN_TEST(probe_k8s_cr_prefers_the_crd_in_its_bundle);
+    RUN_TEST(probe_go_controller_handles_its_kinds);
+    RUN_TEST(probe_go_crd_type_and_embed);
+    RUN_TEST(probe_go_controller_kind_is_the_imported_type);
+    RUN_TEST(probe_go_controller_import_follows_go_mod);
+    RUN_TEST(probe_go_controller_chain_with_comment_lines);
+    RUN_TEST(probe_go_controller_methods_sharing_a_node);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
     RUN_TEST(probe_k8s_selector_within_kustomize_build);
     RUN_TEST(probe_k8s_kustomize_namespace_is_effective);

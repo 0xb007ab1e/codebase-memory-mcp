@@ -194,4 +194,11 @@ int cbm_gbuf_node_set_properties_json(cbm_gbuf_node_t *node, const char *json);
  * properties_json from the buffer after collisions. */
 void cbm_gbuf_settle_variants(cbm_gbuf_t *gb);
 
+/* Visit every definition span node `n` stands for: the spans gathered from
+ * same-QN collisions (not yet written, or already in its `variants`), else
+ * its own. For passes that place a source line inside a definition. */
+typedef void (*cbm_gbuf_span_fn)(const char *file, int start, int end, void *ud);
+void cbm_gbuf_foreach_span(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *n, cbm_gbuf_span_fn fn,
+                           void *ud);
+
 #endif /* CBM_GRAPH_BUFFER_H */

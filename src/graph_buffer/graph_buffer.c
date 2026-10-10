@@ -1131,6 +1131,47 @@ static void gb_free_span_vec(const char *qn, void *value, void *ud) {
     gb_span_vec_free(value);
 }
 
+void cbm_gbuf_foreach_span(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *n, cbm_gbuf_span_fn fn,
+                           void *ud) {
+    if (!gb || !n || !fn) {
+        return;
+    }
+    const gb_span_vec_t *vec = gb->variant_spans && n->qualified_name
+                                   ? cbm_ht_get(gb->variant_spans, n->qualified_name)
+                                   : NULL;
+    if (vec && vec->count > 0) {
+        for (size_t i = 0; i < vec->count; i++) {
+            fn(vec->items[i].file, vec->items[i].start, vec->items[i].end, ud);
+        }
+        return;
+    }
+    if (gb_props_have_variants(n->properties_json)) {
+        yyjson_doc *doc = yyjson_read_opts((char *)n->properties_json, strlen(n->properties_json),
+                                           0, &gb_yy_alc, NULL);
+        yyjson_val *list = gb_variants_list(doc);
+        size_t i;
+        size_t max;
+        yyjson_val *v;
+        bool any = false;
+        yyjson_arr_foreach(list, i, max, v) {
+            const char *f = yyjson_get_str(yyjson_obj_get(v, "file_path"));
+            int s = (int)yyjson_get_int(yyjson_obj_get(v, "start_line"));
+            int e = (int)yyjson_get_int(yyjson_obj_get(v, "end_line"));
+            if (f && s > 0) {
+                fn(f, s, e, ud);
+                any = true;
+            }
+        }
+        yyjson_doc_free(doc);
+        if (any) {
+            return;
+        }
+    }
+    if (n->file_path && n->start_line > 0) {
+        fn(n->file_path, n->start_line, n->end_line, ud);
+    }
+}
+
 void cbm_gbuf_settle_variants(cbm_gbuf_t *gb) {
     if (!gb || !gb->variant_spans) {
         return;

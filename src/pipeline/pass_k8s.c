@@ -1252,9 +1252,35 @@ static bool k8s_same_bundle(k8s_bundles_t *b, const char *a, const char *c) {
  * kind. A CRD vendored in several places: the copy deployed with the
  * resource (one bundle) is the one; with no copy beside it, the resource
  * stands for all of them. */
+/* A CRD node says which group/kind it declares (search, and the Go operator
+ * pass's CRD -> type link). */
+static void k8s_mark_crd(cbm_pipeline_ctx_t *ctx, const k8s_crd_t *crd) {
+    cbm_gbuf_node_t *n = (cbm_gbuf_node_t *)cbm_gbuf_find_by_id(ctx->gbuf, crd->node);
+    const char *props = n ? n->properties_json : NULL;
+    size_t pl = props ? strlen(props) : 0;
+    if (!props || pl < PAIR_LEN || props[pl - SKIP_ONE] != '}' || strstr(props, "\"crd_kind\"")) {
+        return;
+    }
+    char group[K8S_LABEL_LEN * PAIR_LEN];
+    char kind[K8S_LABEL_LEN * PAIR_LEN];
+    cbm_json_escape(group, (int)sizeof(group), crd->group);
+    cbm_json_escape(kind, (int)sizeof(kind), crd->kind);
+    size_t n_out = pl + strlen(group) + strlen(kind) + CBM_SZ_64;
+    char *out = cbm_alloc(CBM_MEM_CLASS_OTHER, n_out);
+    if (out) {
+        snprintf(out, n_out, "%.*s,\"crd_group\":\"%s\",\"crd_kind\":\"%s\"}", (int)(pl - SKIP_ONE),
+                 props, group, kind);
+        (void)cbm_gbuf_node_set_properties_json(n, out);
+        cbm_free(CBM_MEM_CLASS_OTHER, out);
+    }
+}
+
 static void k8s_link_crds(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8s_facts_t *f) {
     if (f->crd_n == 0) {
         return;
+    }
+    for (int i = 0; i < f->crd_n; i++) {
+        k8s_mark_crd(ctx, &f->crds[i]);
     }
     /* group/kind -> the run of its CRDs in `order` (sorted by group/kind), so
      * each resource visits only the CRDs of its own type. */

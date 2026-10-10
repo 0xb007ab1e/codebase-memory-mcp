@@ -1037,6 +1037,11 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project);
 /* Pre-dump pass: config ↔ code linking. */
 int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
 
+/* Go Kubernetes operators (pass_operator.c): controller-runtime controllers
+ * HANDLES the kinds they reconcile, CRDs -> their Go types, //go:embed files.
+ * Runs after USAGE resolution. */
+int cbm_pipeline_pass_operator(cbm_pipeline_ctx_t *ctx);
+
 /* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
 int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
 

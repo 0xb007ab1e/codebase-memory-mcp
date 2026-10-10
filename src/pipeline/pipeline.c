@@ -1837,6 +1837,9 @@ static void predump_sem(cbm_pipeline_ctx_t *ctx) {
 static void predump_cfg(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_configlink(ctx);
 }
+static void predump_operator(cbm_pipeline_ctx_t *ctx) {
+    (void)cbm_pipeline_pass_operator(ctx);
+}
 static void predump_doclinks(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_doclinks(ctx);
 }
@@ -2077,6 +2080,7 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     } passes[] = {
         {predump_deco, "decorator_tags", false},
         {predump_cfg, "configlink", false},
+        {predump_operator, "operator", false},
         {predump_doclinks, "doclinks", false},
         {predump_route, "route_match", false},
         {predump_ensemble, "ensemble_routing", false},

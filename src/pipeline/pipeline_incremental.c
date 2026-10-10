@@ -2021,6 +2021,14 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
     }
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    rc = cbm_pipeline_pass_operator(ctx);
+    cbm_log_info("pass.timing", "pass", "incr_operator", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
+    if (rc < 0 || cbm_pipeline_check_cancel(ctx)) {
+        return rc < 0 ? rc : CBM_NOT_FOUND;
+    }
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     rc = cbm_pipeline_pass_doclinks(ctx);
     cbm_log_info("pass.timing", "pass", "incr_doclinks", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
