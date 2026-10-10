@@ -1561,6 +1561,100 @@ TEST(probe_k8s_ingress_and_httproute_expose_routes) {
     PASS();
 }
 
+/* ── MCP surface: infra filters + topology (P1.5) ───────────────────── */
+
+/* Run MCP `tool` on the indexed fixture; `args_fmt` holds one %s, the
+ * project. The response is the caller's to free; NULL when indexing failed. */
+static char *gpf_tool_on(const GpfFile *files, int nfiles, const char *tool,
+                         const char *args_fmt) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *resp = NULL;
+    if (store && lp.srv) {
+        char args[2048];
+        snprintf(args, sizeof(args), args_fmt, lp.project);
+        resp = cbm_mcp_handle_tool(lp.srv, tool, args);
+    }
+    gpf_cleanup(&lp, store);
+    return resp;
+}
+
+static const GpfFile k_two_teams[] = {
+    {"k8s/a.yaml",
+     "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: team-a\n---\n"
+     "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: team-a\n"},
+    {"k8s/b.yaml",
+     "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\n  namespace: team-b\n"}};
+
+/* search_graph narrows Resources by kind and by effective namespace, in the
+ * structural and the BM25 query mode alike. */
+TEST(probe_mcp_search_filters_kind_and_namespace) {
+    char *r = gpf_tool_on(k_two_teams, 2, "search_graph",
+                          "{\"project\":\"%s\",\"label\":\"Resource\",\"kind\":\"Deployment\","
+                          "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "Deployment/team-a/web"));
+    ASSERT_NOT_NULL(strstr(r, "Deployment/team-b/api"));
+    ASSERT_NULL(strstr(r, "Service/team-a/web"));
+    free(r);
+    r = gpf_tool_on(k_two_teams, 2, "search_graph",
+                    "{\"project\":\"%s\",\"label\":\"Resource\",\"namespace\":\"team-a\","
+                    "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "Deployment/team-a/web"));
+    ASSERT_NOT_NULL(strstr(r, "Service/team-a/web"));
+    ASSERT_NULL(strstr(r, "Deployment/team-b/api"));
+    free(r);
+    r = gpf_tool_on(k_two_teams, 2, "search_graph",
+                    "{\"project\":\"%s\",\"query\":\"web\",\"kind\":\"Service\","
+                    "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "Service/team-a/web"));
+    ASSERT_NULL(strstr(r, "Deployment/team-a/web"));
+    free(r);
+    PASS();
+}
+
+/* trace_path mode=topology walks infra edges: from a Service out to its
+ * workload and the ConfigMap the workload mounts, and in to the exposed
+ * route and the Ingress that declares it. The call graph modes do not. */
+TEST(probe_mcp_trace_topology) {
+    static const char doc[] =
+        "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: shop\nspec:\n"
+        "  rules:\n    - host: shop.example.com\n      http:\n        paths:\n"
+        "          - path: /api\n            pathType: Prefix\n            backend:\n"
+        "              service:\n                name: api\n                port:\n"
+        "                  number: 80\n---\n"
+        "apiVersion: v1\nkind: Service\nmetadata:\n  name: api\nspec:\n  selector:\n"
+        "    app: api\n---\n"
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  template:\n"
+        "    metadata:\n      labels:\n        app: api\n    spec:\n      volumes:\n"
+        "        - name: cfg\n          configMap:\n            name: api-config\n---\n"
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: api-config\n";
+    static const GpfFile files[] = {{"k8s/shop.yaml", doc}};
+    char *r = gpf_tool_on(files, 1, "trace_path",
+                          "{\"function_name\":\"Service/api\",\"project\":\"%s\","
+                          "\"direction\":\"outbound\",\"mode\":\"topology\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "Deployment/-/api"));
+    ASSERT_NOT_NULL(strstr(r, "ConfigMap/-/api-config"));
+    free(r);
+    r = gpf_tool_on(files, 1, "trace_path",
+                    "{\"function_name\":\"Service/api\",\"project\":\"%s\","
+                    "\"direction\":\"inbound\",\"mode\":\"topology\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "__route__ingress__shop.example")); /* qn groups split at a dot */
+    ASSERT_NOT_NULL(strstr(r, "Ingress/-/shop"));
+    free(r);
+    r = gpf_tool_on(files, 1, "trace_path",
+                    "{\"function_name\":\"Service/api\",\"project\":\"%s\","
+                    "\"direction\":\"outbound\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(strstr(r, "Deployment/-/api"));
+    free(r);
+    PASS();
+}
+
 /* A CRD vendored twice (gardener: example/seed-crds and a chart): a custom
  * resource is an instance of the copy deployed with it; only when no copy
  * shares its bundle does it stand for all of them. */
@@ -3172,6 +3266,8 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_pdb_and_networkpolicy_select_workloads);
     RUN_TEST(probe_k8s_selectors_pick_their_own_version);
     RUN_TEST(probe_k8s_ingress_and_httproute_expose_routes);
+    RUN_TEST(probe_mcp_search_filters_kind_and_namespace);
+    RUN_TEST(probe_mcp_trace_topology);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
     RUN_TEST(probe_k8s_selector_within_kustomize_build);
     RUN_TEST(probe_k8s_kustomize_namespace_is_effective);

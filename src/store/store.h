@@ -231,6 +231,8 @@ typedef struct {
     const char *sort_by; /* "relevance" / "name" / "degree", NULL = relevance */
     bool case_sensitive;
     const char **exclude_labels; /* NULL-terminated array, or NULL */
+    const char *kind;            /* a Resource's kind property ("Deployment"), NULL = any */
+    const char *namespace_name;  /* the namespace of a Resource's obj_key, NULL = any */
 } cbm_search_params_t;
 
 typedef struct {
