@@ -2327,6 +2327,7 @@ typedef struct {
     size_t name_len;
     uint32_t sb;
     uint32_t eb;
+    bool used; /* a sub's doc holds it (pod_doc_by_name): not the module's */
 } pod_sec_t;
 
 typedef struct {
@@ -2587,15 +2588,16 @@ static void pod_index_block(CBMExtractCtx *ctx, pod_index_t *ix, TSNode pod) {
             continue;
         }
         uint32_t se = pod_section_end(cmds, n, ci, pe);
-        pod_sec_t sec = {nm, nl, cmds[ci].sb, pod_trim_end(ctx->source, cmds[ci].sb, se)};
+        pod_sec_t sec = {nm, nl, cmds[ci].sb, pod_trim_end(ctx->source, cmds[ci].sb, se), false};
         pod_index_push(a, ix, &sec);
     }
 }
 
-/* The file's POD sections by name, built on the first Perl sub. */
-static const pod_index_t *pod_index(CBMExtractCtx *ctx) {
+/* The file's POD sections by name, built on the first Perl sub (or for the
+ * module doc of a file without one). */
+static pod_index_t *pod_index(CBMExtractCtx *ctx) {
     if (ctx->doc_pod_index) {
-        return (const pod_index_t *)ctx->doc_pod_index;
+        return (pod_index_t *)ctx->doc_pod_index;
     }
     pod_index_t *ix = (pod_index_t *)cbm_arena_alloc(doc_scratch(ctx), sizeof(pod_index_t));
     if (!ix) {
@@ -2623,7 +2625,7 @@ static bool pod_sec_names(const pod_sec_t *s, const char *name, size_t nl) {
 /* Every POD section whose =head / =item names the sub exactly, joined in
  * document order; NULL when none does. */
 static const char *pod_doc_by_name(CBMExtractCtx *ctx, const char *name) {
-    const pod_index_t *ix = pod_index(ctx);
+    pod_index_t *ix = pod_index(ctx);
     if (!ix || !name || !name[0]) {
         return NULL;
     }
@@ -2643,10 +2645,11 @@ static const char *pod_doc_by_name(CBMExtractCtx *ctx, const char *name) {
     }
     size_t w = 0;
     for (int i = 0; i < ix->count; i++) {
-        const pod_sec_t *s = &ix->items[i];
+        pod_sec_t *s = &ix->items[i];
         if (!pod_sec_names(s, name, nl)) {
             continue;
         }
+        s->used = true;
         if (w > 0) {
             buf[w++] = '\n';
             buf[w++] = '\n';
@@ -2656,6 +2659,137 @@ static const char *pod_doc_by_name(CBMExtractCtx *ctx, const char *name) {
     }
     buf[w] = '\0';
     return buf;
+}
+
+/* True when src[b, e) holds a paragraph that is text, or a =head / =item
+ * command: not only =cut, =pod, =over and =back lines. */
+static bool pod_run_has_text(const char *src, uint32_t b, uint32_t e) {
+    uint32_t pos = b;
+    uint32_t sb = 0;
+    uint32_t eb = 0;
+    int depth = 0;
+    while (pod_next_para(src, &pos, e, &sb, &eb)) {
+        if (src[sb] != '=' || sb + SKIP_ONE >= eb || !isalpha((unsigned char)src[sb + SKIP_ONE])) {
+            return true;
+        }
+        pod_cmd_t c = pod_classify(src, sb, eb, &depth);
+        if (c.type == POD_HEAD || c.type == POD_ITEM || c.type == POD_OTHER) {
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct {
+    CBMExtractCtx *ctx;
+    char *buf;
+    size_t w;
+    uint32_t first_line; /* source line of the first run kept, 0 before it */
+    TSNode block;
+    int next_sec; /* the first index section not yet passed: blocks go in order */
+} pod_module_t;
+
+/* Append src[b, e) of the current block to the module doc, after a blank
+ * line, unless it holds no text. */
+static void pod_module_run(pod_module_t *m, uint32_t b, uint32_t e) {
+    const char *src = m->ctx->source;
+    while (b < e) { /* leading blank lines */
+        uint32_t le = b;
+        while (le < e && src[le] != '\n') {
+            le++;
+        }
+        if (!pod_line_is_blank(src, b, le)) {
+            break;
+        }
+        b = le < e ? le + SKIP_ONE : e;
+    }
+    e = pod_trim_end(src, b, e);
+    if (b >= e || !pod_run_has_text(src, b, e)) {
+        return;
+    }
+    if (m->first_line == 0) {
+        uint32_t line = ts_node_start_point(m->block).row + SKIP_ONE;
+        for (uint32_t k = ts_node_start_byte(m->block); k < b; k++) {
+            line += src[k] == '\n' ? SKIP_ONE : 0;
+        }
+        m->first_line = line;
+    }
+    if (m->w > 0) {
+        m->buf[m->w++] = '\n';
+        m->buf[m->w++] = '\n';
+    }
+    memcpy(m->buf + m->w, src + b, e - b);
+    m->w += e - b;
+}
+
+/* Perl's module doc, for the File node: the file's POD outside the sections a
+ * sub's doc holds, so that no reference is read twice. Every POD block with
+ * those sections cut out, each remaining run as it is in the source, in
+ * document order and joined by a blank line (a sub's doc joins its sections
+ * the same way); a run of only =cut / =pod / =over / =back lines is dropped.
+ * Built after the definitions, which mark the sections they take. NULL when
+ * nothing is left. */
+static const char *doc_perl_module(CBMExtractCtx *ctx) {
+    pod_index_t *ix = pod_index(ctx);
+    if (!ix) {
+        return NULL;
+    }
+    size_t total = 0;
+    int blocks = 0;
+    TSTreeCursor cur = ts_tree_cursor_new(ctx->root);
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            TSNode ch = ts_tree_cursor_current_node(&cur);
+            if (strcmp(ts_node_type(ch), "pod") == 0) {
+                total += ts_node_end_byte(ch) - ts_node_start_byte(ch);
+                blocks++;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    if (blocks == 0) {
+        ts_tree_cursor_delete(&cur);
+        return NULL;
+    }
+    /* each block yields at most one run more than the sections it loses */
+    size_t runs = (size_t)blocks + (size_t)ix->count;
+    pod_module_t m = {.ctx = ctx};
+    m.buf = (char *)cbm_arena_alloc(ctx->arena, total + (runs * PAIR_LEN) + SKIP_ONE);
+    if (!m.buf) {
+        ts_tree_cursor_delete(&cur);
+        return NULL;
+    }
+    ts_tree_cursor_reset(&cur, ctx->root);
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            TSNode ch = ts_tree_cursor_current_node(&cur);
+            if (strcmp(ts_node_type(ch), "pod") != 0) {
+                continue;
+            }
+            m.block = ch;
+            uint32_t pb = ts_node_start_byte(ch);
+            uint32_t pe = ts_node_end_byte(ch);
+            uint32_t at = pb;
+            /* the index holds the blocks' sections in document order */
+            for (; m.next_sec < ix->count && ix->items[m.next_sec].sb < pe; m.next_sec++) {
+                const pod_sec_t *s = &ix->items[m.next_sec];
+                if (!s->used || s->sb < pb) {
+                    continue;
+                }
+                if (s->sb > at) {
+                    pod_module_run(&m, at, s->sb);
+                }
+                at = s->eb > at ? s->eb : at;
+            }
+            pod_module_run(&m, at, pe);
+        } while (ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    ts_tree_cursor_delete(&cur);
+    if (m.w == 0) {
+        return NULL;
+    }
+    m.buf[m.w] = '\0';
+    cbm_doclink_note_doc_line(ctx, m.buf, m.first_line);
+    return m.buf;
 }
 
 /* ── Doc entry points ── */
@@ -12065,6 +12199,10 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     ctx->result->module_doc = extract_module_doc(ctx);
 
     cbm_extract_definitions_without_module(ctx);
+    if (ctx->language == CBM_LANG_PERL) {
+        /* after the subs: the POD sections they hold are not the module's */
+        ctx->result->module_doc = doc_perl_module(ctx);
+    }
 
     if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
         ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
