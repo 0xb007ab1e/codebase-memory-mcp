@@ -1129,9 +1129,18 @@ typedef struct {
  * Application). */
 typedef struct {
     int64_t node;
-    char *dir; /* normalised, "" = the repository root */
-    char *ns;  /* the namespace it deploys into, NULL = the objects' own */
+    char *dir;       /* normalised, "" = the repository root */
+    char *ns;        /* the namespace it deploys into, NULL = the objects' own */
+    const char *via; /* static: "flux" / "argo" */
 } k8s_deploy_t;
+
+/* A HelmRelease and the chart it deploys: a repository path (Git / Bucket
+ * source), else a chart name of a Helm repository. */
+typedef struct {
+    int64_t node;
+    char *chart;
+    char *source; /* the sourceRef kind, NULL when unset */
+} k8s_hr_t;
 
 typedef struct {
     k8s_ref_t *refs;
@@ -1143,6 +1152,9 @@ typedef struct {
     k8s_deploy_t *deploys;
     int dep_n;
     int dep_cap;
+    k8s_hr_t *hrs;
+    int hr_n;
+    int hr_cap;
 } k8s_facts_t;
 
 static void k8s_facts_free(k8s_facts_t *f) {
@@ -1160,6 +1172,11 @@ static void k8s_facts_free(k8s_facts_t *f) {
         cbm_free(CBM_MEM_CLASS_OTHER, f->deploys[i].dir);
         cbm_free(CBM_MEM_CLASS_OTHER, f->deploys[i].ns);
     }
+    for (int i = 0; i < f->hr_n; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, f->hrs[i].chart);
+        cbm_free(CBM_MEM_CLASS_OTHER, f->hrs[i].source);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, f->hrs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->refs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->crds);
     cbm_free(CBM_MEM_CLASS_OTHER, f->deploys);
@@ -1218,13 +1235,19 @@ static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64
             continue;
         }
         int64_t node = node_of[x->def_index];
-        if (x->fact == CBM_K8S_FACT_DEPLOY) {
+        if (x->fact == CBM_K8S_FACT_DEPLOY && x->via && strcmp(x->via, "helmrelease") == 0) {
+            if (x->name && k8s_grow((void **)&f->hrs, &f->hr_cap, f->hr_n, sizeof(*f->hrs))) {
+                f->hrs[f->hr_n++] =
+                    (k8s_hr_t){node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name),
+                               x->kind ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->kind) : NULL};
+            }
+        } else if (x->fact == CBM_K8S_FACT_DEPLOY) {
             char dir[CBM_SZ_1K];
             if (k8s_norm_dir(x->name, dir, sizeof(dir)) &&
                 k8s_grow((void **)&f->deploys, &f->dep_cap, f->dep_n, sizeof(*f->deploys))) {
-                f->deploys[f->dep_n++] =
-                    (k8s_deploy_t){node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, dir),
-                                   x->ns ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->ns) : NULL};
+                f->deploys[f->dep_n++] = (k8s_deploy_t){
+                    node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, dir),
+                    x->ns ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->ns) : NULL, x->via};
             }
         } else if (x->fact == CBM_K8S_FACT_CRD) {
             if (k8s_grow((void **)&f->crds, &f->crd_cap, f->crd_n, sizeof(*f->crds))) {
@@ -1316,7 +1339,7 @@ static void k8s_kust_closure(const k8s_kusts_t *ks, int root, int *seen, int mar
  * manifest path, sorted (a directory's are one range). */
 static void k8s_dir_members(const k8s_kusts_t *ks, CBMHashTable *by_path,
                             const k8s_paths_t *manifests, const char *dir, int *seen, int mark,
-                            k8s_paths_t *out) {
+                            k8s_paths_t *out, k8s_paths_t *units) {
     size_t dl = strlen(dir);
     int lo = 0;
     int hi = dl ? manifests->count : 0;
@@ -1350,7 +1373,13 @@ static void k8s_dir_members(const k8s_kusts_t *ks, CBMHashTable *by_path,
         }
         if (!top) {
             k8s_paths_push(out, file);
+            if (units) {
+                k8s_paths_push(units, file);
+            }
         } else if (seen[top - SKIP_ONE] != mark) {
+            if (units) {
+                k8s_paths_push(units, ks->items[top - SKIP_ONE].path);
+            }
             k8s_kust_closure(ks, top - SKIP_ONE, seen, mark, out);
         }
     }
@@ -1442,7 +1471,7 @@ static void k8s_deploys_build(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bund
                 node[d] && node[d]->qualified_name ? node[d]->qualified_name : "",
                 f->deploys[d].dir, d};
             k8s_dir_members(ks, by_path, &manifests, f->deploys[d].dir, seen, d + SKIP_ONE,
-                            &members[d]);
+                            &members[d], NULL);
         }
         qsort(keys, un, sizeof(*keys), k8s_cmp_deploy_key);
         /* deploy d reaches deploy e when e sits in a manifest d applies */
@@ -3136,6 +3165,149 @@ static void k8s_link_includes(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b,
     }
 }
 
+/* ── DEPLOYS (PHASE 3 P3.1) ────────────────────────────────────────── */
+
+/* What a GitOps object deploys, as DEPLOYS edges to existing nodes only:
+ * a Flux Kustomization / Argo Application -> the units its path applies (the
+ * outermost kustomizations below it -- their Kustomization node -- and the
+ * manifests outside any, their File node; a chart dir: its Chart); a
+ * HelmRelease -> its chart (a repository chart dir of a Git/Bucket source,
+ * else the shared external Chart of that name). */
+
+typedef struct {
+    cbm_pipeline_ctx_t *ctx;
+    CBMHashTable *files;  /* file -> File node */
+    CBMHashTable *charts; /* Chart.yaml path -> Chart node */
+    CBMHashTable *kusts;  /* kustomization path -> its Kustomization Resource */
+    int edges;
+} k8s_dep_link_t;
+
+static int64_t k8s_first_id(CBMHashTable *ix, const char *key) {
+    const k8s_ids_t *v = cbm_ht_get(ix, key);
+    return v && v->count > 0 ? v->items[0] : 0;
+}
+
+static void k8s_deploys_edge(k8s_dep_link_t *l, int64_t src, int64_t tgt, const char *props) {
+    if (src > 0 && tgt > 0 && src != tgt) {
+        cbm_gbuf_insert_edge(l->ctx->gbuf, src, tgt, "DEPLOYS", props);
+        l->edges++;
+    }
+}
+
+/* The Chart node of chart dir `dir`, 0 when it is none. */
+static int64_t k8s_chart_node(k8s_dep_link_t *l, const char *dir) {
+    static const char *const names[] = {"Chart.yaml", "Chart.yml"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char path[CBM_SZ_1K];
+        snprintf(path, sizeof(path), "%s%s%s", dir, dir[0] ? "/" : "", names[i]);
+        int64_t id = k8s_first_id(l->charts, path);
+        if (id > 0) {
+            return id;
+        }
+    }
+    return 0;
+}
+
+/* The shared external Chart of `name` (the one chart dependencies use). */
+static int64_t k8s_external_chart(k8s_dep_link_t *l, const char *name, const char *file) {
+    char qn[CBM_SZ_512];
+    snprintf(qn, sizeof(qn), "%s.__helm_dep__.%s", l->ctx->project_name, name);
+    const cbm_gbuf_node_t *known = cbm_gbuf_find_by_qn(l->ctx->gbuf, qn);
+    if (known) {
+        return known->id;
+    }
+    return cbm_gbuf_upsert_node(l->ctx->gbuf, "Chart", name, qn, file, SKIP_ONE, 0,
+                                "{\"source\":\"helm\",\"external\":true}");
+}
+
+static void k8s_link_deploys(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundles_t *b,
+                             const k8s_facts_t *f) {
+    if (f->dep_n == 0 && f->hr_n == 0) {
+        return;
+    }
+    k8s_dep_link_t l = {.ctx = ctx,
+                        .files = k8s_index_by_file(ctx, "File"),
+                        .charts = k8s_index_by_file(ctx, "Chart"),
+                        .kusts = cbm_ht_create(0)};
+    const cbm_gbuf_node_t **res = NULL;
+    int rn = 0;
+    k8s_paths_t manifests = {0};
+    if (l.kusts && cbm_gbuf_find_by_label(ctx->gbuf, "Resource", &res, &rn) == 0) {
+        for (int i = 0; i < rn; i++) {
+            if (!res[i]->file_path) {
+                continue;
+            }
+            k8s_paths_push(&manifests, res[i]->file_path);
+            if (res[i]->name && strcmp(res[i]->name, "Kustomization") == 0) {
+                k8s_index_add(l.kusts, res[i]->file_path, res[i]->id);
+            }
+        }
+    }
+    k8s_paths_sort_unique(&manifests);
+    CBMHashTable *by_path = cbm_ht_create(0);
+    for (int i = 0; by_path && i < ks->count; i++) {
+        cbm_ht_set(by_path, ks->items[i].path, (void *)(intptr_t)(i + SKIP_ONE));
+    }
+    int *seen =
+        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)(ks->count ? ks->count : SKIP_ONE) * sizeof(int));
+    k8s_paths_t members = {0};
+    k8s_paths_t units = {0};
+    for (int d = 0; l.files && l.charts && l.kusts && by_path && seen && d < f->dep_n; d++) {
+        const k8s_deploy_t *dp = &f->deploys[d];
+        char esc[CBM_SZ_1K];
+        char props[CBM_SZ_2K];
+        cbm_json_escape(esc, (int)sizeof(esc), dp->dir);
+        snprintf(props, sizeof(props), "{\"via\":\"%s\",\"path\":\"%s\"}", dp->via, esc);
+        int64_t chart = cbm_ht_get(b->charts, dp->dir) ? k8s_chart_node(&l, dp->dir) : 0;
+        if (chart > 0) {
+            k8s_deploys_edge(&l, dp->node, chart, props);
+            continue;
+        }
+        members.count = 0;
+        units.count = 0;
+        k8s_dir_members(ks, by_path, &manifests, dp->dir, seen, d + SKIP_ONE, &members, &units);
+        k8s_paths_sort_unique(&units);
+        for (int u = 0; u < units.count; u++) {
+            int64_t tgt = k8s_first_id(l.kusts, units.items[u]);
+            k8s_deploys_edge(&l, dp->node, tgt > 0 ? tgt : k8s_first_id(l.files, units.items[u]),
+                             props);
+        }
+    }
+    for (int h = 0; l.files && l.charts && h < f->hr_n; h++) {
+        const k8s_hr_t *hr = &f->hrs[h];
+        const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(ctx->gbuf, hr->node);
+        bool repo_path = hr->source && (strcmp(hr->source, "GitRepository") == 0 ||
+                                        strcmp(hr->source, "Bucket") == 0);
+        char esc[CBM_SZ_1K];
+        char props[CBM_SZ_2K];
+        cbm_json_escape(esc, (int)sizeof(esc), hr->chart);
+        snprintf(props, sizeof(props), "{\"via\":\"helmrelease\",\"chart\":\"%s\"%s}", esc,
+                 repo_path ? "" : ",\"external\":true");
+        char dir[CBM_SZ_1K];
+        if (repo_path) {
+            if (k8s_norm_dir(hr->chart, dir, sizeof(dir)) && cbm_ht_get(b->charts, dir)) {
+                k8s_deploys_edge(&l, hr->node, k8s_chart_node(&l, dir), props);
+            }
+        } else if (src && src->file_path && !strchr(hr->chart, '/') && !strchr(hr->chart, '$')) {
+            k8s_deploys_edge(&l, hr->node, k8s_external_chart(&l, hr->chart, src->file_path),
+                             props);
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)members.items);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)units.items);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)manifests.items);
+    cbm_free(CBM_MEM_CLASS_OTHER, seen);
+    if (by_path) {
+        cbm_ht_free(by_path);
+    }
+    k8s_free_index(l.files);
+    k8s_free_index(l.charts);
+    k8s_free_index(l.kusts);
+    if (l.edges > 0) {
+        cbm_log_info("pass.k8s.deploys_edges", "edges", itoa_k8s(l.edges));
+    }
+}
+
 int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count) {
     cbm_log_info("pass.start", "pass", "k8s", "files", itoa_k8s(file_count));
 
@@ -3232,6 +3404,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_link_selectors(ctx, &recs, &bundles);
     k8s_resolve_refs(ctx, &bundles, &facts);
     k8s_link_crds(ctx, &bundles, &facts);
+    k8s_link_deploys(ctx, &kusts, &bundles, &facts);
     k8s_facts_free(&facts);
     k8s_records_free(&recs);
     /* Link `file://` chart dependencies now that every Chart.yaml is read,

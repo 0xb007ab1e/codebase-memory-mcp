@@ -1655,6 +1655,47 @@ TEST(probe_mcp_trace_topology) {
     PASS();
 }
 
+/* ── DEPLOYS (Phase 3) ──────────────────────────────────────────────── */
+
+/* A Flux Kustomization deploys what its path applies: the outermost
+ * kustomization below it (its Kustomization node) and a manifest outside any
+ * (its File); a HelmRelease its chart -- the repository chart of a Git
+ * source, else the external chart of that name; an Argo Application whose
+ * path is a chart dir, that Chart. */
+TEST(probe_gitops_objects_deploy_their_units) {
+    static const GpfFile files[] = {
+        {"clusters/prod/flux-system/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
+         "resources:\n  - gotk-sync.yaml\n"},
+        {"clusters/prod/flux-system/gotk-sync.yaml",
+         "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\n"
+         "metadata:\n  name: flux-system\n  namespace: flux-system\n"
+         "spec:\n  path: ./clusters/prod\n"},
+        {"clusters/prod/apps.yaml",
+         "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\n"
+         "metadata:\n  name: apps\n  namespace: flux-system\nspec:\n  path: ./apps\n"},
+        {"apps/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
+         "resources:\n  - release.yaml\n"},
+        {"apps/release.yaml",
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: web\n"
+         "spec:\n  chart:\n    spec:\n      chart: ./charts/web\n      sourceRef:\n"
+         "        kind: GitRepository\n        name: flux-system\n---\n"
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: redis\n"
+         "spec:\n  chart:\n    spec:\n      chart: redis\n      sourceRef:\n"
+         "        kind: HelmRepository\n        name: bitnami\n"},
+        {"charts/web/Chart.yaml", "apiVersion: v2\nname: web\nversion: 0.1.0\n"},
+        {"argo/web.yaml",
+         "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: web\n"
+         "spec:\n  source:\n    path: charts/web\n"}};
+    ASSERT_EQ(gpf_typed_edges(files, 7, "DEPLOYS", "Resource", "Resource", "\"via\":\"flux\""), 2);
+    ASSERT_EQ(gpf_typed_edges(files, 7, "DEPLOYS", "Resource", "File", "\"via\":\"flux\""), 1);
+    ASSERT_EQ(
+        gpf_typed_edges(files, 7, "DEPLOYS", "Resource", "Chart", "\"via\":\"helmrelease\""), 2);
+    ASSERT_EQ(gpf_typed_edges(files, 7, "DEPLOYS", "Resource", "Chart", "\"via\":\"argo\""), 1);
+    PASS();
+}
+
 /* ── Helm symbolic (Phase 2) ────────────────────────────────────────── */
 
 /* A chart template is YAML only once rendered: a document opened by
@@ -3325,6 +3366,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_ingress_and_httproute_expose_routes);
     RUN_TEST(probe_mcp_search_filters_kind_and_namespace);
     RUN_TEST(probe_mcp_trace_topology);
+    RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_helm_templated_objects_are_resources);
     RUN_TEST(probe_helm_include_resolves_in_the_chart_family);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);

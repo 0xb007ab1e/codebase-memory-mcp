@@ -705,6 +705,8 @@ typedef struct {
     char crd_group[K8S_BUF_SIZE];
     char crd_kind[K8S_BUF_SIZE];
     const char *deploy_ns; // a deploying object's target namespace
+    const char *hr_chart;  // a HelmRelease's spec.chart.spec.chart
+    const char *hr_source; // ... and its sourceRef kind
 } k8s_walk_t;
 
 // Is the document of a source kind in group list `groups`?
@@ -719,6 +721,14 @@ static void k8s_deploy_leaf(k8s_walk_t *w, const char *path, const char *value) 
     if ((flux && strcmp(path, "spec.targetNamespace") == 0) ||
         (argo && strcmp(path, "spec.destination.namespace") == 0)) {
         w->deploy_ns = strstr(value, "{{") ? NULL : value;
+        return;
+    }
+    if (k8s_source_is(w, K8S_FLUX_HELM, "|HelmRelease|")) {
+        if (strcmp(path, "spec.chart.spec.chart") == 0 && !strstr(value, "{{")) {
+            w->hr_chart = value;
+        } else if (strcmp(path, "spec.chart.spec.sourceRef.kind") == 0) {
+            w->hr_source = value;
+        }
         return;
     }
     if ((flux && strcmp(path, "spec.path") == 0) ||
@@ -1085,6 +1095,16 @@ static void k8s_emit_facts(CBMExtractCtx *ctx, TSNode mapping, const char *group
     char path[CBM_SZ_512] = "";
     int first = ctx->result->k8s_facts.count;
     k8s_walk(&w, mapping, path, 0, sizeof(path));
+    /* a HelmRelease deploys its chart: a path of a Git/Bucket source, else
+     * a chart name of a Helm repository (kind: the source kind) */
+    if (w.hr_chart) {
+        CBMK8sFact f = {.fact = CBM_K8S_FACT_DEPLOY,
+                        .def_index = def_index,
+                        .kind = w.hr_source ? cbm_arena_strdup(ctx->arena, w.hr_source) : NULL,
+                        .name = cbm_arena_strdup(ctx->arena, w.hr_chart),
+                        .via = "helmrelease"};
+        cbm_k8sfact_push(&ctx->result->k8s_facts, ctx->arena, f);
+    }
     /* the target namespace may follow the path in the document */
     for (int i = first; w.deploy_ns && i < ctx->result->k8s_facts.count; i++) {
         CBMK8sFact *f = &ctx->result->k8s_facts.items[i];
