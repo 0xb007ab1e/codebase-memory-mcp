@@ -301,6 +301,7 @@ extern const cbm_doclink_resolver_t cbm_doclink_rs_resolver;
 extern const cbm_doclink_resolver_t cbm_doclink_perl_resolver;
 extern const cbm_doclink_resolver_t cbm_doclink_ts_resolver;
 extern const cbm_doclink_resolver_t cbm_doclink_php_resolver;
+extern const cbm_doclink_resolver_t cbm_doclink_c_resolver;
 
 /* True when `rel_path` is a scope input of some language (scope_input). */
 bool cbm_doclinks_is_scope_input(const char *rel_path);

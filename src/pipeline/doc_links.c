@@ -48,7 +48,7 @@ static const cbm_doclink_resolver_t *const DOCLINK_RESOLVERS[] = {
     &cbm_doclink_cs_resolver,  &cbm_doclink_md_resolver,   &cbm_doclink_pdf_resolver,
     &cbm_doclink_rst_resolver, &cbm_doclink_adoc_resolver, &cbm_doclink_go_resolver,
     &cbm_doclink_jvm_resolver, &cbm_doclink_rs_resolver,   &cbm_doclink_perl_resolver,
-    &cbm_doclink_ts_resolver,  &cbm_doclink_php_resolver,
+    &cbm_doclink_ts_resolver,  &cbm_doclink_php_resolver,  &cbm_doclink_c_resolver,
 };
 
 enum { DOCLINK_RESOLVER_COUNT = sizeof(DOCLINK_RESOLVERS) / sizeof(DOCLINK_RESOLVERS[0]) };

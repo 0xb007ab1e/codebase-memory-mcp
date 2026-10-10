@@ -22,6 +22,10 @@
  *                       identical on full and incremental runs. Optional.
  *       scope_tag,      the blob's tag line and its persisted form (line
  *       portable_scope  numbers dropped). Optional.
+ *       loose_docs      after the definitions and the file's own doc: the
+ *                       file's other doc comments (C: a prototype's doc,
+ *                       which the graph keeps no node for); what it pushes
+ *                       belongs to the file. Optional.
  *       scan_file       instead of parse_doc, for a DOCUMENT language whose
  *                       text is the documentation (Markdown): one pass over
  *                       the file's bytes pushes every reference, with the
@@ -106,6 +110,9 @@
     X(CBM_DOCLINK_TS_SEE, CBM_LANG_TYPESCRIPT, "see", false, false, "MENTIONS")                \
     /* php (doclink_php.c): PHPDoc @see and {@see}; held until their audit passes */           \
     X(CBM_DOCLINK_PHP_SEE, CBM_LANG_PHP, "see", false, false, "MENTIONS")                      \
+    /* c (doclink_c.c): Doxygen @ref and @see in .c and .h files; held until their audit */    \
+    X(CBM_DOCLINK_C_REF, CBM_LANG_C, "doxygen_ref", false, false, "MENTIONS")                  \
+    X(CBM_DOCLINK_C_SEE, CBM_LANG_C, "see", false, false, "MENTIONS")                          \
     /* markdown (doclink_md.c): what a document's text names explicitly */                     \
     X(CBM_DOCLINK_MD_LINK, CBM_LANG_MARKDOWN, "link", false, true, "MENTIONS")                 \
     X(CBM_DOCLINK_MD_PATH, CBM_LANG_MARKDOWN, "path", false, true, "MENTIONS")                 \
@@ -590,6 +597,26 @@ typedef struct {
 size_t cbm_doclink_php_qualify(char *out, size_t cap, const char *ns, size_t ns_len,
                                const cbm_doclink_php_use_t *uses, int nuses, const char *ref,
                                size_t n);
+
+/* ── C (doclink_c.c) ───────────────────────────────────────────────── */
+
+/* Asked by a loose_docs hook for a doc comment on lines [first, last]: true
+ * when a definition's doc or the file's own doc there was already taken. */
+typedef bool (*cbm_doclink_taken_fn)(const CBMExtractCtx *ctx, uint32_t first, uint32_t last);
+
+void cbm_doclink_c_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                             uint32_t doc_line);
+void cbm_doclink_c_loose_docs(CBMExtractCtx *ctx, const CBMDefinition *file_def,
+                              cbm_doclink_taken_fn taken);
+const char *cbm_doclink_c_scan_scope(CBMExtractCtx *ctx);
+
+/* C files and the headers C++ parses share one scope tag: one resolver
+ * indexes them. The blob holds no line: it is its own persisted form. */
+#define CBM_DOCLINK_C_SCOPE_TAG "c1"
+
+/* The longest reference a C token keeps; a longer one is cut just past this
+ * length and the resolver reports it as unparseable. */
+enum { CBM_DOCLINK_C_REF_MAX = 256 };
 
 /* ── Perl POD (doclink_perl.c) ─────────────────────────────────────── */
 

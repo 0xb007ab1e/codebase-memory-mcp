@@ -1831,6 +1831,7 @@ extern void suite_doc_mentions_rs(void);
 extern void suite_doc_mentions_perl(void);
 extern void suite_doc_mentions_ts(void);
 extern void suite_doc_mentions_php(void);
+extern void suite_doc_mentions_c(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
 extern void suite_agent_clients(void);
@@ -2308,6 +2309,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(doc_mentions_perl);
     RUN_SELECTED_SUITE(doc_mentions_ts);
     RUN_SELECTED_SUITE(doc_mentions_php);
+    RUN_SELECTED_SUITE(doc_mentions_c);
 
     /* Infrastructure scanning */
     RUN_SELECTED_SUITE(infrascan);

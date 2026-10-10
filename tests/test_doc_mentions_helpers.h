@@ -442,6 +442,7 @@ static const int DM_HELD_FAMILIES[] = {
     CBM_DOCLINK_RS_LINK_DEF,    CBM_DOCLINK_PERL_POD_L,
     CBM_DOCLINK_TS_LINK,        CBM_DOCLINK_TS_LINKCODE,
     CBM_DOCLINK_TS_SEE,         CBM_DOCLINK_PHP_SEE,
+    CBM_DOCLINK_C_REF,          CBM_DOCLINK_C_SEE,
 };
 
 static inline void dm_ship_held_families(void) {
