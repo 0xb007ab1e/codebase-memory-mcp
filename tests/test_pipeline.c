@@ -16992,9 +16992,10 @@ TEST(incremental_k8s_manifest_indexed) {
     PASS();
 }
 
-TEST(incremental_kustomize_module_indexed) {
+TEST(incremental_kustomize_entries_indexed) {
     /* Verifies that a kustomization.yaml added after the initial full index
-     * gets a Module node via the incremental k8s pass. */
+     * is indexed incrementally: its entry becomes an IMPORTS edge to the
+     * manifest it names. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_kust_incr_XXXXXX");
     if (!cbm_mkdtemp(tmpdir)) {
@@ -17035,20 +17036,27 @@ TEST(incremental_kustomize_module_indexed) {
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
-    /* Verify Module node created for the kustomization overlay */
+    /* Verify the overlay's entry was resolved: kustomization.yaml IMPORTS deploy.yaml */
     cbm_store_t *s = cbm_store_open_path(dbpath);
     ASSERT_NOT_NULL(s);
-    cbm_node_t *nodes = NULL;
-    int count = 0;
-    cbm_store_find_nodes_by_label(s, project, "Module", &nodes, &count);
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, "IMPORTS", &edges, &edge_count);
     bool found_kust = false;
-    for (int i = 0; i < count; i++) {
-        if (nodes[i].properties_json && strstr(nodes[i].properties_json, "kustomize")) {
-            found_kust = true;
-            break;
+    for (int i = 0; i < edge_count && !found_kust; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            found_kust = src.file_path && strcmp(src.file_path, "kustomization.yaml") == 0 &&
+                         tgt.file_path && strcmp(tgt.file_path, "deploy.yaml") == 0;
         }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
     }
-    cbm_store_free_nodes(nodes, count);
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
     cbm_store_close(s);
     ASSERT_TRUE(found_kust);
 
@@ -19783,7 +19791,7 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
     RUN_TEST(incremental_k8s_manifest_indexed);
-    RUN_TEST(incremental_kustomize_module_indexed);
+    RUN_TEST(incremental_kustomize_entries_indexed);
     /* Resource management & internal helper tests */
     RUN_TEST(pipeline_empty_path);
     RUN_TEST(pipeline_project_name_content);

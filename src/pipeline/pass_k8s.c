@@ -1,14 +1,12 @@
 /*
- * pass_k8s.c — Pipeline pass for Kubernetes manifest and Kustomize overlay processing.
+ * pass_k8s.c — Pipeline pass for Kubernetes manifests, Helm charts and dependency manifests.
  *
- * For each discovered YAML file:
- *   1. Check if it is a kustomize overlay (kustomization.yaml / kustomization.yml)
- *      → emit a Module node and IMPORTS edges for each resources/bases/patches entry
- *   2. Else if it is a generic k8s manifest (apiVersion: detected)
- *      → emit one Resource node per file (first document only — multi-document YAML is not yet
- * supported)
+ * For each discovered YAML file that is a generic k8s manifest (apiVersion: detected)
+ *   → emit one Resource node per file (first document only — multi-document YAML is not yet
+ * supported). Kustomizations are not handled here: their entries are IMPORTS of the
+ * file itself, resolved by the import resolver (resolve_kustomize_entry).
  *
- * Depends on: pass_infrascan.c (cbm_is_kustomize_file, cbm_is_k8s_manifest, cbm_infra_qn),
+ * Depends on: pass_infrascan.c (cbm_is_k8s_manifest, cbm_infra_qn),
  *             extraction layer (cbm.h), graph_buffer, pipeline internals.
  */
 #include "foundation/constants.h"
@@ -84,59 +82,6 @@ static const char *itoa_k8s(int val) {
 static const char *k8s_basename(const char *path) {
     const char *p = strrchr(path, '/');
     return p ? p + SKIP_ONE : path;
-}
-
-/* ── Kustomize handler ───────────────────────────────────────────── */
-
-/* `result` is the cached parallel-pass result or, for an uncached file, the
- * re-extraction the preparation step made; the caller owns it. */
-static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *rel_path,
-                             const CBMFileResult *result) {
-    /* Emit Module node for this kustomize overlay file */
-    char *mod_qn = cbm_infra_qn(ctx->project_name, rel_path, "kustomize", NULL);
-    if (!mod_qn) {
-        return;
-    }
-
-    int64_t mod_id = cbm_gbuf_upsert_node(ctx->gbuf, "Module", k8s_basename(rel_path), mod_qn,
-                                          rel_path, SKIP_ONE, 0, "{\"source\":\"kustomize\"}");
-    free(mod_qn);
-
-    if (mod_id <= 0) {
-        return;
-    }
-
-    /* With an extraction result, emit IMPORTS edges for
-     * resources/bases/patches/components entries */
-    int import_count = 0;
-    const CBMFileResult *res = result;
-
-    if (res) {
-        for (int j = 0; j < res->imports.count; j++) {
-            CBMImport *imp = &res->imports.items[j];
-            if (!imp->module_path) {
-                continue;
-            }
-
-            /* Compute target file QN */
-            char *target_qn =
-                cbm_pipeline_fqn_compute(ctx->project_name, imp->module_path, "__file__");
-            if (!target_qn) {
-                continue;
-            }
-
-            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
-            free(target_qn);
-
-            if (target) {
-                cbm_gbuf_insert_edge(ctx->gbuf, mod_id, target->id, "IMPORTS",
-                                     "{\"via\":\"kustomize\"}");
-                import_count++;
-            }
-        }
-    }
-
-    cbm_log_info("pass.k8s.kustomize", "file", rel_path, "imports", itoa_k8s(import_count));
 }
 
 /* ── K8s cross-manifest label-selector matching ──────────────────────
@@ -623,13 +568,13 @@ static void handle_dep_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, c
  * the sequential loop did. Sequentially the pass re-read and re-parsed every
  * YAML manifest on one thread -- 1.1 s of the Go corpus (6,275 manifests;
  * profile + waste sanitizer, 2026-09-17). */
-typedef enum { K8S_SKIP = 0, K8S_DEP, K8S_KUSTOMIZE, K8S_HELM, K8S_MANIFEST } k8s_kind_t;
+typedef enum { K8S_SKIP = 0, K8S_DEP, K8S_HELM, K8S_MANIFEST } k8s_kind_t;
 
 typedef struct {
     k8s_kind_t kind;
     char *source; /* DEP, HELM, MANIFEST */
     int src_len;
-    CBMFileResult *res; /* MANIFEST, or KUSTOMIZE without a cached result */
+    CBMFileResult *res; /* MANIFEST */
 } k8s_prep_t;
 
 typedef struct {
@@ -653,19 +598,6 @@ static void k8s_prep_file(const k8s_prep_job_t *job, int i, k8s_prep_t *out) {
     if (is_gomod_file(base) || lang == CBM_LANG_GOMOD || is_requirements_file(base)) {
         out->source = k8s_read_file(path, &out->src_len);
         out->kind = out->source ? K8S_DEP : K8S_SKIP;
-    } else if (cbm_is_kustomize_file(base)) {
-        out->kind = K8S_KUSTOMIZE;
-        bool cached = ctx->result_cache && ctx->result_cache[i];
-        if (!cached) {
-            /* Fall back to re-extraction */
-            int src_len = 0;
-            char *source = k8s_read_file(path, &src_len);
-            if (source) {
-                out->res = cbm_extract_file(source, src_len, CBM_LANG_KUSTOMIZE, ctx->project_name,
-                                            rel, CBM_EXTRACT_BUDGET, NULL, NULL);
-                cbm_free(CBM_MEM_CLASS_OTHER, source);
-            }
-        }
     } else if (lang == CBM_LANG_YAML || lang == CBM_LANG_K8S) {
         /* Read source once to classify (and reuse for uncached extraction). */
         out->source = k8s_read_file(path, &out->src_len);
@@ -711,7 +643,6 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
 
     cbm_init();
 
-    int kustomize_count = 0;
     int manifest_count = 0;
     int helm_count = 0;
 
@@ -750,16 +681,10 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
             if (!cancelled) {
                 const char *rel = files[i].rel_path;
                 const char *base = k8s_basename(rel);
-                CBMFileResult *cached =
-                    (ctx->result_cache && ctx->result_cache[i]) ? ctx->result_cache[i] : NULL;
                 switch (p->kind) {
                 case K8S_DEP:
                     handle_dep_manifest(ctx, rel, p->source,
                                         is_requirements_file(base) ? "pypi" : "gomod");
-                    break;
-                case K8S_KUSTOMIZE:
-                    handle_kustomize(ctx, rel, cached ? cached : p->res);
-                    kustomize_count++;
                     break;
                 case K8S_HELM:
                     handle_helm_chart(ctx, rel, p->source);
@@ -796,8 +721,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_link_selectors(ctx, &recs);
     cbm_free(CBM_MEM_CLASS_OTHER, recs.items);
 
-    cbm_log_info("pass.done", "pass", "k8s", "kustomize", itoa_k8s(kustomize_count), "manifests",
-                 itoa_k8s(manifest_count));
+    cbm_log_info("pass.done", "pass", "k8s", "manifests", itoa_k8s(manifest_count));
     (void)helm_count;
     return 0;
 }

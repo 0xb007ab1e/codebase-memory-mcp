@@ -564,6 +564,20 @@ TEST(probe_kustomize_remote_base_names_no_symbol) {
     PASS();
 }
 
+/* The k8s pass minted a second, edgeless Module per kustomization next to
+ * the file's own Module: its import lookup took entries as repo-root paths
+ * and resolved none of them in any of 17 infra repositories. */
+TEST(probe_kustomize_single_module) {
+    GpfMetrics m = gpf_metrics("kustomization.yaml",
+        "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+        "kind: Kustomization\n"
+        "resources:\n"
+        "  - deploy.yaml\n");
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.modules, 1);
+    PASS();
+}
+
 /* Entries are relative to the kustomization's own directory; in a nested
  * overlay they resolve through the sibling lookup, not the repo root. */
 TEST(probe_kustomize_nested_sibling_entries) {
@@ -1725,6 +1739,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_kustomize_extensionless_file);
     RUN_TEST(probe_kustomize_remote_base_names_no_symbol);
     RUN_TEST(probe_kustomize_nested_sibling_entries);
+    RUN_TEST(probe_kustomize_single_module);
 
     /* Nix */
     RUN_TEST(probe_nix_attrset_node);
