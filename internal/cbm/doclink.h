@@ -104,6 +104,8 @@
     X(CBM_DOCLINK_TS_LINK, CBM_LANG_TYPESCRIPT, "link", false, false, "MENTIONS")              \
     X(CBM_DOCLINK_TS_LINKCODE, CBM_LANG_TYPESCRIPT, "linkcode", false, false, "MENTIONS")      \
     X(CBM_DOCLINK_TS_SEE, CBM_LANG_TYPESCRIPT, "see", false, false, "MENTIONS")                \
+    /* php (doclink_php.c): PHPDoc @see and {@see}; held until their audit passes */           \
+    X(CBM_DOCLINK_PHP_SEE, CBM_LANG_PHP, "see", false, false, "MENTIONS")                      \
     /* markdown (doclink_md.c): what a document's text names explicitly */                     \
     X(CBM_DOCLINK_MD_LINK, CBM_LANG_MARKDOWN, "link", false, true, "MENTIONS")                 \
     X(CBM_DOCLINK_MD_PATH, CBM_LANG_MARKDOWN, "path", false, true, "MENTIONS")                 \
@@ -554,6 +556,40 @@ char *cbm_doclink_ts_portable_scope(const char *scope);
 /* The longest reference a TS/JS token keeps; a longer one is cut just past
  * this length and the resolver reports it as unparseable. */
 enum { CBM_DOCLINK_TS_REF_MAX = 512 };
+
+/* ── PHP (doclink_php.c) ───────────────────────────────────────────── */
+
+void cbm_doclink_php_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                               uint32_t doc_line);
+const char *cbm_doclink_php_scan_scope(CBMExtractCtx *ctx);
+char *cbm_doclink_php_portable_scope(const char *scope);
+
+#define CBM_DOCLINK_PHP_SCOPE_TAG "php1"
+
+/* The longest reference a PHP token keeps; a longer one is cut just past this
+ * length and the resolver reports it as unparseable. */
+enum { CBM_DOCLINK_PHP_REF_MAX = 512 };
+
+/* One `use` import of a PHP namespace block: kind 'c' (a class or namespace),
+ * 'f' (a function), 'k' (a constant); the name without a leading backslash. */
+typedef struct {
+    const char *alias;
+    size_t alias_len;
+    const char *name;
+    size_t name_len;
+    char kind;
+} cbm_doclink_php_use_t;
+
+/* The fully qualified name (no leading backslash) of a type name `ref` (n
+ * bytes) written in namespace `ns` (ns_len 0: the global one) under these
+ * imports, as PHP resolves it: a leading backslash is taken as written,
+ * `namespace\` stands for the current namespace, else the first segment is
+ * replaced when it is the alias of a class import (compared without case),
+ * else the namespace is put in front. Writes NUL-terminated into out (cap
+ * bytes); returns the length, 0 when it does not fit. */
+size_t cbm_doclink_php_qualify(char *out, size_t cap, const char *ns, size_t ns_len,
+                               const cbm_doclink_php_use_t *uses, int nuses, const char *ref,
+                               size_t n);
 
 /* ── Perl POD (doclink_perl.c) ─────────────────────────────────────── */
 

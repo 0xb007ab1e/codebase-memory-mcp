@@ -234,6 +234,11 @@ static const doclink_lang_t DOCLINK_LANGS[] = {
      .scan_scope = cbm_doclink_ts_scan_scope,
      .scope_tag = CBM_DOCLINK_TS_SCOPE_TAG,
      .portable_scope = cbm_doclink_ts_portable_scope},
+    {.lang = CBM_LANG_PHP,
+     .parse_doc = cbm_doclink_php_parse_doc,
+     .scan_scope = cbm_doclink_php_scan_scope,
+     .scope_tag = CBM_DOCLINK_PHP_SCOPE_TAG,
+     .portable_scope = cbm_doclink_php_portable_scope},
 };
 
 static const doclink_lang_t *doclink_lang(CBMLanguage lang) {
