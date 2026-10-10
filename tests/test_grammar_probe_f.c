@@ -845,6 +845,61 @@ TEST(probe_k8s_selector_across_documents) {
     PASS();
 }
 
+/* ── Bundles: a Service selects inside what is deployed together ───── */
+
+#define GPF_DEPLOY(name, label)                                                                  \
+    "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: " name "\nspec:\n  template:\n" \
+    "    metadata:\n      labels:\n        app: " label "\n"
+#define GPF_SVC(name, label)                                                                     \
+    "apiVersion: v1\nkind: Service\nmetadata:\n  name: " name "\nspec:\n  selector:\n    app: " \
+    label "\n"
+
+/* Two copies of one app in two directories (microservices-demo ships
+ * kubernetes-manifests/, release/ and kustomize/base/; k8s.io one prow per
+ * cluster): each Service selects its own copy's Deployment, not the other. */
+TEST(probe_k8s_selector_stays_in_its_directory) {
+    static const GpfFile files[] = {{"gke/svc.yaml", GPF_SVC("web", "web")},
+                                    {"gke/deploy.yaml", GPF_DEPLOY("web", "web")},
+                                    {"eks/deploy.yaml", GPF_DEPLOY("web", "web")}};
+    GpfMetrics m = gpf_metrics_files(files, 3);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.resources, 3);
+    ASSERT_EQ(m.infra_maps, 1);
+    PASS();
+}
+
+/* A kustomize build root deploys what its entries reach, across
+ * directories; a same-labelled Deployment outside it is another bundle. */
+TEST(probe_k8s_selector_within_kustomize_build) {
+    static const GpfFile files[] = {
+        {"overlay/kustomization.yaml", "resources:\n  - ../svc\n  - ../app\n"},
+        {"svc/kustomization.yaml", "resources:\n  - svc.yaml\n"},
+        {"svc/svc.yaml", GPF_SVC("web", "web")},
+        {"app/kustomization.yaml", "resources:\n  - deploy.yaml\n"},
+        {"app/deploy.yaml", GPF_DEPLOY("web", "web")},
+        {"other/deploy.yaml", GPF_DEPLOY("web-copy", "web")}};
+    GpfMetrics m = gpf_metrics_files(files, 6);
+    ASSERT_TRUE(m.ok);
+    ASSERT_EQ(m.resources, 3);
+    ASSERT_EQ(m.infra_maps, 1);
+    PASS();
+}
+
+/* The build root's `namespace:` is where its objects live: the logical
+ * key carries it (kustomize's namespace transformer, outermost wins). */
+TEST(probe_k8s_kustomize_namespace_is_effective) {
+    static const GpfFile files[] = {
+        {"prod/kustomization.yaml", "namespace: prod\nresources:\n  - ../base\n"},
+        {"base/kustomization.yaml", "namespace: base-ns\nresources:\n  - deploy.yaml\n"},
+        {"base/deploy.yaml", GPF_DEPLOY("web", "web")}};
+    char qn[256];
+    char props[512];
+    ASSERT_TRUE(gpf_resource(files, 3, "Deployment/web", qn, sizeof(qn), props, sizeof(props)));
+    ASSERT_STR_EQ(qn, "::apps/Deployment/-/web");
+    ASSERT_NOT_NULL(strstr(props, "\"obj_key\":\"apps/Deployment/prod/web\""));
+    PASS();
+}
+
 /* Flow-style label maps (`labels: { app: kdc }`, deckhouse's kerberos demo)
  * are label maps; a selector given that way selects just the same. */
 TEST(probe_k8s_selector_flow_mapping) {
@@ -2361,6 +2416,9 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_identity_core_namespaced_and_cluster_scoped);
     RUN_TEST(probe_k8s_anchored_and_tagged_names);
     RUN_TEST(probe_k8s_selector_flow_mapping);
+    RUN_TEST(probe_k8s_selector_stays_in_its_directory);
+    RUN_TEST(probe_k8s_selector_within_kustomize_build);
+    RUN_TEST(probe_k8s_kustomize_namespace_is_effective);
 
     /* Nix */
     RUN_TEST(probe_nix_attrset_node);

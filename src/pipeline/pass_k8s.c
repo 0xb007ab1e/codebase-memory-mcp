@@ -523,9 +523,10 @@ static bool k8s_cluster_scoped(const char *kind) {
 /* A Resource's properties from its identity key, the part of its QN after
  * "::": `<group>/<Kind>/<declared namespace or ->/<name>` (IDENTITY.md).
  * `obj_key` is the logical identity: the namespace it lives in, `_` for a
- * cluster-scoped kind, `?` when the deploy decides. NULL for a QN without a
- * well-formed key (the caller keeps the plain source tag). */
-static char *k8s_resource_props(const char *qn) {
+ * cluster-scoped kind, `?` when the deploy decides; `effective_ns` (when
+ * not NULL) is the namespace a kustomize build gives it. NULL for a QN
+ * without a well-formed key (the caller keeps the plain source tag). */
+static char *k8s_resource_props(const char *qn, const char *effective_ns) {
     enum { K8S_KEY_PARTS = 4, K8S_ESC = 6 * K8S_LABEL_LEN };
     const char *key = qn ? strstr(qn, "::") : NULL;
     if (!key) {
@@ -548,7 +549,10 @@ static char *k8s_resource_props(const char *qn) {
     const char *kind = part[1];
     const char *ns = strcmp(part[2], "-") == 0 ? "" : part[2];
     const char *name = part[3];
-    const char *effective = k8s_cluster_scoped(kind) ? "_" : ns[0] ? ns : "?";
+    const char *effective = k8s_cluster_scoped(kind) ? "_"
+                            : effective_ns           ? effective_ns
+                            : ns[0]                  ? ns
+                                                     : "?";
     char esc[K8S_KEY_PARTS + SKIP_ONE][K8S_ESC];
     cbm_json_escape(esc[0], K8S_ESC, group);
     cbm_json_escape(esc[1], K8S_ESC, kind);
@@ -628,14 +632,447 @@ static bool k8s_has_pair(const k8s_record_array_t *recs, const k8s_record_t *rec
     return false;
 }
 
-/* Two set namespaces must agree; an unset one is the deploy-time namespace. */
-static bool k8s_same_namespace(const k8s_record_t *a, const k8s_record_t *b) {
-    return !a->ns[0] || !b->ns[0] || strcmp(a->ns, b->ns) == 0;
+/* ── Bundles: what is deployed together (IDENTITY.md) ────────────── */
+
+/* A Service selects pods of its own deployment, never a same-labelled copy
+ * elsewhere in the repository. A bundle is a kustomize build root (a
+ * kustomization no other one includes) with every manifest its entries
+ * reach; outside kustomize, the Helm chart a file sits in, else its
+ * directory. A base several overlays include belongs to each of them. */
+
+typedef struct {
+    char *path; /* the kustomization file */
+    char *ns;   /* its `namespace:`, NULL when unset */
+    int *kids;  /* kustomizations its entries name (indices) */
+    int kid_n;
+    int kid_cap;
+    const char **files; /* manifests its entries name (graph-owned paths) */
+    int file_n;
+    int file_cap;
+    bool referenced; /* included by another kustomization */
+} k8s_kust_t;
+
+typedef struct {
+    k8s_kust_t *items;
+    int count;
+    int cap;
+} k8s_kusts_t;
+
+/* One bundle a manifest belongs to, with the namespace the bundle gives
+ * its objects (NULL: their own). `bundle` is an interned name, compared by
+ * pointer. */
+typedef struct {
+    const char *bundle;
+    const char *ns;
+} k8s_member_t;
+
+typedef struct {
+    k8s_member_t *items;
+    int count;
+    int cap;
+} k8s_members_t;
+
+typedef struct {
+    CBMHashTable *names;   /* bundle name -> itself (owned key) */
+    CBMHashTable *members; /* manifest path -> k8s_members_t* */
+    CBMHashTable *charts;  /* Helm chart directory -> itself (owned key) */
+} k8s_bundles_t;
+
+static bool k8s_grow(void **items, int *cap, int count, size_t elem) {
+    if (count < *cap) {
+        return true;
+    }
+    int ncap = *cap ? *cap * PAIR_LEN : K8S_GROW_MIN;
+    void *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, *items, (size_t)ncap * elem);
+    if (!grown) {
+        return false;
+    }
+    *items = grown;
+    *cap = ncap;
+    return true;
+}
+
+/* The top-level `namespace:` of a kustomization, NULL when it sets none. */
+static char *k8s_kustomize_namespace(const char *source) {
+    for (const char *p = source; p && *p;) {
+        const char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        if (strncmp(p, "namespace:", K8S_SLEN("namespace:")) == 0) {
+            char line[CBM_SZ_512];
+            snprintf(line, sizeof(line), "%.*s", (int)len, p);
+            char key[64];
+            char val[K8S_LABEL_LEN];
+            if (k8s_split_kv(line, key, sizeof(key), val, sizeof(val)) && val[0]) {
+                return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, val);
+            }
+            return NULL;
+        }
+        p = eol ? eol + SKIP_ONE : NULL;
+    }
+    return NULL;
+}
+
+static void k8s_kusts_push(k8s_kusts_t *ks, const char *path, char *ns) {
+    if (!k8s_grow((void **)&ks->items, &ks->cap, ks->count, sizeof(*ks->items))) {
+        cbm_free(CBM_MEM_CLASS_OTHER, ns);
+        return;
+    }
+    ks->items[ks->count++] =
+        (k8s_kust_t){.path = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, path), .ns = ns};
+}
+
+static void k8s_kusts_free(k8s_kusts_t *ks) {
+    for (int i = 0; i < ks->count; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, ks->items[i].path);
+        cbm_free(CBM_MEM_CLASS_OTHER, ks->items[i].ns);
+        cbm_free(CBM_MEM_CLASS_OTHER, ks->items[i].kids);
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)ks->items[i].files);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, ks->items);
+    *ks = (k8s_kusts_t){0};
+}
+
+static int k8s_cmp_str(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static int k8s_cmp_int(const void *a, const void *b) {
+    int x = *(const int *)a;
+    int y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+static int k8s_cmp_kust(const void *a, const void *b) {
+    return strcmp(((const k8s_kust_t *)a)->path, ((const k8s_kust_t *)b)->path);
+}
+
+/* index + 1 of the kustomization at `path`, 0 when none. */
+static int k8s_kust_at(CBMHashTable *by_path, const char *path) {
+    return (int)(intptr_t)cbm_ht_get(by_path, path);
+}
+
+/* The kustomization file inside directory `dir`, as kustomize looks for it. */
+static int k8s_kust_in_dir(CBMHashTable *by_path, const char *dir) {
+    static const char *const names[] = {"kustomization.yaml", "kustomization.yml", "Kustomization"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char path[CBM_SZ_1K];
+        snprintf(path, sizeof(path), "%s%s%s", dir, dir[0] ? "/" : "", names[i]);
+        int k = k8s_kust_at(by_path, path);
+        if (k) {
+            return k;
+        }
+    }
+    return 0;
+}
+
+/* Wire each kustomization to what its entries name, from the IMPORTS edges
+ * the kustomize resolver drew: a directory means the kustomization in it,
+ * a file another kustomization or a manifest. */
+static void k8s_kusts_wire(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, CBMHashTable *by_path) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_type(ctx->gbuf, "IMPORTS", &edges, &count) != 0) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(ctx->gbuf, edges[i]->source_id);
+        int k = src && src->file_path ? k8s_kust_at(by_path, src->file_path) : 0;
+        const cbm_gbuf_node_t *tgt = k ? cbm_gbuf_find_by_id(ctx->gbuf, edges[i]->target_id) : NULL;
+        if (!tgt || !tgt->file_path) {
+            continue;
+        }
+        k8s_kust_t *kust = &ks->items[k - SKIP_ONE];
+        int kid = tgt->label && strcmp(tgt->label, "Folder") == 0
+                      ? k8s_kust_in_dir(by_path, tgt->file_path)
+                      : k8s_kust_at(by_path, tgt->file_path);
+        if (kid && kid != k) {
+            if (k8s_grow((void **)&kust->kids, &kust->kid_cap, kust->kid_n, sizeof(int))) {
+                kust->kids[kust->kid_n++] = kid - SKIP_ONE;
+                ks->items[kid - SKIP_ONE].referenced = true;
+            }
+        } else if (!kid && strcmp(tgt->label ? tgt->label : "", "Folder") != 0) {
+            if (k8s_grow((void **)&kust->files, &kust->file_cap, kust->file_n,
+                         sizeof(*kust->files))) {
+                kust->files[kust->file_n++] = tgt->file_path;
+            }
+        }
+    }
+    for (int i = 0; i < ks->count; i++) {
+        qsort(ks->items[i].files, (size_t)ks->items[i].file_n, sizeof(*ks->items[i].files),
+              k8s_cmp_str);
+        qsort(ks->items[i].kids, (size_t)ks->items[i].kid_n, sizeof(int), k8s_cmp_int);
+    }
+}
+
+static const char *k8s_bundle_name(k8s_bundles_t *b, const char *kind, const char *where) {
+    char name[CBM_SZ_1K];
+    snprintf(name, sizeof(name), "%s:%s", kind, where);
+    const char *known = cbm_ht_get_key(b->names, name);
+    if (known) {
+        return known;
+    }
+    char *owned = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, name);
+    if (owned) {
+        cbm_ht_set(b->names, owned, owned);
+    }
+    return owned;
+}
+
+static void k8s_member_add(k8s_bundles_t *b, const char *file, const char *bundle, const char *ns) {
+    k8s_members_t *m = cbm_ht_get(b->members, file);
+    if (!m) {
+        m = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*m));
+        if (!m) {
+            return;
+        }
+        cbm_ht_set(b->members, file, m);
+    }
+    for (int i = 0; i < m->count; i++) {
+        if (m->items[i].bundle == bundle) {
+            return; /* reached twice from one root: the first path's namespace */
+        }
+    }
+    if (k8s_grow((void **)&m->items, &m->cap, m->count, sizeof(*m->items))) {
+        m->items[m->count++] = (k8s_member_t){bundle, ns};
+    }
+}
+
+/* Every build root's manifests, each with the namespace the outermost
+ * kustomization on its path sets (kustomize applies the root's namespace
+ * transformer last, so it wins). */
+static void k8s_bundles_from_kusts(k8s_bundles_t *b, k8s_kusts_t *ks) {
+    typedef struct {
+        int kust;
+        const char *ns;
+    } frame_t;
+    int *seen =
+        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)(ks->count ? ks->count : SKIP_ONE) * sizeof(int));
+    frame_t *stack = NULL;
+    int depth = 0;
+    int cap = 0;
+    for (int r = 0; seen && r < ks->count; r++) {
+        if (ks->items[r].referenced) {
+            continue;
+        }
+        const char *bundle = k8s_bundle_name(b, "kustomize", ks->items[r].path);
+        if (!bundle || !k8s_grow((void **)&stack, &cap, depth, sizeof(*stack))) {
+            continue;
+        }
+        stack[depth++] = (frame_t){r, ks->items[r].ns};
+        while (depth > 0) {
+            frame_t f = stack[--depth];
+            if (seen[f.kust] == r + SKIP_ONE) {
+                continue;
+            }
+            seen[f.kust] = r + SKIP_ONE;
+            const k8s_kust_t *k = &ks->items[f.kust];
+            for (int i = 0; i < k->file_n; i++) {
+                k8s_member_add(b, k->files[i], bundle, f.ns);
+            }
+            for (int i = k->kid_n - SKIP_ONE; i >= 0; i--) {
+                if (k8s_grow((void **)&stack, &cap, depth, sizeof(*stack))) {
+                    int kid = k->kids[i];
+                    stack[depth++] = (frame_t){kid, f.ns ? f.ns : ks->items[kid].ns};
+                }
+            }
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, stack);
+    cbm_free(CBM_MEM_CLASS_OTHER, seen);
+}
+
+static void k8s_dirname(const char *path, char *out, size_t out_sz) {
+    const char *slash = strrchr(path, '/');
+    snprintf(out, out_sz, "%.*s", slash ? (int)(slash - path) : 0, path);
+}
+
+/* The bundles of the manifest at `file`: its kustomize build roots; else
+ * the Helm chart it sits in; else its directory. */
+static const k8s_members_t *k8s_bundles_of(k8s_bundles_t *b, const char *file,
+                                           k8s_members_t *single) {
+    const k8s_members_t *m = cbm_ht_get(b->members, file);
+    if (m && m->count > 0) {
+        return m;
+    }
+    char dir[CBM_SZ_1K];
+    k8s_dirname(file, dir, sizeof(dir));
+    char up[CBM_SZ_1K];
+    snprintf(up, sizeof(up), "%s", dir);
+    const char *bundle = NULL;
+    while (!bundle) {
+        if (cbm_ht_get(b->charts, up)) {
+            bundle = k8s_bundle_name(b, "chart", up);
+            break;
+        }
+        if (!up[0]) {
+            break;
+        }
+        char parent[CBM_SZ_1K];
+        k8s_dirname(up, parent, sizeof(parent));
+        snprintf(up, sizeof(up), "%s", parent);
+    }
+    if (!bundle) {
+        bundle = k8s_bundle_name(b, "dir", dir);
+    }
+    single->items[0] = (k8s_member_t){bundle, NULL};
+    single->count = bundle ? SKIP_ONE : 0;
+    return single;
+}
+
+static void k8s_free_owned_key(const char *key, void *value, void *ud) {
+    (void)value;
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+static void k8s_free_members(const char *key, void *value, void *ud) {
+    (void)key;
+    (void)ud;
+    k8s_members_t *m = value;
+    cbm_free(CBM_MEM_CLASS_OTHER, m->items);
+    cbm_free(CBM_MEM_CLASS_OTHER, m);
+}
+
+static void k8s_bundles_free(k8s_bundles_t *b) {
+    if (b->members) {
+        cbm_ht_foreach(b->members, k8s_free_members, NULL);
+        cbm_ht_free(b->members);
+    }
+    if (b->names) {
+        cbm_ht_foreach(b->names, k8s_free_owned_key, NULL);
+        cbm_ht_free(b->names);
+    }
+    if (b->charts) {
+        cbm_ht_foreach(b->charts, k8s_free_owned_key, NULL);
+        cbm_ht_free(b->charts);
+    }
+    *b = (k8s_bundles_t){0};
+}
+
+/* A Helm chart's directory bundles the plain manifests below it. */
+static void k8s_chart_dir_add(k8s_bundles_t *b, const char *chart_yaml) {
+    char dir[CBM_SZ_1K];
+    k8s_dirname(chart_yaml, dir, sizeof(dir));
+    if (b->charts && !cbm_ht_get(b->charts, dir)) {
+        char *owned = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, dir);
+        if (owned) {
+            cbm_ht_set(b->charts, owned, owned);
+        }
+    }
+}
+
+/* Build the kustomize bundles (call once every manifest and kustomization is
+ * known and the IMPORTS edges exist). */
+static void k8s_bundles_build(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundles_t *b) {
+    b->names = cbm_ht_create(0);
+    b->members = cbm_ht_create(0);
+    if (!b->charts) {
+        b->charts = cbm_ht_create(0);
+    }
+    if (!b->names || !b->members || !b->charts) {
+        return;
+    }
+    qsort(ks->items, (size_t)ks->count, sizeof(*ks->items), k8s_cmp_kust);
+    CBMHashTable *by_path = cbm_ht_create(0);
+    if (!by_path) {
+        return;
+    }
+    for (int i = 0; i < ks->count; i++) {
+        cbm_ht_set(by_path, ks->items[i].path, (void *)(intptr_t)(i + SKIP_ONE));
+    }
+    k8s_kusts_wire(ctx, ks, by_path);
+    cbm_ht_free(by_path);
+    k8s_bundles_from_kusts(b, ks);
+}
+
+/* A Service and a workload meet when they share a bundle whose namespaces
+ * agree: two set namespaces must be equal; an unset one is the deploy's. */
+static bool k8s_share_bundle(k8s_bundles_t *b, const cbm_pipeline_ctx_t *ctx,
+                             const k8s_record_t *svc, const k8s_record_t *wl) {
+    const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_id(ctx->gbuf, svc->node_id);
+    const cbm_gbuf_node_t *wn = cbm_gbuf_find_by_id(ctx->gbuf, wl->node_id);
+    if (!sn || !wn || !sn->file_path || !wn->file_path) {
+        return false;
+    }
+    k8s_member_t one_s[SKIP_ONE];
+    k8s_member_t one_w[SKIP_ONE];
+    k8s_members_t single_s = {.items = one_s, .cap = SKIP_ONE};
+    k8s_members_t single_w = {.items = one_w, .cap = SKIP_ONE};
+    const k8s_members_t *ms = k8s_bundles_of(b, sn->file_path, &single_s);
+    const k8s_members_t *mw = k8s_bundles_of(b, wn->file_path, &single_w);
+    for (int i = 0; i < ms->count; i++) {
+        for (int j = 0; j < mw->count; j++) {
+            if (ms->items[i].bundle != mw->items[j].bundle) {
+                continue;
+            }
+            const char *ns_s = ms->items[i].ns ? ms->items[i].ns : svc->ns;
+            const char *ns_w = mw->items[j].ns ? mw->items[j].ns : wl->ns;
+            if (!ns_s[0] || !ns_w[0] || strcmp(ns_s, ns_w) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* The declared namespace inside a Resource QN's key ("" when `-`). */
+static void k8s_declared_ns(const char *qn, char *out, size_t out_sz) {
+    out[0] = '\0';
+    const char *key = qn ? strstr(qn, "::") : NULL;
+    const char *p = key ? key + K8S_SLEN("::") : NULL;
+    for (int part = 0; p && part < PAIR_LEN; part++) {
+        p = strchr(p, '/');
+        p = p ? p + SKIP_ONE : NULL;
+    }
+    const char *end = p ? strchr(p, '/') : NULL;
+    if (end && !(end - p == SKIP_ONE && p[0] == '-')) {
+        snprintf(out, out_sz, "%.*s", (int)(end - p), p);
+    }
+}
+
+/* Objects a kustomize build deploys live in the namespace it gives them:
+ * when every bundle of the file agrees on one, that is the namespace of
+ * the object's logical key; bundles that disagree leave it to the deploy. */
+static void k8s_apply_effective_namespaces(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b) {
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (!b->members || cbm_gbuf_find_by_label(ctx->gbuf, "Resource", &nodes, &count) != 0) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *n = nodes[i];
+        const k8s_members_t *m = n->file_path ? cbm_ht_get(b->members, n->file_path) : NULL;
+        if (!m || m->count == 0) {
+            continue;
+        }
+        char declared[K8S_LABEL_LEN];
+        k8s_declared_ns(n->qualified_name, declared, sizeof(declared));
+        const char *eff = NULL;
+        bool agree = true;
+        bool any_set = false;
+        for (int j = 0; j < m->count; j++) {
+            const char *v = m->items[j].ns ? m->items[j].ns : declared;
+            any_set = any_set || m->items[j].ns;
+            if (!v[0] || (eff && strcmp(eff, v) != 0)) {
+                agree = false;
+            }
+            eff = eff ? eff : v;
+        }
+        if (!any_set) {
+            continue; /* no build sets a namespace: the declared one stands */
+        }
+        char *props = k8s_resource_props(n->qualified_name, agree ? eff : "?");
+        if (props) {
+            (void)cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)n, props);
+            cbm_free(CBM_MEM_CLASS_OTHER, props);
+        }
+    }
 }
 
 /* Connect each Service to the workloads its selector targets via an INFRA_MAPS
- * edge (Service Resource → workload Resource). */
-static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t *recs) {
+ * edge (Service Resource → workload Resource), inside a shared bundle. */
+static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t *recs,
+                               k8s_bundles_t *bundles) {
     CBMHashTable *index = cbm_ht_create(0);
     if (!index) {
         return;
@@ -668,7 +1105,7 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
         }
         for (int c = 0; rarest && c < rarest->count; c++) {
             const k8s_record_t *wl = &recs->items[rarest->items[c]];
-            bool all = k8s_same_namespace(svc, wl);
+            bool all = k8s_share_bundle(bundles, ctx, svc, wl);
             for (int p = 0; all && p < svc->pair_n; p++) {
                 all = k8s_has_pair(recs, wl, recs->pairs[svc->pair_off + p]);
             }
@@ -716,7 +1153,7 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, c
             continue;
         }
 
-        char *props = k8s_resource_props(def->qualified_name);
+        char *props = k8s_resource_props(def->qualified_name, NULL);
         int64_t node_id = cbm_gbuf_upsert_node(
             ctx->gbuf, "Resource", def->name, def->qualified_name, rel_path, (int)def->start_line,
             (int)def->end_line, props ? props : "{\"source\":\"k8s\"}");
@@ -1056,7 +1493,7 @@ static void handle_dep_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, c
  * the sequential loop did. Sequentially the pass re-read and re-parsed every
  * YAML manifest on one thread -- 1.1 s of the Go corpus (6,275 manifests;
  * profile + waste sanitizer, 2026-09-17). */
-typedef enum { K8S_SKIP = 0, K8S_DEP, K8S_HELM, K8S_MANIFEST } k8s_kind_t;
+typedef enum { K8S_SKIP = 0, K8S_DEP, K8S_HELM, K8S_MANIFEST, K8S_KUSTOMIZE } k8s_kind_t;
 
 typedef struct {
     k8s_kind_t kind;
@@ -1086,6 +1523,10 @@ static void k8s_prep_file(const k8s_prep_job_t *job, int i, k8s_prep_t *out) {
     if (is_gomod_file(base) || lang == CBM_LANG_GOMOD || is_requirements_file(base)) {
         out->source = k8s_read_file(path, &out->src_len);
         out->kind = out->source ? K8S_DEP : K8S_SKIP;
+    } else if (lang == CBM_LANG_KUSTOMIZE) {
+        /* Its `namespace:` is the namespace of the objects it builds. */
+        out->source = k8s_read_file(path, &out->src_len);
+        out->kind = out->source ? K8S_KUSTOMIZE : K8S_SKIP;
     } else if (lang == CBM_LANG_YAML || lang == CBM_LANG_K8S) {
         /* Read source once to classify (and reuse for uncached extraction). */
         out->source = k8s_read_file(path, &out->src_len);
@@ -1137,9 +1578,12 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     /* Collect per-manifest selector/label records for cross-manifest matching. */
     k8s_record_array_t recs = {0};
     k8s_local_deps_t local_deps = {0};
+    k8s_kusts_t kusts = {0};
+    k8s_bundles_t bundles = {.charts = cbm_ht_create(0)};
 
     k8s_prep_t *prep = cbm_calloc(CBM_MEM_CLASS_OTHER, K8S_CHUNK * sizeof(*prep));
     if (!prep) {
+        k8s_bundles_free(&bundles);
         return CBM_NOT_FOUND;
     }
     int workers = cbm_default_worker_count(false);
@@ -1150,6 +1594,8 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
             cbm_free(CBM_MEM_CLASS_OTHER, prep);
             k8s_records_free(&recs);
             k8s_local_deps_free(&local_deps);
+            k8s_kusts_free(&kusts);
+            k8s_bundles_free(&bundles);
             return CBM_NOT_FOUND;
         }
         memset(prep, 0, (size_t)K8S_CHUNK * sizeof(*prep));
@@ -1175,7 +1621,11 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                     break;
                 case K8S_HELM:
                     handle_helm_chart(ctx, rel, p->source, &local_deps);
+                    k8s_chart_dir_add(&bundles, rel);
                     helm_count++;
+                    break;
+                case K8S_KUSTOMIZE:
+                    k8s_kusts_push(&kusts, rel, k8s_kustomize_namespace(p->source));
                     break;
                 case K8S_MANIFEST:
                     handle_k8s_manifest(ctx, rel, p->source, p->res, &recs);
@@ -1195,14 +1645,21 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
             cbm_free(CBM_MEM_CLASS_OTHER, prep);
             k8s_records_free(&recs);
             k8s_local_deps_free(&local_deps);
+            k8s_kusts_free(&kusts);
+            k8s_bundles_free(&bundles);
             return CBM_NOT_FOUND;
         }
     }
     cbm_free(CBM_MEM_CLASS_OTHER, prep);
 
-    /* Connect Services to the workloads their selectors target (INFRA_MAPS). */
-    k8s_link_selectors(ctx, &recs);
+    /* Connect Services to the workloads their selectors target (INFRA_MAPS),
+     * inside the bundles that deploy them together. */
+    k8s_bundles_build(ctx, &kusts, &bundles);
+    k8s_apply_effective_namespaces(ctx, &bundles);
+    k8s_link_selectors(ctx, &recs, &bundles);
     k8s_records_free(&recs);
+    k8s_bundles_free(&bundles);
+    k8s_kusts_free(&kusts);
     /* Link `file://` chart dependencies now that every Chart.yaml is read. */
     k8s_link_local_deps(ctx, &local_deps);
 
