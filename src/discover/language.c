@@ -971,9 +971,9 @@ static CBMLanguage lang_for_filename(const cbm_userconfig_t *ucfg, const char *f
 
     /* DotEnv variant filenames (".env.local", ".env.production", …): the
      * filename starts with ".env." but its last "extension" (e.g. ".local")
-     * is not a real language extension.  Match the dotenv convention used by
-     * pass_envscan/pass_infrascan (".env" exact, ".env." prefix, "*.env"
-     * suffix) so file-index routing agrees with direct extraction. */
+     * is not a real language extension.  Match the dotenv convention (".env"
+     * exact, ".env." prefix, "*.env" suffix) so file-index routing agrees with
+     * direct extraction. */
     if (strncmp(filename, ".env.", SLEN(".env.")) == 0) {
         return CBM_LANG_DOTENV;
     }

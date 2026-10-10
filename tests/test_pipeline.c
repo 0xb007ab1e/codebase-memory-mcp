@@ -10002,8 +10002,8 @@ static int python_typed_field_scope_case(bool external) {
              "class TestCase:\n    pass\n\n"
              "class Holder:\n    field: %s\n",
              external ? "unittest.TestCase" : "TestCase");
-    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON,
-                                             "proj", "models.py", 0, NULL, NULL);
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "proj",
+                                             "models.py", 0, NULL, NULL);
     cbm_registry_t *reg = cbm_registry_new();
     cbm_gbuf_t *gbuf = cbm_gbuf_new("proj", "/unused");
     CBMArena arena;
@@ -10019,11 +10019,11 @@ static int python_typed_field_scope_case(bool external) {
         const char **keys = NULL;
         const char **vals = NULL;
         int import_count = 0;
-        cbm_pxc_build_import_map(gbuf, "proj", "models.py", CBM_LANG_PYTHON, result, &keys,
-                                 &vals, &import_count);
-        cbm_resolution_t raw = cbm_registry_resolve(
-            reg, external ? "unittest.TestCase" : "TestCase", "proj.models", keys, vals,
-            import_count);
+        cbm_pxc_build_import_map(gbuf, "proj", "models.py", CBM_LANG_PYTHON, result, &keys, &vals,
+                                 &import_count);
+        cbm_resolution_t raw =
+            cbm_registry_resolve(reg, external ? "unittest.TestCase" : "TestCase", "proj.models",
+                                 keys, vals, import_count);
         bool candidate = raw.qualified_name && raw.strategy &&
                          strcmp(raw.qualified_name, "proj.models.TestCase") == 0 &&
                          strcmp(raw.strategy, "same_module") == 0;
@@ -10032,18 +10032,18 @@ static int python_typed_field_scope_case(bool external) {
         cbm_file_info_t files[1] = {{.rel_path = "models.py", .language = CBM_LANG_PYTHON}};
         CBMFileResult *cache[1] = {result};
         int count = 0;
-        defs = cbm_pxc_collect_all_defs(&ctx, &arena, cache, files, 1, "proj", modules, &count,
-                                        NULL);
+        defs =
+            cbm_pxc_collect_all_defs(&ctx, &arena, cache, files, 1, "proj", modules, &count, NULL);
         int holders = 0;
         bool field_ok = false;
         for (int i = 0; defs && i < count; i++) {
             if (defs[i].qualified_name &&
                 strcmp(defs[i].qualified_name, "proj.models.Holder") == 0) {
                 holders++;
-                field_ok = external ? !defs[i].field_defs
-                                    : defs[i].field_defs &&
-                                          strcmp(defs[i].field_defs,
-                                                 "field:proj.models.TestCase") == 0;
+                field_ok = external
+                               ? !defs[i].field_defs
+                               : defs[i].field_defs &&
+                                     strcmp(defs[i].field_defs, "field:proj.models.TestCase") == 0;
             }
         }
         ok = candidate && holders == 1 && field_ok;
@@ -10170,8 +10170,7 @@ TEST(override_explicit_walks_to_nearest_declaring_ancestor) {
     cbm_gbuf_insert_edge(gb, tied, tie_left_mid, "INHERITS", "{}");
 
     /* The separate Go implicit-satisfaction pass owns .go classes. */
-    int64_t go_type =
-        cbm_gbuf_upsert_node(gb, "Struct", "GoType", "m.GoType", "m.go", 1, 5, "{}");
+    int64_t go_type = cbm_gbuf_upsert_node(gb, "Struct", "GoType", "m.GoType", "m.go", 1, 5, "{}");
     int64_t go_process = ovr_method(gb, go_type, "GoType", "process");
     cbm_gbuf_insert_edge(gb, go_type, processor, "IMPLEMENTS", "{}");
 
@@ -13637,49 +13636,6 @@ TEST(compile_commands_parse_invalid) {
 
 /* ── Infrascan: file identification ──────────────────────────────── */
 
-TEST(infra_is_compose_file) {
-    /* Port of TestIsComposeFile (8 cases) */
-    ASSERT(cbm_is_compose_file("docker-compose.yml"));
-    ASSERT(cbm_is_compose_file("docker-compose.yaml"));
-    ASSERT(cbm_is_compose_file("docker-compose.prod.yml"));
-    ASSERT(cbm_is_compose_file("compose.yml"));
-    ASSERT(cbm_is_compose_file("compose.yaml"));
-    ASSERT(!cbm_is_compose_file("mycompose.yml"));
-    ASSERT(!cbm_is_compose_file("docker-compose.txt"));
-    ASSERT(!cbm_is_compose_file("Dockerfile"));
-    PASS();
-}
-
-TEST(infra_is_cloudbuild_file) {
-    /* Port of TestIsCloudbuildFile (5 cases) */
-    ASSERT(cbm_is_cloudbuild_file("cloudbuild.yaml"));
-    ASSERT(cbm_is_cloudbuild_file("cloudbuild.yml"));
-    ASSERT(cbm_is_cloudbuild_file("cloudbuild-prod.yaml"));
-    ASSERT(cbm_is_cloudbuild_file("Cloudbuild.yml"));
-    ASSERT(!cbm_is_cloudbuild_file("build.yaml"));
-    PASS();
-}
-
-TEST(infra_is_shell_script) {
-    /* Port of TestIsShellScript (5 cases) */
-    ASSERT(cbm_is_shell_script("run.sh", ".sh"));
-    ASSERT(cbm_is_shell_script("deploy.bash", ".bash"));
-    ASSERT(cbm_is_shell_script("init.zsh", ".zsh"));
-    ASSERT(!cbm_is_shell_script("main.py", ".py"));
-    ASSERT(!cbm_is_shell_script("Dockerfile", ""));
-    PASS();
-}
-
-TEST(infra_is_dockerfile) {
-    ASSERT(cbm_is_dockerfile("Dockerfile"));
-    ASSERT(cbm_is_dockerfile("dockerfile"));
-    ASSERT(cbm_is_dockerfile("Dockerfile.prod"));
-    ASSERT(cbm_is_dockerfile("app.dockerfile"));
-    ASSERT(!cbm_is_dockerfile("docker-compose.yml"));
-    ASSERT(!cbm_is_dockerfile("main.go"));
-    PASS();
-}
-
 TEST(infra_is_kustomize_file) {
     ASSERT(cbm_is_kustomize_file("kustomization.yaml"));
     ASSERT(cbm_is_kustomize_file("kustomization.yml"));
@@ -13704,36 +13660,6 @@ TEST(infra_is_k8s_manifest) {
     PASS();
 }
 
-TEST(infra_is_env_file) {
-    ASSERT(cbm_is_env_file(".env"));
-    ASSERT(cbm_is_env_file(".env.local"));
-    ASSERT(cbm_is_env_file("prod.env"));
-    ASSERT(!cbm_is_env_file("main.go"));
-    ASSERT(!cbm_is_env_file("env.txt"));
-    PASS();
-}
-
-/* ── Infrascan: cleanJSONBrackets ───────────────────────────────── */
-
-TEST(infra_clean_json_brackets) {
-    /* Port of TestCleanJSONBrackets (4 cases) */
-    char out[256];
-
-    cbm_clean_json_brackets("[\"./server\"]", out, sizeof(out));
-    ASSERT_STR_EQ(out, "./server");
-
-    cbm_clean_json_brackets("[\"python\", \"main.py\"]", out, sizeof(out));
-    ASSERT_STR_EQ(out, "python main.py");
-
-    cbm_clean_json_brackets("./server", out, sizeof(out));
-    ASSERT_STR_EQ(out, "./server");
-
-    cbm_clean_json_brackets("[\"./app\", \"--flag\", \"value\"]", out, sizeof(out));
-    ASSERT_STR_EQ(out, "./app --flag value");
-
-    PASS();
-}
-
 /* ── Infrascan: secret detection ────────────────────────────────── */
 
 TEST(infra_secret_detection) {
@@ -13755,395 +13681,6 @@ TEST(infra_secret_detection) {
     ASSERT(cbm_is_secret_binding("ANYTHING", "sk-1234567890abcdef12345"));
     ASSERT(!cbm_is_secret_binding("PORT", "8080"));
 
-    PASS();
-}
-
-/* ── Infrascan: Dockerfile parser ───────────────────────────────── */
-
-/* Helper: find env var by key in result */
-static const char *find_env_var(const cbm_env_kv_t *vars, int count, const char *key) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(vars[i].key, key) == 0)
-            return vars[i].value;
-    }
-    return NULL;
-}
-
-/* Helper: check if string array contains value */
-static bool str_array_contains(const char (*arr)[32], int count, const char *val) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(arr[i], val) == 0)
-            return true;
-    }
-    return false;
-}
-
-static bool str_array_128_contains(const char (*arr)[128], int count, const char *val) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(arr[i], val) == 0)
-            return true;
-    }
-    return false;
-}
-
-static bool str_array_256_contains(const char (*arr)[256], int count, const char *val) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(arr[i], val) == 0)
-            return true;
-    }
-    return false;
-}
-
-TEST(infra_parse_dockerfile_multistage) {
-    /* Port of TestParseDockerfile "multi-stage with all directives" */
-    const char *src = "FROM golang:1.23-alpine AS builder\n"
-                      "WORKDIR /app\n"
-                      "ARG SSH_PRIVATE_KEY\n"
-                      "RUN go build -o server .\n"
-                      "\n"
-                      "FROM alpine:3.19\n"
-                      "WORKDIR /usr/app\n"
-                      "ENV PORT=8080\n"
-                      "ENV PYTHONUNBUFFERED=1\n"
-                      "EXPOSE 8080 443\n"
-                      "USER appuser\n"
-                      "CMD [\"./server\"]\n"
-                      "HEALTHCHECK CMD wget http://localhost:8080/health\n";
-
-    cbm_dockerfile_result_t r;
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
-    ASSERT_STR_EQ(r.base_image, "alpine:3.19");
-    ASSERT_EQ(r.stage_count, 2);
-    ASSERT_STR_EQ(r.stage_images[0], "golang:1.23-alpine");
-    ASSERT_STR_EQ(r.stage_images[1], "alpine:3.19");
-    ASSERT(str_array_contains(r.exposed_ports, r.port_count, "8080"));
-    ASSERT(str_array_contains(r.exposed_ports, r.port_count, "443"));
-    ASSERT_STR_EQ(r.workdir, "/usr/app");
-    ASSERT_STR_EQ(r.user, "appuser");
-    ASSERT_STR_EQ(r.cmd, "./server");
-    ASSERT_STR_EQ(r.healthcheck, "wget http://localhost:8080/health");
-
-    ASSERT_NOT_NULL(find_env_var(r.env_vars, r.env_count, "PORT"));
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "PORT"), "8080");
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "PYTHONUNBUFFERED"), "1");
-
-    ASSERT(str_array_128_contains(r.build_args, r.build_arg_count, "SSH_PRIVATE_KEY"));
-
-    PASS();
-}
-
-TEST(infra_parse_dockerfile_entrypoint) {
-    /* Port of TestParseDockerfile "single stage with entrypoint" */
-    const char *src = "FROM python:3.9-slim\n"
-                      "ENTRYPOINT [\"python\", \"main.py\"]\n";
-
-    cbm_dockerfile_result_t r;
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
-    ASSERT_STR_EQ(r.base_image, "python:3.9-slim");
-    ASSERT_STR_EQ(r.entrypoint, "python main.py");
-    ASSERT_EQ(r.stage_count, 1);
-    PASS();
-}
-
-TEST(infra_parse_dockerfile_secret_filtered) {
-    /* Port of TestParseDockerfile "secret env vars filtered" */
-    const char *src = "FROM node:20\n"
-                      "ENV API_KEY=sk-1234567890abcdef12345\n"
-                      "ENV DATABASE_URL=https://db.example.com\n"
-                      "ENV JWT_SECRET=supersecret\n";
-
-    cbm_dockerfile_result_t r;
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
-
-    /* API_KEY and JWT_SECRET should be filtered */
-    ASSERT(find_env_var(r.env_vars, r.env_count, "API_KEY") == NULL);
-    ASSERT(find_env_var(r.env_vars, r.env_count, "JWT_SECRET") == NULL);
-
-    /* DATABASE_URL should remain */
-    ASSERT_NOT_NULL(find_env_var(r.env_vars, r.env_count, "DATABASE_URL"));
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "DATABASE_URL"), "https://db.example.com");
-    PASS();
-}
-
-TEST(infra_parse_dockerfile_expose_protocol) {
-    /* Port of TestParseDockerfile "expose with protocol suffix" */
-    const char *src = "FROM nginx:latest\n"
-                      "EXPOSE 80/tcp 443/tcp\n";
-
-    cbm_dockerfile_result_t r;
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
-    ASSERT(str_array_contains(r.exposed_ports, r.port_count, "80"));
-    ASSERT(str_array_contains(r.exposed_ports, r.port_count, "443"));
-    PASS();
-}
-
-TEST(infra_parse_dockerfile_env_space) {
-    /* Port of TestParseDockerfile "ENV space-separated format" */
-    const char *src = "FROM python:3.9\n"
-                      "ENV PYTHONPATH /usr/app\n";
-
-    cbm_dockerfile_result_t r;
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
-    ASSERT_NOT_NULL(find_env_var(r.env_vars, r.env_count, "PYTHONPATH"));
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "PYTHONPATH"), "/usr/app");
-    PASS();
-}
-
-TEST(infra_parse_dockerfile_empty) {
-    /* Port of TestParseDockerfileEmpty */
-    cbm_dockerfile_result_t r;
-    ASSERT_EQ(cbm_parse_dockerfile_source("# just a comment\n", &r), -1);
-    PASS();
-}
-
-/* ── Infrascan: Dotenv parser ───────────────────────────────────── */
-
-TEST(infra_parse_dotenv) {
-    /* Port of TestParseDotenvFile */
-    const char *src = "# Database config\n"
-                      "DATABASE_HOST=localhost\n"
-                      "DATABASE_PORT=5432\n"
-                      "DATABASE_NAME=mydb\n"
-                      "API_SECRET=should-not-appear\n"
-                      "PLAIN_VALUE=hello world\n";
-
-    cbm_dotenv_result_t r;
-    ASSERT_EQ(cbm_parse_dotenv_source(src, &r), 0);
-
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "DATABASE_HOST"), "localhost");
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "DATABASE_PORT"), "5432");
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "PLAIN_VALUE"), "hello world");
-
-    /* API_SECRET should be filtered */
-    ASSERT(find_env_var(r.env_vars, r.env_count, "API_SECRET") == NULL);
-    PASS();
-}
-
-TEST(infra_parse_dotenv_quoted) {
-    /* Port of TestParseDotenvQuotedValues */
-    const char *src = "KEY1=\"quoted value\"\n"
-                      "KEY2='single quoted'\n";
-
-    cbm_dotenv_result_t r;
-    ASSERT_EQ(cbm_parse_dotenv_source(src, &r), 0);
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "KEY1"), "quoted value");
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "KEY2"), "single quoted");
-    PASS();
-}
-
-/* ── Infrascan: Shell script parser ─────────────────────────────── */
-
-TEST(infra_parse_shell) {
-    /* Port of TestParseShellScript */
-    const char *src = "#!/bin/bash\n"
-                      "set -e\n"
-                      "\n"
-                      "# Configuration\n"
-                      "YOUR_CONTAINER_NAME=\"order-email-extractor-endpoint\"\n"
-                      "DOCKERFILE_PATH=\"/path/to/dockerfile\"\n"
-                      "\n"
-                      "export ENVIRONMENT=\"development\"\n"
-                      "export USE_STACKDRIVER=\"false\"\n"
-                      "\n"
-                      "# Shut down existing containers\n"
-                      "./shut-down-docker-container.sh\n"
-                      "\n"
-                      "docker build -t \"$YOUR_CONTAINER_NAME\" \"$DOCKERFILE_PATH\"\n"
-                      "docker run -d --name \"$YOUR_CONTAINER_NAME\" \"$YOUR_CONTAINER_NAME\"\n"
-                      "docker-compose up -d\n";
-
-    cbm_shell_result_t r;
-    ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
-    ASSERT_STR_EQ(r.shebang, "/bin/bash");
-
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "ENVIRONMENT"), "development");
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "YOUR_CONTAINER_NAME"),
-                  "order-email-extractor-endpoint");
-
-    ASSERT(str_array_256_contains(r.docker_cmds, r.docker_cmd_count, "docker build"));
-    ASSERT(str_array_256_contains(r.docker_cmds, r.docker_cmd_count, "docker run"));
-    ASSERT(str_array_256_contains(r.docker_cmds, r.docker_cmd_count, "docker-compose up"));
-
-    PASS();
-}
-
-TEST(infra_parse_shell_with_source) {
-    /* Port of TestParseShellScriptWithSource */
-    const char *src = "#!/usr/bin/env bash\n"
-                      "source ./config.sh\n"
-                      ". /etc/profile.d/env.sh\n";
-
-    cbm_shell_result_t r;
-    ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
-    ASSERT_STR_EQ(r.shebang, "/usr/bin/env bash");
-    ASSERT(str_array_256_contains(r.sources, r.source_count, "./config.sh"));
-    ASSERT(str_array_256_contains(r.sources, r.source_count, "/etc/profile.d/env.sh"));
-    PASS();
-}
-
-TEST(infra_parse_shell_secret_filtered) {
-    /* Port of TestParseShellScriptSecretFiltered */
-    const char *src = "#!/bin/bash\n"
-                      "export API_SECRET=\"should-not-appear\"\n"
-                      "export DATABASE_URL=\"https://db.example.com\"\n";
-
-    cbm_shell_result_t r;
-    ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
-    ASSERT(find_env_var(r.env_vars, r.env_count, "API_SECRET") == NULL);
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "DATABASE_URL"), "https://db.example.com");
-    PASS();
-}
-
-TEST(infra_parse_shell_shebang_only) {
-    /* Port of TestParseShellScriptShebanOnly */
-    const char *src = "#!/bin/bash\n# just comments\n";
-    cbm_shell_result_t r;
-    ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
-    ASSERT_STR_EQ(r.shebang, "/bin/bash");
-    PASS();
-}
-
-TEST(infra_parse_shell_truly_empty) {
-    /* Port of TestParseShellScriptTrulyEmpty */
-    cbm_shell_result_t r;
-    ASSERT_EQ(cbm_parse_shell_source("# no shebang, just comments\n", &r), -1);
-    PASS();
-}
-
-/* ── Infrascan: Terraform parser ────────────────────────────────── */
-
-TEST(infra_parse_terraform_full) {
-    /* Port of TestParseTerraformFile */
-    const char *src = "\n"
-                      "terraform {\n"
-                      "  required_providers {\n"
-                      "    google = {\n"
-                      "      source  = \"hashicorp/google\"\n"
-                      "      version = \"~> 6.35.0\"\n"
-                      "    }\n"
-                      "  }\n"
-                      "  backend \"gcs\" {\n"
-                      "    bucket = \"example-tf\"\n"
-                      "    prefix = \"state\"\n"
-                      "  }\n"
-                      "}\n"
-                      "\n"
-                      "variable \"project_id\" {\n"
-                      "  description = \"The GCP project ID\"\n"
-                      "  type        = string\n"
-                      "  default     = \"example-cloud\"\n"
-                      "}\n"
-                      "\n"
-                      "variable \"region\" {\n"
-                      "  description = \"The region\"\n"
-                      "  type        = string\n"
-                      "}\n"
-                      "\n"
-                      "resource \"google_cloud_run_service\" \"main\" {\n"
-                      "  name     = \"my-service\"\n"
-                      "  location = var.region\n"
-                      "}\n"
-                      "\n"
-                      "resource \"google_compute_address\" \"nat_ip\" {\n"
-                      "  name   = \"nat-ip\"\n"
-                      "  region = var.region\n"
-                      "}\n"
-                      "\n"
-                      "output \"service_url\" {\n"
-                      "  value = google_cloud_run_service.main.status[0].url\n"
-                      "}\n"
-                      "\n"
-                      "data \"google_project\" \"project\" {\n"
-                      "}\n"
-                      "\n"
-                      "module \"vpc\" {\n"
-                      "  source = \"./modules/vpc\"\n"
-                      "}\n"
-                      "\n"
-                      "locals {\n"
-                      "  env = \"prod\"\n"
-                      "}\n";
-
-    cbm_terraform_result_t r;
-    ASSERT_EQ(cbm_parse_terraform_source(src, &r), 0);
-    ASSERT_STR_EQ(r.backend, "gcs");
-
-    /* Resources */
-    ASSERT_EQ(r.resource_count, 2);
-    bool found_cloud_run = false;
-    for (int i = 0; i < r.resource_count; i++) {
-        if (strcmp(r.resources[i].type, "google_cloud_run_service") == 0 &&
-            strcmp(r.resources[i].name, "main") == 0) {
-            found_cloud_run = true;
-        }
-    }
-    ASSERT(found_cloud_run);
-
-    /* Variables */
-    ASSERT_EQ(r.variable_count, 2);
-    bool found_project_id = false;
-    for (int i = 0; i < r.variable_count; i++) {
-        if (strcmp(r.variables[i].name, "project_id") == 0) {
-            ASSERT_STR_EQ(r.variables[i].default_val, "example-cloud");
-            ASSERT_STR_EQ(r.variables[i].type, "string");
-            ASSERT_STR_EQ(r.variables[i].description, "The GCP project ID");
-            found_project_id = true;
-        }
-    }
-    ASSERT(found_project_id);
-
-    /* Outputs */
-    ASSERT_EQ(r.output_count, 1);
-    ASSERT_STR_EQ(r.outputs[0], "service_url");
-
-    /* Data sources */
-    ASSERT_EQ(r.data_source_count, 1);
-    ASSERT_STR_EQ(r.data_sources[0].type, "google_project");
-    ASSERT_STR_EQ(r.data_sources[0].name, "project");
-
-    /* Modules */
-    ASSERT_EQ(r.module_count, 1);
-    ASSERT_STR_EQ(r.modules[0].tf_name, "vpc");
-    ASSERT_STR_EQ(r.modules[0].source, "./modules/vpc");
-
-    /* Locals */
-    ASSERT(r.has_locals);
-
-    PASS();
-}
-
-TEST(infra_parse_terraform_variables_only) {
-    /* Port of TestParseTerraformVariablesOnly — secret default filtered */
-    const char *src = "\n"
-                      "variable \"project_id\" {\n"
-                      "  description = \"The GCP project ID\"\n"
-                      "  type        = string\n"
-                      "  default     = \"example-cloud\"\n"
-                      "}\n"
-                      "\n"
-                      "variable \"secret_key\" {\n"
-                      "  description = \"A secret\"\n"
-                      "  type        = string\n"
-                      "  default     = \"sk-1234567890abcdef12345\"\n"
-                      "}\n";
-
-    cbm_terraform_result_t r;
-    ASSERT_EQ(cbm_parse_terraform_source(src, &r), 0);
-    ASSERT_EQ(r.variable_count, 2);
-
-    /* secret_key default should be filtered */
-    for (int i = 0; i < r.variable_count; i++) {
-        if (strcmp(r.variables[i].name, "secret_key") == 0) {
-            ASSERT_STR_EQ(r.variables[i].default_val, "");
-        }
-    }
-    PASS();
-}
-
-TEST(infra_parse_terraform_empty) {
-    /* Port of TestParseTerraformEmpty */
-    cbm_terraform_result_t r;
-    ASSERT_EQ(cbm_parse_terraform_source("# just comments\n", &r), -1);
     PASS();
 }
 
@@ -14673,50 +14210,6 @@ TEST(infra_qn_helper) {
     PASS();
 }
 
-/* ── Infrascan integration tests ────────────────────────────────── */
-
-TEST(infra_pipeline_integration) {
-    /* Port of TestPassInfraFilesIntegration (Dockerfile + .env parts).
-     * Tests parse functions on source text (pipeline infrascan pass not
-     * wired yet — compose YAML also blocked on YAML parser). */
-
-    /* Parse Dockerfile */
-    cbm_dockerfile_result_t dr;
-    ASSERT_EQ(cbm_parse_dockerfile_source("FROM alpine:3.19\nEXPOSE 8080\n", &dr), 0);
-    ASSERT_STR_EQ(dr.base_image, "alpine:3.19");
-    ASSERT_GTE(dr.port_count, 1);
-
-    /* Parse .env */
-    cbm_dotenv_result_t er;
-    ASSERT_EQ(cbm_parse_dotenv_source("APP_PORT=8080\nDEBUG=true\n", &er), 0);
-    ASSERT_GTE(er.env_count, 1);
-    /* APP_PORT should be present */
-    bool found_port = false;
-    for (int i = 0; i < er.env_count; i++) {
-        if (strcmp(er.env_vars[i].key, "APP_PORT") == 0 &&
-            strcmp(er.env_vars[i].value, "8080") == 0)
-            found_port = true;
-    }
-    ASSERT_TRUE(found_port);
-
-    PASS();
-}
-
-TEST(infra_pipeline_idempotent) {
-    /* Port of TestPassInfraFilesIdempotent:
-     * Parsing same source twice should produce identical results. */
-    const char *src = "FROM alpine:3.19\nEXPOSE 8080\nENV PORT=8080\n";
-    cbm_dockerfile_result_t r1, r2;
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r1), 0);
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r2), 0);
-
-    ASSERT_STR_EQ(r1.base_image, r2.base_image);
-    ASSERT_EQ(r1.port_count, r2.port_count);
-    ASSERT_EQ(r1.env_count, r2.env_count);
-
-    PASS();
-}
-
 /* ── K8s / Kustomize extraction tests ──────────────────────────── */
 
 TEST(k8s_extract_kustomize) {
@@ -14818,7 +14311,7 @@ TEST(k8s_extract_manifest_multidoc) {
     PASS();
 }
 
-/* ── Envscan tests (port of envscan_test.go) ───────────────────── */
+/* ── Temp-file fixture helpers ───────────────────────────────────── */
 
 /* Helper: write a file inside a temp dir */
 static void write_temp_file(const char *dir, const char *name, const char *content) {
@@ -15064,349 +14557,6 @@ TEST(pipeline_nested_fixture_graph_has_endpoints) {
     ASSERT_TRUE(expected_call);
     ASSERT_FALSE(forbidden_call);
     ASSERT_EQ(cleanup_rc, 0);
-    PASS();
-}
-
-/* Helper: find binding by key in results */
-static const cbm_env_binding_t *find_binding_by_key(const cbm_env_binding_t *bindings, int count,
-                                                    const char *key) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(bindings[i].key, key) == 0)
-            return &bindings[i];
-    }
-    return NULL;
-}
-
-/* Helper: find binding by value in results */
-static int has_binding_value(const cbm_env_binding_t *bindings, int count, const char *value) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(bindings[i].value, value) == 0)
-            return 1;
-    }
-    return 0;
-}
-
-TEST(envscan_dockerfile_env_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_dock_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "Dockerfile",
-                    "FROM python:3.9-slim\n"
-                    "ENV ORDER_URL=https://api.example.com/api/orders\n"
-                    "ENV DB_HOST=localhost\n"
-                    "ARG WEBHOOK_URL=https://hooks.example.com/webhook\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "ORDER_URL"));
-    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "ORDER_URL")->value,
-                  "https://api.example.com/api/orders");
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "WEBHOOK_URL"));
-    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "WEBHOOK_URL")->value,
-                  "https://hooks.example.com/webhook");
-    /* DB_HOST=localhost is NOT a URL → should be absent */
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "DB_HOST") == NULL);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_shell_env_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sh_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "setup.sh",
-                    "#!/bin/bash\n"
-                    "export DB_URL=\"https://db.example.com/api/sync\"\n"
-                    "APP_NAME=\"my-service\"\n"
-                    "CALLBACK_URL=https://hooks.example.com/notify\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "DB_URL"));
-    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "DB_URL")->value,
-                  "https://db.example.com/api/sync");
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CALLBACK_URL"));
-    /* APP_NAME is NOT a URL → absent */
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "APP_NAME") == NULL);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_env_file_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_env_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, ".env",
-                    "\nAPI_URL=https://api.example.com/v1\n"
-                    "DEBUG=true\n"
-                    "SERVICE_URL=https://service.example.com/api\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "API_URL"));
-    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "API_URL")->value,
-                  "https://api.example.com/v1");
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "SERVICE_URL"));
-    /* DEBUG=true is NOT a URL */
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "DEBUG") == NULL);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_toml_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_toml_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "config.toml",
-                    "[service]\n"
-                    "base_url = \"https://api.example.com\"\n"
-                    "name = \"my-service\"\n"
-                    "callback_url = \"https://hooks.example.com/notify\"\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "base_url"));
-    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "base_url")->value,
-                  "https://api.example.com");
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "callback_url"));
-    /* name="my-service" is NOT a URL */
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "name") == NULL);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_yaml_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_yaml_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "config.yaml",
-                    "service:\n"
-                    "  service_url: \"https://api.internal.com/api/process\"\n"
-                    "  timeout: 30\n"
-                    "  callback_url: \"https://hooks.internal.com/callback\"\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "service_url"));
-    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "service_url")->value,
-                  "https://api.internal.com/api/process");
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "callback_url"));
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_terraform_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_tf_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "variables.tf",
-                    "variable \"webhook_url\" {\n"
-                    "  description = \"Webhook endpoint\"\n"
-                    "  default     = \"https://api.example.com/webhook\"\n"
-                    "}\n\n"
-                    "variable \"region\" {\n"
-                    "  default = \"us-east-1\"\n"
-                    "}\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_GTE(count, 1);
-    ASSERT_TRUE(has_binding_value(bindings, count, "https://api.example.com/webhook"));
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_properties_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_prop_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "app.properties",
-                    "api.url=https://api.example.com/health\n"
-                    "app.name=myapp\n"
-                    "service.endpoint=https://service.example.com/api\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_TRUE(has_binding_value(bindings, count, "https://api.example.com/health"));
-    ASSERT_TRUE(has_binding_value(bindings, count, "https://service.example.com/api"));
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_secret_key_exclusion) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_skey_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "Dockerfile",
-                    "FROM node:18\n"
-                    "ENV SECRET_TOKEN=https://api.example.com/api\n"
-                    "ENV API_KEY=https://api.example.com/v1\n"
-                    "ENV PASSWORD=https://auth.example.com/login\n"
-                    "ENV NORMAL_URL=https://api.example.com/orders\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    /* Secret keys should be excluded */
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "SECRET_TOKEN") == NULL);
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "API_KEY") == NULL);
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "PASSWORD") == NULL);
-    /* Normal key should be present */
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "NORMAL_URL"));
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_secret_value_exclusion) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sval_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(
-        tmpdir, "deploy.sh",
-        "#!/bin/bash\n"
-        "export GH_URL=\"https://ghp_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE@github.com/repo\"\n"
-        "export NORMAL_ENDPOINT=\"https://api.example.com/orders\"\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    /* ghp_ token URL should be excluded */
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "GH_URL") == NULL);
-    /* Normal URL should be present */
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "NORMAL_ENDPOINT"));
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_secret_file_exclusion) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sfile_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    /* Secret file should be skipped */
-    write_temp_file(tmpdir, "credentials.sh",
-                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
-    /* Normal file should be scanned */
-    write_temp_file(tmpdir, "setup.sh",
-                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    /* Should find binding from setup.sh but not credentials.sh */
-    int from_credentials = 0;
-    int from_setup = 0;
-    for (int i = 0; i < count; i++) {
-        if (strcmp(bindings[i].file_path, "credentials.sh") == 0)
-            from_credentials = 1;
-        if (strcmp(bindings[i].file_path, "setup.sh") == 0)
-            from_setup = 1;
-    }
-    ASSERT_EQ(from_credentials, 0);
-    ASSERT_EQ(from_setup, 1);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_skips_ignored_dirs) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_ign_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    static const char ignored_content[] =
-        "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n";
-    write_temp_file(tmpdir, ".git/config.sh", ignored_content);
-    write_temp_file(tmpdir, "node_modules/pkg/config.sh", ignored_content);
-    bool git_written = fixture_file_matches(TH_PATH(tmpdir, ".git/config.sh"), ignored_content);
-    bool module_written =
-        fixture_file_matches(TH_PATH(tmpdir, "node_modules/pkg/config.sh"), ignored_content);
-
-    /* File at root level should be scanned */
-    write_temp_file(tmpdir, "deploy.sh",
-                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    int from_git = 0, from_nm = 0, from_root = 0;
-    for (int i = 0; i < count; i++) {
-        if (strncmp(bindings[i].file_path, ".git/", 5) == 0)
-            from_git = 1;
-        if (strncmp(bindings[i].file_path, "node_modules/", 13) == 0)
-            from_nm = 1;
-        if (strcmp(bindings[i].file_path, "deploy.sh") == 0)
-            from_root = 1;
-    }
-    ASSERT_TRUE(git_written);
-    ASSERT_TRUE(module_written);
-    ASSERT_EQ(from_git, 0);
-    ASSERT_EQ(from_nm, 0);
-    ASSERT_EQ(from_root, 1);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_non_url_values_skipped) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_nurl_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "Dockerfile",
-                    "FROM python:3.9\n"
-                    "ENV APP_NAME=my-service\n"
-                    "ENV PORT=8080\n"
-                    "ENV DEBUG=true\n"
-                    "ENV LOG_LEVEL=info\n");
-    write_temp_file(tmpdir, "config.sh",
-                    "#!/bin/bash\n"
-                    "export REGION=\"us-east-1\"\n"
-                    "export COUNT=42\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_EQ(count, 0);
-
-    th_rmtree(tmpdir);
     PASS();
 }
 
@@ -15750,40 +14900,6 @@ TEST(pkgmap_scan_repo_honors_discovery_exclusions) {
     ASSERT_TRUE(pkg_entries_has_name(&entries, "@org/app"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "@org/vendored"));
     cbm_pkg_entries_free(&entries);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-/* The env-URL walk must honor discovery exclusions the same way (#792).
- * Control run first via the NULL-exclusion wrapper so the exclusion
- * assertion cannot pass vacuously. */
-TEST(envscan_walk_honors_discovery_exclusions) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_excl_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    char dir[512];
-    snprintf(dir, sizeof(dir), "%s/big_generated", tmpdir);
-    cbm_mkdir(dir);
-
-    write_temp_file(tmpdir, "deploy.sh",
-                    "#!/bin/bash\nexport CONTROL_URL=\"https://api.example.com/v1\"\n");
-    write_temp_file(tmpdir, "big_generated/env.sh",
-                    "#!/bin/bash\nexport EXCLUDED_URL=\"https://excluded.example.com/v1\"\n");
-
-    /* Control: the NULL-exclusion wrapper sees both bindings. */
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CONTROL_URL"));
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "EXCLUDED_URL"));
-
-    /* With big_generated excluded, its binding must disappear. */
-    char *excluded[] = {(char *)"big_generated"};
-    count = cbm_scan_project_env_urls_excluded(tmpdir, bindings, 32, excluded, 1);
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CONTROL_URL"));
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "EXCLUDED_URL") == NULL);
 
     th_rmtree(tmpdir);
     PASS();
@@ -17541,31 +16657,6 @@ TEST(coupling_single_file_commit) {
     cbm_change_coupling_t results[16];
     int n = cbm_compute_change_coupling(commits, 2, results, 16);
     ASSERT_EQ(n, 0);
-    PASS();
-}
-
-TEST(clean_json_brackets_array) {
-    /* JSON array → space-joined */
-    char out[256];
-    cbm_clean_json_brackets("[\"./app\", \"--flag\"]", out, sizeof(out));
-    ASSERT_TRUE(strstr(out, "./app") != NULL);
-    ASSERT_TRUE(strstr(out, "--flag") != NULL);
-    PASS();
-}
-
-TEST(clean_json_brackets_plain) {
-    /* Plain string → unchanged */
-    char out[256];
-    cbm_clean_json_brackets("./app --flag", out, sizeof(out));
-    ASSERT_STR_EQ(out, "./app --flag");
-    PASS();
-}
-
-TEST(clean_json_brackets_empty) {
-    /* Empty string → empty output */
-    char out[256];
-    cbm_clean_json_brackets("", out, sizeof(out));
-    ASSERT_STR_EQ(out, "");
     PASS();
 }
 
@@ -19718,62 +18809,20 @@ SUITE(pipeline) {
     RUN_TEST(compile_commands_parse_empty);
     RUN_TEST(compile_commands_parse_invalid);
     /* Infrascan helpers */
-    RUN_TEST(infra_is_compose_file);
-    RUN_TEST(infra_is_cloudbuild_file);
-    RUN_TEST(infra_is_shell_script);
-    RUN_TEST(infra_is_dockerfile);
     RUN_TEST(infra_is_kustomize_file);
     RUN_TEST(infra_is_k8s_manifest);
-    RUN_TEST(infra_is_env_file);
-    RUN_TEST(infra_clean_json_brackets);
     RUN_TEST(infra_secret_detection);
-    /* Infrascan: Dockerfile parser */
-    RUN_TEST(infra_parse_dockerfile_multistage);
-    RUN_TEST(infra_parse_dockerfile_entrypoint);
-    RUN_TEST(infra_parse_dockerfile_secret_filtered);
-    RUN_TEST(infra_parse_dockerfile_expose_protocol);
-    RUN_TEST(infra_parse_dockerfile_env_space);
-    RUN_TEST(infra_parse_dockerfile_empty);
-    /* Infrascan: Dotenv parser */
-    RUN_TEST(infra_parse_dotenv);
-    RUN_TEST(infra_parse_dotenv_quoted);
-    /* Infrascan: Shell script parser */
-    RUN_TEST(infra_parse_shell);
-    RUN_TEST(infra_parse_shell_with_source);
-    RUN_TEST(infra_parse_shell_secret_filtered);
-    RUN_TEST(infra_parse_shell_shebang_only);
-    RUN_TEST(infra_parse_shell_truly_empty);
-    /* Infrascan: Terraform parser */
-    RUN_TEST(infra_parse_terraform_full);
-    RUN_TEST(infra_parse_terraform_variables_only);
-    RUN_TEST(infra_parse_terraform_empty);
     RUN_TEST(helm_parse_chart_dependencies_issue338);
     RUN_TEST(helm_parse_chart_no_deps_issue338);
     RUN_TEST(helm_parse_chart_dependency_entries);
     RUN_TEST(helm_parse_chart_many_dependencies);
     /* Infrascan: QN helper */
     RUN_TEST(infra_qn_helper);
-    /* Infrascan: pipeline integration */
-    RUN_TEST(infra_pipeline_integration);
-    RUN_TEST(infra_pipeline_idempotent);
     /* K8s / Kustomize extraction */
     RUN_TEST(k8s_extract_kustomize);
     RUN_TEST(k8s_extract_manifest);
     RUN_TEST(k8s_extract_manifest_no_name);
     RUN_TEST(k8s_extract_manifest_multidoc);
-    /* Env URL scanning */
-    RUN_TEST(envscan_dockerfile_env_urls);
-    RUN_TEST(envscan_shell_env_urls);
-    RUN_TEST(envscan_env_file_urls);
-    RUN_TEST(envscan_toml_urls);
-    RUN_TEST(envscan_yaml_urls);
-    RUN_TEST(envscan_terraform_urls);
-    RUN_TEST(envscan_properties_urls);
-    RUN_TEST(envscan_secret_key_exclusion);
-    RUN_TEST(envscan_secret_value_exclusion);
-    RUN_TEST(envscan_secret_file_exclusion);
-    RUN_TEST(envscan_skips_ignored_dirs);
-    RUN_TEST(envscan_non_url_values_skipped);
     /* SwiftPM Package.swift manifest resolution (issue #551 item 1) */
     RUN_TEST(pkgmap_swift_targets_registers_module);
     RUN_TEST(pkgmap_swift_products_do_not_register_alias);
@@ -19788,7 +18837,6 @@ SUITE(pipeline) {
     /* Discovery-exclusion plumbing in auxiliary repo walks (#792) */
     RUN_TEST(pipeline_relpath_excluded_boundary);
     RUN_TEST(pkgmap_scan_repo_honors_discovery_exclusions);
-    RUN_TEST(envscan_walk_honors_discovery_exclusions);
     /* Function registry / resolver */
     RUN_TEST(registry_resolve_single_candidate);
     RUN_TEST(registry_fuzzy_nonexistent);
@@ -19889,9 +18937,6 @@ SUITE(pipeline) {
     RUN_TEST(coupling_empty_commits);
     RUN_TEST(coupling_single_file_commit);
     /* JSON bracket cleaning */
-    RUN_TEST(clean_json_brackets_array);
-    RUN_TEST(clean_json_brackets_plain);
-    RUN_TEST(clean_json_brackets_empty);
     /* FQN computation */
     RUN_TEST(fqn_compute_basic);
     RUN_TEST(fqn_compute_strips_ext);

@@ -886,114 +886,12 @@ int cbm_parse_compile_commands(const char *json_data, const char *repo_path, cha
 /* ── Infrascan helpers (pass_infrascan.c) ─────────────────────────── */
 
 /* File identification helpers */
-bool cbm_is_dockerfile(const char *name);
-bool cbm_is_compose_file(const char *name);
-bool cbm_is_cloudbuild_file(const char *name);
-bool cbm_is_env_file(const char *name);
-bool cbm_is_shell_script(const char *name, const char *ext);
 bool cbm_is_kustomize_file(const char *name);
 bool cbm_is_k8s_manifest(const char *name, const char *content);
 
 /* Secret detection */
 bool cbm_is_secret_binding(const char *key, const char *value);
 bool cbm_is_secret_value(const char *value);
-
-/* Clean JSON array brackets from CMD/ENTRYPOINT values.
- * E.g. ["./app", "--flag"] → ./app --flag
- * Writes result to out (up to out_sz). */
-void cbm_clean_json_brackets(const char *s, char *out, size_t out_sz);
-
-/* Key-value pair for environment variables / config entries */
-typedef struct {
-    char key[CBM_SZ_128];
-    char value[CBM_SZ_512];
-} cbm_env_kv_t;
-
-/* Dockerfile parsing result */
-typedef struct {
-    char base_image[CBM_SZ_256];
-    char stage_images[CBM_SZ_16][CBM_SZ_256];
-    char stage_names[CBM_SZ_16][CBM_SZ_128];
-    int stage_count;
-    char exposed_ports[CBM_SZ_16][CBM_SZ_32];
-    int port_count;
-    cbm_env_kv_t env_vars[CBM_SZ_64];
-    int env_count;
-    char build_args[CBM_SZ_32][CBM_SZ_128];
-    int build_arg_count;
-    char workdir[CBM_SZ_256];
-    char cmd[CBM_SZ_512];
-    char entrypoint[CBM_SZ_512];
-    char healthcheck[CBM_SZ_512];
-    char user[CBM_SZ_64];
-} cbm_dockerfile_result_t;
-
-/* Dotenv parsing result */
-typedef struct {
-    cbm_env_kv_t env_vars[CBM_SZ_64];
-    int env_count;
-} cbm_dotenv_result_t;
-
-/* Shell script parsing result */
-typedef struct {
-    char shebang[CBM_SZ_256];
-    cbm_env_kv_t env_vars[CBM_SZ_64];
-    int env_count;
-    char sources[CBM_SZ_16][CBM_SZ_256];
-    int source_count;
-    char docker_cmds[CBM_SZ_16][CBM_SZ_256];
-    int docker_cmd_count;
-} cbm_shell_result_t;
-
-/* Terraform variable */
-typedef struct {
-    char name[CBM_SZ_128];
-    char type[CBM_SZ_64];
-    char default_val[CBM_SZ_256];
-    char description[CBM_SZ_256];
-} cbm_tf_variable_t;
-
-/* Terraform resource / data source */
-typedef struct {
-    char type[CBM_SZ_128];
-    char name[CBM_SZ_128];
-} cbm_tf_resource_t;
-
-/* Terraform module */
-typedef struct {
-    char tf_name[CBM_SZ_128];
-    char source[CBM_SZ_256];
-} cbm_tf_module_t;
-
-/* Terraform parsing result */
-typedef struct {
-    cbm_tf_resource_t resources[CBM_SZ_32];
-    int resource_count;
-    cbm_tf_variable_t variables[CBM_SZ_32];
-    int variable_count;
-    char outputs[CBM_SZ_32][CBM_SZ_128];
-    int output_count;
-    char providers[CBM_SZ_16][CBM_SZ_128];
-    int provider_count;
-    cbm_tf_module_t modules[CBM_SZ_16];
-    int module_count;
-    cbm_tf_resource_t data_sources[CBM_SZ_16];
-    int data_source_count;
-    char backend[CBM_SZ_128];
-    bool has_locals;
-} cbm_terraform_result_t;
-
-/* Parse a Dockerfile from source text. Returns 0 if parsed, -1 if empty/invalid. */
-int cbm_parse_dockerfile_source(const char *source, cbm_dockerfile_result_t *out);
-
-/* Parse a .env file from source text. Returns 0 if parsed, -1 if empty. */
-int cbm_parse_dotenv_source(const char *source, cbm_dotenv_result_t *out);
-
-/* Parse a shell script from source text. Returns 0 if parsed, -1 if empty. */
-int cbm_parse_shell_source(const char *source, cbm_shell_result_t *out);
-
-/* Parse a Terraform file from source text. Returns 0 if parsed, -1 if empty. */
-int cbm_parse_terraform_source(const char *source, cbm_terraform_result_t *out);
 
 /* Helm Chart.yaml parse result: chart name + its dependencies (#338). */
 enum { CBM_HELM_NAME_MAX = 128, CBM_HELM_REPO_MAX = 512 };
@@ -1214,26 +1112,6 @@ extern _Atomic uint64_t g_importance_name_visits;
 /* Rows rescored by the SQL-level store recompute. Lets a test prove the
  * closure-delta route actually took that path instead of passing vacuously. */
 extern _Atomic uint64_t g_importance_store_rows;
-
-/* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
-
-typedef struct {
-    char key[CBM_SZ_128];
-    char value[CBM_SZ_512];
-    char file_path[CBM_SZ_256];
-} cbm_env_binding_t;
-
-/* Scan a project directory for environment variable assignments with URL values.
- * Walks the filesystem, scans Dockerfiles, shell scripts, .env, YAML, TOML,
- * Terraform, and .properties files. Filters out secrets.
- * Returns number of bindings written to out (up to max_out).
- * NOTE: this walker currently has no production callers — it is exercised
- * only by tests. The _excluded variant honors discovery exclusions for
- * consistency with the pkgmap/path-alias walks (#792); the plain variant
- * scans unexcluded (NULL exclusion list). */
-int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int max_out);
-int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t *out, int max_out,
-                                       char **excluded_dirs, int excluded_count);
 
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
