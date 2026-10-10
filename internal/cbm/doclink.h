@@ -83,6 +83,8 @@
     X(CBM_DOCLINK_CS_SEEALSO, CBM_LANG_CSHARP, "seealso", false, true, "MENTIONS")             \
     X(CBM_DOCLINK_CS_EXCEPTION, CBM_LANG_CSHARP, "exception", false, true, "MENTIONS")         \
     X(CBM_DOCLINK_CS_INHERITDOC, CBM_LANG_CSHARP, "inheritdoc", false, true, "MENTIONS")       \
+    /* go (doclink_go.c): [Name] doc links; held until its held-out audit passes */            \
+    X(CBM_DOCLINK_GO_DOC_LINK, CBM_LANG_GO, "doc_link", false, false, "MENTIONS")              \
     /* markdown (doclink_md.c): what a document's text names explicitly */                     \
     X(CBM_DOCLINK_MD_LINK, CBM_LANG_MARKDOWN, "link", false, true, "MENTIONS")                 \
     X(CBM_DOCLINK_MD_PATH, CBM_LANG_MARKDOWN, "path", false, true, "MENTIONS")                 \
@@ -385,5 +387,45 @@ void cbm_pdf_test_scan_page(CBMExtractCtx *ctx, const char *text, size_t len, ui
 /* candidates the scanner's joins have compared so far (a cost counter) */
 size_t cbm_pdf_test_join_steps(void);
 #endif
+/* ── Go (doclink_go.c) ─────────────────────────────────────────────── */
+
+void cbm_doclink_go_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                              uint32_t doc_line);
+const char *cbm_doclink_go_scan_scope(CBMExtractCtx *ctx);
+char *cbm_doclink_go_portable_scope(const char *scope);
+
+/* A go.mod file has no doc links; its scope is the module path, in the Go
+ * scope format, so that import paths map to the repository's directories. */
+void cbm_doclink_gomod_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                                 uint32_t doc_line);
+const char *cbm_doclink_gomod_scan_scope(CBMExtractCtx *ctx);
+
+/* The parts of a Go doc link as go/doc/comment splits it (docLink,
+ * splitDocName): `pkg`, `recv` and `name` are slices of the reference text,
+ * each possibly empty. [Name] {name}; [Recv.Name] {recv, name}; [pkg] {pkg};
+ * [pkg.Name] {pkg, name}; [pkg.Recv.Name] {pkg, recv, name}. */
+typedef struct {
+    const char *pkg; /* a package name, or an import path when it has a '/' */
+    size_t pkg_len;
+    const char *recv;
+    size_t recv_len;
+    const char *name;
+    size_t name_len;
+} CBMDocLinkGoRef;
+
+/* The longest reference text, and the longest name, the Go leg handles. A
+ * longer bracket text made of doc-link characters is harvested clipped to at
+ * most one byte more than this, and the resolver reports it as unparseable:
+ * a reference is never resolved by its beginning. */
+enum { CBM_DOCLINK_GO_REF_MAX = 512 };
+
+/* Split the text between the brackets (a leading `*` is skipped). False for
+ * text that go/doc/comment could not take for a doc link whatever the package
+ * declares or imports (nothing is harvested from it), and for text longer than
+ * CBM_DOCLINK_GO_REF_MAX. */
+bool cbm_doclink_go_parse_ref(const char *raw, size_t len, CBMDocLinkGoRef *out);
+
+/* The Go scope blob (Go files and go.mod files) starts with this tag line. */
+#define CBM_DOCLINK_GO_SCOPE_TAG "go1"
 
 #endif /* CBM_DOCLINK_H */

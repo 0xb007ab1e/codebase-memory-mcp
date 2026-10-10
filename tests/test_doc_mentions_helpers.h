@@ -432,7 +432,7 @@ static inline int dm_reason_lines(const char *db, const char *block) {
 static const int DM_HELD_FAMILIES[] = {
     CBM_DOCLINK_MD_BARE_PATH,   CBM_DOCLINK_MD_SUPERSEDES_PROSE, CBM_DOCLINK_RST_INCLUDE,
     CBM_DOCLINK_RST_KERNEL_DOC, CBM_DOCLINK_ADOC_ATTRIBUTE,      CBM_DOCLINK_ADOC_CODE_PATH,
-    CBM_DOCLINK_ADOC_CODE_NAME,
+    CBM_DOCLINK_ADOC_CODE_NAME, CBM_DOCLINK_GO_DOC_LINK,
 };
 
 static inline void dm_ship_held_families(void) {

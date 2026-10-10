@@ -180,6 +180,16 @@ static const doclink_lang_t DOCLINK_LANGS[] = {
     {.lang = CBM_LANG_YAML,
      .scan_scope = cbm_doclink_antora_scan_scope,
      .scope_tag = CBM_DOCLINK_ADOC_SCOPE_TAG},
+    {.lang = CBM_LANG_GO,
+     .parse_doc = cbm_doclink_go_parse_doc,
+     .scan_scope = cbm_doclink_go_scan_scope,
+     .scope_tag = CBM_DOCLINK_GO_SCOPE_TAG,
+     .portable_scope = cbm_doclink_go_portable_scope},
+    {.lang = CBM_LANG_GOMOD,
+     .parse_doc = cbm_doclink_gomod_parse_doc,
+     .scan_scope = cbm_doclink_gomod_scan_scope,
+     .scope_tag = CBM_DOCLINK_GO_SCOPE_TAG,
+     .portable_scope = cbm_doclink_go_portable_scope},
 };
 
 static const doclink_lang_t *doclink_lang(CBMLanguage lang) {

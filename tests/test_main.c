@@ -1825,6 +1825,7 @@ extern void suite_doc_links_md(void);
 extern void suite_doc_links_pdf(void);
 extern void suite_doc_links_rst(void);
 extern void suite_doc_links_adoc(void);
+extern void suite_doc_mentions_go(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
 extern void suite_agent_clients(void);
@@ -2296,6 +2297,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(doc_links_pdf);
     RUN_SELECTED_SUITE(doc_links_rst);
     RUN_SELECTED_SUITE(doc_links_adoc);
+    RUN_SELECTED_SUITE(doc_mentions_go);
 
     /* Infrastructure scanning */
     RUN_SELECTED_SUITE(infrascan);
