@@ -1102,6 +1102,9 @@ static void k8s_apply_effective_namespaces(cbm_pipeline_ctx_t *ctx, k8s_bundles_
     }
 }
 
+/* Candidates examined by the resolvers below (pipeline_internal.h). */
+_Atomic uint64_t g_k8s_candidates = 0;
+
 /* ── Object references (PHASE1.md) ───────────────────────────────── */
 
 /* A reference fact of a manifest, kept past its file's extraction. */
@@ -1517,6 +1520,144 @@ static void k8s_deploys_build(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bund
     cbm_log_info("pass.k8s.deploys", "deploys", itoa_k8s(n), "roots", itoa_k8s(roots));
 }
 
+/* ── Bundle-keyed candidate indexes ───────────────────────────────── */
+
+/* Candidates are looked up per bundle the source shares, never by name
+ * across the repository: copies of one name in independent bundles would
+ * otherwise make every lookup visit every copy (quadratic in copies). */
+
+typedef struct {
+    int64_t *items;
+    int count;
+    int cap;
+} k8s_ids_t;
+
+static void k8s_ids_push(k8s_ids_t *v, int64_t id) {
+    if (k8s_grow((void **)&v->items, &v->cap, v->count, sizeof(*v->items))) {
+        v->items[v->count++] = id;
+    }
+}
+
+static int k8s_cmp_id(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a;
+    int64_t y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static void k8s_ids_sort_unique(k8s_ids_t *v) {
+    if (v->count < PAIR_LEN) {
+        return;
+    }
+    qsort(v->items, (size_t)v->count, sizeof(*v->items), k8s_cmp_id);
+    int w = SKIP_ONE;
+    for (int i = SKIP_ONE; i < v->count; i++) {
+        if (v->items[i] != v->items[w - SKIP_ONE]) {
+            v->items[w++] = v->items[i];
+        }
+    }
+    v->count = w;
+}
+
+static void k8s_free_ids_entry(const char *key, void *value, void *ud) {
+    (void)ud;
+    k8s_ids_t *v = value;
+    cbm_free(CBM_MEM_CLASS_OTHER, v->items);
+    cbm_free(CBM_MEM_CLASS_OTHER, v);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+/* "<bundle>\x1f<name>": an interned bundle (by address) with an object
+ * name, a type or a label pair. */
+static void k8s_bkey(char *out, size_t out_sz, const char *bundle, const char *name) {
+    snprintf(out, out_sz, "%p\x1f%s", (const void *)bundle, name);
+}
+
+static void k8s_index_add(CBMHashTable *ix, const char *key, int64_t id) {
+    k8s_ids_t *v = cbm_ht_get(ix, key);
+    if (!v) {
+        v = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*v));
+        char *owned = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
+        if (!v || !owned) {
+            cbm_free(CBM_MEM_CLASS_OTHER, v);
+            cbm_free(CBM_MEM_CLASS_OTHER, owned);
+            return;
+        }
+        cbm_ht_set(ix, owned, v);
+    }
+    if (v->count == 0 || v->items[v->count - SKIP_ONE] != id) {
+        k8s_ids_push(v, id);
+    }
+}
+
+/* Calls `fn(bundle, ud)` for every bundle of `file`: its build roots /
+ * chart / dir and, when `deploys`, the deploy scopes reaching it. */
+typedef void (*k8s_scope_fn)(const char *bundle, void *ud);
+
+static void k8s_each_scope(k8s_bundles_t *b, const char *file, bool deploys, k8s_scope_fn fn,
+                           void *ud) {
+    k8s_member_t one[SKIP_ONE];
+    k8s_members_t single = {.items = one, .cap = SKIP_ONE};
+    const k8s_members_t *m = k8s_bundles_of(b, file, &single);
+    for (int i = 0; i < m->count; i++) {
+        fn(m->items[i].bundle, ud);
+    }
+    const k8s_members_t *d = deploys && b->deploys ? cbm_ht_get(b->deploys, file) : NULL;
+    for (int i = 0; d && i < d->count; i++) {
+        fn(d->items[i].bundle, ud);
+    }
+}
+
+typedef struct {
+    CBMHashTable *ix;
+    const char *name;
+    int64_t id;
+    k8s_ids_t *found;
+} k8s_scope_job_t;
+
+static void k8s_scope_add(const char *bundle, void *ud) {
+    k8s_scope_job_t *j = ud;
+    char key[CBM_SZ_1K];
+    k8s_bkey(key, sizeof(key), bundle, j->name);
+    k8s_index_add(j->ix, key, j->id);
+}
+
+static void k8s_scope_find(const char *bundle, void *ud) {
+    k8s_scope_job_t *j = ud;
+    char key[CBM_SZ_1K];
+    k8s_bkey(key, sizeof(key), bundle, j->name);
+    const k8s_ids_t *v = cbm_ht_get(j->ix, key);
+    for (int i = 0; v && i < v->count; i++) {
+        k8s_ids_push(j->found, v->items[i]);
+    }
+}
+
+/* Index every Resource by "<scope>\x1f<Kind/name>" over its bundles (and
+ * deploy scopes when `deploys`). */
+static CBMHashTable *k8s_index_objects(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, bool deploys) {
+    CBMHashTable *ix = cbm_ht_create(0);
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (!ix || cbm_gbuf_find_by_label(ctx->gbuf, "Resource", &nodes, &count) != 0) {
+        return ix;
+    }
+    for (int i = 0; i < count; i++) {
+        if (nodes[i]->file_path && nodes[i]->name) {
+            k8s_scope_job_t j = {ix, nodes[i]->name, nodes[i]->id, NULL};
+            k8s_each_scope(b, nodes[i]->file_path, deploys, k8s_scope_add, &j);
+        }
+    }
+    return ix;
+}
+
+/* The ids `name` has in any scope of `file`, sorted, unique. */
+static void k8s_find_in_scopes(k8s_bundles_t *b, CBMHashTable *ix, const char *file,
+                               const char *name, bool deploys, k8s_ids_t *found) {
+    found->count = 0;
+    k8s_scope_job_t j = {ix, name, 0, found};
+    k8s_each_scope(b, file, deploys, k8s_scope_find, &j);
+    k8s_ids_sort_unique(found);
+}
+
 /* The namespace of a Resource's logical key ("" when unknown `?` or
  * cluster-scoped `_`), else its declared one. */
 static void k8s_effective_ns(const cbm_gbuf_node_t *n, char *out, size_t out_sz) {
@@ -1624,7 +1765,11 @@ static int64_t k8s_route_node(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *sr
 static void k8s_resolve_refs(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8s_facts_t *f) {
     int edges = 0;
     int unresolved = 0;
-    for (int i = 0; i < f->ref_n; i++) {
+    CBMHashTable *ix = f->ref_n > 0 ? k8s_index_objects(ctx, b, true) : NULL;
+    k8s_ids_t found = {0};
+    const cbm_gbuf_node_t **cands = NULL;
+    int cand_cap = 0;
+    for (int i = 0; ix && i < f->ref_n; i++) {
         const k8s_ref_t *ref = &f->refs[i];
         const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(ctx->gbuf, ref->src);
         int64_t from = src ? src->id : 0;
@@ -1636,11 +1781,17 @@ static void k8s_resolve_refs(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8
         }
         char name[CBM_SZ_1K];
         snprintf(name, sizeof(name), "%s/%s", ref->kind, ref->name);
-        const cbm_gbuf_node_t **cands = NULL;
         int n = 0;
-        if (!src || !src->file_path || cbm_gbuf_find_by_name(ctx->gbuf, name, &cands, &n) != 0) {
-            n = 0;
+        if (src && src->file_path) {
+            k8s_find_in_scopes(b, ix, src->file_path, name, true, &found);
+            for (int c = 0; c < found.count; c++) {
+                const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(ctx->gbuf, found.items[c]);
+                if (t && k8s_grow((void **)&cands, &cand_cap, n, sizeof(*cands))) {
+                    cands[n++] = t;
+                }
+            }
         }
+        atomic_fetch_add_explicit(&g_k8s_candidates, (uint64_t)(n), memory_order_relaxed);
         char props[CBM_SZ_256];
         snprintf(props, sizeof(props), "{\"%s\":\"%s\"}",
                  strcmp(ref->edge, "INFRA_MAPS") == 0   ? "kind"
@@ -1671,6 +1822,12 @@ static void k8s_resolve_refs(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8
         edges += hits;
         unresolved += hits == 0;
     }
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)cands);
+    cbm_free(CBM_MEM_CLASS_OTHER, found.items);
+    if (ix) {
+        cbm_ht_foreach(ix, k8s_free_ids_entry, NULL);
+        cbm_ht_free(ix);
+    }
     if (f->ref_n > 0) {
         cbm_log_info("pass.k8s.refs", "refs", itoa_k8s(f->ref_n), "edges", itoa_k8s(edges),
                      "unresolved", itoa_k8s(unresolved));
@@ -1688,24 +1845,6 @@ static int k8s_cmp_crd_key(const void *a, const void *b) {
     const k8s_crd_key_t *y = b;
     int c = strcmp(x->key, y->key);
     return c ? c : (x->crd > y->crd) - (x->crd < y->crd);
-}
-
-/* Do the files at `a` and `b` share a bundle? */
-static bool k8s_same_bundle(k8s_bundles_t *b, const char *a, const char *c) {
-    k8s_member_t one_a[SKIP_ONE];
-    k8s_member_t one_c[SKIP_ONE];
-    k8s_members_t single_a = {.items = one_a, .cap = SKIP_ONE};
-    k8s_members_t single_c = {.items = one_c, .cap = SKIP_ONE};
-    const k8s_members_t *ma = k8s_bundles_of(b, a, &single_a);
-    const k8s_members_t *mc = k8s_bundles_of(b, c, &single_c);
-    for (int i = 0; i < ma->count; i++) {
-        for (int j = 0; j < mc->count; j++) {
-            if (ma->items[i].bundle == mc->items[j].bundle) {
-                return true;
-            }
-        }
-    }
-    return false;
 }
 
 /* A custom resource is an instance of the CRD declaring its group and
@@ -1761,10 +1900,20 @@ static void k8s_link_crds(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8s_f
     for (int i = f->crd_n - SKIP_ONE; i >= 0; i--) {
         cbm_ht_set(by_type, order[i].key, (void *)(intptr_t)(i + SKIP_ONE)); /* first of run */
     }
+    /* "<bundle>\x1f<group/kind>" -> the CRDs of that type in that bundle */
+    CBMHashTable *in_bundle = cbm_ht_create(0);
+    for (int i = 0; in_bundle && i < f->crd_n; i++) {
+        const cbm_gbuf_node_t *crd = cbm_gbuf_find_by_id(ctx->gbuf, f->crds[order[i].crd].node);
+        if (crd && crd->file_path) {
+            k8s_scope_job_t j = {in_bundle, order[i].key, crd->id, NULL};
+            k8s_each_scope(b, crd->file_path, false, k8s_scope_add, &j);
+        }
+    }
+    k8s_ids_t beside = {0};
     const cbm_gbuf_node_t **nodes = NULL;
     int count = 0;
     int edges = 0;
-    if (cbm_gbuf_find_by_label(ctx->gbuf, "Resource", &nodes, &count) == 0) {
+    if (in_bundle && cbm_gbuf_find_by_label(ctx->gbuf, "Resource", &nodes, &count) == 0) {
         for (int i = 0; i < count; i++) {
             const char *key =
                 nodes[i]->qualified_name ? strstr(nodes[i]->qualified_name, "::") : NULL;
@@ -1783,34 +1932,98 @@ static void k8s_link_crds(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8s_f
             if (first < 0) {
                 continue;
             }
+            k8s_find_in_scopes(b, in_bundle, nodes[i]->file_path, type, false, &beside);
+            if (beside.count > 0) {
+                atomic_fetch_add_explicit(&g_k8s_candidates, (uint64_t)beside.count,
+                                          memory_order_relaxed);
+                for (int r = 0; r < beside.count; r++) {
+                    if (beside.items[r] != nodes[i]->id) {
+                        cbm_gbuf_insert_edge(ctx->gbuf, nodes[i]->id, beside.items[r], "USAGE",
+                                             "{\"ref\":\"crd\"}");
+                        edges++;
+                    }
+                }
+                continue;
+            }
             int end = first;
             while (end < f->crd_n && strcmp(order[end].key, type) == 0) {
                 end++;
             }
-            bool beside = false;
-            for (int r = first; r < end && !beside; r++) {
-                const cbm_gbuf_node_t *crd =
-                    cbm_gbuf_find_by_id(ctx->gbuf, f->crds[order[r].crd].node);
-                beside = crd && crd->file_path &&
-                         k8s_same_bundle(b, nodes[i]->file_path, crd->file_path);
-            }
+            atomic_fetch_add_explicit(&g_k8s_candidates, (uint64_t)(end - first),
+                                      memory_order_relaxed);
             for (int r = first; r < end; r++) {
                 int64_t crd_id = f->crds[order[r].crd].node;
-                const cbm_gbuf_node_t *crd = cbm_gbuf_find_by_id(ctx->gbuf, crd_id);
-                if (crd_id == nodes[i]->id ||
-                    (beside && (!crd || !crd->file_path ||
-                                !k8s_same_bundle(b, nodes[i]->file_path, crd->file_path)))) {
-                    continue;
+                if (crd_id != nodes[i]->id) {
+                    cbm_gbuf_insert_edge(ctx->gbuf, nodes[i]->id, crd_id, "USAGE",
+                                         "{\"ref\":\"crd\"}");
+                    edges++;
                 }
-                cbm_gbuf_insert_edge(ctx->gbuf, nodes[i]->id, crd_id, "USAGE", "{\"ref\":\"crd\"}");
-                edges++;
             }
         }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, beside.items);
+    if (in_bundle) {
+        cbm_ht_foreach(in_bundle, k8s_free_ids_entry, NULL);
+        cbm_ht_free(in_bundle);
     }
     cbm_ht_free(by_type);
     cbm_free(CBM_MEM_CLASS_OTHER, order);
     if (edges > 0) {
         cbm_log_info("pass.k8s.crds", "instances", itoa_k8s(edges));
+    }
+}
+
+/* Selector postings keyed by "<bundle>\x1f<key=value>" (owned keys): the
+ * workloads (record indices) of one bundle carrying one label pair. */
+static void k8s_posting_free_owned(const char *key, void *value, void *userdata) {
+    k8s_posting_free(key, value, userdata);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+typedef struct {
+    CBMHashTable *index;
+    const k8s_record_array_t *recs;
+    const k8s_record_t *rec;
+    int rec_idx;
+    k8s_ids_t *cand; /* record indices */
+} k8s_sel_job_t;
+
+static void k8s_sel_post(const char *bundle, void *ud) {
+    k8s_sel_job_t *j = ud;
+    for (int p = 0; p < j->rec->pair_n; p++) {
+        char key[CBM_SZ_1K];
+        k8s_bkey(key, sizeof(key), bundle, j->recs->pairs[j->rec->pair_off + p]);
+        if (!cbm_ht_get(j->index, key)) {
+            k8s_posting_t *posting = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*posting));
+            char *owned = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
+            if (!posting || !owned) {
+                cbm_free(CBM_MEM_CLASS_OTHER, posting);
+                cbm_free(CBM_MEM_CLASS_OTHER, owned);
+                continue;
+            }
+            cbm_ht_set(j->index, owned, posting);
+        }
+        (void)k8s_posting_add(j->index, key, j->rec_idx);
+    }
+}
+
+/* The workloads of `bundle` carrying the selector's rarest pair there. */
+static void k8s_sel_rarest(const char *bundle, void *ud) {
+    k8s_sel_job_t *j = ud;
+    const k8s_posting_t *rarest = NULL;
+    for (int p = 0; p < j->rec->pair_n; p++) {
+        char key[CBM_SZ_1K];
+        k8s_bkey(key, sizeof(key), bundle, j->recs->pairs[j->rec->pair_off + p]);
+        const k8s_posting_t *posting = cbm_ht_get(j->index, key);
+        if (!posting) {
+            return;
+        }
+        if (!rarest || posting->count < rarest->count) {
+            rarest = posting;
+        }
+    }
+    for (int c = 0; rarest && c < rarest->count; c++) {
+        k8s_ids_push(j->cand, rarest->items[c]);
     }
 }
 
@@ -1882,12 +2095,13 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
     int match_cap = 0;
     for (int i = 0; i < recs->count; i++) {
         const k8s_record_t *wl = &recs->items[i];
-        if (wl->kind == K8S_REC_WORKLOAD || wl->kind == K8S_REC_POD) {
-            for (int p = 0; p < wl->pair_n; p++) {
-                (void)k8s_posting_add(index, recs->pairs[wl->pair_off + p], i);
-            }
+        const cbm_gbuf_node_t *wn = cbm_gbuf_find_by_id(ctx->gbuf, wl->node_id);
+        if ((wl->kind == K8S_REC_WORKLOAD || wl->kind == K8S_REC_POD) && wn && wn->file_path) {
+            k8s_sel_job_t j = {index, recs, wl, i, NULL};
+            k8s_each_scope(bundles, wn->file_path, false, k8s_sel_post, &j);
         }
     }
+    k8s_ids_t cand = {0};
     int edges = 0;
     for (int i = 0; i < recs->count; i++) {
         /* a Service, PodDisruptionBudget or NetworkPolicy selector; one with
@@ -1899,22 +2113,20 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
             svc->pair_n == 0 || svc->has_expr) {
             continue;
         }
-        /* Candidates: the workloads carrying the Service's rarest pair. */
-        const k8s_posting_t *rarest = NULL;
-        for (int p = 0; p < svc->pair_n; p++) {
-            const k8s_posting_t *posting = cbm_ht_get(index, recs->pairs[svc->pair_off + p]);
-            if (!posting) {
-                rarest = NULL;
-                break;
-            }
-            if (!rarest || posting->count < rarest->count) {
-                rarest = posting;
-            }
-        }
+        /* Candidates: per bundle of the selector, the workloads there
+         * carrying its rarest pair. */
         const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_id(ctx->gbuf, svc->node_id);
+        cand.count = 0;
+        if (sn && sn->file_path) {
+            k8s_sel_job_t j = {index, recs, svc, i, &cand};
+            k8s_each_scope(bundles, sn->file_path, false, k8s_sel_rarest, &j);
+        }
+        k8s_ids_sort_unique(&cand);
+        atomic_fetch_add_explicit(&g_k8s_candidates, (uint64_t)cand.count, memory_order_relaxed);
         int n = 0;
-        for (int c = 0; sn && rarest && c < rarest->count; c++) {
-            const k8s_record_t *wl = &recs->items[rarest->items[c]];
+        for (int c = 0; c < cand.count; c++) {
+            int rec = (int)cand.items[c];
+            const k8s_record_t *wl = &recs->items[rec];
             bool all = k8s_share_bundle(bundles, ctx, svc, wl);
             for (int p = 0; all && p < svc->pair_n; p++) {
                 all = k8s_has_pair(recs, wl, recs->pairs[svc->pair_off + p]);
@@ -1922,15 +2134,15 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
             const cbm_gbuf_node_t *wn = all ? cbm_gbuf_find_by_id(ctx->gbuf, wl->node_id) : NULL;
             if (wn && wn->name && wn->file_path &&
                 k8s_grow((void **)&matches, &match_cap, n, sizeof(*matches))) {
-                matches[n++] = (k8s_match_t){
-                    wn->name, wl->ns, sn->file_path && strcmp(wn->file_path, sn->file_path) == 0,
-                    rarest->items[c]};
+                matches[n++] =
+                    (k8s_match_t){wn->name, wl->ns, strcmp(wn->file_path, sn->file_path) == 0, rec};
             }
         }
         edges += k8s_draw_matches(ctx, recs, svc, matches, n);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, matches);
-    cbm_ht_foreach(index, k8s_posting_free, NULL);
+    cbm_free(CBM_MEM_CLASS_OTHER, cand.items);
+    cbm_ht_foreach(index, k8s_posting_free_owned, NULL);
     cbm_ht_free(index);
     if (edges > 0) {
         cbm_log_info("pass.k8s.selectors", "linked", itoa_k8s(edges));

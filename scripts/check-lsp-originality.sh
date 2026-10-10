@@ -64,7 +64,20 @@ REFS=(
   # Perl (PR #461) was authored clean-room. We scan against PerlNavigator (MIT)
   # — the leading OSS Perl language server — for defensive copy-detection.
   "perl|https://github.com/bscan/PerlNavigator|server/src"
+  # Infrastructure hybrid LSPs (K8s YAML, Kustomize bundles, Flux/Argo deploy
+  # scopes, the Go operator extension) were written from the Kubernetes, Flux,
+  # Argo, Cluster API, cert-manager and Kubermatic API types. Scanned against
+  # the YAML/K8s language server, helm-ls, kustomize, Flux's kustomization
+  # generator and controller-tools (the +groupName markers).
+  "yaml|https://github.com/redhat-developer/yaml-language-server|src"
+  "helm|https://github.com/mrjosh/helm-ls|internal"
+  "kustomize|https://github.com/kubernetes-sigs/kustomize|api/krusty,api/internal/target"
+  "flux|https://github.com/fluxcd/pkg|kustomize"
+  "kube|https://github.com/kubernetes-sigs/controller-tools|pkg"
 )
+
+# Infrastructure hybrid LSP sources outside internal/cbm/lsp/ (scanned too).
+INFRA_SRC=(internal/cbm/extract_k8s.c src/pipeline/pass_k8s.c src/pipeline/pass_operator.c)
 
 ONLY_LANG=""; REFRESH=0; LIST_ONLY=0
 while [ $# -gt 0 ]; do
@@ -87,6 +100,9 @@ fi
 LSP_SRC=()
 while IFS= read -r f; do LSP_SRC+=("$f"); done < <(
   find "$LSP_DIR" -type f \( -name '*.c' -o -name '*.h' \) -not -path '*/generated/*' | sort)
+for f in "${INFRA_SRC[@]}"; do
+  [ -f "$ROOT/$f" ] && LSP_SRC+=("$ROOT/$f")
+done
 if [ "${#LSP_SRC[@]}" -eq 0 ]; then
   echo "$TAG ERROR: no LSP sources under $LSP_DIR" >&2; exit 2
 fi

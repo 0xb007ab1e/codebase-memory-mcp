@@ -1118,6 +1118,13 @@ extern _Atomic uint64_t g_importance_name_visits;
  * closure-delta route actually took that path instead of passing vacuously. */
 extern _Atomic uint64_t g_importance_store_rows;
 
+/* Work counters of the infra resolvers, gated by the complexity suite:
+ * candidate objects the K8s pass examines for references, selectors and
+ * CRDs (pass_k8s.c), and candidate Go types / package dirs the operator pass
+ * examines (pass_operator.c). Independent copies must grow them linearly. */
+extern _Atomic uint64_t g_k8s_candidates;
+extern _Atomic uint64_t g_op_candidates;
+
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
 /* Run incremental re-index on an existing disk DB.

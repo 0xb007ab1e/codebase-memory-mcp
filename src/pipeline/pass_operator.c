@@ -28,6 +28,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +37,9 @@
 #define OP_SLEN(lit) (sizeof(lit) - SKIP_ONE)
 
 enum { OP_GROW_MIN = 16, OP_IDENT_MAX = 128 };
+
+/* Candidates examined by the resolvers below (pipeline_internal.h). */
+_Atomic uint64_t g_op_candidates = 0;
 
 /* Read a whole file into a core-owned NUL-terminated buffer, NULL on error
  * or past the indexer's file-size policy. */
@@ -251,6 +255,82 @@ static bool op_import_dir(const op_modules_t *m, const char *import, char *out, 
     return true;
 }
 
+/* ── Indexes: Go types by package dir, module roots ───────────────────── */
+
+/* Graph-owned nodes. */
+typedef struct {
+    const cbm_gbuf_node_t **items;
+    int count;
+    int cap;
+} op_nodes_t;
+
+static void op_nodes_push(op_nodes_t *v, const cbm_gbuf_node_t *n) {
+    if (v->count == v->cap) {
+        int cap = v->cap ? v->cap * PAIR_LEN : OP_GROW_MIN;
+        const cbm_gbuf_node_t **grown =
+            cbm_realloc(CBM_MEM_CLASS_OTHER, (void *)v->items, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return;
+        }
+        v->items = grown;
+        v->cap = cap;
+    }
+    v->items[v->count++] = n;
+}
+
+static void op_free_nodes_entry(const char *key, void *value, void *ud) {
+    (void)ud;
+    op_nodes_t *v = value;
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)v->items);
+    cbm_free(CBM_MEM_CLASS_OTHER, v);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+/* "<a>\x1f<b>": a directory (or module root) with a name. */
+static void op_key(char *out, size_t out_sz, const char *a, const char *b) {
+    snprintf(out, out_sz, "%s\x1f%s", a, b);
+}
+
+/* "<dir>\x1f<Name>" -> the Struct / Class / Type nodes Name names in dir. */
+static CBMHashTable *op_types_by_dir(const cbm_gbuf_t *gb) {
+    CBMHashTable *ix = cbm_ht_create(0);
+    static const char *const labels[] = {"Struct", "Class", "Type"};
+    for (size_t l = 0; ix && l < sizeof(labels) / sizeof(labels[0]); l++) {
+        const cbm_gbuf_node_t **nodes = NULL;
+        int count = 0;
+        if (cbm_gbuf_find_by_label(gb, labels[l], &nodes, &count) != 0) {
+            continue;
+        }
+        for (int i = 0; i < count; i++) {
+            if (!nodes[i]->file_path || !nodes[i]->name) {
+                continue;
+            }
+            char dir[CBM_SZ_1K];
+            char key[PAIR_LEN * CBM_SZ_1K];
+            op_dirname(nodes[i]->file_path, dir, sizeof(dir));
+            op_key(key, sizeof(key), dir, nodes[i]->name);
+            op_nodes_t *v = cbm_ht_get(ix, key);
+            if (!v) {
+                v = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*v));
+                char *owned = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
+                if (!v || !owned) {
+                    cbm_free(CBM_MEM_CLASS_OTHER, v);
+                    cbm_free(CBM_MEM_CLASS_OTHER, owned);
+                    continue;
+                }
+                cbm_ht_set(ix, owned, v);
+            }
+            op_nodes_push(v, nodes[i]);
+        }
+    }
+    return ix;
+}
+
+typedef struct {
+    const op_modules_t *mods;
+    CBMHashTable *dir_types; /* op_types_by_dir */
+} op_index_t;
+
 /* ── Controllers: For / Owns / Watches / source.Kind ──────────────────── */
 
 static int op_line_of(const char *text, const char *at) {
@@ -419,30 +499,46 @@ static bool op_dir_is_import(const char *dir, const char *path) {
 }
 
 /* HANDLES from `fn` to the Go type `type` resolved as Go resolves it: the
- * package the file imports as `qual`, or (unqualified) the file's own. */
-static int op_handle(cbm_gbuf_t *gb, const op_modules_t *mods, const cbm_gbuf_node_t *fn,
+ * package the file imports as `qual`, or (unqualified) the file's own -- one
+ * directory, looked up in the type index. Only an import no module of the
+ * repository has falls back to the same-named types whose directory ends
+ * the import path. */
+static int op_handle(cbm_gbuf_t *gb, const op_index_t *ix, const cbm_gbuf_node_t *fn,
                      const char *file, const char *text, const char *qual, const char *type,
                      const char *role) {
     char import[CBM_SZ_1K] = "";
-    char own_dir[CBM_SZ_1K];
     char pkg_dir[CBM_SZ_1K] = "";
-    op_dirname(file, own_dir, sizeof(own_dir));
     bool in_repo = false;
     if (qual[0]) {
         op_import_path(text, qual, import, sizeof(import));
         if (!import[0]) {
             return 0;
         }
-        in_repo = op_import_dir(mods, import, pkg_dir, sizeof(pkg_dir));
+        in_repo = op_import_dir(ix->mods, import, pkg_dir, sizeof(pkg_dir));
+    } else {
+        op_dirname(file, pkg_dir, sizeof(pkg_dir));
+    }
+    char props[CBM_SZ_128];
+    snprintf(props, sizeof(props), "{\"via\":\"controller\",\"role\":\"%s\"}", role);
+    int linked = 0;
+    if (!qual[0] || in_repo) {
+        char key[PAIR_LEN * CBM_SZ_1K];
+        op_key(key, sizeof(key), pkg_dir, type);
+        const op_nodes_t *v = cbm_ht_get(ix->dir_types, key);
+        atomic_fetch_add_explicit(&g_op_candidates, (uint64_t)(v ? v->count : 0),
+                                  memory_order_relaxed);
+        for (int i = 0; v && i < v->count; i++) {
+            cbm_gbuf_insert_edge(gb, fn->id, v->items[i]->id, "HANDLES", props);
+            linked++;
+        }
+        return linked;
     }
     const cbm_gbuf_node_t **types = NULL;
     int tn = 0;
     if (cbm_gbuf_find_by_name(gb, type, &types, &tn) != 0) {
         return 0;
     }
-    char props[CBM_SZ_128];
-    snprintf(props, sizeof(props), "{\"via\":\"controller\",\"role\":\"%s\"}", role);
-    int linked = 0;
+    atomic_fetch_add_explicit(&g_op_candidates, (uint64_t)(tn), memory_order_relaxed);
     for (int i = 0; i < tn; i++) {
         const cbm_gbuf_node_t *t = types[i];
         if (!t->label || !t->file_path ||
@@ -452,10 +548,7 @@ static int op_handle(cbm_gbuf_t *gb, const op_modules_t *mods, const cbm_gbuf_no
         }
         char dir[CBM_SZ_1K];
         op_dirname(t->file_path, dir, sizeof(dir));
-        bool same = !qual[0]  ? strcmp(dir, own_dir) == 0
-                    : in_repo ? strcmp(dir, pkg_dir) == 0
-                              : op_dir_is_import(dir, import);
-        if (same) {
+        if (op_dir_is_import(dir, import)) {
             cbm_gbuf_insert_edge(gb, fn->id, t->id, "HANDLES", props);
             linked++;
         }
@@ -464,7 +557,7 @@ static int op_handle(cbm_gbuf_t *gb, const op_modules_t *mods, const cbm_gbuf_no
 }
 
 /* Every `&[pkg.]Type{` in the arguments of a controller builder call. */
-static int op_controller_calls(cbm_gbuf_t *gb, CBMHashTable *by_file, const op_modules_t *mods,
+static int op_controller_calls(cbm_gbuf_t *gb, CBMHashTable *by_file, const op_index_t *ix,
                                const char *file, const char *text) {
     /* method name + "(", called on a receiver outside a comment: the previous
      * code char is '.', and Kind's receiver is the `source` package. */
@@ -529,7 +622,7 @@ static int op_controller_calls(cbm_gbuf_t *gb, CBMHashTable *by_file, const op_m
                     snprintf(type, sizeof(type), "%.*s", (int)(q - last), last);
                     snprintf(qual, sizeof(qual), "%.*s",
                              last > first ? (int)(last - first - SKIP_ONE) : 0, first);
-                    linked += op_handle(gb, mods, fn, file, text, qual, type, calls[c].role);
+                    linked += op_handle(gb, ix, fn, file, text, qual, type, calls[c].role);
                 }
             }
         }
@@ -571,37 +664,42 @@ static void op_strs_push(op_strs_t *v, const char *s) {
     }
 }
 
-/* group -> the package directories that declare it (owned keys and lists). */
-static void op_note_group(CBMHashTable *groups, const char *group, const char *dir) {
-    if (!group[0]) {
+/* group -> the package directories that declare it (owned keys and lists);
+ * `seen` holds "group\x1fdir" (owned keys) so a repeat is one lookup. */
+static void op_note_group(CBMHashTable *groups, CBMHashTable *seen, const char *group,
+                          const char *dir) {
+    char key[PAIR_LEN * CBM_SZ_1K];
+    op_key(key, sizeof(key), group, dir);
+    if (!group[0] || cbm_ht_get(seen, key)) {
         return;
     }
+    char *seen_key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
+    if (!seen_key) {
+        return;
+    }
+    cbm_ht_set(seen, seen_key, seen_key);
     op_strs_t *dirs = cbm_ht_get(groups, group);
     if (!dirs) {
         dirs = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*dirs));
-        char *key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, group);
-        if (!dirs || !key) {
+        char *gkey = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, group);
+        if (!dirs || !gkey) {
             cbm_free(CBM_MEM_CLASS_OTHER, dirs);
-            cbm_free(CBM_MEM_CLASS_OTHER, key);
+            cbm_free(CBM_MEM_CLASS_OTHER, gkey);
             return;
         }
-        cbm_ht_set(groups, key, dirs);
-    }
-    for (int i = 0; i < dirs->count; i++) {
-        if (strcmp(dirs->items[i], dir) == 0) {
-            return;
-        }
+        cbm_ht_set(groups, gkey, dirs);
     }
     op_strs_push(dirs, dir);
 }
 
-static void op_scan_groups(CBMHashTable *groups, const char *file, const char *text) {
+static void op_scan_groups(CBMHashTable *groups, CBMHashTable *seen, const char *file,
+                           const char *text) {
     char dir[CBM_SZ_1K];
     op_dirname(file, dir, sizeof(dir));
     for (const char *p = strstr(text, "+groupName="); p; p = strstr(p + SKIP_ONE, "+groupName=")) {
         char g[CBM_SZ_256];
         op_token(p + OP_SLEN("+groupName="), g, sizeof(g));
-        op_note_group(groups, g, dir);
+        op_note_group(groups, seen, g, dir);
     }
     for (const char *p = strstr(text, "GroupName"); p; p = strstr(p + SKIP_ONE, "GroupName")) {
         const char *q = p + OP_SLEN("GroupName");
@@ -618,9 +716,15 @@ static void op_scan_groups(CBMHashTable *groups, const char *file, const char *t
         if (*q == '"') {
             char g[CBM_SZ_256];
             op_token(q + SKIP_ONE, g, sizeof(g));
-            op_note_group(groups, g, dir);
+            op_note_group(groups, seen, g, dir);
         }
     }
+}
+
+static void op_free_seen(const char *key, void *value, void *ud) {
+    (void)value;
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
 }
 
 static void op_free_groups(const char *key, void *value, void *ud) {
@@ -651,8 +755,10 @@ static bool op_prop(const char *props, const char *key, char *out, size_t out_sz
     return true;
 }
 
-/* CRD -> the Go type declared under its group, in a package marking it. */
-static int op_link_crd_types(cbm_gbuf_t *gb, CBMHashTable *groups) {
+/* CRD -> the Go type declared under its group, in every package marking it:
+ * an API group is one identity, and its CRDs and Go types routinely sit in
+ * different modules (cluster-api's api/, kubermatic's sdk/). */
+static int op_link_crd_types(cbm_gbuf_t *gb, const op_index_t *ix, CBMHashTable *groups) {
     const cbm_gbuf_node_t **res = NULL;
     int count = 0;
     int linked = 0;
@@ -662,29 +768,25 @@ static int op_link_crd_types(cbm_gbuf_t *gb, CBMHashTable *groups) {
     for (int i = 0; i < count; i++) {
         char group[CBM_SZ_256];
         char kind[CBM_SZ_256];
-        if (!op_prop(res[i]->properties_json, "crd_group", group, sizeof(group)) ||
+        if (!res[i]->file_path ||
+            !op_prop(res[i]->properties_json, "crd_group", group, sizeof(group)) ||
             !op_prop(res[i]->properties_json, "crd_kind", kind, sizeof(kind))) {
             continue;
         }
+        char key[PAIR_LEN * CBM_SZ_1K];
         const op_strs_t *dirs = cbm_ht_get(groups, group);
-        const cbm_gbuf_node_t **types = NULL;
-        int tn = 0;
-        if (!dirs || cbm_gbuf_find_by_name(gb, kind, &types, &tn) != 0) {
+        if (!dirs) {
             continue;
         }
-        for (int t = 0; t < tn; t++) {
-            if (!types[t]->label || strcmp(types[t]->label, "Struct") != 0 ||
-                !types[t]->file_path) {
-                continue;
-            }
-            char dir[CBM_SZ_1K];
-            op_dirname(types[t]->file_path, dir, sizeof(dir));
-            for (int d = 0; d < dirs->count; d++) {
-                if (strcmp(dirs->items[d], dir) == 0) {
-                    cbm_gbuf_insert_edge(gb, res[i]->id, types[t]->id, "USAGE",
+        atomic_fetch_add_explicit(&g_op_candidates, (uint64_t)dirs->count, memory_order_relaxed);
+        for (int d = 0; d < dirs->count; d++) {
+            op_key(key, sizeof(key), dirs->items[d], kind);
+            const op_nodes_t *v = cbm_ht_get(ix->dir_types, key);
+            for (int t = 0; v && t < v->count; t++) {
+                if (v->items[t]->label && strcmp(v->items[t]->label, "Struct") == 0) {
+                    cbm_gbuf_insert_edge(gb, res[i]->id, v->items[t]->id, "USAGE",
                                          "{\"ref\":\"crd-type\"}");
                     linked++;
-                    break;
                 }
             }
         }
@@ -886,6 +988,7 @@ int cbm_pipeline_pass_operator(cbm_pipeline_ctx_t *ctx) {
     qsort((void *)files, (size_t)nfiles, sizeof(*files), op_cmp_path);
     CBMHashTable *by_file = op_functions_by_file(gb);
     CBMHashTable *groups = cbm_ht_create(0);
+    CBMHashTable *seen = cbm_ht_create(0);
     op_modules_t mods = {0};
     for (int i = 0; i < nfiles; i++) {
         const char *slash = strrchr(files[i]->file_path, '/');
@@ -899,9 +1002,11 @@ int cbm_pipeline_pass_operator(cbm_pipeline_ctx_t *ctx) {
             }
         }
     }
+    op_index_t ix = {.mods = &mods, .dir_types = op_types_by_dir(gb)};
     int handles = 0;
     int embeds = 0;
-    for (int i = 0; by_file && groups && i < nfiles; i++) {
+    bool ready = by_file && groups && seen && ix.dir_types;
+    for (int i = 0; ready && i < nfiles; i++) {
         if (!op_is_go(files[i]->file_path) || cbm_pipeline_check_cancel(ctx)) {
             continue;
         }
@@ -912,19 +1017,27 @@ int cbm_pipeline_pass_operator(cbm_pipeline_ctx_t *ctx) {
             continue;
         }
         if (strstr(text, "controller-runtime") || strstr(text, "source.Kind(")) {
-            handles += op_controller_calls(gb, by_file, &mods, files[i]->file_path, text);
+            handles += op_controller_calls(gb, by_file, &ix, files[i]->file_path, text);
         }
-        op_scan_groups(groups, files[i]->file_path, text);
+        op_scan_groups(groups, seen, files[i]->file_path, text);
         if (strstr(text, "//go:embed ")) {
             embeds += op_embed(gb, files[i], text, files, nfiles);
         }
         cbm_free(CBM_MEM_CLASS_OTHER, text);
     }
-    int crd_types = groups ? op_link_crd_types(gb, groups) : 0;
+    int crd_types = ready ? op_link_crd_types(gb, &ix, groups) : 0;
+    if (ix.dir_types) {
+        cbm_ht_foreach(ix.dir_types, op_free_nodes_entry, NULL);
+        cbm_ht_free(ix.dir_types);
+    }
     op_modules_free(&mods);
     if (groups) {
         cbm_ht_foreach(groups, op_free_groups, NULL);
         cbm_ht_free(groups);
+    }
+    if (seen) {
+        cbm_ht_foreach(seen, op_free_seen, NULL);
+        cbm_ht_free(seen);
     }
     if (by_file) {
         cbm_ht_foreach(by_file, op_free_spans, NULL);

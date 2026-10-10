@@ -28,6 +28,51 @@ enum {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+// The children of `node` (named only when `named`), in order, through a
+// tree cursor: ts_node_child(n, i) / ts_node_named_child(n, i) walk from the
+// first child on every call, so an index loop over a wide node (a list of
+// 100k items, a file of thousands of documents) is quadratic. The cursor is
+// released when the children are exhausted, or by k8s_kids_done.
+typedef struct {
+    TSTreeCursor cur;
+    bool live;
+} k8s_kids_t;
+
+static k8s_kids_t k8s_kids(TSNode node) {
+    k8s_kids_t k = {.live = false};
+    if (ts_node_is_null(node)) {
+        return k;
+    }
+    k.cur = ts_tree_cursor_new(node);
+    k.live = ts_tree_cursor_goto_first_child(&k.cur);
+    if (!k.live) {
+        ts_tree_cursor_delete(&k.cur);
+    }
+    return k;
+}
+
+static bool k8s_kid(k8s_kids_t *k, bool named, TSNode *out) {
+    while (k->live) {
+        TSNode n = ts_tree_cursor_current_node(&k->cur);
+        if (!ts_tree_cursor_goto_next_sibling(&k->cur)) {
+            ts_tree_cursor_delete(&k->cur);
+            k->live = false;
+        }
+        if (!named || ts_node_is_named(n)) {
+            *out = n;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void k8s_kids_done(k8s_kids_t *k) {
+    if (k->live) {
+        ts_tree_cursor_delete(&k->cur);
+        k->live = false;
+    }
+}
+
 // The value inside a flow_node: its first named child that is not an anchor
 // (`&name`), a tag (`!!str`) or a comment, all of which precede the value.
 static TSNode flow_node_value(TSNode node) {
@@ -96,16 +141,16 @@ static int is_kustomize_list_key(const char *key) {
 // scalar child, using key_name as the local_name.
 static void emit_kustomize_sequence(CBMExtractCtx *ctx, TSNode seq_node, const char *key_name) {
     CBMArena *a = ctx->arena;
-    uint32_t n = ts_node_child_count(seq_node);
-    for (uint32_t i = 0; i < n; i++) {
-        TSNode item = ts_node_child(seq_node, i);
+    k8s_kids_t items = k8s_kids(seq_node);
+    TSNode item;
+    while (k8s_kid(&items, false, &item)) {
         if (strcmp(ts_node_type(item), "block_sequence_item") != 0) {
             continue;
         }
         // block_sequence_item has one named child: the value
-        uint32_t ic = ts_node_child_count(item);
-        for (uint32_t j = 0; j < ic; j++) {
-            TSNode val = ts_node_child(item, j);
+        k8s_kids_t vals = k8s_kids(item);
+        TSNode val;
+        while (k8s_kid(&vals, false, &val)) {
             const char *scalar = get_scalar_text(a, val, ctx->source);
             if (!scalar) {
                 continue;
@@ -198,9 +243,9 @@ static void process_kustomize_pair(CBMExtractCtx *ctx, TSNode pair) {
 // Mirrors the K8s manifest kind-def so Kustomize resources are also discoverable.
 static void emit_kustomize_kind_def(CBMExtractCtx *ctx, TSNode mapping) {
     CBMArena *a = ctx->arena;
-    uint32_t pair_n = ts_node_child_count(mapping);
-    for (uint32_t pi = 0; pi < pair_n; pi++) {
-        TSNode pair = ts_node_child(mapping, pi);
+    k8s_kids_t pairs = k8s_kids(mapping);
+    TSNode pair;
+    while (k8s_kid(&pairs, false, &pair)) {
         if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
             continue;
         }
@@ -228,15 +273,15 @@ static void emit_kustomize_kind_def(CBMExtractCtx *ctx, TSNode mapping) {
         def.start_line = ts_node_start_point(mapping).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(mapping).row + TS_LINE_OFFSET;
         cbm_defs_push(&ctx->result->defs, a, def);
+        k8s_kids_done(&pairs);
         return;
     }
 }
 
 static void extract_kustomize(CBMExtractCtx *ctx) {
-    TSNode root = ctx->root;
-    uint32_t root_n = ts_node_child_count(root);
-    for (uint32_t si = 0; si < root_n; si++) {
-        TSNode stream_child = ts_node_child(root, si);
+    k8s_kids_t docs = k8s_kids(ctx->root);
+    TSNode stream_child;
+    while (k8s_kid(&docs, false, &stream_child)) {
         if (strcmp(ts_node_type(stream_child), "document") != 0) {
             continue;
         }
@@ -247,9 +292,10 @@ static void extract_kustomize(CBMExtractCtx *ctx) {
 
         emit_kustomize_kind_def(ctx, mapping);
 
-        uint32_t pair_n = ts_node_child_count(mapping);
-        for (uint32_t pi = 0; pi < pair_n; pi++) {
-            process_kustomize_pair(ctx, ts_node_child(mapping, pi));
+        k8s_kids_t pairs = k8s_kids(mapping);
+        TSNode pair;
+        while (k8s_kid(&pairs, false, &pair)) {
+            process_kustomize_pair(ctx, pair);
         }
     }
 }
@@ -272,9 +318,9 @@ static void extract_metadata(CBMArena *a, TSNode meta_mapping, const char *sourc
     if (ts_node_is_null(meta_mapping) || strcmp(ts_node_type(meta_mapping), "block_mapping") != 0) {
         return;
     }
-    uint32_t mn = ts_node_child_count(meta_mapping);
-    for (uint32_t mi = 0; mi < mn; mi++) {
-        TSNode mpair = ts_node_child(meta_mapping, mi);
+    k8s_kids_t pairs = k8s_kids(meta_mapping);
+    TSNode mpair;
+    while (k8s_kid(&pairs, false, &mpair)) {
         if (strcmp(ts_node_type(mpair), "block_mapping_pair") != 0) {
             continue;
         }
@@ -299,9 +345,9 @@ static void extract_metadata(CBMArena *a, TSNode meta_mapping, const char *sourc
 // Read apiVersion, kind and metadata from a document's top-level mapping.
 static void extract_k8s_scalars(CBMExtractCtx *ctx, TSNode mapping, k8s_doc_id_t *id) {
     CBMArena *a = ctx->arena;
-    uint32_t n = ts_node_child_count(mapping);
-    for (uint32_t i = 0; i < n; i++) {
-        TSNode pair = ts_node_child(mapping, i);
+    k8s_kids_t pairs = k8s_kids(mapping);
+    TSNode pair;
+    while (k8s_kid(&pairs, false, &pair)) {
         if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
             continue;
         }
@@ -781,9 +827,9 @@ static bool k8s_is_pair(TSNode n) {
 
 // The scalar value of `field` in a mapping, or NULL.
 static const char *k8s_field(k8s_walk_t *w, TSNode mapping, const char *field) {
-    uint32_t n = ts_node_named_child_count(mapping);
-    for (uint32_t i = 0; i < n; i++) {
-        TSNode pair = ts_node_named_child(mapping, i);
+    k8s_kids_t pairs = k8s_kids(mapping);
+    TSNode pair;
+    while (k8s_kid(&pairs, true, &pair)) {
         if (!k8s_is_pair(pair)) {
             continue;
         }
@@ -791,6 +837,7 @@ static const char *k8s_field(k8s_walk_t *w, TSNode mapping, const char *field) {
         const char *k =
             ts_node_is_null(key) ? NULL : get_scalar_text(w->ctx->arena, key, w->ctx->source);
         if (k && strcmp(k, field) == 0) {
+            k8s_kids_done(&pairs);
             TSNode v = unwrap_pair_value(pair);
             return ts_node_is_null(v) ? NULL : get_scalar_text(w->ctx->arena, v, w->ctx->source);
         }
@@ -804,9 +851,9 @@ static TSNode k8s_child(k8s_walk_t *w, TSNode mapping, const char *field) {
     if (ts_node_is_null(mapping) || !k8s_is_mapping(mapping)) {
         return none;
     }
-    uint32_t n = ts_node_named_child_count(mapping);
-    for (uint32_t i = 0; i < n; i++) {
-        TSNode pair = ts_node_named_child(mapping, i);
+    k8s_kids_t pairs = k8s_kids(mapping);
+    TSNode pair;
+    while (k8s_kid(&pairs, true, &pair)) {
         if (!k8s_is_pair(pair)) {
             continue;
         }
@@ -814,6 +861,7 @@ static TSNode k8s_child(k8s_walk_t *w, TSNode mapping, const char *field) {
         const char *k =
             ts_node_is_null(key) ? NULL : get_scalar_text(w->ctx->arena, key, w->ctx->source);
         if (k && strcmp(k, field) == 0) {
+            k8s_kids_done(&pairs);
             TSNode v = unwrap_pair_value(pair);
             return ts_node_is_null(v) ? none : k8s_unwrap(v);
         }
@@ -821,25 +869,20 @@ static TSNode k8s_child(k8s_walk_t *w, TSNode mapping, const char *field) {
     return none;
 }
 
-// The items of a sequence node, unwrapped, comments skipped.
-typedef struct {
-    TSNode seq;
-    uint32_t i;
-    uint32_t n;
-} k8s_iter_t;
+// The items of a sequence node, unwrapped, comments skipped (iterate to the
+// end: the cursor is released when the items are exhausted).
+typedef k8s_kids_t k8s_iter_t;
 
 static k8s_iter_t k8s_iter(TSNode seq) {
-    k8s_iter_t it = {.seq = seq};
-    if (!ts_node_is_null(seq) && (strcmp(ts_node_type(seq), "block_sequence") == 0 ||
-                                  strcmp(ts_node_type(seq), "flow_sequence") == 0)) {
-        it.n = ts_node_named_child_count(seq);
-    }
-    return it;
+    TSNode none = {0};
+    bool is_seq = !ts_node_is_null(seq) && (strcmp(ts_node_type(seq), "block_sequence") == 0 ||
+                                            strcmp(ts_node_type(seq), "flow_sequence") == 0);
+    return k8s_kids(is_seq ? seq : none);
 }
 
 static bool k8s_next(k8s_iter_t *it, TSNode *out) {
-    while (it->i < it->n) {
-        TSNode item = ts_node_named_child(it->seq, it->i++);
+    TSNode item;
+    while (k8s_kid(it, true, &item)) {
         if (strcmp(ts_node_type(item), "block_sequence_item") == 0) {
             item = first_content_child(item);
         }
@@ -985,9 +1028,9 @@ static void k8s_walk(k8s_walk_t *w, TSNode node, char *path, size_t len, size_t 
     const char *type = ts_node_type(node);
     if (k8s_is_mapping(node)) {
         k8s_mapping(w, path, node);
-        uint32_t n = ts_node_named_child_count(node);
-        for (uint32_t i = 0; i < n; i++) {
-            TSNode pair = ts_node_named_child(node, i);
+        k8s_kids_t pairs = k8s_kids(node);
+        TSNode pair;
+        while (k8s_kid(&pairs, true, &pair)) {
             if (!k8s_is_pair(pair)) {
                 continue;
             }
@@ -1019,9 +1062,9 @@ static void k8s_walk(k8s_walk_t *w, TSNode node, char *path, size_t len, size_t 
             path[len] = '\0';
             return;
         }
-        uint32_t n = ts_node_named_child_count(node);
-        for (uint32_t i = 0; i < n; i++) {
-            TSNode item = ts_node_named_child(node, i);
+        k8s_kids_t items = k8s_kids(node);
+        TSNode item;
+        while (k8s_kid(&items, true, &item)) {
             if (strcmp(ts_node_type(item), "block_sequence_item") == 0) {
                 item = first_content_child(item);
             }
@@ -1108,10 +1151,9 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         return;
     }
 
-    TSNode root = ctx->root;
-    uint32_t root_n = ts_node_child_count(root);
-    for (uint32_t si = 0; si < root_n; si++) {
-        TSNode stream_child = ts_node_child(root, si);
+    k8s_kids_t docs = k8s_kids(ctx->root);
+    TSNode stream_child;
+    while (k8s_kid(&docs, false, &stream_child)) {
         if (strcmp(ts_node_type(stream_child), "document") != 0) {
             continue;
         }
