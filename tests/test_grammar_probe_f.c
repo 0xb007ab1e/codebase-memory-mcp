@@ -1974,6 +1974,62 @@ TEST(probe_make_programs_by_path_spawn) {
     PASS();
 }
 
+/* Go code that loads a chart DEPLOYS it: a call of a loader (a function
+ * reading <param>/Chart.yaml, or the Helm SDK's loader.Load) whose argument
+ * evaluates over the package's constants, filepath.Join and a local assigned
+ * once. Under an unknown root (opt.ChartsDirectory) the tail names the one
+ * chart dir ending with it; a tail two dirs end with takes the root the
+ * other loads under that root showed. A parameter is not a constant of the
+ * same name. */
+TEST(probe_go_installer_deploys_charts) {
+    static const GpfFile files[] = {
+        {"go.mod", "module example.com/inst\n\ngo 1.22\n"},
+        {"charts/monitoring/node-exporter/Chart.yaml",
+         "apiVersion: v2\nname: node-exporter\nversion: 0.1.0\n"},
+        {"charts/minio/Chart.yaml", "apiVersion: v2\nname: minio\nversion: 0.1.0\n"},
+        {"charts/mla/minio/Chart.yaml", "apiVersion: v2\nname: mla-minio\nversion: 0.1.0\n"},
+        {"charts/telemetry/Chart.yaml", "apiVersion: v2\nname: telemetry\nversion: 0.1.0\n"},
+        {"pkg/sdk/testdata/examplechart/Chart.yaml",
+         "apiVersion: v2\nname: examplechart\nversion: 0.1.0\n"},
+        {"pkg/helm/types.go", "package helm\n\n"
+                              "import (\n\t\"os\"\n\t\"path/filepath\"\n)\n\n"
+                              "type Chart struct{ Name string }\n\n"
+                              "func LoadChart(directory string) (*Chart, error) {\n"
+                              "\tf, err := os.Open(filepath.Join(directory, \"Chart.yaml\"))\n"
+                              "\tif err != nil {\n\t\treturn nil, err\n\t}\n"
+                              "\tdefer f.Close()\n\treturn &Chart{}, nil\n}\n"},
+        {"pkg/stack/stack.go", "package stack\n\n"
+                               "import (\n\t\"path/filepath\"\n\n"
+                               "\t\"example.com/inst/pkg/helm\"\n)\n\n"
+                               "const (\n"
+                               "\tMonitoringPrefix      = \"monitoring\"\n"
+                               "\tNodeExporterChartName = \"node-exporter\"\n"
+                               "\tMinioChartName        = \"minio\"\n"
+                               "\tchartName             = \"telemetry\"\n)\n\n"
+                               "type Options struct{ ChartsDirectory string }\n\n"
+                               "func deployNodeExporter(opt Options) {\n"
+                               "\thelm.LoadChart(filepath.Join(opt.ChartsDirectory, "
+                               "MonitoringPrefix, NodeExporterChartName))\n}\n\n"
+                               "func deployMinio(opt Options) {\n"
+                               "\tname := MinioChartName\n"
+                               "\thelm.LoadChart(filepath.Join(opt.ChartsDirectory, name))\n}\n\n"
+                               "func deployTelemetry(opt Options) {\n"
+                               "\thelm.LoadChart(filepath.Join(opt.ChartsDirectory, "
+                               "\"telemetry\"))\n}\n\n"
+                               "func deployFromArg(opt Options, chartName string) {\n"
+                               "\thelm.LoadChart(filepath.Join(opt.ChartsDirectory, chartName))\n}\n"},
+        {"pkg/sdk/load.go", "package sdk\n\n"
+                            "import \"helm.sh/helm/v3/pkg/chart/loader\"\n\n"
+                            "func loadExample() {\n"
+                            "\t_, _ = loader.Load(\"testdata/examplechart\")\n}\n"}};
+    GPF_ASSERT_DEPLOYS(files, 9,
+                       "deployMinio -> chart:minio (helm-sdk)\n"
+                       "deployNodeExporter -> chart:node-exporter (helm-sdk)\n"
+                       "deployTelemetry -> chart:telemetry (helm-sdk)\n"
+                       "loadExample -> chart:examplechart (helm-sdk)");
+    PASS();
+}
+
 /* A Make recipe runs in its Makefile's directory with the Makefile's
  * variables expanded ($(shell pwd), ?=, a conditional's: unknown): a
  * kustomize build into kubectl, kubectl -f a directory, find -name -exec
@@ -3689,6 +3745,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_make_recipes_deploy);
     RUN_TEST(probe_shell_programs_by_path_spawn);
     RUN_TEST(probe_make_programs_by_path_spawn);
+    RUN_TEST(probe_go_installer_deploys_charts);
     RUN_TEST(probe_helm_templated_objects_are_resources);
     RUN_TEST(probe_helm_include_resolves_in_the_chart_family);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);

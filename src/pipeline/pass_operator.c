@@ -13,8 +13,12 @@
  *     marked `+groupName=<group>` (or `GroupName = "<group>"`): USAGE
  *     {ref: crd-type} from the CRD Resource to that Struct;
  *   - `//go:embed <patterns>` puts files into the binary: REFERENCES_FILE
- *     {via: go:embed} from the Go file to each embedded file.
- * Runs after USAGE resolution; reads each Go file once.
+ *     {via: go:embed} from the Go file to each embedded file;
+ *   - an installer loads a chart of the repository (helm.LoadChart(
+ *     filepath.Join(opt.ChartsDirectory, ...)), the Helm SDK's loader):
+ *     DEPLOYS {via: helm-sdk} from the function to the Chart (PHASE 3 P3.3).
+ * Runs after USAGE resolution; reads each Go file once, and the files that
+ * mention a chart again.
  */
 #include "foundation/constants.h"
 #include "foundation/compat.h"
@@ -967,6 +971,1037 @@ static bool op_is_go(const char *path) {
     return n > OP_SLEN(".go") && strcmp(path + n - OP_SLEN(".go"), ".go") == 0;
 }
 
+/* ── Helm charts the Go code loads (PHASE 3 P3.3) ─────────────────────── */
+
+/* An installer written in Go (kubermatic's) deploys charts it loads from a
+ * charts directory: helm.LoadChart(filepath.Join(opt.ChartsDirectory,
+ * MonitoringChartsPrefix, NodeExporterChartName)). A chart loader is the
+ * Helm SDK's loader.Load / loader.LoadDir, or a function of the repository
+ * whose body reads `<param>/Chart.yaml` or hands its parameter to the SDK
+ * loader. Its call DEPLOYS {via: helm-sdk} the chart directory its argument
+ * names, evaluated over string literals, the package's constants (and an
+ * imported package's), filepath.Join / path.Join, + and a local assigned
+ * once: a leading unknown part (a charts root chosen at run time) leaves a
+ * known tail, linked when exactly one chart directory of the repository ends
+ * with it. */
+
+typedef struct {
+    char *dir;  /* package directory */
+    char *name; /* function */
+    int param;  /* index of the chart-directory parameter */
+} gc_loader_t;
+
+typedef struct {
+    const char *dir; /* graph-owned chart dir path */
+    int64_t id;
+} gc_chart_t;
+
+typedef struct {
+    gc_chart_t *items;
+    int count;
+    int cap;
+} gc_charts_t;
+
+/* One chart load whose argument evaluated: linked once all are read. */
+typedef struct {
+    int64_t fn;
+    int line;
+    char *tail;
+    char *root; /* NULL: no unknown root */
+} gc_site_t;
+
+typedef struct {
+    cbm_pipeline_ctx_t *ctx;
+    const op_modules_t *mods;
+    CBMHashTable *by_file;
+    const cbm_gbuf_node_t **files; /* sorted File nodes */
+    int nfiles;
+    gc_loader_t *loaders;
+    int nloaders;
+    int cap_loaders;
+    char **noted; /* Go files that mention a chart */
+    int nnoted;
+    int cap_noted;
+    CBMHashTable *consts; /* dir -> CBMHashTable name -> expression (owned) */
+    CBMHashTable *charts; /* chart dir basename -> gc_charts_t */
+    gc_site_t *sites;
+    int nsites;
+    int cap_sites;
+    int edges;
+} gc_t;
+
+typedef struct {
+    char s[CBM_SZ_1K];
+    bool known;
+    bool open_root;        /* an unknown leading part: s is a tail */
+    char root[CBM_SZ_256]; /* that part's source text (opt.ChartsDirectory) */
+} gc_val_t;
+
+enum { GC_ARGS_MAX = 8, GC_EVAL_DEPTH = 16 };
+
+static bool gc_grow(void **items, int *cap, int count, size_t elem) {
+    if (count < *cap) {
+        return true;
+    }
+    int ncap = *cap ? *cap * PAIR_LEN : OP_GROW_MIN;
+    void *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, *items, (size_t)ncap * elem);
+    if (!grown) {
+        return false;
+    }
+    *items = grown;
+    *cap = ncap;
+    return true;
+}
+
+/* Past a string / rune literal or a comment starting at p; p when none. */
+static const char *gc_skip(const char *p) {
+    if (*p == '"' || *p == '\'') {
+        char q = *p++;
+        while (*p && *p != q && *p != '\n') {
+            p += (*p == '\\' && p[SKIP_ONE]) ? PAIR_LEN : SKIP_ONE;
+        }
+        return *p == q ? p + SKIP_ONE : p;
+    }
+    if (*p == '`') {
+        const char *e = strchr(p + SKIP_ONE, '`');
+        return e ? e + SKIP_ONE : p + strlen(p);
+    }
+    if (p[0] == '/' && p[SKIP_ONE] == '/') {
+        const char *e = strchr(p, '\n');
+        return e ? e : p + strlen(p);
+    }
+    if (p[0] == '/' && p[SKIP_ONE] == '*') {
+        const char *e = strstr(p + PAIR_LEN, "*/");
+        return e ? e + PAIR_LEN : p + strlen(p);
+    }
+    return p;
+}
+
+/* The '}' closing the block opened at `open`. */
+static const char *gc_block_end(const char *open) {
+    int depth = 0;
+    for (const char *p = open; *p;) {
+        const char *q = gc_skip(p);
+        if (q != p) {
+            p = q;
+            continue;
+        }
+        depth += *p == '{';
+        depth -= *p == '}';
+        if (depth == 0) {
+            return p;
+        }
+        p++;
+    }
+    return open + strlen(open);
+}
+
+/* The top-level comma-separated parts of the list opened at `open` ('(').
+ * Returns their count (at most `max`); *end: the closing ')'. */
+static int gc_args(const char *open, const char *starts[], size_t lens[], int max,
+                   const char **end) {
+    int n = 0;
+    int depth = 0;
+    const char *start = open + SKIP_ONE;
+    for (const char *p = open; *p;) {
+        const char *q = gc_skip(p);
+        if (q != p) {
+            p = q;
+            continue;
+        }
+        if (strchr("([{", *p)) {
+            depth++;
+        } else if (strchr(")]}", *p)) {
+            depth--;
+            if (depth == 0) {
+                if (n < max && p > start) {
+                    starts[n] = start;
+                    lens[n++] = (size_t)(p - start);
+                }
+                *end = p;
+                return n;
+            }
+        } else if (*p == ',' && depth == SKIP_ONE && n < max) {
+            starts[n] = start;
+            lens[n++] = (size_t)(p - start);
+            start = p + SKIP_ONE;
+        }
+        p++;
+    }
+    *end = open + strlen(open);
+    return n;
+}
+
+static void gc_trim(const char **s, size_t *n) {
+    while (*n && strchr(" \t\r\n", **s)) {
+        (*s)++;
+        (*n)--;
+    }
+    while (*n && strchr(" \t\r\n", (*s)[*n - SKIP_ONE])) {
+        (*n)--;
+    }
+}
+
+static bool gc_is_ident(const char *s, size_t n) {
+    if (n == 0 || (s[0] >= '0' && s[0] <= '9')) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (!op_ident_char(s[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool gc_ident_eq(const char *s, size_t n, const char *name) {
+    return strlen(name) == n && strncmp(s, name, n) == 0;
+}
+
+/* The repository directory a file binds package qualifier `qual` to. */
+static bool gc_qual_dir(const gc_t *g, const char *text, const char *qual, size_t ql, char *out,
+                        size_t out_sz) {
+    char alias[OP_IDENT_MAX];
+    char import[CBM_SZ_1K];
+    if (ql == 0 || ql >= sizeof(alias)) {
+        return false;
+    }
+    snprintf(alias, sizeof(alias), "%.*s", (int)ql, qual);
+    op_import_path(text, alias, import, sizeof(import));
+    return import[0] && op_import_dir(g->mods, import, out, out_sz);
+}
+
+static bool gc_qual_is(const char *text, const char *qual, size_t ql, const char *path) {
+    char alias[OP_IDENT_MAX];
+    char import[CBM_SZ_1K];
+    if (ql == 0 || ql >= sizeof(alias)) {
+        return false;
+    }
+    snprintf(alias, sizeof(alias), "%.*s", (int)ql, qual);
+    op_import_path(text, alias, import, sizeof(import));
+    return strcmp(import, path) == 0;
+}
+
+static const char GC_SDK_LOADER[] = "helm.sh/helm/v3/pkg/chart/loader";
+
+/* The flag before a noted file's path: it imports the SDK loader, or not. */
+enum { GC_NOTED_SDK = 'S', GC_NOTED_PLAIN = '-' };
+
+/* ── Loaders: functions whose parameter is a chart directory ── */
+
+static void gc_note_loader(gc_t *g, const char *dir, const char *name, size_t nl, int param) {
+    for (int i = 0; i < g->nloaders; i++) {
+        if (strcmp(g->loaders[i].dir, dir) == 0 && gc_ident_eq(name, nl, g->loaders[i].name)) {
+            return;
+        }
+    }
+    if (!gc_grow((void **)&g->loaders, &g->cap_loaders, g->nloaders, sizeof(*g->loaders))) {
+        return;
+    }
+    char nm[OP_IDENT_MAX];
+    snprintf(nm, sizeof(nm), "%.*s", (int)nl, name);
+    g->loaders[g->nloaders++] = (gc_loader_t){cbm_mem_strdup(CBM_MEM_CLASS_OTHER, dir),
+                                              cbm_mem_strdup(CBM_MEM_CLASS_OTHER, nm), param};
+}
+
+/* Does body [b, e) load a chart from the parameter named p: Join(p,
+ * "Chart.yaml") or the SDK loader on p. */
+static bool gc_body_loads(const char *text, const char *b, const char *e, const char *p,
+                          size_t pl) {
+    for (const char *s = b; s < e;) {
+        const char *q = gc_skip(s);
+        if (q != s) {
+            s = q;
+            continue;
+        }
+        const char *open = NULL;
+        bool join = false;
+        if (strncmp(s, "filepath.Join(", OP_SLEN("filepath.Join(")) == 0) {
+            open = s + OP_SLEN("filepath.Join");
+            join = true;
+        } else if (strncmp(s, "path.Join(", OP_SLEN("path.Join(")) == 0 &&
+                   (s == b || !op_ident_char(s[-SKIP_ONE]))) {
+            open = s + OP_SLEN("path.Join");
+            join = true;
+        } else if ((strncmp(s, ".Load(", OP_SLEN(".Load(")) == 0 ||
+                    strncmp(s, ".LoadDir(", OP_SLEN(".LoadDir(")) == 0)) {
+            const char *qe = s;
+            const char *qs = qe;
+            while (qs > text && op_ident_char(qs[-SKIP_ONE])) {
+                qs--;
+            }
+            if (gc_qual_is(text, qs, (size_t)(qe - qs), GC_SDK_LOADER)) {
+                open = strchr(s, '(');
+            }
+        }
+        if (!open) {
+            s++;
+            continue;
+        }
+        const char *starts[GC_ARGS_MAX];
+        size_t lens[GC_ARGS_MAX];
+        const char *end = NULL;
+        int n = gc_args(open, starts, lens, GC_ARGS_MAX, &end);
+        for (int i = 0; i < n; i++) {
+            gc_trim(&starts[i], &lens[i]);
+        }
+        if (n > 0 && lens[0] == pl && strncmp(starts[0], p, pl) == 0) {
+            if (!join && n == SKIP_ONE) {
+                return true;
+            }
+            if (join && n == PAIR_LEN &&
+                (gc_ident_eq(starts[SKIP_ONE], lens[SKIP_ONE], "\"Chart.yaml\"") ||
+                 gc_ident_eq(starts[SKIP_ONE], lens[SKIP_ONE], "\"Chart.yml\""))) {
+                return true;
+            }
+        }
+        s = end > s ? end : s + SKIP_ONE;
+    }
+    return false;
+}
+
+/* Note the file's top-level functions (not methods) that load a chart from
+ * a parameter. */
+static void gc_summarize(gc_t *g, const char *file, const char *text) {
+    char dir[CBM_SZ_1K];
+    op_dirname(file, dir, sizeof(dir));
+    for (const char *p = strstr(text, "func "); p; p = strstr(p + SKIP_ONE, "func ")) {
+        if (p > text && p[-SKIP_ONE] != '\n') {
+            continue;
+        }
+        const char *name = p + OP_SLEN("func ");
+        const char *ne = name;
+        while (op_ident_char(*ne)) {
+            ne++;
+        }
+        if (ne == name || *ne != '(') {
+            continue; /* a method, or generic */
+        }
+        const char *starts[GC_ARGS_MAX];
+        size_t lens[GC_ARGS_MAX];
+        const char *pend = NULL;
+        int np = gc_args(ne, starts, lens, GC_ARGS_MAX, &pend);
+        const char *open = pend;
+        while (*open && *open != '{' && *open != '\n') {
+            open++;
+        }
+        if (*open != '{') {
+            continue;
+        }
+        const char *close = gc_block_end(open);
+        for (int i = 0; i < np; i++) {
+            const char *ps = starts[i];
+            size_t pl = lens[i];
+            gc_trim(&ps, &pl);
+            size_t idl = 0;
+            while (idl < pl && op_ident_char(ps[idl])) {
+                idl++;
+            }
+            if (idl && gc_body_loads(text, open, close, ps, idl)) {
+                gc_note_loader(g, dir, name, (size_t)(ne - name), i);
+            }
+        }
+    }
+}
+
+/* ── Constants of a package ── */
+
+static void gc_free_expr(const char *key, void *value, void *ud) {
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+    cbm_free(CBM_MEM_CLASS_OTHER, value);
+}
+
+static void gc_free_consts(const char *key, void *value, void *ud) {
+    (void)ud;
+    cbm_ht_foreach(value, gc_free_expr, NULL);
+    cbm_ht_free(value);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+/* One `NAME [TYPE] = expr` of a const declaration, line [ls, le). */
+static void gc_const_line(CBMHashTable *t, const char *ls, const char *le) {
+    while (ls < le && (*ls == ' ' || *ls == '\t')) {
+        ls++;
+    }
+    const char *ne = ls;
+    while (ne < le && op_ident_char(*ne)) {
+        ne++;
+    }
+    const char *eq = memchr(ne, '=', (size_t)(le - ne));
+    if (ne == ls || !eq || (eq + SKIP_ONE < le && eq[SKIP_ONE] == '=')) {
+        return;
+    }
+    const char *ve = op_comment_start(eq + SKIP_ONE, le);
+    const char *vs = eq + SKIP_ONE;
+    size_t vl = (size_t)(ve - vs);
+    gc_trim(&vs, &vl);
+    char name[OP_IDENT_MAX];
+    snprintf(name, sizeof(name), "%.*s", (int)(ne - ls), ls);
+    if (vl == 0 || cbm_ht_get(t, name)) {
+        return;
+    }
+    char *key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, name);
+    char *val = cbm_alloc(CBM_MEM_CLASS_OTHER, vl + SKIP_ONE);
+    if (!key || !val) {
+        cbm_free(CBM_MEM_CLASS_OTHER, key);
+        cbm_free(CBM_MEM_CLASS_OTHER, val);
+        return;
+    }
+    memcpy(val, vs, vl);
+    val[vl] = '\0';
+    cbm_ht_set(t, key, val);
+}
+
+static void gc_scan_consts(CBMHashTable *t, const char *text) {
+    for (const char *p = strstr(text, "const"); p; p = strstr(p + SKIP_ONE, "const")) {
+        if ((p > text && p[-SKIP_ONE] != '\n') || op_ident_char(p[OP_SLEN("const")])) {
+            continue;
+        }
+        const char *q = p + OP_SLEN("const");
+        while (*q == ' ' || *q == '\t') {
+            q++;
+        }
+        if (*q == '(') {
+            const char *starts[SKIP_ONE];
+            size_t lens[SKIP_ONE];
+            const char *end = NULL;
+            (void)gc_args(q, starts, lens, 0, &end);
+            for (const char *l = q + SKIP_ONE; l < end;) {
+                const char *le = memchr(l, '\n', (size_t)(end - l));
+                le = le ? le : end;
+                gc_const_line(t, l, le);
+                l = le + SKIP_ONE;
+            }
+        } else {
+            const char *le = strchr(q, '\n');
+            gc_const_line(t, q, le ? le : q + strlen(q));
+        }
+    }
+}
+
+/* The constants of package directory `dir` (its non-test Go files). */
+static CBMHashTable *gc_consts(gc_t *g, const char *dir) {
+    CBMHashTable *t = cbm_ht_get(g->consts, dir);
+    if (t) {
+        return t;
+    }
+    t = cbm_ht_create(0);
+    char *key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, dir);
+    if (!t || !key) {
+        if (t) {
+            cbm_ht_free(t);
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, key);
+        return NULL;
+    }
+    cbm_ht_set(g->consts, key, t);
+    size_t dl = strlen(dir);
+    for (int i = 0; i < g->nfiles; i++) {
+        const char *fp = g->files[i]->file_path;
+        const char *slash = strrchr(fp, '/');
+        size_t fdl = slash ? (size_t)(slash - fp) : 0;
+        size_t fl = strlen(fp);
+        if (fdl != dl || strncmp(fp, dir, dl) != 0 || !op_is_go(fp) ||
+            (fl > OP_SLEN("_test.go") && strcmp(fp + fl - OP_SLEN("_test.go"), "_test.go") == 0)) {
+            continue;
+        }
+        char path[CBM_SZ_4K];
+        snprintf(path, sizeof(path), "%s/%s", g->ctx->repo_path, fp);
+        char *text = op_read_file(path);
+        if (text) {
+            gc_scan_consts(t, text);
+            cbm_free(CBM_MEM_CLASS_OTHER, text);
+        }
+    }
+    return t;
+}
+
+/* ── Values ── */
+
+typedef struct {
+    gc_t *g;
+    const char *text; /* the call's file */
+    const char *dir;  /* its package */
+    const char *sig;  /* the enclosing function's `func` .. its body, NULL at top level */
+    const char *body;
+    const char *body_end;
+    const char *at; /* the call */
+} gc_scope_t;
+
+/* Is `name` a word of the enclosing function's signature (a parameter). */
+static bool gc_is_param(const gc_scope_t *sc, const char *name, size_t nl) {
+    for (const char *p = sc->sig; sc->sig && p + nl <= sc->body; p++) {
+        if (strncmp(p, name, nl) == 0 && !op_ident_char(p[-SKIP_ONE]) && !op_ident_char(p[nl])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void gc_eval(const gc_scope_t *sc, const char *s, size_t n, int depth, gc_val_t *out);
+
+static void gc_join(gc_val_t *acc, const gc_val_t *part, bool path) {
+    if (!acc->known) {
+        return;
+    }
+    bool empty = !acc->s[0];
+    if (!part->known || part->open_root) {
+        if (!path || !empty) {
+            acc->known = false; /* an unknown part after a known one */
+            return;
+        }
+        acc->open_root = true; /* still the leading, unknown root */
+        if (!part->known) {
+            return;
+        }
+    }
+    size_t al = strlen(acc->s);
+    bool sep = path && al && part->s[0] && acc->s[al - SKIP_ONE] != '/' && part->s[0] != '/';
+    snprintf(acc->s + al, sizeof(acc->s) - al, "%s%s", sep ? "/" : "", part->s);
+}
+
+/* A local assigned exactly once in the enclosing function, before the call. */
+static bool gc_local(const gc_scope_t *sc, const char *name, size_t nl, const char **vs,
+                     size_t *vlen) {
+    if (!sc->body) {
+        return false;
+    }
+    int seen = 0;
+    for (const char *p = sc->body; p < sc->body_end;) {
+        const char *q = gc_skip(p);
+        if (q != p) {
+            p = q;
+            continue;
+        }
+        if (strncmp(p, name, nl) == 0 && (p == sc->body || !op_ident_char(p[-SKIP_ONE])) &&
+            !op_ident_char(p[nl]) && p[-SKIP_ONE] != '.') {
+            const char *a = p + nl;
+            while (*a == ' ' || *a == '\t') {
+                a++;
+            }
+            if (a[0] && strchr("+-*/%|&^", a[0]) && a[SKIP_ONE] == '=') {
+                return false; /* modified in place */
+            }
+            bool assign =
+                (a[0] == ':' && a[SKIP_ONE] == '=') || (a[0] == '=' && a[SKIP_ONE] != '=');
+            if (assign) {
+                if (++seen > SKIP_ONE || p > sc->at) {
+                    return false;
+                }
+                const char *v = a + (a[0] == ':' ? PAIR_LEN : SKIP_ONE);
+                const char *le = strchr(v, '\n');
+                le = le ? le : v + strlen(v);
+                *vs = v;
+                *vlen = (size_t)(op_comment_start(v, le) - v);
+            }
+        }
+        p++;
+    }
+    return seen == SKIP_ONE;
+}
+
+static void gc_const_value(const gc_scope_t *sc, const char *dir, const char *name, int depth,
+                           gc_val_t *out) {
+    CBMHashTable *t = gc_consts(sc->g, dir);
+    const char *expr = t ? cbm_ht_get(t, name) : NULL;
+    if (!expr) {
+        out->known = false;
+        return;
+    }
+    gc_scope_t inner = {sc->g, sc->text, dir, NULL, NULL, NULL, NULL};
+    gc_eval(&inner, expr, strlen(expr), depth + SKIP_ONE, out);
+}
+
+static void gc_eval(const gc_scope_t *sc, const char *s, size_t n, int depth, gc_val_t *out) {
+    *out = (gc_val_t){.known = false};
+    gc_trim(&s, &n);
+    if (n == 0 || depth > GC_EVAL_DEPTH) {
+        return;
+    }
+    /* a + b */
+    int pd = 0;
+    for (size_t i = 0; i < n; i++) {
+        const char *q = gc_skip(s + i);
+        if (q != s + i) {
+            i = (size_t)(q - s) - SKIP_ONE;
+            continue;
+        }
+        pd += strchr("([{", s[i]) != NULL;
+        pd -= strchr(")]}", s[i]) != NULL;
+        if (s[i] == '+' && pd == 0) {
+            gc_val_t a;
+            gc_val_t b;
+            gc_eval(sc, s, i, depth + SKIP_ONE, &a);
+            gc_eval(sc, s + i + SKIP_ONE, n - i - SKIP_ONE, depth + SKIP_ONE, &b);
+            *out = a;
+            if (!b.known || b.open_root) {
+                out->known = false;
+            } else if (out->known) {
+                gc_join(out, &b, false);
+            }
+            return;
+        }
+    }
+    if ((s[0] == '"' || s[0] == '`') && gc_skip(s) == s + n) {
+        size_t w = 0;
+        for (size_t i = SKIP_ONE; i + SKIP_ONE < n && w + SKIP_ONE < sizeof(out->s); i++) {
+            if (s[0] == '"' && s[i] == '\\' && i + PAIR_LEN < n) {
+                i++;
+            }
+            out->s[w++] = s[i];
+        }
+        out->s[w] = '\0';
+        out->known = true;
+        return;
+    }
+    bool fp = n > OP_SLEN("filepath.Join(") &&
+              strncmp(s, "filepath.Join(", OP_SLEN("filepath.Join(")) == 0;
+    bool pp = n > OP_SLEN("path.Join(") && strncmp(s, "path.Join(", OP_SLEN("path.Join(")) == 0;
+    if ((fp || pp) && s[n - SKIP_ONE] == ')') {
+        const char *open = s + (fp ? OP_SLEN("filepath.Join") : OP_SLEN("path.Join"));
+        const char *starts[GC_ARGS_MAX];
+        size_t lens[GC_ARGS_MAX];
+        const char *end = NULL;
+        int na = gc_args(open, starts, lens, GC_ARGS_MAX, &end);
+        if (end != s + n - SKIP_ONE || na == 0 || na == GC_ARGS_MAX) {
+            return;
+        }
+        *out = (gc_val_t){.known = true};
+        for (int i = 0; i < na && out->known; i++) {
+            gc_val_t part;
+            gc_eval(sc, starts[i], lens[i], depth + SKIP_ONE, &part);
+            bool was_open = out->open_root;
+            gc_join(out, &part, true);
+            if (out->known && out->open_root && !was_open) {
+                if (part.known && part.root[0]) {
+                    snprintf(out->root, sizeof(out->root), "%s", part.root);
+                } else {
+                    const char *rs = starts[i];
+                    size_t rl = lens[i];
+                    gc_trim(&rs, &rl);
+                    snprintf(out->root, sizeof(out->root), "%.*s", (int)rl, rs);
+                }
+            } else if (out->known && was_open && !part.known) {
+                out->root[0] = '\0'; /* several unknown parts: no one root */
+            }
+        }
+        return;
+    }
+    if (gc_is_ident(s, n)) {
+        const char *vs = NULL;
+        size_t vl = 0;
+        char name[OP_IDENT_MAX];
+        snprintf(name, sizeof(name), "%.*s", (int)n, s);
+        if (gc_local(sc, s, n, &vs, &vl)) {
+            gc_scope_t outer = *sc;
+            outer.at = vs; /* what the local reads, read before it */
+            gc_eval(&outer, vs, vl, depth + SKIP_ONE, out);
+            return;
+        }
+        if (gc_is_param(sc, s, n)) {
+            return; /* an argument: whatever the caller passes */
+        }
+        gc_const_value(sc, sc->dir, name, depth, out);
+        return;
+    }
+    const char *dot = memchr(s, '.', n);
+    if (dot && gc_is_ident(s, (size_t)(dot - s)) &&
+        gc_is_ident(dot + SKIP_ONE, n - (size_t)(dot - s) - SKIP_ONE)) {
+        char dir[CBM_SZ_1K];
+        char name[OP_IDENT_MAX];
+        snprintf(name, sizeof(name), "%.*s", (int)(n - (size_t)(dot - s) - SKIP_ONE),
+                 dot + SKIP_ONE);
+        if (gc_qual_dir(sc->g, sc->text, s, (size_t)(dot - s), dir, sizeof(dir))) {
+            gc_const_value(sc, dir, name, depth, out);
+        }
+    }
+}
+
+/* ── Charts and edges ── */
+
+static void gc_free_chart_list(const char *key, void *value, void *ud) {
+    (void)ud;
+    gc_charts_t *v = value;
+    cbm_free(CBM_MEM_CLASS_OTHER, v->items);
+    cbm_free(CBM_MEM_CLASS_OTHER, v);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+static CBMHashTable *gc_chart_index(const cbm_gbuf_t *gb) {
+    CBMHashTable *ix = cbm_ht_create(0);
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (!ix || cbm_gbuf_find_by_label(gb, "Chart", &nodes, &count) != 0) {
+        return ix;
+    }
+    for (int i = 0; i < count; i++) {
+        const char *fp = nodes[i]->file_path;
+        const char *qn = nodes[i]->qualified_name;
+        const char *slash = fp ? strrchr(fp, '/') : NULL;
+        const char *base = slash ? slash + SKIP_ONE : fp;
+        if (!fp || !qn || strstr(qn, ".__helm_dep__.") ||
+            (strcmp(base, "Chart.yaml") != 0 && strcmp(base, "Chart.yml") != 0) || !slash) {
+            continue;
+        }
+        const char *db = slash;
+        while (db > fp && db[-SKIP_ONE] != '/') {
+            db--;
+        }
+        char key[CBM_SZ_256];
+        snprintf(key, sizeof(key), "%.*s", (int)(slash - db), db);
+        gc_charts_t *v = cbm_ht_get(ix, key);
+        if (!v) {
+            v = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*v));
+            char *k = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
+            if (!v || !k) {
+                cbm_free(CBM_MEM_CLASS_OTHER, v);
+                cbm_free(CBM_MEM_CLASS_OTHER, k);
+                continue;
+            }
+            cbm_ht_set(ix, k, v);
+        }
+        if (gc_grow((void **)&v->items, &v->cap, v->count, sizeof(*v->items))) {
+            v->items[v->count++] = (gc_chart_t){fp, nodes[i]->id};
+        }
+    }
+    return ix;
+}
+
+/* The one chart directory a value names: the tail itself, or the only chart
+ * directory ending with it. */
+static const gc_chart_t *gc_match(gc_t *g, const gc_val_t *v, char *dir, size_t dir_sz) {
+    const char *t = v->s;
+    while (t[0] == '.' && t[SKIP_ONE] == '/') {
+        t += PAIR_LEN;
+    }
+    while (*t == '/') {
+        t++;
+    }
+    snprintf(dir, dir_sz, "%s", t);
+    size_t dl = strlen(dir);
+    while (dl && dir[dl - SKIP_ONE] == '/') {
+        dir[--dl] = '\0';
+    }
+    if (!dl) {
+        return NULL;
+    }
+    const char *base = strrchr(dir, '/');
+    base = base ? base + SKIP_ONE : dir;
+    const gc_charts_t *list = cbm_ht_get(g->charts, base);
+    const gc_chart_t *hit = NULL;
+    for (int i = 0; list && i < list->count; i++) {
+        atomic_fetch_add_explicit(&g_op_candidates, SKIP_ONE, memory_order_relaxed);
+        const char *cd = list->items[i].dir; /* "<dir>/Chart.yaml" */
+        size_t cl = (size_t)(strrchr(cd, '/') - cd);
+        bool same = cl == dl && strncmp(cd, dir, dl) == 0;
+        bool tail = cl > dl && cd[cl - dl - SKIP_ONE] == '/' && strncmp(cd + cl - dl, dir, dl) == 0;
+        if (same || tail) {
+            if (hit) {
+                return NULL;
+            }
+            hit = &list->items[i];
+        }
+    }
+    if (hit) {
+        const char *cd = hit->dir;
+        snprintf(dir, dir_sz, "%.*s", (int)(strrchr(cd, '/') - cd), cd);
+    }
+    return hit;
+}
+
+/* The body of the top-level function around `at`, else NULL; *sig: its
+ * `func` keyword. */
+static const char *gc_body_of(const char *text, const char *at, const char **end,
+                              const char **sig) {
+    const char *best = NULL;
+    for (const char *p = strstr(text, "func "); p && p < at; p = strstr(p + SKIP_ONE, "func ")) {
+        if (p == text || p[-SKIP_ONE] == '\n') {
+            best = p;
+        }
+    }
+    if (!best) {
+        return NULL;
+    }
+    const char *open = best;
+    int pd = 0;
+    while (*open && !(*open == '{' && pd == 0)) {
+        const char *q = gc_skip(open);
+        if (q != open) {
+            open = q;
+            continue;
+        }
+        pd += *open == '(';
+        pd -= *open == ')';
+        open++;
+    }
+    if (*open != '{') {
+        return NULL;
+    }
+    const char *close = gc_block_end(open);
+    if (close < at) {
+        return NULL;
+    }
+    *end = close;
+    *sig = best;
+    return open;
+}
+
+static void gc_link_call(gc_t *g, const char *file, const char *text, const char *name_at,
+                         const char *open, int param) {
+    const char *starts[GC_ARGS_MAX];
+    size_t lens[GC_ARGS_MAX];
+    const char *end = NULL;
+    int n = gc_args(open, starts, lens, GC_ARGS_MAX, &end);
+    if (param >= n) {
+        return;
+    }
+    char dir[CBM_SZ_1K];
+    op_dirname(file, dir, sizeof(dir));
+    const char *body_end = NULL;
+    const char *sig = NULL;
+    const char *body = gc_body_of(text, name_at, &body_end, &sig);
+    gc_scope_t sc = {g, text, dir, body ? sig : NULL, body, body_end, name_at};
+    gc_val_t v;
+    gc_eval(&sc, starts[param], lens[param], 0, &v);
+    int line = op_line_of(text, name_at);
+    const cbm_gbuf_node_t *fn = v.known ? op_enclosing(g->by_file, file, line) : NULL;
+    if (!fn || !gc_grow((void **)&g->sites, &g->cap_sites, g->nsites, sizeof(*g->sites))) {
+        return;
+    }
+    g->sites[g->nsites++] =
+        (gc_site_t){fn->id, line, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, v.s),
+                    v.open_root && v.root[0] ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, v.root) : NULL};
+}
+
+static void gc_edge(gc_t *g, const gc_site_t *s, const gc_chart_t *hit, const char *chart,
+                    const char *root) {
+    char esc[CBM_SZ_1K];
+    char resc[CBM_SZ_512];
+    char props[CBM_SZ_2K];
+    cbm_json_escape(esc, (int)sizeof(esc), chart);
+    cbm_json_escape(resc, (int)sizeof(resc), root ? root : "");
+    snprintf(props, sizeof(props), "{\"via\":\"helm-sdk\",\"chart\":\"%s\"%s%s%s,\"line\":%d}", esc,
+             root ? ",\"root\":\"" : "", root ? resc : "", root ? "\"" : "", s->line);
+    cbm_gbuf_insert_edge(g->ctx->gbuf, s->fn, hit->id, "DEPLOYS", props);
+    g->edges++;
+}
+
+/* The repository dir a chart load's unknown root stood for: the matched
+ * chart directory without the tail. */
+static void gc_root_dir(const char *chart, const char *tail, char *out, size_t out_sz) {
+    while (tail[0] == '.' && tail[SKIP_ONE] == '/') {
+        tail += PAIR_LEN;
+    }
+    while (*tail == '/') {
+        tail++;
+    }
+    size_t cl = strlen(chart);
+    size_t tl = strlen(tail);
+    while (tl && tail[tl - SKIP_ONE] == '/') {
+        tl--;
+    }
+    size_t rl = cl > tl ? cl - tl - SKIP_ONE : 0;
+    snprintf(out, out_sz, "%.*s", (int)rl, chart);
+}
+
+static const char GC_CONFLICT[] = "\x01";
+
+/* Remember that root text `root` stood for directory `rdir`; two different
+ * directories for one root text: it stands for none. */
+static void gc_note_root(CBMHashTable *roots, const char *root, const char *rdir) {
+    const char *known = cbm_ht_get(roots, root);
+    if (!known) {
+        char *k = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, root);
+        char *d = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rdir);
+        if (k && d) {
+            cbm_ht_set(roots, k, d);
+            return;
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, k);
+        cbm_free(CBM_MEM_CLASS_OTHER, d);
+        return;
+    }
+    if (strcmp(known, GC_CONFLICT) != 0 && strcmp(known, rdir) != 0) {
+        char *c = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, GC_CONFLICT);
+        if (c) {
+            cbm_free(CBM_MEM_CLASS_OTHER, cbm_ht_set(roots, cbm_ht_get_key(roots, root), c));
+        }
+    }
+}
+
+/* Link the chart loads: a tail exactly one chart directory ends with; else,
+ * when the loads under the same unknown root (opt.ChartsDirectory) whose
+ * tail matched one directory all put that root at one place, <root>/<tail>. */
+static void gc_link_sites(gc_t *g) {
+    CBMHashTable *roots = cbm_ht_create(0); /* root text -> its dir (owned) */
+    for (int i = 0; roots && i < g->nsites; i++) {
+        const gc_site_t *s = &g->sites[i];
+        gc_val_t v = {.known = true, .open_root = s->root != NULL};
+        snprintf(v.s, sizeof(v.s), "%s", s->tail);
+        char chart[CBM_SZ_1K];
+        if (s->root && gc_match(g, &v, chart, sizeof(chart))) {
+            char rdir[CBM_SZ_1K];
+            gc_root_dir(chart, s->tail, rdir, sizeof(rdir));
+            gc_note_root(roots, s->root, rdir);
+        }
+    }
+    for (int i = 0; roots && i < g->nsites; i++) {
+        const gc_site_t *s = &g->sites[i];
+        gc_val_t v = {.known = true, .open_root = s->root != NULL};
+        snprintf(v.s, sizeof(v.s), "%s", s->tail);
+        char chart[CBM_SZ_1K];
+        const gc_chart_t *hit = gc_match(g, &v, chart, sizeof(chart));
+        if (hit) {
+            gc_edge(g, s, hit, chart, NULL);
+            continue;
+        }
+        const char *rdir = s->root ? cbm_ht_get(roots, s->root) : NULL;
+        if (!rdir || strcmp(rdir, GC_CONFLICT) == 0) {
+            continue;
+        }
+        gc_val_t full = {.known = true};
+        snprintf(full.s, sizeof(full.s), "%s%s%s", rdir, rdir[0] ? "/" : "", s->tail);
+        char want[CBM_SZ_1K];
+        snprintf(want, sizeof(want), "%s", full.s);
+        hit = gc_match(g, &full, chart, sizeof(chart));
+        if (hit && strcmp(chart, want) == 0) {
+            gc_edge(g, s, hit, chart, rdir);
+        }
+    }
+    if (roots) {
+        cbm_ht_foreach(roots, gc_free_expr, NULL);
+        cbm_ht_free(roots);
+    }
+}
+
+/* The chart loads in one file: calls of a noted loader (qualified by an
+ * import of its package, or unqualified in it) and of the SDK loader. */
+static void gc_calls(gc_t *g, const char *file, const char *text) {
+    char dir[CBM_SZ_1K];
+    op_dirname(file, dir, sizeof(dir));
+    for (const char *p = text; *p;) {
+        const char *q = gc_skip(p);
+        if (q != p) {
+            p = q;
+            continue;
+        }
+        if (!op_ident_char(*p) || (p > text && op_ident_char(p[-SKIP_ONE]))) {
+            p++;
+            continue;
+        }
+        const char *ne = p;
+        while (op_ident_char(*ne)) {
+            ne++;
+        }
+        if (*ne != '(') {
+            p = ne;
+            continue;
+        }
+        size_t nl = (size_t)(ne - p);
+        const char *qual = NULL;
+        size_t ql = 0;
+        if (p > text && p[-SKIP_ONE] == '.') {
+            qual = p - SKIP_ONE;
+            while (qual > text && op_ident_char(qual[-SKIP_ONE])) {
+                qual--;
+            }
+            ql = (size_t)(p - SKIP_ONE - qual);
+        }
+        bool is_def = p >= text + OP_SLEN("func ") &&
+                      strncmp(p - OP_SLEN("func "), "func ", OP_SLEN("func ")) == 0;
+        int param = -1;
+        if (!is_def && qual && (gc_ident_eq(p, nl, "Load") || gc_ident_eq(p, nl, "LoadDir")) &&
+            gc_qual_is(text, qual, ql, GC_SDK_LOADER)) {
+            param = 0;
+        }
+        char qdir[CBM_SZ_1K];
+        bool resolved = !qual || gc_qual_dir(g, text, qual, ql, qdir, sizeof(qdir));
+        for (int i = 0; !is_def && param < 0 && resolved && i < g->nloaders; i++) {
+            if (gc_ident_eq(p, nl, g->loaders[i].name) &&
+                strcmp(g->loaders[i].dir, qual ? qdir : dir) == 0) {
+                param = g->loaders[i].param;
+            }
+        }
+        if (param >= 0) {
+            gc_link_call(g, file, text, p, ne, param);
+        }
+        p = ne;
+    }
+}
+
+/* A Go file that mentions a chart: its loaders noted now; the file is read
+ * again for its loader calls once every loader is known. A file importing
+ * the SDK loader is marked: it is read again even when no loader of the
+ * repository exists. */
+static void gc_note(gc_t *g, const char *file, const char *text) {
+    if (!strstr(text, "Chart") && !strstr(text, "chart/loader")) {
+        return;
+    }
+    gc_summarize(g, file, text);
+    bool sdk = strstr(text, GC_SDK_LOADER) != NULL;
+    size_t fl = strlen(file);
+    char *entry = cbm_alloc(CBM_MEM_CLASS_OTHER, fl + PAIR_LEN); /* flag + path */
+    if (!entry || !gc_grow((void **)&g->noted, &g->cap_noted, g->nnoted, sizeof(*g->noted))) {
+        cbm_free(CBM_MEM_CLASS_OTHER, entry);
+        return;
+    }
+    entry[0] = sdk ? GC_NOTED_SDK : GC_NOTED_PLAIN;
+    memcpy(entry + SKIP_ONE, file, fl + SKIP_ONE);
+    g->noted[g->nnoted++] = entry;
+}
+
+static int gc_run(gc_t *g) {
+    if (g->nnoted == 0) {
+        return 0;
+    }
+    g->consts = cbm_ht_create(0);
+    g->charts = gc_chart_index(g->ctx->gbuf);
+    for (int i = 0; g->consts && g->charts && i < g->nnoted; i++) {
+        const char *noted = g->noted[i];
+        if (!noted || (g->nloaders == 0 && noted[0] != GC_NOTED_SDK)) {
+            continue; /* no loader it could call */
+        }
+        const char *file = noted + SKIP_ONE;
+        char path[CBM_SZ_4K];
+        snprintf(path, sizeof(path), "%s/%s", g->ctx->repo_path, file);
+        char *text = op_read_file(path);
+        if (text) {
+            gc_calls(g, file, text);
+            cbm_free(CBM_MEM_CLASS_OTHER, text);
+        }
+    }
+    if (g->charts) {
+        gc_link_sites(g);
+    }
+    if (g->consts) {
+        cbm_ht_foreach(g->consts, gc_free_consts, NULL);
+        cbm_ht_free(g->consts);
+    }
+    if (g->charts) {
+        cbm_ht_foreach(g->charts, gc_free_chart_list, NULL);
+        cbm_ht_free(g->charts);
+    }
+    return g->edges;
+}
+
+static void gc_free(gc_t *g) {
+    for (int i = 0; i < g->nloaders; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, g->loaders[i].dir);
+        cbm_free(CBM_MEM_CLASS_OTHER, g->loaders[i].name);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, g->loaders);
+    for (int i = 0; i < g->nnoted; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, g->noted[i]);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)g->noted);
+    for (int i = 0; i < g->nsites; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, g->sites[i].tail);
+        cbm_free(CBM_MEM_CLASS_OTHER, g->sites[i].root);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, g->sites);
+}
+
 int cbm_pipeline_pass_operator(cbm_pipeline_ctx_t *ctx) {
     cbm_gbuf_t *gb = ctx->gbuf;
     const cbm_gbuf_node_t **all = NULL;
@@ -1003,6 +2038,7 @@ int cbm_pipeline_pass_operator(cbm_pipeline_ctx_t *ctx) {
         }
     }
     op_index_t ix = {.mods = &mods, .dir_types = op_types_by_dir(gb)};
+    gc_t gc = {0};
     int handles = 0;
     int embeds = 0;
     bool ready = by_file && groups && seen && ix.dir_types;
@@ -1023,9 +2059,17 @@ int cbm_pipeline_pass_operator(cbm_pipeline_ctx_t *ctx) {
         if (strstr(text, "//go:embed ")) {
             embeds += op_embed(gb, files[i], text, files, nfiles);
         }
+        gc_note(&gc, files[i]->file_path, text);
         cbm_free(CBM_MEM_CLASS_OTHER, text);
     }
     int crd_types = ready ? op_link_crd_types(gb, &ix, groups) : 0;
+    gc.ctx = ctx;
+    gc.mods = &mods;
+    gc.by_file = by_file;
+    gc.files = files;
+    gc.nfiles = nfiles;
+    int deploys = ready ? gc_run(&gc) : 0;
+    gc_free(&gc);
     if (ix.dir_types) {
         cbm_ht_foreach(ix.dir_types, op_free_nodes_entry, NULL);
         cbm_ht_free(ix.dir_types);
@@ -1044,14 +2088,17 @@ int cbm_pipeline_pass_operator(cbm_pipeline_ctx_t *ctx) {
         cbm_ht_free(by_file);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)files);
-    if (handles + embeds + crd_types > 0) {
+    if (handles + embeds + crd_types + deploys > 0) {
         char h[CBM_SZ_32];
         char e[CBM_SZ_32];
         char c[CBM_SZ_32];
+        char d[CBM_SZ_32];
         snprintf(h, sizeof(h), "%d", handles);
         snprintf(e, sizeof(e), "%d", embeds);
         snprintf(c, sizeof(c), "%d", crd_types);
-        cbm_log_info("pass.operator", "handles", h, "embeds", e, "crd_types", c);
+        snprintf(d, sizeof(d), "%d", deploys);
+        cbm_log_info("pass.operator", "handles", h, "embeds", e, "crd_types", c, "chart_deploys",
+                     d);
     }
     return 0;
 }
