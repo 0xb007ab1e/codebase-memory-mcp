@@ -1074,6 +1074,26 @@ bool cbm_ci_path(const char *rel);
 void cbm_ci_commands(CBMArena *a, const char *rel, const char *src, size_t len, cbm_ci_cmd_fn fn,
                      void *ud);
 
+/* An image a build configuration builds from a Dockerfile (pass_ci.c). */
+typedef struct {
+    const char *via;        /* "skaffold" / "compose" */
+    const char *image;      /* the reference, variables expanded */
+    const char *dockerfile; /* repository path */
+    int line;
+} cbm_build_site_t;
+typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
+
+/* Whether `rel` names a build configuration: skaffold*.yaml|yml,
+ * [docker-]compose[.x].yaml|yml. */
+bool cbm_build_path(const char *rel);
+
+/* Hand fn each image build configuration `rel` (YAML text src) declares:
+ * skaffold build.artifacts (top level and profiles; the docker builder),
+ * compose services with build and image. `dotenv` (may be NULL): the text of
+ * the compose project's .env, whose variables compose interpolates. */
+void cbm_build_sites(CBMArena *a, const char *rel, const char *src, size_t len, const char *dotenv,
+                     cbm_build_site_fn fn, void *ud);
+
 /* Terraform / OpenTofu modules (pass_terraform.c): a helm_release DEPLOYS its
  * chart. Run at the end of the K8s pass, over the same files. */
 void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
@@ -1306,6 +1326,18 @@ int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *
  * on failure. */
 int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const char *label,
                                 const char *const *edge_types);
+/* An Image's build edges (Image -DEPENDS_ON {via:build}-> Dockerfile,
+ * pass_docker.c) belong to the build configuration declaring them, not to
+ * either end: every run recomputes them whole from all build files, the
+ * incremental routes drop the old set first and write the new one even
+ * between pre-existing nodes. */
+#define CBM_BUILD_EDGE_TYPE "DEPENDS_ON"
+#define CBM_BUILD_EDGE_SOURCE "Image"
+
+/* Delete the project's `type` edges whose source node has label `label`;
+ * returns how many, or -1 on failure. */
+int cbm_delta_drop_edges_from_label(cbm_store_t *store, const char *project, const char *type,
+                                    const char *label);
 /* The edges that keep a file-less shared node alive. */
 #define SH_PROCESS_EDGES ((const char *const[]){"SPAWNS", NULL})
 #define DK_IMAGE_EDGES ((const char *const[]){"DEPENDS_ON", "USAGE", NULL})

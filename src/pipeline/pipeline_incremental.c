@@ -3080,6 +3080,14 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         }
     }
 
+    /* An Image's build edges (Image -> Dockerfile, pass_docker.c) belong to
+     * the skaffold / compose file declaring them, not to either end: the K8s
+     * pass just recomputed them from every build file, so they replace the
+     * staging set wholesale. */
+    if (cbm_delta_drop_edges_from_label(staging, project, CBM_BUILD_EDGE_TYPE,
+                                        CBM_BUILD_EDGE_SOURCE) < 0) {
+        goto out;
+    }
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (cbm_delta_patch(staging, project, gbuf, max_db_id, snapshot, snapshot_count) != 0) {
         goto out;
@@ -3597,6 +3605,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     legacy_doc_t legacy_doc;
     legacy_doc_load(&legacy_doc, store, project, changed_files, ci, deleted, deleted_count);
     cbm_store_close(store);
+
+    /* An Image's build edges (Image -> Dockerfile, pass_docker.c) belong to
+     * the skaffold / compose file declaring them, not to either end: the K8s
+     * pass recomputes them all from every build file, so none is kept (nor
+     * captured below). */
+    (void)cbm_gbuf_delete_edges_from_label(existing, CBM_BUILD_EDGE_TYPE, CBM_BUILD_EDGE_SOURCE);
 
     /* Snapshot inbound cross-file edges into changed files BEFORE purging, so
      * the cascade delete doesn't permanently drop edges whose source lives in

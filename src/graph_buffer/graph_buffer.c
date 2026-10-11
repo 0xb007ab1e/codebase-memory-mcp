@@ -1855,16 +1855,15 @@ int cbm_gbuf_edge_count_by_type(const cbm_gbuf_t *gb, const char *type) {
     return arr ? arr->count : 0;
 }
 
-int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
-    if (!gb || !type) {
-        return CBM_NOT_FOUND;
-    }
+/* Remove the edges `drop` selects from the array and the dedup index, then
+ * rebuild the secondary indexes. */
+typedef bool (*gbuf_edge_pred_t)(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e, const void *ud);
 
-    /* Remove edges of the given type from array and dedup index */
+static int gbuf_delete_edges_if(cbm_gbuf_t *gb, gbuf_edge_pred_t drop, const void *ud) {
     int write_idx = 0;
     for (int i = 0; i < gb->edges.count; i++) {
         cbm_gbuf_edge_t *e = gb->edges.items[i];
-        if (strcmp(e->type, type) == 0) {
+        if (drop(gb, e, ud)) {
             char key[EDGE_KEY_BUF];
             make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type,
                           e->properties_json);
@@ -1884,6 +1883,40 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
     rebuild_edge_secondary_indexes(gb);
 
     return 0;
+}
+
+static bool gbuf_edge_is_type(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e, const void *ud) {
+    (void)gb;
+    return strcmp(e->type, (const char *)ud) == 0;
+}
+
+int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
+    if (!gb || !type) {
+        return CBM_NOT_FOUND;
+    }
+    return gbuf_delete_edges_if(gb, gbuf_edge_is_type, type);
+}
+
+typedef struct {
+    const char *type;
+    const char *label;
+} gbuf_type_label_t;
+
+static bool gbuf_edge_from_label(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e, const void *ud) {
+    const gbuf_type_label_t *tl = ud;
+    if (strcmp(e->type, tl->type) != 0) {
+        return false;
+    }
+    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(gb, e->source_id);
+    return src && src->label && strcmp(src->label, tl->label) == 0;
+}
+
+int cbm_gbuf_delete_edges_from_label(cbm_gbuf_t *gb, const char *type, const char *label) {
+    if (!gb || !type || !label) {
+        return CBM_NOT_FOUND;
+    }
+    gbuf_type_label_t tl = {type, label};
+    return gbuf_delete_edges_if(gb, gbuf_edge_from_label, &tl);
 }
 
 /* ── Merge ───────────────────────────────────────────────────────── */

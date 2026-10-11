@@ -2051,6 +2051,69 @@ TEST(probe_k8s_container_images_are_images) {
     PASS();
 }
 
+/* Every DEPENDS_ON {via:build} edge as "<image> -> <dockerfile> (tool)". */
+static char *gpf_builds(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT s.name || ' -> ' || "
+            "t.file_path || ' (' || json_extract(e.properties,'$.tool') || ')' AS x FROM edges e "
+            "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE "
+            "e.project=?1 AND e.type='DEPENDS_ON' AND s.label='Image' AND "
+            "json_extract(e.properties,'$.via')='build' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* An image a build configuration builds DEPENDS_ON {via:build} its
+ * Dockerfile: skaffold artifacts (top level and profiles; docker.dockerfile
+ * relative to the context; a ko artifact is none), compose services with
+ * build and image, variables from the project's .env. A service without an
+ * image or a build, or a build without a Dockerfile, is none. */
+TEST(probe_build_configs_build_images_from_dockerfiles) {
+    static const GpfFile files[] = {
+        {"src/web/Dockerfile", "FROM nginx:1.27\n"},
+        {"src/api/Dockerfile.prod", "FROM golang:1.22\n"},
+        {"skaffold.yaml",
+         "apiVersion: skaffold/v4beta6\nkind: Config\nbuild:\n  artifacts:\n"
+         "    - image: web\n      context: src/web\n"
+         "    - image: api\n      context: src/api\n      docker:\n"
+         "        dockerfile: Dockerfile.prod\n"
+         "    - image: koapp\n      ko:\n        main: ./cmd\n"
+         "profiles:\n  - name: dev\n    build:\n      artifacts:\n"
+         "        - image: dev-web\n          context: src/web\n"},
+        {".env", "REG=ghcr.io/acme\n# comment\nexport UNUSED='x'\n"},
+        {"compose.yaml", "services:\n  frontend:\n    image: ${REG}/frontend:${TAG:-1}\n"
+                         "    build:\n      context: ./src/web\n"
+                         "  worker:\n    build: ./src/api\n"
+                         "  db:\n    image: postgres:16\n"
+                         "  missing:\n    image: acme/missing\n    build: ./nope\n"
+                         "  unknown:\n    image: ${NOPE}/x\n    build: ./src/web\n"}};
+    char *got = gpf_builds(files, 5);
+    static const char want[] = "docker.io/library/api -> src/api/Dockerfile.prod (skaffold)\n"
+                               "docker.io/library/dev-web -> src/web/Dockerfile (skaffold)\n"
+                               "docker.io/library/web -> src/web/Dockerfile (skaffold)\n"
+                               "ghcr.io/acme/frontend -> src/web/Dockerfile (compose)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "builds got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("DEPENDS_ON {via:build} edge set");
+    }
+    free(got);
+    PASS();
+}
+
 #define GPF_CM(name) "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " name "\n"
 #define GPF_KUST "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
 
@@ -4318,6 +4381,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_dockerfile_variants_are_dockerfiles);
     RUN_TEST(probe_dockerfile_entrypoint_runs);
     RUN_TEST(probe_k8s_container_images_are_images);
+    RUN_TEST(probe_build_configs_build_images_from_dockerfiles);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
     RUN_TEST(probe_shell_helm_deploys_its_chart);

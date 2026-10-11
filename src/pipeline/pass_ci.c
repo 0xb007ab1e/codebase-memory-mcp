@@ -29,6 +29,7 @@
 #include "cbm.h"
 #include "lang_specs.h"
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -50,6 +51,7 @@ typedef struct {
     const char *src;
     const char *rel;
     cbm_ci_cmd_fn fn;
+    cbm_build_site_fn site_fn; /* a build-site walk's callback */
     void *ud;
 } ci_t;
 
@@ -678,6 +680,358 @@ static bool ci_action_path(const char *rel) {
     const char *slash = strrchr(rel, '/');
     const char *base = slash ? slash + SKIP_ONE : rel;
     return strcmp(base, "action.yml") == 0 || strcmp(base, "action.yaml") == 0;
+}
+
+/* ── Build configurations (PHASE 4 P4.3) ──────────────────────────────
+ * Which Dockerfile builds which image, as a skaffold or compose file says:
+ *  - skaffold: every build.artifacts[] item (top level, profiles) of a
+ *    document whose apiVersion is skaffold/...: image, context (default the
+ *    file's directory), docker.dockerfile (default Dockerfile, relative to
+ *    the context); an artifact of another builder (jib, ko, bazel,
+ *    buildpacks, custom, kaniko) is none.
+ *  - compose: services.<name> with build (a context, or context /
+ *    dockerfile) and image; ${X}, ${X:-d}, ${X-d} and $X from the project's
+ *    .env (a variable without a value: none). */
+
+static bool ci_build_ident(const char *s, size_t n) {
+    if (n == 0 || !(isalpha((unsigned char)s[0]) || s[0] == '_')) {
+        return false;
+    }
+    for (size_t i = SKIP_ONE; i < n; i++) {
+        if (!isalnum((unsigned char)s[i]) && s[i] != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Value v[0, *len) without the quotes around it (*len shortened). */
+static const char *ci_unquote(const char *v, size_t *len) {
+    size_t l = *len;
+    if (l >= PAIR_LEN && (v[0] == '"' || v[0] == '\'') && v[l - SKIP_ONE] == v[0]) {
+        *len = l - PAIR_LEN;
+        return v + SKIP_ONE;
+    }
+    return v;
+}
+
+/* One .env line s[0, n): KEY=VALUE (an `export ` prefix, quotes around the
+ * value removed) appended to env; a comment, a blank or another line: none. */
+static void ci_dotenv_line(CBMArena *a, const char *s, size_t n, ci_env_t *env) {
+    static const char EXPORT[] = "export ";
+    size_t b = 0;
+    while (b < n && isspace((unsigned char)s[b])) {
+        b++;
+    }
+    while (n > b && isspace((unsigned char)s[n - SKIP_ONE])) {
+        n--;
+    }
+    if (n - b > sizeof(EXPORT) - SKIP_ONE &&
+        strncmp(s + b, EXPORT, sizeof(EXPORT) - SKIP_ONE) == 0) {
+        b += sizeof(EXPORT) - SKIP_ONE;
+    }
+    const char *eq = b < n && s[b] != '#' ? memchr(s + b, '=', n - b) : NULL;
+    size_t kl = eq ? (size_t)(eq - (s + b)) : 0;
+    if (!eq || !ci_build_ident(s + b, kl)) {
+        return;
+    }
+    size_t v = b + kl + SKIP_ONE;
+    while (v < n && isspace((unsigned char)s[v])) {
+        v++;
+    }
+    size_t vl = n - v;
+    const char *val = ci_unquote(s + v, &vl);
+    env->kv[PAIR_LEN * env->n] = cbm_arena_strndup(a, s + b, kl);
+    env->kv[PAIR_LEN * env->n + SKIP_ONE] = cbm_arena_strndup(a, val, vl);
+    env->n++;
+}
+
+/* KEY=VALUE pairs of a .env text (quotes removed; a later key wins). */
+static ci_env_t ci_dotenv(CBMArena *a, const char *text) {
+    size_t lines = SKIP_ONE;
+    for (const char *q = text; *q; q++) {
+        lines += *q == '\n';
+    }
+    ci_env_t env = {cbm_arena_alloc(a, lines * PAIR_LEN * sizeof(char *)), 0};
+    for (const char *p = text; env.kv && p && *p;) {
+        const char *e = strchr(p, '\n');
+        ci_dotenv_line(a, p, e ? (size_t)(e - p) : strlen(p), &env);
+        p = e ? e + SKIP_ONE : NULL;
+    }
+    return env;
+}
+
+static const char *ci_env_lookup(const ci_env_t *env, const char *name, size_t nl) {
+    for (int i = env->n - SKIP_ONE; i >= 0; i--) {
+        const char *k = env->kv[(size_t)i * PAIR_LEN];
+        if (k && strlen(k) == nl && strncmp(k, name, nl) == 0) {
+            return env->kv[(size_t)i * PAIR_LEN + SKIP_ONE];
+        }
+    }
+    return NULL;
+}
+
+/* `s` with ${X} / ${X:-d} / ${X-d} / $X expanded from env; NULL when a
+ * variable has no value (and no default). */
+static const char *ci_interp(CBMArena *a, const char *s, const ci_env_t *env) {
+    if (!s || !strchr(s, '$')) {
+        return s;
+    }
+    size_t cap = strlen(s) + SKIP_ONE;
+    for (int i = 0; i < env->n; i++) {
+        const char *v = env->kv[(size_t)i * PAIR_LEN + SKIP_ONE];
+        cap += v ? strlen(v) : 0;
+    }
+    char *out = cbm_arena_alloc(a, cap);
+    size_t len = 0;
+    for (const char *p = s; out && *p;) {
+        if (*p != '$') {
+            out[len++] = *p++;
+            continue;
+        }
+        bool braced = p[SKIP_ONE] == '{';
+        const char *name = p + (braced ? PAIR_LEN : SKIP_ONE);
+        size_t nl = 0;
+        while (isalnum((unsigned char)name[nl]) || name[nl] == '_') {
+            nl++;
+        }
+        if (nl == 0 || !ci_build_ident(name, nl)) {
+            return NULL;
+        }
+        const char *after = name + nl;
+        const char *dflt = NULL;
+        size_t dl = 0;
+        bool colon = false;
+        if (braced) {
+            const char *close = strchr(after, '}');
+            if (!close) {
+                return NULL;
+            }
+            if (after[0] == ':' && after[SKIP_ONE] == '-') {
+                colon = true;
+                dflt = after + PAIR_LEN;
+            } else if (after[0] == '-') {
+                dflt = after + SKIP_ONE;
+            } else if (after != close) {
+                return NULL;
+            }
+            dl = dflt ? (size_t)(close - dflt) : 0;
+            after = close + SKIP_ONE;
+        }
+        const char *v = ci_env_lookup(env, name, nl);
+        const char *use = v;
+        size_t ul = v ? strlen(v) : 0;
+        if (!v || (colon && !v[0])) {
+            if (!dflt) {
+                return NULL;
+            }
+            use = dflt;
+            ul = dl;
+        }
+        if (len + ul + SKIP_ONE > cap) {
+            return NULL;
+        }
+        memcpy(out + len, use, ul);
+        len += ul;
+        p = after;
+    }
+    if (out) {
+        out[len] = '\0';
+    }
+    return out;
+}
+
+/* Repository path of `rel` under repository directory `base`, normalised;
+ * NULL when it leaves the repository or is absolute. */
+static const char *ci_repo_path(CBMArena *a, const char *base, const char *rel) {
+    if (!rel || rel[0] == '/' || strstr(rel, "://")) {
+        return NULL;
+    }
+    size_t cap = strlen(base) + strlen(rel) + PAIR_LEN;
+    char *out = cbm_arena_alloc(a, cap);
+    if (!out) {
+        return NULL;
+    }
+    size_t len = 0;
+    const char *parts[PAIR_LEN] = {base, rel};
+    for (int k = 0; k < PAIR_LEN; k++) {
+        for (const char *s = parts[k]; *s;) {
+            while (*s == '/') {
+                s++;
+            }
+            const char *e = s;
+            while (*e && *e != '/') {
+                e++;
+            }
+            size_t sl = (size_t)(e - s);
+            if (sl == PAIR_LEN && s[0] == '.' && s[SKIP_ONE] == '.') {
+                if (len == 0) {
+                    return NULL;
+                }
+                while (len > 0 && out[len - SKIP_ONE] != '/') {
+                    len--;
+                }
+                len = len > 0 ? len - SKIP_ONE : 0;
+            } else if (sl > 0 && !(sl == SKIP_ONE && s[0] == '.')) {
+                if (len > 0) {
+                    out[len++] = '/';
+                }
+                memcpy(out + len, s, sl);
+                len += sl;
+            }
+            s = e;
+        }
+    }
+    out[len] = '\0';
+    return out;
+}
+
+static void ci_build_emit(const ci_t *c, const char *via, const char *image, const char *cdir,
+                          const char *dockerfile, int row) {
+    const char *df = cdir ? ci_repo_path(c->a, cdir, dockerfile) : NULL;
+    if (!image || !df) {
+        return;
+    }
+    cbm_build_site_t site = {.via = via, .image = image, .dockerfile = df, .line = row + SKIP_ONE};
+    c->site_fn(&site, c->ud);
+}
+
+static void ci_skaffold_artifact(const ci_t *c, TSNode art, const char *dir) {
+    static const char *const OTHER[] = {"jib",    "ko",     "bazel", "buildpacks",
+                                        "custom", "kaniko", NULL};
+    for (int i = 0; OTHER[i]; i++) {
+        if (!ts_node_is_null(ci_get(c, art, OTHER[i]))) {
+            return;
+        }
+    }
+    int row = 0;
+    const char *image = ci_scalar(c, ci_get(c, art, "image"), &row);
+    const char *ctx = ci_get_str(c, art, "context");
+    const char *df = ci_get_str(c, ci_get(c, art, "docker"), "dockerfile");
+    const char *cdir = ci_repo_path(c->a, dir, ctx ? ctx : ".");
+    ci_build_emit(c, "skaffold", image, cdir, df ? df : "Dockerfile", row);
+}
+
+/* Every build.artifacts list under `n` (any depth: top level, profiles). */
+static void ci_skaffold_walk(const ci_t *c, TSNode n, const char *dir, int depth) {
+    enum { CI_SKAFFOLD_DEPTH = 16 };
+    if (depth > CI_SKAFFOLD_DEPTH) {
+        return;
+    }
+    int np = 0;
+    ci_pair_t *pairs = ci_pairs(c, n, &np);
+    for (int i = 0; i < np; i++) {
+        if (strcmp(pairs[i].key, "build") == 0) {
+            int na = 0;
+            TSNode *arts = ci_items(c, ci_get(c, pairs[i].value, "artifacts"), &na);
+            for (int k = 0; k < na; k++) {
+                ci_skaffold_artifact(c, arts[k], dir);
+            }
+        }
+        ci_skaffold_walk(c, pairs[i].value, dir, depth + SKIP_ONE);
+    }
+    int ni = 0;
+    TSNode *items = ci_items(c, n, &ni);
+    for (int i = 0; i < ni; i++) {
+        ci_skaffold_walk(c, items[i], dir, depth + SKIP_ONE);
+    }
+}
+
+static void ci_compose(const ci_t *c, TSNode root, const char *dir, const ci_env_t *env) {
+    int ns = 0;
+    ci_pair_t *svcs = ci_pairs(c, ci_get(c, root, "services"), &ns);
+    for (int i = 0; i < ns; i++) {
+        TSNode svc = svcs[i].value;
+        TSNode build = ci_get(c, svc, "build");
+        int row = 0;
+        const char *image = ci_scalar(c, ci_get(c, svc, "image"), &row);
+        if (ts_node_is_null(build) || !image) {
+            continue;
+        }
+        const char *ctx = ci_scalar(c, build, NULL);
+        const char *df = "Dockerfile";
+        if (!ctx) {
+            ctx = ci_get_str(c, build, "context");
+            const char *d = ci_get_str(c, build, "dockerfile");
+            ctx = ctx ? ctx : ".";
+            df = d ? d : df;
+        }
+        ctx = ci_interp(c->a, ctx, env);
+        df = ci_interp(c->a, df, env);
+        image = ci_interp(c->a, image, env);
+        if (!ctx || !df || !image) {
+            continue;
+        }
+        ci_build_emit(c, "compose", image, ci_repo_path(c->a, dir, ctx), df, row);
+    }
+}
+
+bool cbm_build_path(const char *rel) {
+    if (!rel || !ci_yaml_ext(rel)) {
+        return false;
+    }
+    const char *slash = strrchr(rel, '/');
+    const char *base = slash ? slash + SKIP_ONE : rel;
+    if (strncmp(base, "skaffold", strlen("skaffold")) == 0) {
+        return true;
+    }
+    const char *b =
+        strncmp(base, "docker-", strlen("docker-")) == 0 ? base + strlen("docker-") : base;
+    size_t cl = strlen("compose");
+    return strncmp(b, "compose", cl) == 0 && (b[cl] == '.' || b[cl] == '-' || b[cl] == '_');
+}
+
+void cbm_build_sites(CBMArena *a, const char *rel, const char *src, size_t len, const char *dotenv,
+                     cbm_build_site_fn fn, void *ud) {
+    if (!cbm_build_path(rel)) {
+        return;
+    }
+    TSParser *parser = ts_parser_new();
+    if (!parser) {
+        return;
+    }
+    TSTree *tree = NULL;
+    if (ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_YAML))) {
+        tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)len);
+    }
+    const char *slash = strrchr(rel, '/');
+    const char *dir = slash ? cbm_arena_strndup(a, rel, (size_t)(slash - rel)) : "";
+    const char *base = slash ? slash + SKIP_ONE : rel;
+    bool skaffold = strncmp(base, "skaffold", strlen("skaffold")) == 0;
+    ci_env_t env = {0};
+    if (!skaffold && dotenv) {
+        env = ci_dotenv(a, dotenv);
+    }
+    if (tree && dir) {
+        ci_t c = {.a = a, .src = src, .rel = rel, .site_fn = fn, .ud = ud};
+        TSNode stream = ts_tree_root_node(tree);
+        for (uint32_t i = 0; i < ts_node_named_child_count(stream); i++) {
+            TSNode doc = ts_node_named_child(stream, i);
+            if (!ci_type(doc, "document")) {
+                continue;
+            }
+            TSNode root = {0};
+            for (uint32_t k = 0; k < ts_node_named_child_count(doc); k++) {
+                TSNode x = ts_node_named_child(doc, k);
+                if (!ci_type(x, "comment")) {
+                    root = x;
+                    break;
+                }
+            }
+            if (skaffold) {
+                const char *api = ci_get_str(&c, root, "apiVersion");
+                if (api && strncmp(api, "skaffold/", strlen("skaffold/")) == 0) {
+                    ci_skaffold_walk(&c, root, dir, 0);
+                }
+            } else {
+                ci_compose(&c, root, dir, &env);
+            }
+        }
+    }
+    if (tree) {
+        ts_tree_delete(tree);
+    }
+    ts_parser_delete(parser);
 }
 
 bool cbm_ci_path(const char *rel) {

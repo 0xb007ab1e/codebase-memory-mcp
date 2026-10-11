@@ -3541,6 +3541,130 @@ static int incremental_dockerfile_delete(bool legacy, cbm_incremental_route_t *r
     return full == 2 ? after : -1;
 }
 
+/* Editing one Dockerfile keeps every image's build edge -- also the one
+ * between nodes that both pre-existed (Image -> the unchanged Dockerfile),
+ * which the incremental routes recompute whole. `legacy`: through the
+ * full-load route, else the closure-repair route. Returns the build edge
+ * count before / after as "full=N inc=M", or NULL; *route: the route taken. */
+static char *incremental_build_keep(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_buildkeep_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    write_temp_file(tmp, "src/web/Dockerfile", "FROM nginx:1.27\n");
+    write_temp_file(tmp, "src/api/Dockerfile", "FROM golang:1.22\n");
+    write_temp_file(tmp, "skaffold.yaml",
+                    "apiVersion: skaffold/v4beta6\nkind: Config\nbuild:\n  artifacts:\n"
+                    "    - image: web\n      context: src/web\n"
+                    "    - image: api\n      context: src/api\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/buildkeep.db", tmp);
+    static const char builds[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id WHERE e.type='DEPENDS_ON' "
+        "AND s.label='Image' AND json_extract(e.properties,'$.via')='build'";
+    int full = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, builds) : -1;
+    write_temp_file(tmp, "src/web/Dockerfile", "FROM nginx:1.27\n# edited\n");
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    char *out = NULL;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "full=%d inc=%d", full, k8s_inc_count(db_path, builds));
+        out = strdup(buf);
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return out;
+}
+
+TEST(incremental_dockerfile_edit_keeps_build_edges) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    char *got = incremental_build_keep(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "full=2 inc=2");
+    free(got);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    got = incremental_build_keep(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "full=2 inc=2");
+    free(got);
+#endif
+    PASS();
+}
+
+/* A compose file's edit replaces its build edges: the renamed image keeps
+ * no edge (nor node), the new one has its edge. `legacy`: through the
+ * full-load route, else the closure-repair route. Returns "old=N new=M"
+ * after the edit, or NULL; *route: the route taken. */
+static char *incremental_compose_edit(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_composeedit_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    write_temp_file(tmp, "src/web/Dockerfile", "FROM nginx:1.27\n");
+    write_temp_file(tmp, "src/api/Dockerfile", "FROM golang:1.22\n");
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  web:\n    image: acme/web-old\n    build: ./src/web\n"
+                    "  api:\n    image: acme/api\n    build: ./src/api\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/composeedit.db", tmp);
+    static const char old_img[] = "SELECT COUNT(*) FROM nodes WHERE label='Image' AND "
+                                  "name='docker.io/acme/web-old'";
+    static const char new_edge[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id WHERE e.type='DEPENDS_ON' "
+        "AND s.name='docker.io/acme/web-new'";
+    if (k8s_inc_index(tmp, db_path) != 0 || k8s_inc_count(db_path, old_img) != 1) {
+        th_rmtree(tmp);
+        return NULL;
+    }
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  web:\n    image: acme/web-new\n    build: ./src/web\n"
+                    "  api:\n    image: acme/api\n    build: ./src/api\n");
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    char *out = NULL;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "old=%d new=%d", k8s_inc_count(db_path, old_img),
+                 k8s_inc_count(db_path, new_edge));
+        out = strdup(buf);
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return out;
+}
+
+TEST(incremental_compose_edit_replaces_build_edges) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    char *got = incremental_compose_edit(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "old=0 new=1");
+    free(got);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    got = incremental_compose_edit(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "old=0 new=1");
+    free(got);
+#endif
+    PASS();
+}
+
 TEST(incremental_deleted_dockerfile_drops_its_image) {
     cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
     int left = incremental_dockerfile_delete(false, &route);
@@ -19181,6 +19305,8 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_shell_deploy_edit_keeps_its_edges);
     RUN_TEST(incremental_deleted_spawner_drops_its_process);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
+    RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);
+    RUN_TEST(incremental_compose_edit_replaces_build_edges);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);

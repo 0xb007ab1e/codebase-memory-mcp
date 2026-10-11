@@ -1097,6 +1097,84 @@ static char *dk_read(const char *path, size_t *len) {
     return buf;
 }
 
+typedef struct {
+    cbm_pipeline_ctx_t *ctx;
+    CBMArena *a;
+    const char *file;
+    int edges;
+} dk_builds_t;
+
+/* An Image a build configuration builds DEPENDS_ON {via:build} the
+ * Dockerfile it is built from. */
+static void dk_build_site(const cbm_build_site_t *s, void *ud) {
+    dk_builds_t *b = ud;
+    const char *mqn = cbm_fqn_module(b->a, b->ctx->project_name, s->dockerfile);
+    const cbm_gbuf_node_t *mod = mqn ? cbm_gbuf_find_by_qn(b->ctx->gbuf, mqn) : NULL;
+    if (!mod || !mod->file_path || strcmp(mod->file_path, s->dockerfile) != 0) {
+        return;
+    }
+    int64_t img = cbm_pipeline_image_node(b->ctx, s->image);
+    if (img <= 0) {
+        return;
+    }
+    char esc_file[CBM_SZ_1K];
+    char esc_img[CBM_SZ_1K];
+    cbm_json_escape(esc_file, (int)sizeof(esc_file), b->file);
+    cbm_json_escape(esc_img, (int)sizeof(esc_img), s->image);
+    char props[CBM_SZ_4K];
+    snprintf(props, sizeof(props),
+             "{\"via\":\"build\",\"tool\":\"%s\",\"file\":\"%s\",\"image\":\"%s\",\"line\":%d}",
+             s->via, esc_file, esc_img, s->line);
+    cbm_gbuf_insert_edge(b->ctx->gbuf, img, mod->id, "DEPENDS_ON", props);
+    b->edges++;
+}
+
+/* The .env of the directory of `rel` under the repository, NULL when none. */
+static char *dk_read_dotenv(const cbm_pipeline_ctx_t *ctx, const char *rel) {
+    if (!ctx->repo_path) {
+        return NULL;
+    }
+    const char *slash = strrchr(rel, '/');
+    char path[CBM_SZ_4K];
+    snprintf(path, sizeof(path), "%s/%.*s%s.env", ctx->repo_path, slash ? (int)(slash - rel) : 0,
+             rel, slash ? "/" : "");
+    size_t len = 0;
+    return dk_read(path, &len);
+}
+
+/* Every build configuration of the repository -- read from disk through the
+ * File nodes, so an incremental run (which recomputes these edges whole)
+ * sees the unchanged ones too. */
+static int dk_link_builds(cbm_pipeline_ctx_t *ctx, CBMArena *a) {
+    const cbm_gbuf_node_t **files = NULL;
+    int n = 0;
+    if (!ctx->repo_path || cbm_gbuf_find_by_label(ctx->gbuf, "File", &files, &n) != 0) {
+        return 0;
+    }
+    dk_builds_t b = {.ctx = ctx, .a = a};
+    for (int i = 0; i < n; i++) {
+        const char *rel = files[i]->file_path;
+        if (!rel || !cbm_build_path(rel)) {
+            continue;
+        }
+        char path[CBM_SZ_4K];
+        snprintf(path, sizeof(path), "%s/%s", ctx->repo_path, rel);
+        size_t len = 0;
+        char *src = dk_read(path, &len);
+        if (!src) {
+            continue;
+        }
+        char *dotenv = dk_read_dotenv(ctx, rel);
+        b.file = rel;
+        cbm_build_sites(a, rel, src, len, dotenv, dk_build_site, &b);
+        if (dotenv) {
+            cbm_free(CBM_MEM_CLASS_OTHER, dotenv);
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, src);
+    }
+    return b.edges;
+}
+
 static bool dk_node_before(const cbm_gbuf_node_t *a, const cbm_gbuf_node_t *b) {
     int c = strcmp(a->file_path, b->file_path);
     return c < 0 || (c == 0 && a->start_line < b->start_line);
@@ -1205,6 +1283,7 @@ void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fi
     if (ix.gomain) {
         cbm_ht_free(ix.gomain);
     }
+    edges += dk_link_builds(ctx, &arena);
     cbm_arena_destroy(&arena);
     if (edges > 0) {
         char buf[CBM_SZ_32];
