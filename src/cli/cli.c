@@ -13203,6 +13203,45 @@ static int cli_update_activate_binary(void *opaque) {
     return CLI_OK;
 }
 
+#ifdef __APPLE__
+/* The first step of the signed-candidate preparation that failed. One boolean
+ * used to cover all of them, so a full disk read exactly like a broken
+ * codesign: "candidate preparation failed", and nothing else. */
+typedef struct {
+    const char *step;
+    int os_error;       /* errno left by an OS-level step; 0 when none applies */
+    const char *detail; /* the reason when no OS error applies, or NULL */
+} cli_update_prep_failure_t;
+
+/* Records the first failing step. An OS-level step keeps the errno it left; a
+ * step that succeeds clears errno so the next one starts clean. Returns ok, so
+ * the steps chain with &&. */
+static bool cli_update_prep_step(bool ok, const char *step, bool os_level, const char *detail,
+                                 cli_update_prep_failure_t *failure) {
+    if (ok) {
+        errno = 0;
+        return true;
+    }
+    if (!failure->step) {
+        failure->step = step;
+        failure->os_error = os_level ? errno : 0;
+        failure->detail = detail;
+    }
+    return false;
+}
+
+static void cli_update_prep_report(const cli_update_prep_failure_t *failure) {
+    const char *step = failure->step ? failure->step : "an unrecorded step";
+    const char *reason = failure->os_error != 0 ? strerror(failure->os_error) : failure->detail;
+    if (reason) {
+        (void)fprintf(stderr, "error: signed update candidate preparation failed while %s: %s\n",
+                      step, reason);
+    } else {
+        (void)fprintf(stderr, "error: signed update candidate preparation failed while %s\n", step);
+    }
+}
+#endif
+
 static int extract_and_install_binary(extract_install_args_t args) {
     const char *tmp_archive = args.tmp_archive;
     const char *ext = args.ext;
@@ -13260,42 +13299,79 @@ static int extract_and_install_binary(extract_install_args_t args) {
 #ifdef __APPLE__
     /* codesign replaces the signed file on current macOS releases. Publish and
      * sign a disposable private copy first, then stage the resulting immutable
-     * bytes into the final transaction. */
+     * bytes into the final transaction. Every step records why it failed, so a
+     * full disk is reported as one and not as a signing failure. */
+    cli_update_prep_failure_t failure = {0};
     char prepared_dir[CLI_BUF_1K];
     char prepared_candidate[CLI_BUF_1K];
     int prepared_dir_length =
         snprintf(prepared_dir, sizeof(prepared_dir), "%s/cbm-update-sign-XXXXXX", cbm_tmpdir());
-    bool prepared = prepared_dir_length > 0 && (size_t)prepared_dir_length < sizeof(prepared_dir) &&
-                    cbm_mkdtemp(prepared_dir) != NULL;
+    errno = 0;
+    bool prepared = cli_update_prep_step(prepared_dir_length > 0 &&
+                                             (size_t)prepared_dir_length < sizeof(prepared_dir) &&
+                                             cbm_mkdtemp(prepared_dir) != NULL,
+                                         "creating its private directory", true, NULL, &failure);
     int prepared_candidate_length = prepared
                                         ? snprintf(prepared_candidate, sizeof(prepared_candidate),
                                                    "%s/codebase-memory-mcp", prepared_dir)
                                         : CLI_ERR;
-    prepared = prepared && prepared_candidate_length > 0 &&
-               (size_t)prepared_candidate_length < sizeof(prepared_candidate);
+    prepared = prepared && cli_update_prep_step(prepared_candidate_length > 0 &&
+                                                    (size_t)prepared_candidate_length <
+                                                        sizeof(prepared_candidate),
+                                                "naming the candidate file", false, NULL, &failure);
     cbm_activation_transaction_t *preparation = NULL;
     stage_status = prepared ? cbm_activation_transaction_stage_bytes(prepared_candidate, bin_data,
                                                                      (size_t)bin_len, &preparation)
                             : CBM_ACTIVATION_TRANSACTION_IO;
+    prepared = prepared &&
+               cli_update_prep_step(
+                   stage_status == CBM_ACTIVATION_TRANSACTION_OK && preparation,
+                   "writing the unsigned candidate", stage_status == CBM_ACTIVATION_TRANSACTION_IO,
+                   cbm_activation_transaction_status_message(stage_status), &failure);
     free(bin_data);
     cli_binary_validator_t unsigned_validator = {{0}};
-    prepared = stage_status == CBM_ACTIVATION_TRANSACTION_OK && preparation &&
-               cli_activation_transaction_expected_build(preparation, &unsigned_validator) &&
-               cli_activation_transaction_commit_validated(preparation, &unsigned_validator,
-                                                           CLI_OCTAL_PERM) == CLI_OK &&
-               cli_activation_transaction_finalize_close(&preparation) == CLI_OK &&
-               cbm_macos_adhoc_sign(prepared_candidate) == CLI_OK &&
-               cbm_daemon_build_fingerprint_file(prepared_candidate, validator.fingerprint);
+    prepared = prepared &&
+               cli_update_prep_step(
+                   cli_activation_transaction_expected_build(preparation, &unsigned_validator),
+                   "fingerprinting the unsigned candidate", true, NULL, &failure) &&
+               cli_update_prep_step(cli_activation_transaction_commit_validated(
+                                        preparation, &unsigned_validator, CLI_OCTAL_PERM) == CLI_OK,
+                                    "publishing the unsigned candidate", false, NULL, &failure) &&
+               cli_update_prep_step(
+                   cli_activation_transaction_finalize_close(&preparation) == CLI_OK,
+                   "closing the unsigned candidate's transaction", false, NULL, &failure) &&
+               cli_update_prep_step(cbm_macos_adhoc_sign(prepared_candidate) == CLI_OK,
+                                    "signing the candidate ad hoc", false, NULL, &failure) &&
+               cli_update_prep_step(
+                   cbm_daemon_build_fingerprint_file(prepared_candidate, validator.fingerprint),
+                   "fingerprinting the signed candidate", true, NULL, &failure);
     const char *prepared_argv[] = {prepared_candidate, "--version", NULL};
-    prepared = prepared && cbm_exec_no_shell(prepared_argv) == CLI_OK;
+    int version_rc = prepared ? cbm_exec_no_shell(prepared_argv) : CLI_OK;
+    char version_detail[80];
+    if (version_rc == CBM_NOT_FOUND) {
+        snprintf(version_detail, sizeof(version_detail), "it could not run or was killed");
+    } else {
+        snprintf(version_detail, sizeof(version_detail), "--version exited with status %d",
+                 version_rc);
+    }
+    prepared =
+        prepared && cli_update_prep_step(version_rc == CLI_OK, "running the signed candidate",
+                                         false, version_detail, &failure);
     if (prepared) {
         stage_status = cbm_activation_transaction_stage_file(bin_dest, prepared_candidate,
                                                              &binary_transaction);
         cli_binary_validator_t staged_validator = {{0}};
         prepared =
-            stage_status == CBM_ACTIVATION_TRANSACTION_OK && binary_transaction &&
-            cli_activation_transaction_expected_build(binary_transaction, &staged_validator) &&
-            strcmp(staged_validator.fingerprint, validator.fingerprint) == 0;
+            cli_update_prep_step(
+                stage_status == CBM_ACTIVATION_TRANSACTION_OK && binary_transaction,
+                "staging the signed candidate", stage_status == CBM_ACTIVATION_TRANSACTION_IO,
+                cbm_activation_transaction_status_message(stage_status), &failure) &&
+            cli_update_prep_step(
+                cli_activation_transaction_expected_build(binary_transaction, &staged_validator),
+                "fingerprinting the staged candidate", true, NULL, &failure) &&
+            cli_update_prep_step(strcmp(staged_validator.fingerprint, validator.fingerprint) == 0,
+                                 "comparing the staged and signed candidates", false,
+                                 "their fingerprints differ", &failure);
         if (prepared) {
             validator = staged_validator;
         }
@@ -13309,18 +13385,35 @@ static int extract_and_install_binary(extract_install_args_t args) {
         (void)cbm_rmdir(prepared_dir);
     }
     if (!prepared) {
-        (void)fprintf(stderr, "error: signed update candidate preparation failed\n");
+        cli_update_prep_report(&failure);
         (void)cli_activation_transaction_abort(&binary_transaction);
         return CLI_TRUE;
     }
 #else
+    errno = 0;
     stage_status = cbm_activation_transaction_stage_bytes(bin_dest, bin_data, (size_t)bin_len,
                                                           &binary_transaction);
+    /* POSIX only: Windows staging reports through GetLastError, not errno. */
+#ifdef _WIN32
+    int stage_error = 0;
+#else
+    int stage_error = stage_status == CBM_ACTIVATION_TRANSACTION_IO ? errno : 0;
+#endif
     free(bin_data);
-    if (stage_status != CBM_ACTIVATION_TRANSACTION_OK || !binary_transaction ||
-        !cli_activation_transaction_expected_build(binary_transaction, &validator)) {
-        (void)fprintf(stderr, "error: failed to stage verified update: %s\n",
-                      cbm_activation_transaction_status_message(stage_status));
+    if (stage_status != CBM_ACTIVATION_TRANSACTION_OK || !binary_transaction) {
+        if (stage_error != 0) {
+            (void)fprintf(stderr, "error: failed to stage verified update: %s: %s\n",
+                          cbm_activation_transaction_status_message(stage_status),
+                          strerror(stage_error));
+        } else {
+            (void)fprintf(stderr, "error: failed to stage verified update: %s\n",
+                          cbm_activation_transaction_status_message(stage_status));
+        }
+        (void)cli_activation_transaction_abort(&binary_transaction);
+        return CLI_TRUE;
+    }
+    if (!cli_activation_transaction_expected_build(binary_transaction, &validator)) {
+        (void)fprintf(stderr, "error: failed to fingerprint the staged update\n");
         (void)cli_activation_transaction_abort(&binary_transaction);
         return CLI_TRUE;
     }

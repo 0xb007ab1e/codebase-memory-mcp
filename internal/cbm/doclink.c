@@ -152,6 +152,8 @@ typedef struct {
     /* A document language: the whole file is the documentation, so one scan
      * of its bytes replaces parse_doc, the file-level doc and the scope. */
     void (*scan_file)(CBMExtractCtx *ctx);
+    void (*loose_docs)(CBMExtractCtx *ctx, const CBMDefinition *file_def,
+                       cbm_doclink_taken_fn taken);
 } doclink_lang_t;
 
 static const doclink_lang_t DOCLINK_LANGS[] = {
@@ -180,6 +182,77 @@ static const doclink_lang_t DOCLINK_LANGS[] = {
     {.lang = CBM_LANG_YAML,
      .scan_scope = cbm_doclink_antora_scan_scope,
      .scope_tag = CBM_DOCLINK_ADOC_SCOPE_TAG},
+    {.lang = CBM_LANG_GO,
+     .parse_doc = cbm_doclink_go_parse_doc,
+     .scan_scope = cbm_doclink_go_scan_scope,
+     .scope_tag = CBM_DOCLINK_GO_SCOPE_TAG,
+     .portable_scope = cbm_doclink_go_portable_scope},
+    {.lang = CBM_LANG_GOMOD,
+     .parse_doc = cbm_doclink_gomod_parse_doc,
+     .scan_scope = cbm_doclink_gomod_scan_scope,
+     .scope_tag = CBM_DOCLINK_GO_SCOPE_TAG,
+     .portable_scope = cbm_doclink_go_portable_scope},
+    {.lang = CBM_LANG_JAVA,
+     .parse_doc = cbm_doclink_java_parse_doc,
+     .scan_scope = cbm_doclink_java_scan_scope,
+     .scope_tag = CBM_DOCLINK_JVM_SCOPE_TAG,
+     .portable_scope = cbm_doclink_jvm_portable_scope},
+    {.lang = CBM_LANG_KOTLIN,
+     .parse_doc = cbm_doclink_kotlin_parse_doc,
+     .scan_scope = cbm_doclink_kotlin_scan_scope,
+     .scope_tag = CBM_DOCLINK_JVM_SCOPE_TAG,
+     .portable_scope = cbm_doclink_jvm_portable_scope},
+    {.lang = CBM_LANG_RUST,
+     .parse_doc = cbm_doclink_rs_parse_doc,
+     .scan_scope = cbm_doclink_rs_scan_scope,
+     .scope_tag = CBM_DOCLINK_RS_SCOPE_TAG,
+     .portable_scope = cbm_doclink_rs_portable_scope},
+    /* Cargo.toml: the Rust resolver's crate facts come from its scope blob */
+    {.lang = CBM_LANG_TOML,
+     .parse_doc = cbm_doclink_rs_manifest_parse_doc,
+     .scan_scope = cbm_doclink_rs_manifest_scan_scope,
+     .scope_tag = CBM_DOCLINK_RS_SCOPE_TAG,
+     .portable_scope = cbm_doclink_rs_portable_scope},
+    /* Perl: POD L<> codes; the scope blob carries no lines, so it persists as
+     * it is */
+    {.lang = CBM_LANG_PERL,
+     .parse_doc = cbm_doclink_perl_parse_doc,
+     .scan_scope = cbm_doclink_perl_scan_scope,
+     .scope_tag = CBM_DOCLINK_PERL_SCOPE_TAG},
+    /* TypeScript, TSX and JavaScript: one scope, since their files import
+     * each other */
+    {.lang = CBM_LANG_TYPESCRIPT,
+     .parse_doc = cbm_doclink_ts_parse_doc,
+     .scan_scope = cbm_doclink_ts_scan_scope,
+     .scope_tag = CBM_DOCLINK_TS_SCOPE_TAG,
+     .portable_scope = cbm_doclink_ts_portable_scope},
+    {.lang = CBM_LANG_TSX,
+     .parse_doc = cbm_doclink_ts_parse_doc,
+     .scan_scope = cbm_doclink_ts_scan_scope,
+     .scope_tag = CBM_DOCLINK_TS_SCOPE_TAG,
+     .portable_scope = cbm_doclink_ts_portable_scope},
+    {.lang = CBM_LANG_JAVASCRIPT,
+     .parse_doc = cbm_doclink_ts_parse_doc,
+     .scan_scope = cbm_doclink_ts_scan_scope,
+     .scope_tag = CBM_DOCLINK_TS_SCOPE_TAG,
+     .portable_scope = cbm_doclink_ts_portable_scope},
+    /* C, and the .h files C++ parses (the hooks skip every other file) */
+    {.lang = CBM_LANG_C,
+     .parse_doc = cbm_doclink_c_parse_doc,
+     .scan_scope = cbm_doclink_c_scan_scope,
+     .scope_tag = CBM_DOCLINK_C_SCOPE_TAG,
+     .loose_docs = cbm_doclink_c_loose_docs},
+    {.lang = CBM_LANG_CPP,
+     .parse_doc = cbm_doclink_c_parse_doc,
+     .scan_scope = cbm_doclink_c_scan_scope,
+     .scope_tag = CBM_DOCLINK_C_SCOPE_TAG,
+     .loose_docs = cbm_doclink_c_loose_docs},
+    {.lang = CBM_LANG_PHP,
+     .parse_doc = cbm_doclink_php_parse_doc,
+     .scan_scope = cbm_doclink_php_scan_scope,
+     .scope_tag = CBM_DOCLINK_PHP_SCOPE_TAG,
+     .portable_scope = cbm_doclink_php_portable_scope,
+     .loose_docs = cbm_doclink_php_loose_docs},
 };
 
 static const doclink_lang_t *doclink_lang(CBMLanguage lang) {
@@ -300,12 +373,6 @@ static doc_line_ent_t *doc_info_of(CBMExtractCtx *ctx, const char *doc) {
     return NULL;
 }
 
-/* A doc not built by doc_run_text keeps the definition's own line. */
-static uint32_t doc_line_of(CBMExtractCtx *ctx, const char *doc) {
-    const doc_line_ent_t *info = doc_info_of(ctx, doc);
-    return info ? info->line : 0;
-}
-
 /* ── Persisted scope ─────────────────────────────────────────────── */
 
 char *cbm_doclink_portable_scope(const char *scope) {
@@ -402,6 +469,58 @@ static doclink_twin_key_t *twin_keys(CBMExtractCtx *ctx, const char *label, int 
     return keys;
 }
 
+/* True when a doc taken from a definition, or the file's own doc, starts on
+ * one of the lines [first, last]. */
+static bool doclink_taken(const CBMExtractCtx *ctx, uint32_t first, uint32_t last) {
+    const doc_line_map_t *m = (const doc_line_map_t *)ctx->doc_lines;
+    for (int i = 0; m && i < m->count; i++) {
+        if (m->items[i].parsed && m->items[i].line >= first && m->items[i].line <= last) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The file's own doc, then the language's loose docs. The parser gets a
+ * definition-shaped stand-in for the file; what it pushes with the stand-in
+ * is marked, and the resolving half takes the File node as the source (a
+ * loose-doc hook may push with a definition of the file instead). No qualified
+ * name for that node is computed on this side. */
+static void doclink_file_pass(CBMExtractCtx *ctx, const doclink_lang_t *L) {
+    const char *file_doc = ctx->result->module_doc;
+    bool has_doc = file_doc && file_doc[0];
+    if (!has_doc && !L->loose_docs) {
+        return;
+    }
+    CBMDocLinkArray *arr = &ctx->result->doc_links;
+    int first = arr->count;
+    CBMDefinition file_def = {
+        .name = ctx->rel_path,
+        .qualified_name = ctx->module_qn ? ctx->module_qn : "",
+        .label = "File",
+        .file_path = ctx->rel_path,
+        .start_line = SKIP_ONE,
+        .end_line = SKIP_ONE,
+        .docstring = file_doc,
+    };
+    if (has_doc) {
+        doc_line_ent_t *info = doc_info_of(ctx, file_doc);
+        uint32_t doc_line = info ? info->line : 0;
+        L->parse_doc(ctx, &file_def, file_doc, doc_line ? doc_line : file_def.start_line);
+        if (info) {
+            info->parsed = true;
+        }
+    }
+    if (L->loose_docs) {
+        L->loose_docs(ctx, &file_def, doclink_taken);
+    }
+    for (int i = first; i < arr->count; i++) {
+        if (arr->items[i].source_qn == file_def.qualified_name) {
+            arr->items[i].flags |= CBM_DOCLINK_FLAG_FILE; /* not a definition's */
+        }
+    }
+}
+
 void cbm_doclinks_extract(CBMExtractCtx *ctx) {
     if (!ctx || !ctx->result) {
         return;
@@ -461,29 +580,7 @@ void cbm_doclinks_extract(CBMExtractCtx *ctx) {
             info->parsed = true;
         }
     }
-    /* The file's own doc: its references belong to the file. The parser gets
-     * a definition-shaped stand-in for the file; what it pushes is marked, and
-     * the resolving half takes the File node as the source. No qualified name
-     * for that node is computed on this side. */
-    const char *file_doc = ctx->result->module_doc;
-    if (file_doc && file_doc[0]) {
-        CBMDocLinkArray *arr = &ctx->result->doc_links;
-        int first = arr->count;
-        CBMDefinition file_def = {
-            .name = ctx->rel_path,
-            .qualified_name = ctx->module_qn ? ctx->module_qn : "",
-            .label = "File",
-            .file_path = ctx->rel_path,
-            .start_line = SKIP_ONE,
-            .end_line = SKIP_ONE,
-            .docstring = file_doc,
-        };
-        uint32_t doc_line = doc_line_of(ctx, file_doc);
-        L->parse_doc(ctx, &file_def, file_doc, doc_line ? doc_line : file_def.start_line);
-        for (int i = first; i < arr->count; i++) {
-            arr->items[i].flags |= CBM_DOCLINK_FLAG_FILE;
-        }
-    }
+    doclink_file_pass(ctx, L);
     if (L->scan_scope) {
         ctx->result->doc_scope = L->scan_scope(ctx);
     }

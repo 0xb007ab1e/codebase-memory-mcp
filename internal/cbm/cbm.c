@@ -282,6 +282,11 @@ void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch) {
     arr->items[arr->count++] = ch;
 }
 
+void cbm_diagram_arrows_push(CBMDiagramArrowArray *arr, CBMArena *a, CBMDiagramArrow da) {
+    GROW_ARRAY(arr, a);
+    arr->items[arr->count++] = da;
+}
+
 // --- String input reader (for parse_with_options) ---
 
 typedef struct {
@@ -2842,6 +2847,26 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
             .module_qn = result->module_qn,
         };
         cbm_adoc_extract_document(&adoc_ctx);
+        cbm_extract_diagrams(&adoc_ctx); /* after the Sections they hang under */
+        cbm_index_mark_done(rel_path);
+        return result;
+    }
+    /* Diagram files have no grammar either: each format is read from the text
+     * (diagram.c). */
+    if (language == CBM_LANG_DIAGRAM) {
+        result->module_qn = cbm_fqn_module_source_lang(a, project, rel_path, language);
+        CBMExtractCtx diagram_ctx = {
+            .arena = a,
+            .scratch = scratch,
+            .result = result,
+            .source = source,
+            .source_len = source_len,
+            .language = language,
+            .project = project,
+            .rel_path = rel_path,
+            .module_qn = result->module_qn,
+        };
+        cbm_extract_diagram_file(&diagram_ctx);
         cbm_index_mark_done(rel_path);
         return result;
     }
@@ -3025,6 +3050,12 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
 
     // Channel detection (Socket.IO / EventEmitter) — JS/TS only.
     cbm_extract_channels(&ctx);
+
+    // Diagrams: blocks of documents and diagram files (self-gated by language).
+    cbm_extract_diagrams(&ctx);
+
+    // OpenAPI operations as Routes (self-gated: API description documents).
+    cbm_extract_openapi(&ctx);
 
     // K8s / Kustomize semantic pass (additional structured extraction for YAML-based infra files).
     if (ctx.language == CBM_LANG_KUSTOMIZE || ctx.language == CBM_LANG_K8S) {

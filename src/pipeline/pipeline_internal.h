@@ -264,13 +264,7 @@ bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_
  * "no incremental route; continue with a full index" sentinel. */
 #define CBM_PIPELINE_FORCE_FULL_REINDEX (-3)
 
-/* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
- * "${...}") to a single "{}" token so that client call sites and server
- * handlers rendezvous on the same Route QN regardless of framework syntax.
- * Parameter names are intentionally discarded ("/u/{id}" and "/u/{slug}" both
- * canonicalize to "/u/{}"). The result never exceeds the input length, so
- * out_sz >= strlen(in) + 1 always suffices. Returns out. */
-const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz);
+/* cbm_route_canon_path: cbm.h (route_path.c). */
 
 /* True when a graph node is a structural directory container (Folder/Project)
  * rather than a code node. In a directory-based-module language (Java/Go, see
@@ -568,6 +562,15 @@ static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *c
     }
     return 0;
 }
+
+/* Diagrams (pass_diagrams.c). The DEFINES edge from a Diagram's or a
+ * DiagramElement's container (the Section a diagram block sits in, the
+ * Diagram of an element) to the definition's node; nothing for other
+ * definitions. */
+void cbm_pipeline_diagram_parent_edge(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
+                                      int64_t node_id);
+/* The DIAGRAM_ARROW edges of one file's diagrams. */
+void cbm_pipeline_diagram_arrows(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result);
 
 /* Get the current pipeline's package map (NULL if none). */
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
@@ -1282,8 +1285,19 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      sections and PDF pages hold MENTIONS edges into the code, ADR records
  *      are nodes, and AsciiDoc files, PDFs and a Sphinx project's extra
  *      source suffixes are indexed. An index built before has none of this
- *      for its unchanged documents, so it rebuilds once on upgrade. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 6 };
+ *      for its unchanged documents, so it rebuilds once on upgrade.
+ *   7: SEMANTICALLY_RELATED changed: TF-IDF compares vocabulary, string
+ *      properties are read with their escapes, admission is best-first and
+ *      every edge carries "p"; doc_link_candidates holds doc section -> code
+ *      candidates. An index built before has the old pairs and no
+ *      candidates, so it rebuilds once on upgrade. Released together with
+ *      7 (no release in between, so no number of its own): doc comments of
+ *      Go, Java, Kotlin, Rust, Perl, TS/JS, PHP and C hold MENTIONS edges;
+ *      diagrams are Diagram/DiagramElement nodes with DIAGRAM_ARROW edges;
+ *      OpenAPI operations are Routes; a Markdown section's text keeps a
+ *      diagram fence's labels instead of its syntax, and its candidates
+ *      carry the p of its diagrams' kind family. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 7 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -1313,6 +1327,16 @@ typedef struct {
     const cbm_doc_link_row_t *doc_link_rows;
     int doc_link_row_count;
     bool doc_links_failed;
+    /* Doc -> code candidates of this generation (pass_semantic_edges; may be
+     * NULL: none found, or a mode without the semantic pass), written into
+     * the staging store with the graph. */
+    const cbm_doc_candidate_t *doc_candidates;
+    int doc_candidate_count;
+    /* True when the staging store already holds this generation's
+     * candidates: the delta clone keeps the previous generation's rows (its
+     * proxy buffer has no section text or function tokens to recompute
+     * them); a row whose node is gone resolves to nothing when read. */
+    bool doc_candidates_in_place;
 } cbm_pipeline_generation_t;
 
 /* Serialize and fully populate a sibling staging database, then atomically
@@ -1419,6 +1443,12 @@ void cbm_pipeline_set_doc_link_rows(cbm_pipeline_t *p, cbm_doc_link_row_t *rows,
                                     bool failed);
 void cbm_pipeline_take_doc_link_rows(cbm_pipeline_t *p, cbm_doc_link_row_t **rows, int *count,
                                      bool *failed, bool *ran);
+
+/* Hand the run's doc -> code candidates (pass_semantic_edges) to the
+ * pipeline. Takes ownership (rows and strings in CBM_MEM_CLASS_STORE, released
+ * with cbm_store_doc_candidates_free); a NULL p frees them. NULL/0 clears. */
+void cbm_pipeline_set_doc_candidates(cbm_pipeline_t *p, cbm_doc_candidate_t *rows, int count);
+const cbm_doc_candidate_t *cbm_pipeline_doc_candidates(const cbm_pipeline_t *p, int *count);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);

@@ -242,7 +242,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"astro", "Module:1,Variable:1"},
     {"templ", "Class:1,Module:1"},
     {"typst", "Module:1"},
-    {"mermaid", "Module:1"},
+    {"mermaid", "Diagram:1,DiagramElement:2,Module:1"}, /* the fixture's flowchart */
     {NULL, NULL},
 };
 

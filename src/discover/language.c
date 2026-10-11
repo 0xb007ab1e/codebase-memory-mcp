@@ -624,6 +624,17 @@ static const ext_entry_t EXT_TABLE[] = {
     {".pdf", CBM_LANG_PDF},
     /* AsciiDoc; `.asc` is left out: it is as often an ASCII-armored signature */
     {".adoc", CBM_LANG_ASCIIDOC},
+    /* Diagram files, read without a grammar (diagram.c) */
+    {".puml", CBM_LANG_DIAGRAM},
+    {".plantuml", CBM_LANG_DIAGRAM},
+    {".iuml", CBM_LANG_DIAGRAM},
+    {".wsd", CBM_LANG_DIAGRAM},
+    {".dot", CBM_LANG_DIAGRAM},
+    {".gv", CBM_LANG_DIAGRAM},
+    {".d2", CBM_LANG_DIAGRAM},
+    {".drawio", CBM_LANG_DIAGRAM},
+    {".dio", CBM_LANG_DIAGRAM},
+    {".excalidraw", CBM_LANG_DIAGRAM},
     {".asciidoc", CBM_LANG_ASCIIDOC},
 
     /* Slang */
@@ -716,6 +727,8 @@ static const filename_entry_t FILENAME_TABLE[] = {
     {"CMakeLists.txt", CBM_LANG_CMAKE},
     {"Containerfile", CBM_LANG_DOCKERFILE},
     {"Dockerfile", CBM_LANG_DOCKERFILE},
+    {"openapi.json", CBM_LANG_OPENAPI}, /* API descriptions: their operations, not each key */
+    {"swagger.json", CBM_LANG_OPENAPI},
     {"GNUmakefile", CBM_LANG_MAKEFILE},
     {"Makefile", CBM_LANG_MAKEFILE},
     {"makefile", CBM_LANG_MAKEFILE},
@@ -840,6 +853,8 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_CHIALISP] = "Chialisp",
     [CBM_LANG_PDF] = "PDF",
     [CBM_LANG_ASCIIDOC] = "AsciiDoc",
+    [CBM_LANG_DIAGRAM] = "Diagram",
+    [CBM_LANG_OPENAPI] = "OpenAPI",
     [CBM_LANG_FENNEL] = "Fennel",
     [CBM_LANG_FISH] = "Fish",
     [CBM_LANG_AWK] = "AWK",
@@ -1027,6 +1042,9 @@ static CBMLanguage lang_for_filename(const cbm_userconfig_t *ucfg, const char *f
         CBMLanguage lang;
     } COMPOUND_EXT_TABLE[] = {
         {".blade.php", CBM_LANG_BLADE},
+        {".drawio.svg", CBM_LANG_DIAGRAM},     /* draw.io's editable SVG: its diagram, not XML */
+        {".excalidraw.svg", CBM_LANG_DIAGRAM}, /* an Excalidraw export with its scene */
+        {".excalidraw.json", CBM_LANG_DIAGRAM},
     };
     const char *p = strchr(filename, '.');
     while (p && p < last_dot) {
@@ -1562,16 +1580,13 @@ CBMLanguage cbm_disambiguate_cfc(const char *path) {
 
 /* JSON files that are configuration, not source worth indexing. */
 static const char *const IGNORED_JSON_FILES[] = {
-    "package.json",       "package-lock.json", "tsconfig.json",
-    "jsconfig.json",      "composer.json",     "composer.lock",
-    "yarn.lock",          "openapi.json",      "swagger.json",
-    "jest.config.json",   ".eslintrc.json",    ".prettierrc.json",
-    ".babelrc.json",      "tslint.json",       "angular.json",
-    "firebase.json",      "renovate.json",     "lerna.json",
-    "turbo.json",         ".stylelintrc.json", "pnpm-lock.json",
-    "deno.json",          "biome.json",        "devcontainer.json",
-    ".devcontainer.json", "launch.json",       "settings.json",
-    "extensions.json",    "tasks.json",        NULL};
+    "package.json",   "package-lock.json", "tsconfig.json",      "jsconfig.json",
+    "composer.json",  "composer.lock",     "yarn.lock",          "jest.config.json",
+    ".eslintrc.json", ".prettierrc.json",  ".babelrc.json",      "tslint.json",
+    "angular.json",   "firebase.json",     "renovate.json",      "lerna.json",
+    "turbo.json",     ".stylelintrc.json", "pnpm-lock.json",     "deno.json",
+    "biome.json",     "devcontainer.json", ".devcontainer.json", "launch.json",
+    "settings.json",  "extensions.json",   "tasks.json",         NULL};
 
 static bool lang_name_in(const char *name, const char *const *list) {
     for (int i = 0; list[i]; i++) {

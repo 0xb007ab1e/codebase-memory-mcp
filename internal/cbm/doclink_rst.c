@@ -1606,18 +1606,19 @@ static const char *rst_body(rst_doc_t *d, int from, int to) {
         return NULL;
     }
     int w = 0;
-    for (int k = from; k < to && w < RST_BODY_MAX; k++) {
+    bool full = false; /* the next character did not fit: the text ends before it */
+    for (int k = from; k < to && !full; k++) {
         const char *s = d->L[k].s;
         int len = d->L[k].len;
         int i = 0;
-        while (i < len && w < RST_BODY_MAX) {
+        while (i < len && !full) {
             int n;
             uint32_t cp = rst_cp(s, len, i, &n);
             if (rst_space_cp(cp)) {
                 i += n;
                 continue;
             }
-            if (w > 0) {
+            if (w > 0 && w < RST_BODY_MAX) {
                 out[w++] = ' ';
             }
             while (i < len) {
@@ -1626,19 +1627,13 @@ static const char *rst_body(rst_doc_t *d, int from, int to) {
                     break;
                 }
                 if (w + n > RST_BODY_MAX) {
-                    w = RST_BODY_MAX + 1; /* stop: the next character does not fit */
+                    full = true; /* only whole characters are written: none is cut */
                     break;
                 }
                 memcpy(out + w, s + i, (size_t)n);
                 w += n;
                 i += n;
             }
-        }
-    }
-    if (w > RST_BODY_MAX) {
-        w = RST_BODY_MAX;
-        while (w > 0 && ((unsigned char)out[w] & 0xC0) == 0x80) {
-            w--;
         }
     }
     while (w > 0 && out[w - 1] == ' ') {

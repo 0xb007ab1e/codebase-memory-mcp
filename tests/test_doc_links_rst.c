@@ -558,9 +558,48 @@ TEST(rst_ship_gate) {
     PASS();
 }
 
+/* A section's text is cut before the first character that does not fit its
+ * 500 bytes: only whole characters are written, and the text ends at the last
+ * one written (it once tested an unwritten byte past the end, so where the
+ * text ended depended on what that memory held). */
+TEST(rst_section_text_cut) {
+    static const struct {
+        const char *tail;
+        const char *want_tail;
+    } cases[] = {
+        {" xxxxx tail", " xxxxx"},       /* a word that ends at byte 500 */
+        {" xxxx\xc3\xa9 more", " xxxx"}, /* a two-byte character that would cross it */
+        {" yyyyyyyy", " yyyyy"},         /* a word cut at a character */
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        char doc[1024];
+        char want[600];
+        int n = snprintf(doc, sizeof(doc), "Title\n=====\n\n");
+        int w = 0;
+        for (int k = 0; k < 99; k++) { /* 99 words: 494 bytes, nine per paragraph */
+            n += snprintf(doc + n, sizeof(doc) - (size_t)n, "%sabcd",
+                          k == 0       ? ""
+                          : k % 9 == 0 ? "\n\n"
+                                       : " ");
+            w += snprintf(want + w, sizeof(want) - (size_t)w, "%sabcd", k ? " " : "");
+        }
+        snprintf(doc + n, sizeof(doc) - (size_t)n, "%s\n", cases[c].tail);
+        snprintf(want + w, sizeof(want) - (size_t)w, "%s", cases[c].want_tail);
+        CBMFileResult *r = dm_extract(doc, CBM_LANG_RST, "docs/cut.rst");
+        ASSERT_NOT_NULL(r);
+        const CBMDefinition *t = rst_def(r, "Section", "Title");
+        ASSERT_NOT_NULL(t);
+        ASSERT_NOT_NULL(t->docstring);
+        ASSERT_STR_EQ(t->docstring, want);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
 SUITE(doc_links_rst) {
     dm_ship_held_families();
     RUN_TEST(rst_scan_structure);
+    RUN_TEST(rst_section_text_cut);
     RUN_TEST(rst_python_scope_blob);
     RUN_TEST(rst_links_pipeline);
     RUN_TEST(rst_c_member_owner);

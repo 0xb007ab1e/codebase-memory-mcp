@@ -110,8 +110,9 @@ static const char *mdr_base(const char *path) {
 static bool mdr_code_file(const char *path) {
     CBMLanguage lang = cbm_language_for_filename(mdr_base(path));
     return lang != CBM_LANG_COUNT && lang != CBM_LANG_MARKDOWN && lang != CBM_LANG_RST &&
-           lang != CBM_LANG_ASCIIDOC && lang != CBM_LANG_PDF && lang != CBM_LANG_HTML &&
-           lang != CBM_LANG_CSS && lang != CBM_LANG_SCSS && !cbm_has_config_extension(path);
+           lang != CBM_LANG_ASCIIDOC && lang != CBM_LANG_PDF && lang != CBM_LANG_DIAGRAM &&
+           lang != CBM_LANG_OPENAPI && lang != CBM_LANG_HTML && lang != CBM_LANG_CSS &&
+           lang != CBM_LANG_SCSS && !cbm_has_config_extension(path);
 }
 
 /* The stems of a package directory's index file. */
@@ -658,6 +659,35 @@ static void mdr_edge(cbm_doclink_outcome_t *out, const cbm_gbuf_node_t *target, 
     out->exact = true;
     out->target_first = first;
     out->target_last = last;
+}
+
+/* A bare OpenAPI operationId (`getUser`): the one function or method of the
+ * repository with exactly that name, outside the tests; several are
+ * ambiguous, none is missing. (A dotted one, Connexion's, reads as a
+ * qualified code name.) */
+static void mdr_resolve_unique_callable(const cbm_gbuf_t *graph, const char *name,
+                                        cbm_doclink_outcome_t *out) {
+    const cbm_gbuf_node_t **nodes = NULL;
+    int n = 0;
+    const cbm_gbuf_node_t *hit = NULL;
+    int hits = 0;
+    if (cbm_gbuf_find_by_name(graph, name, &nodes, &n) == 0) {
+        for (int i = 0; i < n; i++) {
+            const char *l = nodes[i]->label;
+            if (l && (strcmp(l, "Function") == 0 || strcmp(l, "Method") == 0) &&
+                !(nodes[i]->file_path && mdr_test_path(nodes[i]->file_path))) {
+                hit = nodes[i];
+                hits++;
+            }
+        }
+    }
+    if (hits == 1) {
+        mdr_edge(out, hit, 0, 0);
+        out->exact = false; /* unique by name, not named in full */
+        return;
+    }
+    out->kind = CBM_DOCLINK_UNRESOLVED;
+    out->reason = hits > 1 ? CBM_DOCLINK_REASON_AMBIGUOUS : CBM_DOCLINK_REASON_MISSING;
 }
 
 enum { MDR_MAX_PIECES = 80 }; /* a code span is at most 150 bytes */
@@ -1286,7 +1316,13 @@ static void mdr_resolve(const void *index, void *state, int run_file, const CBMD
     }
     char buf[MDR_PATH_CAP];
     mdr_ref_t r = {0};
-    switch (link->syntax) {
+    if (link->syntax == CBM_DOCLINK_OPENAPI_OPERATION_ID && !strchr(link->raw, '.')) {
+        mdr_resolve_unique_callable(graph, link->raw, out);
+        return;
+    }
+    /* a diagram's link reads as a link, an operationId as a code name */
+    int twin = cbm_doclink_md_twin(link->syntax);
+    switch (twin != CBM_DOCLINK_NONE ? twin : link->syntax) {
     case CBM_DOCLINK_MD_SUPERSEDES:
     case CBM_DOCLINK_MD_SUPERSEDES_PROSE:
         mdr_resolve_adr(x, graph, doc, link->raw, out);
@@ -1586,8 +1622,10 @@ bool cbm_doclink_md_test_path(const char *path) {
 }
 
 const cbm_doclink_resolver_t cbm_doclink_md_resolver = {
-    .langs = {CBM_LANG_MARKDOWN},
-    .lang_count = 1,
+    /* + the links of diagram files and the operationIds of API documents */
+    .langs = {CBM_LANG_MARKDOWN, CBM_LANG_MERMAID, CBM_LANG_DIAGRAM, CBM_LANG_OPENAPI,
+              CBM_LANG_JSON},
+    .lang_count = 5,
     .scope_tag = NULL,
     .build = mdr_build,
     .destroy = mdr_destroy,

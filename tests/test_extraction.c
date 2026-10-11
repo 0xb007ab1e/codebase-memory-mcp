@@ -8610,6 +8610,64 @@ TEST(doc_perl_pod_section_by_sub_name) {
     PASS();
 }
 
+/* A Perl file's module doc (its File node's docstring) is the POD that no
+ * sub's doc holds: each run as it stands, joined by a blank line, so that a
+ * reference is read once. */
+TEST(doc_perl_module_doc_is_the_pod_no_sub_holds) {
+    CBMFileResult *r = extract("package Knob;\n"
+                               "\n"
+                               "=head1 NAME\n"
+                               "\n"
+                               "Knob - see L<Dial>.\n"
+                               "\n"
+                               "=cut\n"
+                               "\n"
+                               "sub turn { return 1; }\n"
+                               "\n"
+                               "1;\n"
+                               "__END__\n"
+                               "\n"
+                               "=head1 METHODS\n"
+                               "\n"
+                               "The knob's methods.\n"
+                               "\n"
+                               "=head2 turn\n"
+                               "\n"
+                               "Turns the knob once.\n"
+                               "\n"
+                               "=head2 spin\n"
+                               "\n"
+                               "Not a sub here.\n"
+                               "\n"
+                               "=cut\n",
+                               CBM_LANG_PERL, "t", "Knob.pm");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r->module_doc, "=head1 NAME\n\nKnob - see L<Dial>.\n\n=cut\n\n"
+                                 "=head1 METHODS\n\nThe knob's methods.\n\n"
+                                 "=head2 spin\n\nNot a sub here.\n\n=cut");
+    const CBMDefinition *d = doc_def(r, "Function", "turn");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->docstring, "=head2 turn\n\nTurns the knob once.");
+    cbm_free_result(r);
+
+    /* all of the POD is a sub's: no module doc */
+    r = extract("package Knob;\n"
+                "sub turn { return 1; }\n"
+                "1;\n"
+                "__END__\n"
+                "\n"
+                "=head2 turn\n"
+                "\n"
+                "Turns.\n"
+                "\n"
+                "=cut\n",
+                CBM_LANG_PERL, "t", "Knob.pm");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(r->module_doc);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(doc_long_comment_kept_whole) {
     /* One 12-line block comment well past the old 500-byte cut, kept byte for
      * byte. */
@@ -10847,6 +10905,7 @@ SUITE(extraction) {
     RUN_TEST(doc_kotlin_kdoc_folded_after_imports);
     RUN_TEST(doc_c_typedef_struct);
     RUN_TEST(doc_perl_pod_section_by_sub_name);
+    RUN_TEST(doc_perl_module_doc_is_the_pod_no_sub_holds);
     RUN_TEST(doc_long_comment_kept_whole);
     RUN_TEST(doc_divider_only_run_is_not_doc);
     RUN_TEST(extract_ts_decorators_survive_interleaved_comment);
