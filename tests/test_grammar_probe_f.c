@@ -2119,6 +2119,84 @@ TEST(probe_ci_and_scripts_run_scripts) {
     PASS();
 }
 
+/* The Make model of a project: every Function of a Makefile / .mk as
+ * "fn <file>:<name> <start>-<end>[ +variants]" and every IMPORTS edge of one as
+ * "import <file> -> <label>:<path> (<local_name>)", sorted. */
+static char *gpf_make_model(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT x FROM ("
+            "SELECT 'fn ' || file_path || ':' || name || ' ' || start_line || '-' || end_line "
+            "|| CASE WHEN json_extract(properties,'$.variants') IS NULL THEN '' ELSE "
+            "' +variants' END AS x FROM nodes WHERE project=?1 AND label='Function' AND (file_path LIKE "
+            "'%Makefile' OR file_path LIKE '%.mk') UNION ALL SELECT 'import ' || s.file_path || "
+            "' -> ' || t.label || ':' || t.file_path || ' (' || "
+            "json_extract(e.properties,'$.local_name') || ')' FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+            "e.type='IMPORTS' AND (s.file_path LIKE '%Makefile' OR s.file_path LIKE '%.mk')) "
+            "ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A rule naming several targets (`up down:`, `kind-% seed-%:`) is a node per
+ * target over the rule's span -- `make down` reaches its own node, and the
+ * shared recipe's edges leave from every target. Special targets (.PHONY)
+ * and target-specific variable lines (`up: export X := 1`) are none.
+ * include / -include import the named files (a name holding a
+ * variable stays out), local name the file's base name. */
+TEST(probe_make_rules_have_a_node_per_target) {
+    static const GpfFile files[] = {
+        {"Makefile", "include mk/tools.mk\n"
+                     "-include mk/opt.mk $(VAR)/x.mk\n\n"
+                     ".PHONY: up down\n"
+                     "up down: deps\n"
+                     "\t./hack/deploy.sh\n\n"
+                     "kind-% seed-%:\n"
+                     "\techo pattern\n\n"
+                     "single:\n"
+                     "\techo one\n\n"
+                     "up kind-%: export MODE := fast\n"
+                     "only-var: private Y = 1\n"},
+        {"mk/tools.mk", "tool:\n\techo tool\n"},
+        {"mk/opt.mk", "opt:\n\techo opt\n"},
+        {"hack/deploy.sh", "#!/bin/sh\necho deploy\n"},
+        {"hack/ci.sh", "#!/bin/sh\nmake down\n"}};
+    char *got = gpf_make_model(files, 5);
+    const char *want = "fn Makefile:down 5-8\n"
+                       "fn Makefile:kind-% 8-11\n"
+                       "fn Makefile:seed-% 8-11\n"
+                       "fn Makefile:single 11-14\n"
+                       "fn Makefile:up 5-8\n"
+                       "fn mk/opt.mk:opt 1-3\n"
+                       "fn mk/tools.mk:tool 1-3\n"
+                       "import Makefile -> Module:mk/opt.mk (opt.mk)\n"
+                       "import Makefile -> Module:mk/tools.mk (tools.mk)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "make model got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("Make model");
+    }
+    free(got);
+    GPF_ASSERT_RUNS(files, 5,
+                    "@hack/ci.sh -> rule:Makefile:down (SPAWNS shell)\n"
+                    "down -> script:hack/deploy.sh (SPAWNS shell)\n"
+                    "up -> script:hack/deploy.sh (SPAWNS shell)");
+    PASS();
+}
+
 /* make TARGET SPAWNS the rule of TARGET the makefile reads: the
  * directory's Makefile (-C, --directory=), a -f file, a rule of a file it
  * includes; from scripts, CI steps and recipes ($(MAKE)), on the line of
@@ -3984,6 +4062,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_make_programs_by_path_spawn);
     RUN_TEST(probe_ci_and_scripts_run_scripts);
     RUN_TEST(probe_make_targets_spawn_their_rules);
+    RUN_TEST(probe_make_rules_have_a_node_per_target);
     RUN_TEST(probe_go_installer_deploys_charts);
     RUN_TEST(probe_terraform_helm_release_deploys_its_chart);
     RUN_TEST(probe_helm_templated_objects_are_resources);

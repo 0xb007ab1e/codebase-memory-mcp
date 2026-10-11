@@ -3138,10 +3138,25 @@ static int sh_cmp_span(const void *a, const void *b) {
     return strcmp(x->file, y->file);
 }
 
+typedef struct {
+    const cbm_gbuf_node_t **items;
+    int count;
+    int cap;
+} sh_srcs_t;
+
+static int sh_cmp_node_qn(const void *a, const void *b) {
+    const cbm_gbuf_node_t *x = *(const cbm_gbuf_node_t *const *)a;
+    const cbm_gbuf_node_t *y = *(const cbm_gbuf_node_t *const *)b;
+    return strcmp(x->qualified_name ? x->qualified_name : "",
+                  y->qualified_name ? y->qualified_name : "");
+}
+
 /* The innermost Function around `line` in `file`, else its Module, else its
- * File node. */
+ * File node. Into `twins` (when given): every Function of exactly that
+ * span, in QN order -- the targets of one Make rule share it, and the
+ * rule's recipe runs for each of them. */
 static int64_t sh_source(cbm_pipeline_ctx_t *ctx, const sh_span_t *spans, int n,
-                         CBMHashTable *modules, const char *file, int line) {
+                         CBMHashTable *modules, const char *file, int line, sh_srcs_t *twins) {
     int lo = 0;
     int hi = n;
     while (lo < hi) {
@@ -3167,6 +3182,17 @@ static int64_t sh_source(cbm_pipeline_ctx_t *ctx, const sh_span_t *spans, int n,
         }
     }
     if (best) {
+        for (int i = lo; twins && i < n && strcmp(spans[i].file, file) == 0; i++) {
+            const cbm_gbuf_node_t *f = spans[i].node;
+            if (f->start_line == best->start_line && f->end_line == best->end_line &&
+                sh_grow((void **)&twins->items, &twins->cap, twins->count, sizeof(*twins->items))) {
+                twins->items[twins->count++] = f;
+            }
+        }
+        if (twins && twins->count > SKIP_ONE) {
+            qsort((void *)twins->items, (size_t)twins->count, sizeof(*twins->items),
+                  sh_cmp_node_qn);
+        }
         return best->id;
     }
     int64_t mod = (int64_t)(intptr_t)cbm_ht_get(modules, file);
@@ -3247,6 +3273,27 @@ static int sh_link_spawn(cbm_pipeline_ctx_t *ctx, int64_t src, const sh_hit_t *x
     return SKIP_ONE;
 }
 
+/* The edge hit `x` draws from source `src`; 1 when drawn. */
+static int sh_link_hit(cbm_pipeline_ctx_t *ctx, const sh_hit_t *x, int64_t src,
+                       CBMHashTable *modules) {
+    if (x->spawn) {
+        return src > 0 ? sh_link_spawn(ctx, src, x, modules) : 0;
+    }
+    int64_t tgt = x->tgt > 0 ? x->tgt : sh_external_chart(ctx, x->ext, x->file);
+    if (src <= 0 || tgt <= 0 || src == tgt) {
+        return 0;
+    }
+    char esc[CBM_SZ_1K];
+    char ci[CBM_SZ_1K];
+    char props[CBM_SZ_4K];
+    cbm_json_escape(esc, (int)sizeof(esc), x->path ? x->path : "");
+    sh_ci_props(x, ci, sizeof(ci));
+    snprintf(props, sizeof(props), "{\"via\":\"%s\",\"%s\":\"%s\"%s%s,\"line\":%d}", x->via,
+             x->chart ? "chart" : "path", esc, x->tgt > 0 ? "" : ",\"external\":true", ci, x->line);
+    cbm_gbuf_insert_edge(ctx->gbuf, src, tgt, "DEPLOYS", props);
+    return SKIP_ONE;
+}
+
 static int sh_link(cbm_pipeline_ctx_t *ctx, const sh_hits_t *h) {
     CBMHashTable *files = cbm_ht_create(0);
     CBMHashTable *modules = cbm_ht_create(0);
@@ -3293,28 +3340,16 @@ static int sh_link(cbm_pipeline_ctx_t *ctx, const sh_hits_t *h) {
         }
     }
     int edges = 0;
+    sh_srcs_t twins = {0};
     for (int i = 0; i < h->count; i++) {
         const sh_hit_t *x = &h->items[i];
-        int64_t src = sh_source(ctx, spans, n, modules, x->file, x->line);
-        if (x->spawn) {
-            edges += src > 0 ? sh_link_spawn(ctx, src, x, modules) : 0;
-            continue;
+        twins.count = 0;
+        int64_t one = sh_source(ctx, spans, n, modules, x->file, x->line, &twins);
+        for (int k = 0; k < (twins.count ? twins.count : SKIP_ONE); k++) {
+            edges += sh_link_hit(ctx, x, twins.count ? twins.items[k]->id : one, modules);
         }
-        int64_t tgt = x->tgt > 0 ? x->tgt : sh_external_chart(ctx, x->ext, x->file);
-        if (src <= 0 || tgt <= 0 || src == tgt) {
-            continue;
-        }
-        char esc[CBM_SZ_1K];
-        char ci[CBM_SZ_1K];
-        char props[CBM_SZ_4K];
-        cbm_json_escape(esc, (int)sizeof(esc), x->path ? x->path : "");
-        sh_ci_props(x, ci, sizeof(ci));
-        snprintf(props, sizeof(props), "{\"via\":\"%s\",\"%s\":\"%s\"%s%s,\"line\":%d}", x->via,
-                 x->chart ? "chart" : "path", esc, x->tgt > 0 ? "" : ",\"external\":true", ci,
-                 x->line);
-        cbm_gbuf_insert_edge(ctx->gbuf, src, tgt, "DEPLOYS", props);
-        edges++;
     }
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)twins.items);
     cbm_free(CBM_MEM_CLASS_OTHER, spans);
     cbm_ht_free(files);
     cbm_ht_free(modules);

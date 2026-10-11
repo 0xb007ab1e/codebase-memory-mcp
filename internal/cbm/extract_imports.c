@@ -48,6 +48,7 @@ static void parse_starlark_imports(CBMExtractCtx *ctx);
 static void parse_tcl_imports(CBMExtractCtx *ctx);
 static void parse_teal_imports(CBMExtractCtx *ctx);
 static void parse_shell_source_imports(CBMExtractCtx *ctx);
+static void parse_make_imports(CBMExtractCtx *ctx);
 static void parse_css_imports(CBMExtractCtx *ctx);
 static void parse_html_imports(CBMExtractCtx *ctx);
 static void parse_cmake_imports(CBMExtractCtx *ctx);
@@ -2221,6 +2222,52 @@ static void parse_shell_source_imports(CBMExtractCtx *ctx) {
     }
 }
 
+// --- Make imports: include / -include / sinclude FILE... ---
+// Every name of an include directive -- outside recipes, conditionals
+// included -- imports that file; its local name is the file's base name. A
+// name holding a variable reference is known only to make and stays out.
+// (The generic text fallback kept the directive's trailing newlines in the
+// path and split it at the extension's dot.)
+static void push_make_include(CBMExtractCtx *ctx, TSNode word) {
+    CBMArena *a = ctx->arena;
+    char *path = cbm_node_text(a, word, ctx->source);
+    if (!path || !path[0] || strchr(path, '$')) {
+        return;
+    }
+    const char *slash = strrchr(path, '/');
+    CBMImport imp = {.local_name = slash ? slash + SKIP_ONE : path, .module_path = path};
+    cbm_imports_push(&ctx->result->imports, a, imp);
+}
+
+static void parse_make_imports(CBMExtractCtx *ctx) {
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
+        const char *k = ts_node_type(node);
+        if (strcmp(k, "recipe") == 0) {
+            continue;
+        }
+        if (strcmp(k, "include_directive") != 0) {
+            ts_nstack_push_children(&stack, node);
+            continue;
+        }
+        TSNode names = ts_node_child_by_field_name(node, TS_FIELD("filenames"));
+        if (ts_node_is_null(names)) {
+            continue;
+        }
+        uint32_t n = ts_node_named_child_count(names);
+        if (strcmp(ts_node_type(names), "list") != 0 || n == 0) {
+            push_make_include(ctx, names);
+            continue;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            push_make_include(ctx, ts_node_named_child(names, i));
+        }
+    }
+}
+
 // --- CSS / SCSS imports ---
 // CSS @import "x.css" and SCSS @use/@forward 'x' are top-level statements that
 // carry a `string_value` (whose `string_content` is the unquoted path). The
@@ -3053,6 +3100,9 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         break;
     case CBM_LANG_BASH:
         parse_shell_source_imports(ctx);
+        break;
+    case CBM_LANG_MAKEFILE:
+        parse_make_imports(ctx);
         break;
     case CBM_LANG_ZIG:
         parse_zig_imports(ctx);

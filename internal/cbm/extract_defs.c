@@ -6275,6 +6275,107 @@ void cbm_test_declarations_finish(CBMExtractCtx *ctx) {
     }
 }
 
+static bool make_name_char(char c) {
+    return c == '_' || c == '.' || c == '-' || (c >= '0' && c <= '9') ||
+           ((c | ' ') >= 'a' && (c | ' ') <= 'z');
+}
+
+/* A `rule` node that is a target-specific variable: after the targets'
+ * colon(s) come [export|override|private|unexport]... NAME and an
+ * assignment operator (= := ::= :::= += ?= !=). */
+static bool make_rule_sets_variable(TSNode rule, const char *src) {
+    static const char *const kws[] = {"export", "override", "private", "unexport", NULL};
+    TSNode targets = cbm_find_child_by_kind(rule, "targets");
+    if (ts_node_is_null(targets)) {
+        return false;
+    }
+    uint32_t p = ts_node_end_byte(targets);
+    uint32_t end = ts_node_end_byte(rule);
+    while (p < end && (src[p] == ' ' || src[p] == '\t')) {
+        p++;
+    }
+    if (p >= end || src[p] != ':') {
+        return false;
+    }
+    while (p < end && src[p] == ':') {
+        p++;
+    }
+    for (bool kw = true; kw;) {
+        while (p < end && (src[p] == ' ' || src[p] == '\t')) {
+            p++;
+        }
+        kw = false;
+        for (int i = 0; kws[i]; i++) {
+            size_t n = strlen(kws[i]);
+            if (p + n < end && strncmp(src + p, kws[i], n) == 0 &&
+                (src[p + n] == ' ' || src[p + n] == '\t')) {
+                p += (uint32_t)n;
+                kw = true;
+                break;
+            }
+        }
+    }
+    uint32_t name = p;
+    while (p < end && make_name_char(src[p])) {
+        p++;
+    }
+    if (p == name) {
+        return false;
+    }
+    while (p < end && (src[p] == ' ' || src[p] == '\t')) {
+        p++;
+    }
+    if (p < end && src[p] == ':') {
+        while (p < end && src[p] == ':') {
+            p++;
+        }
+        return p < end && src[p] == '=';
+    }
+    return p < end && (src[p] == '=' ||
+                       (strchr("+?!", src[p]) && p + SKIP_ONE < end && src[p + SKIP_ONE] == '='));
+}
+
+/* Make: a rule names several targets (`up down: deps`), each a goal
+ * `make <target>` runs. The rule's definition carries the first target;
+ * every further one gets a definition of its own over the same rule span --
+ * without fingerprint, structural profile or body tokens, so the copies of
+ * one recipe do not read as similar code. Special (`.X`) targets and
+ * repeats stay out. */
+static void push_make_rule_targets(CBMExtractCtx *ctx, TSNode node, const CBMDefinition *first) {
+    CBMArena *a = ctx->arena;
+    TSNode targets = cbm_find_child_by_kind(node, "targets");
+    uint32_t n = ts_node_is_null(targets) ? 0 : ts_node_named_child_count(targets);
+    for (uint32_t i = SKIP_ONE; i < n; i++) {
+        char *name =
+            cbm_func_name_node_text(a, ts_node_named_child(targets, i), ctx->source, ctx->language);
+        if (!name || !name[0] || name[0] == '.' || strcmp(name, first->name) == 0) {
+            continue;
+        }
+        bool repeat = false;
+        for (uint32_t j = SKIP_ONE; j < i && !repeat; j++) {
+            char *prev = cbm_func_name_node_text(a, ts_node_named_child(targets, j), ctx->source,
+                                                 ctx->language);
+            repeat = prev && strcmp(prev, name) == 0;
+        }
+        if (repeat) {
+            continue;
+        }
+        CBMDefinition d = *first;
+        d.name = name;
+        d.qualified_name =
+            cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
+        d.is_exported = cbm_is_exported(name, ctx->language);
+        d.is_entry_point = strcmp(name, "main") == 0;
+        d.fingerprint = NULL;
+        d.fingerprint_k = 0;
+        d.structural_profile = NULL;
+        d.body_tokens = NULL;
+        if (d.qualified_name) {
+            cbm_defs_push(&ctx->result->defs, a, d);
+        }
+    }
+}
+
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
@@ -6306,6 +6407,12 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // emit a "..PHONY" segment (a "double dot") and thus a malformed QN. Skip
     // any dot-prefixed Make target.
     if (ctx->language == CBM_LANG_MAKEFILE && name[0] == '.') {
+        return;
+    }
+    // `targets: [export] VAR := value` sets a variable for those targets:
+    // no rule, so no def (else a target only ever configured there is a
+    // phantom, and a real rule of it gains the line as a variant).
+    if (ctx->language == CBM_LANG_MAKEFILE && make_rule_sets_variable(node, ctx->source)) {
         return;
     }
 
@@ -6557,6 +6664,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             return;
     }
     cbm_defs_push(&ctx->result->defs, a, def);
+    if (ctx->language == CBM_LANG_MAKEFILE && strcmp(ts_node_type(node), "rule") == 0) {
+        push_make_rule_targets(ctx, node, &def);
+    }
 }
 
 // --- Class definition extraction ---
