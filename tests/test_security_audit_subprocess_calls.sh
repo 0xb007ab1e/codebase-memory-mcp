@@ -6,7 +6,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-python3 - "$ROOT" <<'PY'
+python3 - "$ROOT" "$BASH" <<'PY'
 from pathlib import Path
 import shutil
 import subprocess
@@ -14,6 +14,7 @@ import sys
 import tempfile
 
 root = Path(sys.argv[1])
+bash_path = sys.argv[2]
 failures = []
 passed = 0
 
@@ -31,7 +32,7 @@ with tempfile.TemporaryDirectory(prefix="cbm-security-subprocess-") as directory
             allowances, encoding="utf-8"
         )
         result = subprocess.run(
-            ["bash", str(fixture / "scripts" / "security-audit.sh")],
+            [bash_path, str(fixture / "scripts" / "security-audit.sh")],
             cwd=fixture, text=True, capture_output=True,
         )
         output = result.stdout + result.stderr
