@@ -3520,8 +3520,8 @@ TEST(doc_mentions_jvm_java_field_outer_outside) {
 TEST(doc_mentions_jvm_java_field_own_far_outside) {
     jt_repo_t r;
     ASSERT(jt_begin(&r, "jfown"));
-    const char *far = "src/main/java/gb/Far.java";
-    jt_write(&r, far,
+    const char *far_src = "src/main/java/gb/Far.java";
+    jt_write(&r, far_src,
              "package gb;\n"
              "public class Far extends java.io.InputStream {\n"
              "    public int read() { return 0; }\n"
@@ -3542,7 +3542,7 @@ TEST(doc_mentions_jvm_java_field_own_far_outside) {
              "}\n");
     ASSERT_EQ(dm_index(r.repo, r.db, NULL), 0);
     const char *db = r.db;
-    ASSERT_EQ(jt_rows(db, far, "#level", "external"), 1);
+    ASSERT_EQ(jt_rows(db, far_src, "#level", "external"), 1);
     ASSERT_EQ(dm_mentions_from(db, "gb.Far.Near.m"), 0);
     /* decoy: only the type's own supertype leaves the repository */
     ASSERT_EQ(jt_edge(db, "gb.Far2.Near2.m", "gb.Far2.Near2.level"), 1);
