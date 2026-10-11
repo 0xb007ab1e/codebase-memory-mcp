@@ -776,7 +776,8 @@ static int k8s_cmp_kust(const void *a, const void *b) {
 
 /* index + 1 of the kustomization at `path`, 0 when none. */
 static int k8s_kust_at(CBMHashTable *by_path, const char *path) {
-    return (int)(intptr_t)cbm_ht_get(by_path, path);
+    intptr_t at = (intptr_t)cbm_ht_get(by_path, path);
+    return (int)at;
 }
 
 /* The kustomization file inside directory `dir`, as kustomize looks for it. */
@@ -2838,7 +2839,7 @@ typedef struct {
     CBMHashTable *yaml_defs;  /* template file -> the defines written in it */
     CBMArena arena;           /* define QNs */
     const char *file;
-    const char *family;
+    char family[CBM_SZ_1K]; /* the chart family of `file` */
     k8s_ids_t found;
     int edges;
     int unresolved;
@@ -2881,9 +2882,9 @@ static void k8s_inc_call(k8s_inc_t *s, const char *name, int line, const char *v
     const k8s_ids_t *deps = cbm_ht_get(s->deps, s->family);
     for (int d = 0; deps && d < deps->count; d++) {
         const cbm_gbuf_node_t *dep = cbm_gbuf_find_by_id(s->ctx->gbuf, deps->items[d]);
-        char chart[CBM_SZ_1K];
-        char family[CBM_SZ_1K];
         if (dep && dep->file_path) {
+            char chart[CBM_SZ_1K];
+            char family[CBM_SZ_1K];
             k8s_dirname(dep->file_path, chart, sizeof(chart));
             k8s_chart_family(s->b, chart, family, sizeof(family));
             k8s_inc_lookup(s, family, name);
@@ -3113,8 +3114,7 @@ static void k8s_includes_run(k8s_inc_t *s, const cbm_file_info_t *files, int fil
     for (int pass = 0; pass < PAIR_LEN; pass++) {
         for (int i = 0; i < file_count; i++) {
             const char *rel = files[i].rel_path;
-            char family[CBM_SZ_1K];
-            if (!k8s_template_family(s->b, rel, family, sizeof(family))) {
+            if (!k8s_template_family(s->b, rel, s->family, sizeof(s->family))) {
                 continue;
             }
             char path[CBM_SZ_4K];
@@ -3125,7 +3125,6 @@ static void k8s_includes_run(k8s_inc_t *s, const cbm_file_info_t *files, int fil
                 continue;
             }
             s->file = rel;
-            s->family = family;
             if (pass == 0) {
                 k8s_scan_defines(s, src);
             } else {
