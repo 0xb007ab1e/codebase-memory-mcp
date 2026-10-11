@@ -74,10 +74,15 @@ REFS=(
   "kustomize|https://github.com/kubernetes-sigs/kustomize|api/krusty,api/internal/target"
   "flux|https://github.com/fluxcd/pkg|kustomize"
   "kube|https://github.com/kubernetes-sigs/controller-tools|pkg"
+  # The Bash (+ Make) layer (deploy commands, constant propagation) was written
+  # from the bash, GNU make, kubectl and helm documentation. Scanned against
+  # bash-language-server (MIT), the leading OSS bash language server.
+  "bash|https://github.com/bash-lsp/bash-language-server|server/src"
 )
 
 # Infrastructure hybrid LSP sources outside internal/cbm/lsp/ (scanned too).
-INFRA_SRC=(internal/cbm/extract_k8s.c src/pipeline/pass_k8s.c src/pipeline/pass_operator.c)
+INFRA_SRC=(internal/cbm/extract_k8s.c src/pipeline/pass_k8s.c src/pipeline/pass_operator.c
+           src/pipeline/pass_shell.c)
 
 ONLY_LANG=""; REFRESH=0; LIST_ONLY=0
 while [ $# -gt 0 ]; do

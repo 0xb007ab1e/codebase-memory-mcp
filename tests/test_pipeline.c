@@ -3422,6 +3422,41 @@ TEST(incremental_k8s_edits_reach_other_files) {
     PASS();
 }
 
+/* A script's deploy commands link nodes of other files (pass_shell.c): the
+ * closure repair re-reads the changed script alone, so editing it must still
+ * leave the edges a fresh index builds. */
+TEST(incremental_shell_deploy_edit_keeps_its_edges) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_shinc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "manifests/app.yaml",
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\n");
+    write_temp_file(tmp, "hack/deploy.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")/..\"\nkubectl apply -f manifests/app.yaml\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/shinc.db", tmp);
+    static const char deploys[] = "SELECT COUNT(*) FROM edges WHERE type='DEPLOYS'";
+
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int deploys_full = k8s_inc_count(db_path, deploys);
+    write_temp_file(tmp, "hack/deploy.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")/..\"\nkubectl apply -f manifests/app.yaml\n"
+                    "# edited\n");
+    int rc_edit = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    int deploys_after = k8s_inc_count(db_path, deploys);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(deploys_full, 1);
+    ASSERT_EQ(rc_edit, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(deploys_after, 1);
+    PASS();
+}
+
 /* SQL DDL becomes first-class Table/View nodes wired into FROM/JOIN lineage,
  * while the shared name registry must NOT leak those relations into other
  * languages' textual resolution: a Python call or identifier sharing the
@@ -19046,6 +19081,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
     RUN_TEST(pipeline_staged_publish_commits_below_full_sync_issue1419);
     RUN_TEST(incremental_k8s_edits_reach_other_files);
+    RUN_TEST(incremental_shell_deploy_edit_keeps_its_edges);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);

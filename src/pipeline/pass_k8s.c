@@ -3412,6 +3412,8 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_link_includes(ctx, &bundles, files, file_count);
     k8s_bundles_free(&bundles);
     k8s_kusts_free(&kusts);
+    /* Shell and Make deploy commands, against the nodes linked above. */
+    cbm_pipeline_pass_shell(ctx, files, file_count);
 
     cbm_log_info("pass.done", "pass", "k8s", "manifests", itoa_k8s(manifest_count));
     (void)helm_count;

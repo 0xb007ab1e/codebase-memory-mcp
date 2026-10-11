@@ -1696,6 +1696,210 @@ TEST(probe_gitops_objects_deploy_their_units) {
     PASS();
 }
 
+/* Every DEPLOYS edge as "source -> target (via)", sorted, one per line: a
+ * function by name, top-level code as "@<file>"; a File or Kustomization by
+ * its path, a Chart by name ("(ext)": the external one). NULL on failure;
+ * the caller frees. */
+static char *gpf_deploys(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT "
+            "CASE WHEN s.label IN ('Module','File') THEN '@' || s.file_path ELSE s.name END "
+            "|| ' -> ' || CASE WHEN t.label='Chart' THEN 'chart:' || t.name || "
+            "CASE WHEN instr(t.qualified_name,'__helm_dep__') THEN '(ext)' ELSE '' END "
+            "ELSE t.label || ':' || t.file_path END "
+            "|| ' (' || json_extract(e.properties,'$.via') || ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='DEPLOYS' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+#define GPF_ASSERT_DEPLOYS(files, n, want)                                                         \
+    do {                                                                                           \
+        char *got_ = gpf_deploys(files, n);                                                        \
+        if (!got_ || strcmp(got_, want) != 0) {                                                    \
+            fprintf(stderr, "DEPLOYS got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want);        \
+            free(got_);                                                                            \
+            FAIL("DEPLOYS edge set");                                                              \
+        }                                                                                          \
+        free(got_);                                                                                \
+    } while (0)
+
+#define GPF_CM(name) "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " name "\n"
+#define GPF_KUST "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
+
+/* kubectl apply -f deploys a manifest, a directory's manifests (-R: below
+ * it too; not a file holding no objects), a glob's; -k and a kustomize build
+ * piped into kubectl a Kustomization. The source is the function running the
+ * command, top-level code its file; paths resolve against the cd'd root. */
+TEST(probe_shell_kubectl_deploys_what_it_applies) {
+    static const GpfFile files[] = {
+        {"manifests/app.yaml", GPF_CM("app")},
+        {"manifests/svc.yaml", GPF_CM("svc")},
+        {"manifests/notes.yaml", "notes:\n  - not an object\n"},
+        {"manifests/nested/cm.yaml", GPF_CM("cm")},
+        {"crds/a.yaml", GPF_CM("a")},
+        {"crds/b.yaml", GPF_CM("b")},
+        {"overlays/prod/kustomization.yaml", GPF_KUST},
+        {"overlays/dev/kustomization.yaml", GPF_KUST},
+        {"hack/deploy.sh", "#!/usr/bin/env bash\n"
+                           "cd \"$(dirname \"$0\")/..\"\n\n"
+                           "apply_all() {\n"
+                           "  kubectl apply -f manifests/app.yaml\n"
+                           "  kubectl --namespace \"$NS\" apply -f manifests\n"
+                           "  kubectl apply -Rf manifests/nested\n"
+                           "}\n\n"
+                           "kubectl apply -f 'crds/*.yaml'\n"
+                           "kubectl apply -k overlays/prod\n"
+                           "kustomize build overlays/dev | sed s/a/b/ | kubectl apply -f -\n"
+                           "cat <<EOF | kubectl apply -f -\nkind: Inline\nEOF\n"}};
+    GPF_ASSERT_DEPLOYS(files, 9,
+                       "@hack/deploy.sh -> File:crds/a.yaml (kubectl)\n"
+                       "@hack/deploy.sh -> File:crds/b.yaml (kubectl)\n"
+                       "@hack/deploy.sh -> Resource:overlays/dev/kustomization.yaml (kustomize)\n"
+                       "@hack/deploy.sh -> Resource:overlays/prod/kustomization.yaml (kubectl)\n"
+                       "apply_all -> File:manifests/app.yaml (kubectl)\n"
+                       "apply_all -> File:manifests/nested/cm.yaml (kubectl)\n"
+                       "apply_all -> File:manifests/svc.yaml (kubectl)");
+    PASS();
+}
+
+/* helm install / upgrade deploys its chart: a chart dir (through options,
+ * a wrapper, $(git rev-parse --show-toplevel)), else the external chart of
+ * repo/name or oci://.../name; a helm template piped into kubectl too. No
+ * edge from an unknown word that may shift the chart's position, nor from
+ * a variable an if/else leaves undecided. */
+TEST(probe_shell_helm_deploys_its_chart) {
+    static const GpfFile files[] = {
+        {"charts/web/Chart.yaml", "apiVersion: v2\nname: web\nversion: 0.1.0\n"},
+        {"charts/web/values-prod.yaml", "replicas: 2\n"},
+        {"charts/api/Chart.yaml", "apiVersion: v2\nname: api\nversion: 0.1.0\n"},
+        {"scripts/install.sh",
+         "#!/bin/sh\n"
+         "ROOT=\"$(git rev-parse --show-toplevel)\"\n"
+         "NS=${NAMESPACE:-web}\n"
+         "install_web() {\n"
+         "  retry 3 helm upgrade --install --namespace \"$NS\" --create-namespace --atomic "
+         "web \"$ROOT/charts/web/\"\n"
+         "}\n"
+         "install_cache() {\n"
+         "  helm install cache bitnami/redis --version 1.2.3\n"
+         "  helm install queue oci://registry.example.com/charts/nats\n"
+         "}\n"
+         "render_web() {\n"
+         "  helm template web charts/web -f charts/web/values-prod.yaml | kubectl apply -f -\n"
+         "}\n"
+         "split_args() {\n"
+         "  helm upgrade $ARGS charts/api\n"
+         "}\n"
+         "branchy() {\n"
+         "  CHART=charts/web\n"
+         "  if [ -n \"$PROD\" ]; then CHART=charts/api; fi\n"
+         "  helm upgrade --install x \"$CHART\"\n"
+         "}\n"}};
+    GPF_ASSERT_DEPLOYS(files, 4,
+                       "install_cache -> chart:nats(ext) (helm)\n"
+                       "install_cache -> chart:redis(ext) (helm)\n"
+                       "install_web -> chart:web (helm)\n"
+                       "render_web -> chart:web (helm)");
+    PASS();
+}
+
+/* Constant propagation: SCRIPT_ROOT from $(cd "$(dirname ...)" && pwd -P),
+ * pushd / popd, an option whose value is unknown, an array holding the
+ * command; a subshell's cd does not leak; with no directory tracked a path
+ * resolves against the script's dir or the root -- only when one of the two
+ * has it. */
+TEST(probe_shell_paths_follow_the_script) {
+    static const GpfFile files[] = {
+        {"apps/web/deployment.yaml", GPF_CM("deployment")},
+        {"apps/web/service.yaml", GPF_CM("service")},
+        {"apps/web/sub/cm.yaml", GPF_CM("cm")},
+        {"apps/web/sub/extra.yaml", GPF_CM("extra")},
+        {"apps/web/config.yaml", GPF_CM("config-here")},
+        {"config.yaml", GPF_CM("config-root")},
+        {"apps/web/deploy.sh",
+         "#!/usr/bin/env bash\n"
+         "SCRIPT_ROOT=$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd -P)\n"
+         "context=\"${KUBECTL_CONTEXT:-gke}\"\n"
+         "if ! kubectl config get-contexts \"${context}\"; then\n"
+         "  context=\"other\"\n"
+         "fi\n"
+         "pushd \"${SCRIPT_ROOT}\" >/dev/null\n"
+         "kubectl --context=\"${context}\" apply -f .\n"
+         "popd >/dev/null\n"
+         "( cd sub && kubectl apply -f cm.yaml )\n"
+         "kubectl apply -f extra.yaml\n"
+         "ambiguous() { kubectl apply -f config.yaml; }\n"
+         "unique() { kubectl apply -f deployment.yaml; }\n"
+         "deploy() {\n"
+         "  local kubectl=(\n"
+         "    kubectl\n"
+         "    --context=\"${context}\"\n"
+         "  )\n"
+         "  \"${kubectl[@]}\" apply -f service.yaml\n"
+         "}\n"}};
+    GPF_ASSERT_DEPLOYS(files, 7,
+                       "@apps/web/deploy.sh -> File:apps/web/config.yaml (kubectl)\n"
+                       "@apps/web/deploy.sh -> File:apps/web/deployment.yaml (kubectl)\n"
+                       "@apps/web/deploy.sh -> File:apps/web/service.yaml (kubectl)\n"
+                       "@apps/web/deploy.sh -> File:apps/web/sub/cm.yaml (kubectl)\n"
+                       "deploy -> File:apps/web/service.yaml (kubectl)\n"
+                       "unique -> File:apps/web/deployment.yaml (kubectl)");
+    PASS();
+}
+
+/* A Make recipe runs in its Makefile's directory with the Makefile's
+ * variables expanded ($(shell pwd), ?=, a conditional's: unknown): a
+ * kustomize build into kubectl, kubectl -f a directory, find -name -exec
+ * kubectl apply -f {}. */
+TEST(probe_make_recipes_deploy) {
+    static const GpfFile files[] = {
+        {"operator/config/default/kustomization.yaml", GPF_KUST},
+        {"operator/config/prod/kustomization.yaml", GPF_KUST},
+        {"operator/config/dev/kustomization.yaml", GPF_KUST},
+        {"operator/config/crd/widgets.yaml", GPF_CM("widgets")},
+        {"operator/config/flux/flux-a.yaml", GPF_CM("flux-a")},
+        {"operator/config/flux/other.yaml", GPF_CM("other")},
+        {"operator/config/flux/sub/flux-b.yaml", GPF_CM("flux-b")},
+        {"operator/Makefile", "LOCALBIN ?= $(shell pwd)/bin\n"
+                              "KUBECTL ?= kubectl\n"
+                              "KUSTOMIZE ?= $(LOCALBIN)/kustomize\n"
+                              "ifeq ($(ENV),prod)\n"
+                              "OVERLAY = config/prod\n"
+                              "else\n"
+                              "OVERLAY = config/dev\n"
+                              "endif\n\n"
+                              "deploy:\n"
+                              "\t$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -\n\n"
+                              "install:\n"
+                              "\t@$(KUBECTL) apply -f config/crd\n\n"
+                              "flux:\n"
+                              "\tfind ./config/flux -type f -name \"flux-*\" -exec $(KUBECTL) "
+                              "apply -f {} \\;\n\n"
+                              "overlay:\n"
+                              "\t$(KUBECTL) apply -k $(OVERLAY)\n"}};
+    GPF_ASSERT_DEPLOYS(files, 8,
+                       "deploy -> Resource:operator/config/default/kustomization.yaml (kustomize)\n"
+                       "flux -> File:operator/config/flux/flux-a.yaml (kubectl)\n"
+                       "flux -> File:operator/config/flux/sub/flux-b.yaml (kubectl)\n"
+                       "install -> File:operator/config/crd/widgets.yaml (kubectl)");
+    PASS();
+}
+
 /* ── Helm symbolic (Phase 2) ────────────────────────────────────────── */
 
 /* A chart template is YAML only once rendered: a document opened by
@@ -3367,6 +3571,10 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_mcp_search_filters_kind_and_namespace);
     RUN_TEST(probe_mcp_trace_topology);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
+    RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
+    RUN_TEST(probe_shell_helm_deploys_its_chart);
+    RUN_TEST(probe_shell_paths_follow_the_script);
+    RUN_TEST(probe_make_recipes_deploy);
     RUN_TEST(probe_helm_templated_objects_are_resources);
     RUN_TEST(probe_helm_include_resolves_in_the_chart_family);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);

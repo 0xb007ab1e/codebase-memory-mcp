@@ -1042,6 +1042,10 @@ int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
  * Runs after USAGE resolution. */
 int cbm_pipeline_pass_operator(cbm_pipeline_ctx_t *ctx);
 
+/* Shell scripts and Make recipes (pass_shell.c): the commands that put
+ * manifests, kustomizations or charts on a cluster DEPLOYS them. Run at the
+ * end of the K8s pass, over the same files. */
+void cbm_pipeline_pass_shell(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 /* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
 int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
 
@@ -1124,6 +1128,7 @@ extern _Atomic uint64_t g_importance_store_rows;
  * examines (pass_operator.c). Independent copies must grow them linearly. */
 extern _Atomic uint64_t g_k8s_candidates;
 extern _Atomic uint64_t g_op_candidates;
+extern _Atomic uint64_t g_sh_candidates;
 
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
