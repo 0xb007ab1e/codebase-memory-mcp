@@ -3099,6 +3099,7 @@ static void sh_make_resolve(sh_pass_t *p, cbm_pipeline_ctx_t *ctx, sh_hits_t *h)
         sh_hit_t *x = &h->items[i];
         const mk_closure_t *cl = x->make ? cbm_ht_get(closures, x->path) : NULL;
         for (int k = 0; cl && k < cl->n && x->tgt <= 0; k++) {
+            atomic_fetch_add_explicit(&g_sh_candidates, SKIP_ONE, memory_order_relaxed);
             const char *key = mk_rule_key(&a, cl->order[k], x->ext);
             const cbm_gbuf_node_t *rule = key ? cbm_ht_get(rules, key) : NULL;
             x->tgt = rule ? rule->id : 0;

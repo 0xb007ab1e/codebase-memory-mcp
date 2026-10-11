@@ -67,9 +67,12 @@
  * lsp_resolve.h — re-declared here to avoid pulling that header's statics). */
 extern _Atomic uint64_t g_lsp_tail_lookups;
 extern _Atomic uint64_t g_lsp_tail_candidates;
-/* Infra resolver candidate counters (pass_k8s.c, pass_operator.c). */
+/* Infra resolver candidate counters (pass_k8s.c, pass_operator.c,
+ * pass_shell.c, pass_terraform.c). */
 extern _Atomic uint64_t g_k8s_candidates;
 extern _Atomic uint64_t g_op_candidates;
+extern _Atomic uint64_t g_sh_candidates;
+extern _Atomic uint64_t g_tf_candidates;
 
 /* ── Corpus scale ──────────────────────────────────────────────────────
  * Small on purpose: the gate reads exponents from ratios, not magnitudes.
@@ -169,8 +172,9 @@ static const CxTemplate CX_TEMPLATES[] = {
 };
 enum { CX_TEMPLATE_COUNT = sizeof(CX_TEMPLATES) / sizeof(CX_TEMPLATES[0]) };
 
-/* Fixture-dir provider: tests/fixtures/complexity/<lang-name>/ — every file in
- * it is copied verbatim into each module dir. Lets a new language join the
+/* Fixture-dir provider: tests/fixtures/complexity/<lang-name>/ — every file
+ * and directory in it (dot-names aside) is copied verbatim into each module
+ * dir. Lets a new language join the
  * guard by dropping fixtures, with no edit to this suite. */
 static bool cx_fixture_dir_for(CBMLanguage lang, char *out, size_t cap) {
     const char *name = cbm_language_name(lang);
@@ -204,6 +208,36 @@ static int cx_copy_file(const char *src, const char *dst) {
     fclose(in);
     fclose(out);
     return 0;
+}
+
+/* A fixture entry into `dst`: a file, or a directory with its contents. */
+static int cx_copy_entry(const char *src, const char *dst, bool is_dir) {
+    if (!is_dir) {
+        return cx_copy_file(src, dst);
+    }
+    if (th_mkdir_p(dst) != 0) {
+        return -1;
+    }
+    cbm_dir_t *d = cbm_opendir(src);
+    if (!d) {
+        return -1;
+    }
+    int rc = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        if (entry->name[0] == '.') {
+            continue;
+        }
+        char from[1024];
+        char to[1024];
+        snprintf(from, sizeof(from), "%s/%s", src, entry->name);
+        snprintf(to, sizeof(to), "%s/%s", dst, entry->name);
+        if (cx_copy_entry(from, to, entry->is_dir) != 0) {
+            rc = -1;
+        }
+    }
+    cbm_closedir(d);
+    return rc;
 }
 
 /* ── Corpus builder ──────────────────────────────────────────────────── */
@@ -257,7 +291,7 @@ static int cx_build_corpus(const char *root, int k_modules) {
                 char src[1024];
                 snprintf(src, sizeof(src), "%s/%s", fixdir, entry->name);
                 snprintf(path, sizeof(path), "%s/%s", dir, entry->name);
-                (void)cx_copy_file(src, path);
+                (void)cx_copy_entry(src, path, entry->is_dir);
             }
         }
         cbm_closedir(d);
@@ -339,13 +373,17 @@ static void cx_pass_sink(const char *line) {
 }
 
 /* Fixture-provided infra corpora (tests/fixtures/complexity/<name>/), scoped
- * by their copy root: Kubernetes manifests with a kustomization, and a Go
- * operator (controller, API types with +groupName, an embedded CRD). An API
+ * by their copy root: Kubernetes manifests with a kustomization (and a Flux
+ * HelmRelease whose chartRef names an OCIRepository), a Go operator
+ * (controller, API types with +groupName, an embedded CRD, a chart loader), a
+ * shell deploy chain (composite CI action -> make -> scripts -> kubectl / helm
+ * of the copy's own manifests and chart), and Terraform helm_releases (one of
+ * a chart dir of the module, one of an external chart). An API
  * group/kind is one identity across a repository: copies declaring the same
  * one ARE joined (a CRD links to every package marking its group), so the
  * fixtures' CRDs use groups no copy's Go code declares -- the guard measures
  * accidental growth, not that by-design join. */
-static const char *const CX_INFRA_DIRS[] = {"fx_Kubernetes", "fx_Go"};
+static const char *const CX_INFRA_DIRS[] = {"fx_Kubernetes", "fx_Go", "fx_Bash", "fx_HCL"};
 enum { CX_INFRA_COUNT = sizeof(CX_INFRA_DIRS) / sizeof(CX_INFRA_DIRS[0]) };
 
 typedef struct {
@@ -365,6 +403,8 @@ typedef struct {
     uint64_t imp_name_visits; /* same-name-group members visited by that pass */
     uint64_t k8s_candidates;  /* objects the K8s resolvers examined */
     uint64_t op_candidates;   /* Go types / dirs the operator pass examined */
+    uint64_t sh_candidates;   /* paths / make rules the shell layer examined */
+    uint64_t tf_candidates;   /* blocks the Terraform layer examined */
     int infra_nodes[CX_INFRA_COUNT];
     int infra_edges[CX_INFRA_COUNT];
     double wall_s;
@@ -391,6 +431,8 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     uint64_t iv0 = atomic_load_explicit(&g_importance_name_visits, memory_order_relaxed);
     uint64_t kc0 = atomic_load_explicit(&g_k8s_candidates, memory_order_relaxed);
     uint64_t oc0 = atomic_load_explicit(&g_op_candidates, memory_order_relaxed);
+    uint64_t sc0 = atomic_load_explicit(&g_sh_candidates, memory_order_relaxed);
+    uint64_t fc0 = atomic_load_explicit(&g_tf_candidates, memory_order_relaxed);
 
     atomic_store_explicit(&g_cx_pass_count, 0, memory_order_relaxed);
     cbm_log_set_sink_ex(cx_pass_sink, CBM_LOG_SINK_TEE);
@@ -430,6 +472,8 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
         atomic_load_explicit(&g_importance_name_visits, memory_order_relaxed) - iv0;
     out->k8s_candidates = atomic_load_explicit(&g_k8s_candidates, memory_order_relaxed) - kc0;
     out->op_candidates = atomic_load_explicit(&g_op_candidates, memory_order_relaxed) - oc0;
+    out->sh_candidates = atomic_load_explicit(&g_sh_candidates, memory_order_relaxed) - sc0;
+    out->tf_candidates = atomic_load_explicit(&g_tf_candidates, memory_order_relaxed) - fc0;
 
     cbm_store_t *s = cbm_store_open_path(db_path);
     if (!s) {
@@ -547,8 +591,10 @@ TEST(complexity_replicated_modules_scale_linearly) {
     PASS();
 }
 
-/* The infra resolvers (K8s references / selectors / CRDs, the Go operator's
- * controller kinds and CRD types) examine candidates by name. Independent
+/* The infra resolvers (K8s references / selectors / CRDs / chartRefs, the Go
+ * operator's controller kinds, CRD types and loaded charts, the shell layer's
+ * manifest dirs and make rules, Terraform's helm_release blocks) examine
+ * candidates by name. Independent
  * copies share every name, so a candidate set that is not scoped to the
  * bundle / package / module grows with the copy count: the examined count
  * goes ~4x per doubling while the edges stay ~2x. Both are gated, on the
@@ -569,6 +615,16 @@ TEST(complexity_infra_resolution_is_linear) {
     printf("    k8s_candidates ratio %.2f  op_candidates ratio %.2f\n", kr, orr);
     ASSERT_TRUE(kr >= CX_RATIO_LO && kr <= CX_RATIO_HI);
     ASSERT_TRUE(orr >= CX_RATIO_LO && orr <= CX_RATIO_HI);
+    printf("    sh_candidates %llu -> %llu  tf_candidates %llu -> %llu\n",
+           (unsigned long long)a->sh_candidates, (unsigned long long)b->sh_candidates,
+           (unsigned long long)a->tf_candidates, (unsigned long long)b->tf_candidates);
+    ASSERT_GT((long long)a->sh_candidates, 0);
+    ASSERT_GT((long long)a->tf_candidates, 0);
+    double sr = cx_ratio((double)b->sh_candidates, (double)a->sh_candidates);
+    double fr = cx_ratio((double)b->tf_candidates, (double)a->tf_candidates);
+    printf("    sh_candidates ratio %.2f  tf_candidates ratio %.2f\n", sr, fr);
+    ASSERT_TRUE(sr >= CX_RATIO_LO && sr <= CX_RATIO_HI);
+    ASSERT_TRUE(fr >= CX_RATIO_LO && fr <= CX_RATIO_HI);
     for (int i = 0; i < CX_INFRA_COUNT; i++) {
         ASSERT_GT(a->infra_nodes[i], 0);
         ASSERT_GT(a->infra_edges[i], 0);

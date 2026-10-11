@@ -3263,6 +3263,7 @@ static void k8s_link_chart_refs(k8s_dep_link_t *l, const k8s_hr_t *oci) {
         return;
     }
     for (int i = 0; i < n; i++) {
+        atomic_fetch_add_explicit(&g_k8s_candidates, SKIP_ONE, memory_order_relaxed);
         const char *p = in[i]->properties_json;
         const cbm_gbuf_node_t *hr = cbm_gbuf_find_by_id(l->ctx->gbuf, in[i]->source_id);
         if (p && strstr(p, "\"ref\":\"chartRef\"") && hr && hr->file_path) {

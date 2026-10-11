@@ -25,15 +25,21 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "cbm.h"
+#include "helpers.h"
 #include "lang_specs.h"
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+/* Blocks a helm_release lookup examined (complexity guard counter). */
+_Atomic uint64_t g_tf_candidates = 0;
+
 typedef struct {
     cbm_pipeline_ctx_t *ctx;
+    CBMArena *arena;      /* lookup QNs */
     CBMHashTable *charts; /* Chart.yaml path -> local Chart node id */
     const char *src;
     const char *file;
@@ -221,21 +227,16 @@ static int64_t tf_external_chart(cbm_pipeline_ctx_t *ctx, const char *name, cons
                                 "{\"source\":\"helm\",\"external\":true}");
 }
 
-/* The node of block `resource.helm_release.<name>` in the file. */
+/* The node of block `resource.helm_release.<name>` in the file, by the QN
+ * its definition got -- not among every block of that name: modules that
+ * share a release name (`this`) would make each lookup scan all of them. */
 static int64_t tf_block_node(const tf_t *t, const char *name) {
     char full[CBM_SZ_512];
     snprintf(full, sizeof(full), "resource.helm_release.%s", name);
-    const cbm_gbuf_node_t **nodes = NULL;
-    int count = 0;
-    if (cbm_gbuf_find_by_name(t->ctx->gbuf, full, &nodes, &count) != 0) {
-        return 0;
-    }
-    for (int i = 0; i < count; i++) {
-        if (nodes[i]->file_path && strcmp(nodes[i]->file_path, t->file) == 0) {
-            return nodes[i]->id;
-        }
-    }
-    return 0;
+    const char *qn = cbm_fqn_compute(t->arena, t->ctx->project_name, t->file, full);
+    const cbm_gbuf_node_t *n = qn ? cbm_gbuf_find_by_qn(t->ctx->gbuf, qn) : NULL;
+    atomic_fetch_add_explicit(&g_tf_candidates, SKIP_ONE, memory_order_relaxed);
+    return n && n->file_path && strcmp(n->file_path, t->file) == 0 ? n->id : 0;
 }
 
 static bool tf_plain_name(const char *s) {
@@ -396,6 +397,8 @@ void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t 
                                  int file_count) {
     TSParser *parser = NULL;
     CBMHashTable *charts = NULL;
+    CBMArena arena;
+    cbm_arena_init_lazy(&arena, CBM_SZ_4K);
     int edges = 0;
     for (int i = 0; i < file_count; i++) {
         if (files[i].language != CBM_LANG_HCL || !tf_is_module_file(files[i].rel_path)) {
@@ -416,7 +419,11 @@ void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t 
                 tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)len);
             }
             if (tree) {
-                tf_t t = {.ctx = ctx, .charts = charts, .src = src, .file = files[i].rel_path};
+                tf_t t = {.ctx = ctx,
+                          .arena = &arena,
+                          .charts = charts,
+                          .src = src,
+                          .file = files[i].rel_path};
                 const char *slash = strrchr(files[i].rel_path, '/');
                 snprintf(t.mdir, sizeof(t.mdir), "%.*s",
                          slash ? (int)(slash - files[i].rel_path) : 0, files[i].rel_path);
@@ -433,6 +440,7 @@ void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t 
     if (charts) {
         cbm_ht_free(charts);
     }
+    cbm_arena_destroy(&arena);
     if (edges > 0) {
         char buf[CBM_SZ_32];
         snprintf(buf, sizeof(buf), "%d", edges);

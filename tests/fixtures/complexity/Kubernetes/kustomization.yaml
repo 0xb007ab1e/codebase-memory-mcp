@@ -4,3 +4,5 @@ namespace: shop
 resources:
   - app.yaml
   - crd.yaml
+  - ocirepository.yaml
+  - helmrelease.yaml
