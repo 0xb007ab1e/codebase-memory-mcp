@@ -1776,6 +1776,50 @@ static char *gpf_spawns(const GpfFile *files, int nfiles) {
         free(got_);                                                                                \
     } while (0)
 
+/* Every SPAWNS and DEPLOYS edge as "source -> target (TYPE api|via[
+ * ci[/job]])", sorted, one per line: top-level code as "@<file>"; a script
+ * as "script:<path>", a Process as "proc:<name>", a Chart as "chart:<name>". */
+static char *gpf_runs(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT DISTINCT "
+            "CASE WHEN s.label IN ('Module','File') THEN '@' || s.file_path ELSE s.name END "
+            "|| ' -> ' || CASE WHEN t.label IN ('Module','File') THEN 'script:' || t.file_path "
+            "WHEN t.label='Process' THEN 'proc:' || t.name WHEN t.label='Chart' THEN "
+            "'chart:' || t.name ELSE t.label || ':' || t.file_path END "
+            "|| ' (' || e.type || ' ' || coalesce(json_extract(e.properties,'$.api'), "
+            "json_extract(e.properties,'$.via')) || coalesce(' ' || "
+            "json_extract(e.properties,'$.ci') || coalesce('/' || "
+            "json_extract(e.properties,'$.job'), ''), '') || ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type IN ('SPAWNS','DEPLOYS') ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+#define GPF_ASSERT_RUNS(files, n, want)                                                            \
+    do {                                                                                           \
+        char *got_ = gpf_runs(files, n);                                                           \
+        if (!got_ || strcmp(got_, want) != 0) {                                                    \
+            fprintf(stderr, "runs got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want);           \
+            free(got_);                                                                            \
+            FAIL("SPAWNS / DEPLOYS edge set");                                                     \
+        }                                                                                          \
+        free(got_);                                                                                \
+    } while (0)
+
 #define GPF_CM(name) "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " name "\n"
 #define GPF_KUST "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
 
@@ -1971,6 +2015,105 @@ TEST(probe_make_programs_by_path_spawn) {
                       "build -> werf\n"
                       "check -> tool\n"
                       "generate -> controller-gen");
+    PASS();
+}
+
+/* A script of the repository a command runs SPAWNS that script (its Module):
+ * by its path, through a shell (bash -e FILE), past `env A="$X/y"`; not
+ * itself. CI runs commands too: a GitHub workflow's run: steps from the
+ * workspace (`${{ github.workspace }}`, env literals, working-directory;
+ * an unknown `${{ }}` prefix leaves a Process; no pwsh step, no step of a
+ * Windows job), a composite action's from its directory
+ * (`${{ github.action_path }}`), a decorated Prow job's container command
+ * exec'd from the checkout (`bash -c TEXT` as shell; undecorated: the
+ * directory unknown, so a Process). Their edges carry the CI and the job. */
+TEST(probe_ci_and_scripts_run_scripts) {
+    static const GpfFile files[] = {
+        {"charts/web/Chart.yaml", "apiVersion: v2\nname: web\nversion: 0.1.0\n"},
+        {"hack/lib/helper.sh", "#!/bin/sh\necho helper\n"},
+        {"hack/lint.sh", "#!/bin/sh\necho lint\n"},
+        {"hack/ci/run-e2e.sh", "#!/bin/sh\necho e2e\n"},
+        {"hack/ci/lint.sh", "#!/bin/sh\necho lint\n"},
+        {"ops/apply.sh", "#!/bin/sh\necho apply\n"},
+        {"hack/test.sh", "#!/usr/bin/env bash\n"
+                         "bash -e \"$(dirname \"$0\")/lib/helper.sh\"\n"
+                         "env OUT=\"$TMPDIR/x.rpm\" ./hack/lint.sh\n"},
+        {"hack/e2e.sh", "#!/bin/sh\n"
+                        "./hack/test.sh\n"
+                        "[ -n \"$AGAIN\" ] || AGAIN=1 \"$0\"\n"},
+        {"Makefile", "test:\n"
+                     "\t./hack/test.sh\n"
+                     "\t/bin/bash hack/lint.sh\n"},
+        {".github/workflows/ci.yml",
+         "name: ci\n"
+         "on: [push]\n"
+         "env:\n"
+         "  CHART_DIR: charts/web\n"
+         "jobs:\n"
+         "  test:\n"
+         "    runs-on: ubuntu-latest\n"
+         "    steps:\n"
+         "      - uses: actions/checkout@v4\n"
+         "      - run: ./hack/test.sh\n"
+         "      - name: multi\n"
+         "        run: |\n"
+         "          sh hack/lint.sh --fix\n"
+         "          ${{ github.workspace }}/hack/e2e.sh\n"
+         "          helm upgrade --install web \"$CHART_DIR\"\n"
+         "          ./bin/tool --x\n"
+         "      - working-directory: ops\n"
+         "        run: ./apply.sh\n"
+         "      - run: \"${{ matrix.dir }}/hack/other.sh\"\n"
+         "      - shell: pwsh\n"
+         "        run: ./hack/ci/lint.sh\n"
+         "  win:\n"
+         "    runs-on: windows-latest\n"
+         "    steps:\n"
+         "      - run: ./hack/ci/run-e2e.sh\n"},
+        {".github/actions/setup/setup.sh", "#!/bin/sh\necho setup\n"},
+        {".github/actions/setup/action.yml", "name: setup\n"
+                                             "runs:\n"
+                                             "  using: composite\n"
+                                             "  steps:\n"
+                                             "    - shell: bash\n"
+                                             "      run: ${{ github.action_path }}/setup.sh\n"},
+        {".prow/jobs.yaml", "presubmits:\n"
+                            "  - name: pre-e2e\n"
+                            "    decorate: true\n"
+                            "    spec:\n"
+                            "      containers:\n"
+                            "        - image: x\n"
+                            "          command:\n"
+                            "            - \"./hack/ci/run-e2e.sh\"\n"
+                            "  - name: pre-lint\n"
+                            "    decorate: true\n"
+                            "    spec:\n"
+                            "      containers:\n"
+                            "        - command: [\"bash\", \"-c\", \"./hack/ci/lint.sh\"]\n"
+                            "  - name: pre-raw\n"
+                            "    spec:\n"
+                            "      containers:\n"
+                            "        - command: [\"./hack/ci/run-e2e.sh\"]\n"}};
+    GPF_ASSERT_RUNS(
+        files, 13,
+        "@.github/actions/setup/action.yml -> script:.github/actions/setup/setup.sh "
+        "(SPAWNS shell github-actions)\n"
+        "@.github/workflows/ci.yml -> chart:web (DEPLOYS helm github-actions/test)\n"
+        "@.github/workflows/ci.yml -> proc:other.sh (SPAWNS shell github-actions/test)\n"
+        "@.github/workflows/ci.yml -> proc:tool (SPAWNS shell github-actions/test)\n"
+        "@.github/workflows/ci.yml -> script:hack/e2e.sh (SPAWNS shell github-actions/test)\n"
+        "@.github/workflows/ci.yml -> script:hack/lint.sh (SPAWNS shell github-actions/test)\n"
+        "@.github/workflows/ci.yml -> script:hack/test.sh (SPAWNS shell github-actions/test)\n"
+        "@.github/workflows/ci.yml -> script:ops/apply.sh (SPAWNS shell github-actions/test)\n"
+        "@.prow/jobs.yaml -> proc:run-e2e.sh (SPAWNS exec prow/pre-raw)\n"
+        "@.prow/jobs.yaml -> script:hack/ci/lint.sh (SPAWNS shell prow/pre-lint)\n"
+        "@.prow/jobs.yaml -> script:hack/ci/run-e2e.sh (SPAWNS exec prow/pre-e2e)\n"
+        "@hack/e2e.sh -> script:hack/test.sh (SPAWNS shell)\n"
+        "@hack/test.sh -> script:hack/lib/helper.sh (SPAWNS shell)\n"
+        "@hack/test.sh -> script:hack/lint.sh (SPAWNS shell)\n"
+        "test -> proc:bash (SPAWNS shell)\n"
+        "test -> script:hack/lint.sh (SPAWNS shell)\n"
+        "test -> script:hack/test.sh (SPAWNS shell)");
     PASS();
 }
 
@@ -3779,6 +3922,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_make_recipes_deploy);
     RUN_TEST(probe_shell_programs_by_path_spawn);
     RUN_TEST(probe_make_programs_by_path_spawn);
+    RUN_TEST(probe_ci_and_scripts_run_scripts);
     RUN_TEST(probe_go_installer_deploys_charts);
     RUN_TEST(probe_terraform_helm_release_deploys_its_chart);
     RUN_TEST(probe_helm_templated_objects_are_resources);

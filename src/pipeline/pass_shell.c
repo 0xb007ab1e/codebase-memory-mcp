@@ -1,5 +1,5 @@
 /*
- * pass_shell.c — the Bash (+ Make) infrastructure layer (PHASE 3 P3.2).
+ * pass_shell.c — the Bash (+ Make, CI) infrastructure layer (PHASE 3 P3.2, P3.5).
  *
  * A shell script or a Make recipe that puts manifests, a kustomization or a
  * chart on a cluster DEPLOYS them: an edge from the function running the
@@ -18,8 +18,14 @@
  *
  * A program started by a path (./_build/kubermatic-installer, ${DIR}/x,
  * $(LOCALBIN)/controller-gen) SPAWNS the Process of its name, as
- * pass_spawns.c draws a call that starts a program; a path naming a file of
- * the repository is a script of its own and not linked here.
+ * pass_spawns.c draws a call that starts a program. A program that is a file
+ * of the repository -- the path names one, or a shell runs one
+ * (bash|sh|zsh|ksh|dash [-opts] FILE) -- SPAWNS that script instead: its
+ * Module (the source of its own top-level edges), else its File (P3.5).
+ *
+ * CI (P3.5): the command lines GitHub Actions steps and Prow job containers
+ * run (pass_ci.c reads them) evaluate the same way, from the step's
+ * directory with its env literals; their edges carry the CI and the job.
  *
  * Words are evaluated by constant propagation over the script, nothing is
  * executed: assignments (local / export / readonly / declare, arrays and
@@ -365,9 +371,11 @@ typedef struct {
     const char *via;  /* static */
     int64_t tgt;      /* the target node; 0: the external chart `ext` */
     const char *ext;  /* pass-arena */
-    const char *path; /* pass-arena: the deployed path or chart */
+    const char *path; /* pass-arena: the deployed path or chart; a spawned script */
+    const char *ci;   /* static: the CI running the command; NULL: none */
+    const char *job;  /* pass-arena: its job; NULL: none */
     bool chart;
-    bool spawn; /* SPAWNS the Process `ext`, not DEPLOYS */
+    bool spawn; /* SPAWNS the script `tgt` / the Process `ext`, not DEPLOYS */
 } sh_hit_t;
 
 typedef struct {
@@ -438,7 +446,10 @@ typedef struct {
     const char *file;   /* the script / Makefile path */
     const char *script; /* $0: anchored script path; NULL: none (Make) */
     const char *sdir;   /* the script's directory */
-    int line_base;      /* Make: the recipe line's row */
+    int line_base;      /* Make / CI: the text's first row */
+    const char *ci;     /* the CI running the text (static); NULL: none */
+    const char *job;    /* its job; NULL: none */
+    bool exec;          /* an argv exec'd without a shell (Prow) */
     int in_func;
     CBMHashTable *env; /* name -> const sh_val_t * */
     sh_undo_t *undo;
@@ -1292,21 +1303,30 @@ static const char *sh_cd_target(sh_t *s, const char *v, sh_cwd_t *out) {
 
 /* ── Deploy commands ───────────────────────────────────────────────── */
 
-static void sh_hit(sh_t *s, TSNode cmd, const char *via, const sh_target_t *t, const char *ext,
-                   bool chart) {
+/* Record hit `x` of command `cmd`: its file, line and CI context are the
+ * state's; ext / path are copied. */
+static void sh_hit_push(sh_t *s, TSNode cmd, sh_hit_t x) {
     sh_hits_t *h = s->hits;
     if (!sh_grow((void **)&h->items, &h->cap, h->count, sizeof(*h->items))) {
         return;
     }
-    const char *path = t ? t->path : ext;
-    h->items[h->count++] =
-        (sh_hit_t){.file = s->file,
-                   .line = (int)ts_node_start_point(cmd).row + SKIP_ONE + s->line_base,
-                   .via = via,
-                   .tgt = t ? t->id : 0,
-                   .ext = ext ? cbm_arena_strdup(&h->arena, ext) : NULL,
-                   .path = path ? cbm_arena_strdup(&h->arena, path) : NULL,
-                   .chart = chart};
+    x.file = s->file;
+    x.line = (int)ts_node_start_point(cmd).row + SKIP_ONE + s->line_base;
+    x.ext = x.ext ? cbm_arena_strdup(&h->arena, x.ext) : NULL;
+    x.path = x.path ? cbm_arena_strdup(&h->arena, x.path) : NULL;
+    x.ci = s->ci;
+    x.job = s->job ? cbm_arena_strdup(&h->arena, s->job) : NULL;
+    h->items[h->count++] = x;
+}
+
+static void sh_hit(sh_t *s, TSNode cmd, const char *via, const sh_target_t *t, const char *ext,
+                   bool chart) {
+    sh_hit_push(s, cmd,
+                (sh_hit_t){.via = via,
+                           .tgt = t ? t->id : 0,
+                           .ext = ext,
+                           .path = t ? t->path : ext,
+                           .chart = chart});
 }
 
 static void sh_hit_all(sh_t *s, TSNode cmd, const char *via, const sh_targets_t *ts, bool chart) {
@@ -1336,10 +1356,23 @@ static bool sh_numberish(const char *v) {
     return true;
 }
 
+/* Word i of argv is an option, assignment or count a wrapper takes before
+ * the program: by its value, or -- the value unknown -- by its text
+ * (env OUT="$TMP/x" prog: the assignment is no program). */
+static bool sh_wrapper_arg(const sh_t *s, const sh_argv_t *a, int i) {
+    const char *v = a->v[i];
+    if (v) {
+        return v[0] == '-' || strchr(v, '=') || sh_numberish(v);
+    }
+    uint32_t b = a->span[PAIR_LEN * i];
+    uint32_t e = a->span[PAIR_LEN * i + SKIP_ONE];
+    return e > b && (s->src[b] == '-' || memchr(s->src + b, '=', e - b));
+}
+
 /* The index of the program argv runs, past wrappers (time, sudo, retry N,
  * timeout D, env A=B, ...); -1 when argv has none. Its value may be unknown
  * (NULL). */
-static int sh_program(const sh_argv_t *a) {
+static int sh_program(const sh_t *s, const sh_argv_t *a) {
     static const char *const wrappers[] = {"time",    "sudo", "exec",    "nice",  "nohup",
                                            "command", "env",  "timeout", "retry", NULL};
     int i = 0;
@@ -1352,8 +1385,7 @@ static int sh_program(const sh_argv_t *a) {
             return -1; /* command -v X: is there an X, not a run of it */
         }
         i++;
-        while (i < a->n && a->v[i] &&
-               (a->v[i][0] == '-' || strchr(a->v[i], '=') || sh_numberish(a->v[i]))) {
+        while (i < a->n && sh_wrapper_arg(s, a, i)) {
             i++;
         }
     }
@@ -1679,7 +1711,7 @@ static void sh_find(sh_t *s, TSNode cmd, const sh_argv_t *a, int prog) {
         sh_argv_push(&e, a->v[i], a->split[i], a->span[PAIR_LEN * i],
                      a->span[PAIR_LEN * i + SKIP_ONE]);
     }
-    int p = sh_program(&e);
+    int p = sh_program(s, &e);
     if (p >= 0 && e.v[p] && strcmp(sh_basename(e.v[p]), "kubectl") == 0) {
         sh_kubectl_t k = {0};
         sh_kubectl_parse(&e, p + SKIP_ONE, &k);
@@ -1701,7 +1733,7 @@ static void sh_find(sh_t *s, TSNode cmd, const sh_argv_t *a, int prog) {
 static void sh_deploy_command(sh_t *s, TSNode cmd, const sh_argv_t *a, const sh_src_t *in,
                               sh_src_t *out) {
     *out = (sh_src_t){SH_SRC_NONE, NULL, NULL};
-    int prog = sh_program(a);
+    int prog = sh_program(s, a);
     if (prog < 0 || !a->v[prog]) {
         return;
     }
@@ -1728,39 +1760,74 @@ static void sh_deploy_command(sh_t *s, TSNode cmd, const sh_argv_t *a, const sh_
     }
 }
 
-/* A repository file: the path names a File node. */
-static int sh_t_repo_file(sh_t *s, const char *path, const sh_find_t *f, sh_targets_t *out) {
-    (void)f;
-    int64_t id = (int64_t)(intptr_t)cbm_ht_get(s->ix->file_ids, path);
-    if (id <= 0) {
-        return 0;
+/* The File node a repository path names; 0: none. */
+static int64_t sh_repo_file_id(const sh_t *s, const char *path) {
+    return (int64_t)(intptr_t)cbm_ht_get(s->ix->file_ids, path);
+}
+
+static const char *const SH_SHELLS[] = {"bash", "sh", "zsh", "ksh", "dash", NULL};
+
+/* The program is a script of the repository -- its path names a file of it,
+ * or a shell runs one (bash [-opts] FILE; -c TEXT is no file) -- resolved to
+ * exactly one file: that script is spawned. */
+static void sh_spawn_script(sh_t *s, TSNode cmd, const sh_argv_t *a, int p) {
+    const char *v = a->v[p];
+    const char *path = NULL;
+    if (sh_in(sh_basename(v), SH_SHELLS)) {
+        int j = p + SKIP_ONE;
+        while (j < a->n && a->v[j] && a->v[j][0] == '-' && !sh_eq(a->v[j], "-c")) {
+            j++;
+        }
+        path = j < a->n && !sh_eq(a->v[j], "-c") ? a->v[j] : NULL;
+    } else if (strchr(v, '/') && !strpbrk(v, "*?[")) {
+        path = v;
     }
-    sh_targets_push(out, id, path);
-    return SKIP_ONE;
+    if (!path) {
+        return;
+    }
+    const char *c[PAIR_LEN] = {NULL, NULL};
+    int n = sh_candidates(s, path, c);
+    const char *hit = NULL;
+    int64_t id = 0;
+    int found = 0;
+    for (int i = 0; i < n; i++) {
+        int64_t f = sh_repo_file_id(s, c[i]);
+        if (f > 0) {
+            found++;
+            id = f;
+            hit = c[i];
+        }
+    }
+    if (found == SKIP_ONE) {
+        sh_hit_push(s, cmd,
+                    (sh_hit_t){.via = s->exec ? "exec" : "shell",
+                               .tgt = id,
+                               .ext = sh_basename(hit),
+                               .path = hit,
+                               .spawn = true});
+    }
 }
 
 /* A program started by a path (./_build/x, ${DIR}/x, $(LOCALBIN)/x) SPAWNS
  * the Process of its name -- the value's last segment, or, the value
  * unknown, the word's literal last segment. A path naming a file of the
- * repository is a script of its own, not linked here. */
+ * repository is a script (sh_spawn_script), not a Process. */
 static void sh_spawn(sh_t *s, TSNode cmd, const sh_argv_t *a) {
-    int p = sh_program(a);
+    int p = sh_program(s, a);
     if (p < 0) {
         return;
     }
     const char *v = a->v[p];
     const char *name = NULL;
     if (v) {
+        sh_spawn_script(s, cmd, a, p);
         if (!strchr(v, '/') || strpbrk(v, "*?[")) {
             return;
         }
         const char *c[PAIR_LEN] = {NULL, NULL};
         int n = sh_candidates(s, v, c);
         for (int i = 0; i < n; i++) {
-            sh_targets_t ts = {0};
-            int hit = sh_t_repo_file(s, c[i], NULL, &ts);
-            cbm_free(CBM_MEM_CLASS_OTHER, ts.items);
-            if (hit) {
+            if (sh_repo_file_id(s, c[i]) > 0) {
                 return;
             }
         }
@@ -1786,15 +1853,7 @@ static void sh_spawn(sh_t *s, TSNode cmd, const sh_argv_t *a) {
     if (!name || !name[0] || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
         return;
     }
-    sh_hits_t *h = s->hits;
-    if (sh_grow((void **)&h->items, &h->cap, h->count, sizeof(*h->items))) {
-        h->items[h->count++] =
-            (sh_hit_t){.file = s->file,
-                       .line = (int)ts_node_start_point(cmd).row + SKIP_ONE + s->line_base,
-                       .via = "shell",
-                       .ext = cbm_arena_strdup(&h->arena, name),
-                       .spawn = true};
-    }
+    sh_hit_push(s, cmd, (sh_hit_t){.via = s->exec ? "exec" : "shell", .ext = name, .spawn = true});
 }
 
 /* ── Statements ────────────────────────────────────────────────────── */
@@ -2633,8 +2692,9 @@ static void sh_makefile(sh_pass_t *p, const char *rel, const char *src, size_t l
         uint32_t e = m.lines[r].e;
         const char *raw = cbm_arena_strndup(&a, src + b, e - b);
         const char *text = raw ? mk_expand(&m, raw) : NULL;
-        if (!text || (!strchr(text, '/') && !sh_mentions_deploy_tool(text, strlen(text)))) {
-            continue; /* neither a deploy nor a program started by a path */
+        if (!text || (!strchr(text, '/') && !strstr(text, "sh") &&
+                      !sh_mentions_deploy_tool(text, strlen(text)))) {
+            continue; /* neither a deploy, a program started by a path, nor a shell */
         }
         size_t tl = strlen(text);
         char *buf = cbm_arena_alloc(&a, tl + CBM_SZ_16);
@@ -2734,23 +2794,53 @@ static int64_t sh_external_chart(cbm_pipeline_ctx_t *ctx, const char *name, cons
                                 "{\"source\":\"helm\",\"external\":true}");
 }
 
-/* SPAWNS to the Process of `program`, as pass_spawns.c draws it. */
-static int sh_link_spawn(cbm_pipeline_ctx_t *ctx, int64_t src, const sh_hit_t *x) {
+/* A hit's CI context as JSON members (`,"ci":..,"job":..`); "" for none. */
+static void sh_ci_props(const sh_hit_t *x, char *out, size_t sz) {
+    out[0] = '\0';
+    if (!x->ci) {
+        return;
+    }
+    char job[CBM_SZ_512];
+    cbm_json_escape(job, (int)sizeof(job), x->job ? x->job : "");
+    if (x->job) {
+        snprintf(out, sz, ",\"ci\":\"%s\",\"job\":\"%s\"", x->ci, job);
+    } else {
+        snprintf(out, sz, ",\"ci\":\"%s\"", x->ci);
+    }
+}
+
+/* SPAWNS to the script `x->tgt` (its Module, else its File) or to the
+ * Process of `x->ext`, as pass_spawns.c draws it. */
+static int sh_link_spawn(cbm_pipeline_ctx_t *ctx, int64_t src, const sh_hit_t *x,
+                         CBMHashTable *modules) {
     char program[CBM_SZ_128];
     cbm_json_escape(program, (int)sizeof(program), x->ext);
-    char qn[CBM_SZ_256];
-    snprintf(qn, sizeof(qn), "__process__%s", x->ext);
-    char node_props[CBM_SZ_256];
-    snprintf(node_props, sizeof(node_props), "{\"program\":\"%s\"}", program);
-    int64_t process = cbm_gbuf_upsert_node(ctx->gbuf, "Process", x->ext, qn, "", 0, 0, node_props);
-    if (process <= 0) {
+    char path[CBM_SZ_1K + CBM_SZ_16];
+    path[0] = '\0';
+    int64_t tgt = 0;
+    if (x->tgt > 0) {
+        int64_t mod = (int64_t)(intptr_t)cbm_ht_get(modules, x->path);
+        tgt = mod > 0 ? mod : x->tgt;
+        char esc[CBM_SZ_1K];
+        cbm_json_escape(esc, (int)sizeof(esc), x->path);
+        snprintf(path, sizeof(path), ",\"path\":\"%s\"", esc);
+    } else {
+        char qn[CBM_SZ_256];
+        snprintf(qn, sizeof(qn), "__process__%s", x->ext);
+        char node_props[CBM_SZ_256];
+        snprintf(node_props, sizeof(node_props), "{\"program\":\"%s\"}", program);
+        tgt = cbm_gbuf_upsert_node(ctx->gbuf, "Process", x->ext, qn, "", 0, 0, node_props);
+    }
+    if (tgt <= 0 || tgt == src) {
         return 0;
     }
-    char props[CBM_SZ_512];
+    char ci[CBM_SZ_1K];
+    sh_ci_props(x, ci, sizeof(ci));
+    char props[CBM_SZ_4K];
     snprintf(props, sizeof(props),
-             "{\"api\":\"%s\",\"program\":\"%s\",\"line\":%d,\"confidence\":1.00}", x->via, program,
-             x->line);
-    cbm_gbuf_insert_edge(ctx->gbuf, src, process, "SPAWNS", props);
+             "{\"api\":\"%s\",\"program\":\"%s\"%s%s,\"line\":%d,\"confidence\":1.00}", x->via,
+             program, path, ci, x->line);
+    cbm_gbuf_insert_edge(ctx->gbuf, src, tgt, "SPAWNS", props);
     return SKIP_ONE;
 }
 
@@ -2767,7 +2857,11 @@ static int sh_link(cbm_pipeline_ctx_t *ctx, const sh_hits_t *h) {
         return 0;
     }
     for (int i = 0; i < h->count; i++) {
-        cbm_ht_set(files, h->items[i].file, (void *)h->items[i].file);
+        const sh_hit_t *x = &h->items[i];
+        cbm_ht_set(files, x->file, (void *)x->file);
+        if (x->spawn && x->tgt > 0) {
+            cbm_ht_set(files, x->path, (void *)x->path); /* a spawned script's Module */
+        }
     }
     sh_span_t *spans = NULL;
     int n = 0;
@@ -2800,7 +2894,7 @@ static int sh_link(cbm_pipeline_ctx_t *ctx, const sh_hits_t *h) {
         const sh_hit_t *x = &h->items[i];
         int64_t src = sh_source(ctx, spans, n, modules, x->file, x->line);
         if (x->spawn) {
-            edges += src > 0 ? sh_link_spawn(ctx, src, x) : 0;
+            edges += src > 0 ? sh_link_spawn(ctx, src, x, modules) : 0;
             continue;
         }
         int64_t tgt = x->tgt > 0 ? x->tgt : sh_external_chart(ctx, x->ext, x->file);
@@ -2808,10 +2902,13 @@ static int sh_link(cbm_pipeline_ctx_t *ctx, const sh_hits_t *h) {
             continue;
         }
         char esc[CBM_SZ_1K];
-        char props[CBM_SZ_2K];
+        char ci[CBM_SZ_1K];
+        char props[CBM_SZ_4K];
         cbm_json_escape(esc, (int)sizeof(esc), x->path ? x->path : "");
-        snprintf(props, sizeof(props), "{\"via\":\"%s\",\"%s\":\"%s\"%s,\"line\":%d}", x->via,
-                 x->chart ? "chart" : "path", esc, x->tgt > 0 ? "" : ",\"external\":true", x->line);
+        sh_ci_props(x, ci, sizeof(ci));
+        snprintf(props, sizeof(props), "{\"via\":\"%s\",\"%s\":\"%s\"%s%s,\"line\":%d}", x->via,
+                 x->chart ? "chart" : "path", esc, x->tgt > 0 ? "" : ",\"external\":true", ci,
+                 x->line);
         cbm_gbuf_insert_edge(ctx->gbuf, src, tgt, "DEPLOYS", props);
         edges++;
     }
@@ -2821,15 +2918,93 @@ static int sh_link(cbm_pipeline_ctx_t *ctx, const sh_hits_t *h) {
     return edges;
 }
 
+/* ── CI configurations (pass_ci.c) ─────────────────────────────────── */
+
+typedef struct {
+    sh_pass_t *p;
+    const char *rel;
+    CBMArena *a;
+} sh_ci_t;
+
+static void sh_ci_var(sh_t *s, const char *name, const char *value) {
+    sh_val_t *v = value ? cbm_arena_alloc(s->a, sizeof(*v)) : NULL;
+    if (v) {
+        *v = (sh_val_t){value, NULL, 0};
+    }
+    sh_set(s, name, v ? v : &SH_UNKNOWN_VAL, false);
+}
+
+/* A command line CI runs: evaluated from its directory with its variables;
+ * $0 is unknown. */
+static void sh_ci_cmd(const cbm_ci_cmd_t *cmd, void *ud) {
+    sh_ci_t *x = ud;
+    sh_t s;
+    sh_state_init(&s, x->p, x->a, x->rel);
+    if (s.env) {
+        s.line_base = cmd->row;
+        s.ci = cmd->ci;
+        s.job = cmd->job;
+        s.exec = cmd->exec;
+        const char *wd = cmd->wd ? sh_join(x->a, "", cmd->wd) : NULL;
+        s.cwd = wd ? (sh_cwd_t){SH_AT, wd} : (sh_cwd_t){SH_LOST, NULL};
+        if (strcmp(cmd->ci, "github-actions") == 0) {
+            sh_ci_var(&s, "GITHUB_WORKSPACE", SH_ROOT);
+            if (cmd->action_dir) {
+                sh_ci_var(&s, "GITHUB_ACTION_PATH", sh_anchor(x->a, cmd->action_dir));
+            }
+        }
+        for (int i = 0; i < cmd->nenv; i++) {
+            sh_ci_var(&s, cmd->env[PAIR_LEN * i], cmd->env[PAIR_LEN * i + SKIP_ONE]);
+        }
+        sh_run(&s, x->p->parser, cmd->text, cmd->len);
+    }
+    sh_state_free(&s);
+}
+
+static void sh_ci_file(sh_pass_t *p, const char *rel, const char *src, size_t len) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    sh_ci_t x = {.p = p, .rel = rel, .a = &a};
+    cbm_ci_commands(&a, rel, src, len, sh_ci_cmd, &x);
+    cbm_arena_destroy(&a);
+}
+
+/* Prow job configs: the files whose top-level keys (YAML Variables) include
+ * presubmits / postsubmits / periodics. */
+static CBMHashTable *sh_prow_files(cbm_pipeline_ctx_t *ctx) {
+    static const char *const keys[] = {"presubmits", "postsubmits", "periodics", NULL};
+    CBMHashTable *out = NULL;
+    for (int k = 0; keys[k]; k++) {
+        const cbm_gbuf_node_t **nodes = NULL;
+        int n = 0;
+        if (cbm_gbuf_find_by_name(ctx->gbuf, keys[k], &nodes, &n) != 0) {
+            continue;
+        }
+        for (int i = 0; i < n; i++) {
+            const char *fp = nodes[i]->file_path;
+            if (!fp || !sh_eq(nodes[i]->label, "Variable")) {
+                continue;
+            }
+            out = out ? out : cbm_ht_create(0);
+            if (out) {
+                cbm_ht_set(out, fp, (void *)fp);
+            }
+        }
+    }
+    return out;
+}
+
 void cbm_pipeline_pass_shell(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                              int file_count) {
     sh_index_t ix = {0};
     sh_hits_t hits = {0};
     cbm_arena_init(&hits.arena);
     sh_pass_t p = {.ix = &ix, .hits = &hits, .parser = NULL};
+    CBMHashTable *prow = sh_prow_files(ctx);
     for (int i = 0; i < file_count; i++) {
         CBMLanguage lang = files[i].language;
-        if (lang != CBM_LANG_BASH && lang != CBM_LANG_MAKEFILE) {
+        bool ci = cbm_ci_path(files[i].rel_path) || (prow && cbm_ht_get(prow, files[i].rel_path));
+        if (lang != CBM_LANG_BASH && lang != CBM_LANG_MAKEFILE && !ci) {
             continue;
         }
         size_t len = 0;
@@ -2843,13 +3018,18 @@ void cbm_pipeline_pass_shell(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
             p.parser = ts_parser_new();
         }
         if (p.ix_ok && p.parser) {
-            if (lang == CBM_LANG_BASH) {
+            if (ci) {
+                sh_ci_file(&p, files[i].rel_path, src, len);
+            } else if (lang == CBM_LANG_BASH) {
                 sh_script(&p, files[i].rel_path, src, len);
             } else {
                 sh_makefile(&p, files[i].rel_path, src, len);
             }
         }
         cbm_free(CBM_MEM_CLASS_OTHER, src);
+    }
+    if (prow) {
+        cbm_ht_free(prow);
     }
     int edges = hits.count > 0 ? sh_link(ctx, &hits) : 0;
     if (p.parser) {

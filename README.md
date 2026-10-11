@@ -233,7 +233,7 @@ The install script placed beside the binary is **reported, not deleted** — uni
 - `USAGE` — an identifier is used, but a unique callable target is not proven (including ambiguous or complex expressions)
 - `IMPORTS`, `DEFINES`, `IMPLEMENTS`, `INHERITS`
 - `HTTP_CALLS`, `ASYNC_CALLS` (cross-service)
-- `SPAWNS` — the caller starts another program (`subprocess.run`, `exec.Command`, `posix_spawn`, `Process.Start`, ...); the target is a `Process` node named after the program, or `<dynamic>` when the program is not a literal
+- `SPAWNS` — the caller starts another program (`subprocess.run`, `exec.Command`, `posix_spawn`, `Process.Start`, a shell command or Make recipe running a program by path, ...); the target is a `Process` node named after the program, or `<dynamic>` when the program is not a literal. When a shell script, Make recipe, GitHub Actions step or Prow job runs a script of the repository (`./hack/x.sh`, `bash hack/x.sh`), the target is that script's `Module` (else its `File`), and edges from CI carry `ci` and `job`
 - `INFRA_MAPS` — a Kubernetes Service to each workload whose pod labels carry every `key: value` of the Service's selector, within one namespace
 - `DEPENDS_ON` — a Helm chart to the charts it declares (the local chart for a resolvable `file://` repository, otherwise an external `Chart`; the edge keeps `repository`), and a `go.mod` / `requirements.txt` file to an external `Package`
 - `EMITS`, `LISTENS_ON` (channels)

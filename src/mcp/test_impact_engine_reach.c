@@ -22,8 +22,9 @@
  * reached, never expanded (their caller is the runner's main). */
 #define TE_RUNNER_ROLE_PREFIX "tf_maybe_run_"
 
-/* SPAWNS only carries reach from a Process node, which enters the walk
- * through te_spawn_lift alone. */
+/* SPAWNS carries reach from a Process node, which enters the walk through
+ * te_spawn_lift alone, and from a script of the repository (its Module /
+ * File, pass_shell.c) to whoever runs it. */
 static const char *const te_walk_types[] = {"CALLS",          "ASYNC_CALLS", "USAGE",
                                             "CALL_REFERENCE", "READS",       "SPAWNS"};
 

@@ -1042,10 +1042,37 @@ int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
  * Runs after USAGE resolution. */
 int cbm_pipeline_pass_operator(cbm_pipeline_ctx_t *ctx);
 
-/* Shell scripts and Make recipes (pass_shell.c): the commands that put
- * manifests, kustomizations or charts on a cluster DEPLOYS them. Run at the
- * end of the K8s pass, over the same files. */
+/* Shell scripts, Make recipes and the commands CI runs (pass_shell.c): a
+ * command that puts manifests, kustomizations or charts on a cluster DEPLOYS
+ * them; one that starts a program by a path, or a script of the repository,
+ * SPAWNS it. Run at the end of the K8s pass, over the same files. */
 void cbm_pipeline_pass_shell(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
+
+/* One command line a CI configuration runs (pass_ci.c). */
+typedef struct {
+    const char *ci;         /* "github-actions" | "prow" */
+    const char *job;        /* the job; NULL: none (a composite action's step) */
+    const char *text;       /* shell text; CBM_SZ_16 zero bytes past len */
+    size_t len;             /* bytes of text */
+    int row;                /* 0-based source row of the text's first line */
+    const char *wd;         /* start directory, repo-relative ("" = root); NULL: unknown */
+    const char *action_dir; /* a composite action's directory; NULL: none */
+    const char **env;       /* name, value pairs (a value NULL: unknown) */
+    int nenv;               /* pairs in env */
+    bool exec;              /* an argv exec'd without a shell, quoted into text */
+} cbm_ci_cmd_t;
+
+typedef void (*cbm_ci_cmd_fn)(const cbm_ci_cmd_t *cmd, void *ud);
+
+/* `rel` is a CI configuration by its path: a GitHub workflow
+ * (.github/workflows/<name>.yml|yaml) or a composite action (action.yml|yaml). */
+bool cbm_ci_path(const char *rel);
+
+/* Hand each command line the CI configuration `rel` (YAML text src) runs to
+ * fn: GitHub Actions run: steps for a workflow or composite action, else
+ * Prow job containers. Strings live in arena `a`. */
+void cbm_ci_commands(CBMArena *a, const char *rel, const char *src, size_t len, cbm_ci_cmd_fn fn,
+                     void *ud);
 
 /* Terraform / OpenTofu modules (pass_terraform.c): a helm_release DEPLOYS its
  * chart. Run at the end of the K8s pass, over the same files. */
