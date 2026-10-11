@@ -512,14 +512,18 @@ void cbm_doclinks_resolve_file(cbm_doclinks_t *dl, int file_idx, const CBMFileRe
             }
             if (cbm_doclink_syntax_ships(link->syntax)) {
                 atomic_fetch_add_explicit(&dl->mentions, 1, memory_order_relaxed);
-                mentions[nm++] = (doclink_mention_t){.src = src->id,
-                                                     .tgt = out.target->id,
-                                                     .line = link->line,
-                                                     .target_first = out.target_first,
-                                                     .target_last = out.target_last,
-                                                     .via = R->via ? R->via : "doc_comment",
-                                                     .syntax = link->syntax,
-                                                     .exact = out.exact};
+                mentions[nm++] =
+                    (doclink_mention_t){.src = src->id,
+                                        .tgt = out.target->id,
+                                        .line = link->line,
+                                        .target_first = out.target_first,
+                                        .target_last = out.target_last,
+                                        .via = cbm_doclink_syntax_via(link->syntax)
+                                                   ? cbm_doclink_syntax_via(link->syntax)
+                                               : R->via ? R->via
+                                                        : "doc_comment",
+                                        .syntax = link->syntax,
+                                        .exact = out.exact};
                 continue;
             }
             /* the ship gate: resolved, but this link family is below the

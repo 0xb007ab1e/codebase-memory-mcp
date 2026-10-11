@@ -83,72 +83,87 @@
  *
  * The enum below and the family table (doclink.c) are both generated from this
  * list, so a value cannot exist without its name and its gate. */
-#define CBM_DOCLINK_FAMILY_LIST(X)                                                             \
-    /* csharp */                                                                               \
-    X(CBM_DOCLINK_CS_SEE, CBM_LANG_CSHARP, "see", false, true, "MENTIONS")                     \
-    X(CBM_DOCLINK_CS_SEEALSO, CBM_LANG_CSHARP, "seealso", false, true, "MENTIONS")             \
-    X(CBM_DOCLINK_CS_EXCEPTION, CBM_LANG_CSHARP, "exception", false, true, "MENTIONS")         \
-    X(CBM_DOCLINK_CS_INHERITDOC, CBM_LANG_CSHARP, "inheritdoc", false, true, "MENTIONS")       \
-    /* go (doclink_go.c): [Name] doc links; held until its held-out audit passes */            \
-    X(CBM_DOCLINK_GO_DOC_LINK, CBM_LANG_GO, "doc_link", false, false, "MENTIONS")              \
-    /* java and kotlin (doclink_jvm.c): Javadoc and KDoc; held until their audit passes */     \
-    X(CBM_DOCLINK_JAVA_LINK, CBM_LANG_JAVA, "link", false, false, "MENTIONS")                  \
-    X(CBM_DOCLINK_JAVA_LINKPLAIN, CBM_LANG_JAVA, "linkplain", false, false, "MENTIONS")        \
-    X(CBM_DOCLINK_JAVA_SEE, CBM_LANG_JAVA, "see", false, false, "MENTIONS")                    \
-    X(CBM_DOCLINK_JAVA_THROWS, CBM_LANG_JAVA, "throws", false, false, "MENTIONS")              \
-    X(CBM_DOCLINK_JAVA_VALUE, CBM_LANG_JAVA, "value", false, false, "MENTIONS")                \
-    X(CBM_DOCLINK_KT_KDOC_LINK, CBM_LANG_KOTLIN, "kdoc_link", false, false, "MENTIONS")        \
-    X(CBM_DOCLINK_KT_SEE, CBM_LANG_KOTLIN, "see", false, false, "MENTIONS")                    \
-    X(CBM_DOCLINK_KT_THROWS, CBM_LANG_KOTLIN, "throws", false, false, "MENTIONS")              \
-    X(CBM_DOCLINK_KT_SAMPLE, CBM_LANG_KOTLIN, "sample", false, false, "MENTIONS")              \
-    /* rust (doclink_rs.c): intra-doc links; held until their audit passes */                  \
-    X(CBM_DOCLINK_RS_INTRA_DOC, CBM_LANG_RUST, "intra_doc", false, false, "MENTIONS")          \
-    X(CBM_DOCLINK_RS_LINK_DEF, CBM_LANG_RUST, "link_def", false, false, "MENTIONS")            \
-    /* perl (doclink_perl.c): POD L<> codes; held until their audit passes */                  \
-    X(CBM_DOCLINK_PERL_POD_L, CBM_LANG_PERL, "pod_L", false, false, "MENTIONS")                \
-    /* typescript and javascript (doclink_ts.c): JSDoc/TSDoc; held until their audit */        \
-    X(CBM_DOCLINK_TS_LINK, CBM_LANG_TYPESCRIPT, "link", false, false, "MENTIONS")              \
-    X(CBM_DOCLINK_TS_LINKCODE, CBM_LANG_TYPESCRIPT, "linkcode", false, false, "MENTIONS")      \
-    X(CBM_DOCLINK_TS_SEE, CBM_LANG_TYPESCRIPT, "see", false, false, "MENTIONS")                \
-    /* php (doclink_php.c): PHPDoc @see and {@see}; held until their audit passes */           \
-    X(CBM_DOCLINK_PHP_SEE, CBM_LANG_PHP, "see", false, false, "MENTIONS")                      \
-    /* c (doclink_c.c): Doxygen @ref and @see in .c and .h files; held until their audit */    \
-    X(CBM_DOCLINK_C_REF, CBM_LANG_C, "doxygen_ref", false, false, "MENTIONS")                  \
-    X(CBM_DOCLINK_C_SEE, CBM_LANG_C, "see", false, false, "MENTIONS")                          \
-    /* markdown (doclink_md.c): what a document's text names explicitly */                     \
-    X(CBM_DOCLINK_MD_LINK, CBM_LANG_MARKDOWN, "link", false, true, "MENTIONS")                 \
-    X(CBM_DOCLINK_MD_PATH, CBM_LANG_MARKDOWN, "path", false, true, "MENTIONS")                 \
-    X(CBM_DOCLINK_MD_CODE_PATH, CBM_LANG_MARKDOWN, "code_path", false, true, "MENTIONS")       \
-    /* a code span naming a file or directory alone (`config.yaml`, `doc/`) */                 \
-    X(CBM_DOCLINK_MD_BARE_PATH, CBM_LANG_MARKDOWN, "bare_path", false, false, "MENTIONS")      \
-    X(CBM_DOCLINK_MD_CODE_NAME, CBM_LANG_MARKDOWN, "code_name", false, true, "MENTIONS")       \
-    /* an ADR's own "supersedes" / "replaces" statement, opening its line or field */          \
-    /* and naming a record directly (doc_adr.c): ADR -> ADR */                                 \
-    X(CBM_DOCLINK_MD_SUPERSEDES, CBM_LANG_MARKDOWN, "supersedes", false, true, "SUPERSEDES")   \
-    /* the same words in running prose ("this record supersedes ADR-3") */                     \
-    X(CBM_DOCLINK_MD_SUPERSEDES_PROSE, CBM_LANG_MARKDOWN, "supersedes_prose", false, false,    \
-      "SUPERSEDES")                                                                            \
-    /* pdf (doc_pdf.c): structural mentions in a page's text; pdf_name (bare      */           \
-    /* names) only decides which line fragments a cross-line join replaces        */           \
-    X(CBM_DOCLINK_PDF_PATH, CBM_LANG_PDF, "pdf_path", false, true, "MENTIONS")                 \
-    X(CBM_DOCLINK_PDF_FILE, CBM_LANG_PDF, "pdf_file", false, true, "MENTIONS")                 \
-    X(CBM_DOCLINK_PDF_QN, CBM_LANG_PDF, "pdf_qn", false, true, "MENTIONS")                     \
-    X(CBM_DOCLINK_PDF_NAME, CBM_LANG_PDF, "pdf_name", false, false, "MENTIONS")                \
-    /* restructuredtext (doclink_rst.c): Sphinx domain markup, directives, inline literals */  \
-    X(CBM_DOCLINK_RST_ROLE, CBM_LANG_RST, "role", false, true, "MENTIONS")                     \
-    X(CBM_DOCLINK_RST_OBJECT, CBM_LANG_RST, "object", false, true, "MENTIONS")                 \
-    X(CBM_DOCLINK_RST_AUTODOC, CBM_LANG_RST, "autodoc", false, true, "MENTIONS")               \
-    X(CBM_DOCLINK_RST_INCLUDE, CBM_LANG_RST, "include", false, false, "MENTIONS")              \
-    X(CBM_DOCLINK_RST_LITERALINCLUDE, CBM_LANG_RST, "literalinclude", false, true, "MENTIONS") \
-    X(CBM_DOCLINK_RST_KERNEL_DOC, CBM_LANG_RST, "kernel_doc", false, false, "MENTIONS")        \
-    X(CBM_DOCLINK_RST_CODE_PATH, CBM_LANG_RST, "code_path", false, true, "MENTIONS")           \
-    X(CBM_DOCLINK_RST_CODE_NAME, CBM_LANG_RST, "code_name", false, true, "MENTIONS")           \
-    /* asciidoc (doc_adoc.c): includes, Antora API attributes, monospace spans */              \
-    X(CBM_DOCLINK_ADOC_INCLUDE, CBM_LANG_ASCIIDOC, "include", false, true, "MENTIONS")         \
-    X(CBM_DOCLINK_ADOC_ATTRIBUTE, CBM_LANG_ASCIIDOC, "attribute", false, false, "MENTIONS")    \
-    X(CBM_DOCLINK_ADOC_CODE_PATH, CBM_LANG_ASCIIDOC, "code_path", false, false, "MENTIONS")    \
-    X(CBM_DOCLINK_ADOC_CODE_NAME, CBM_LANG_ASCIIDOC, "code_name", false, false, "MENTIONS")    \
-    /* any language (CBM_LANG_COUNT): a URL is never an edge */                                \
+#define CBM_DOCLINK_FAMILY_LIST(X)                                                               \
+    /* csharp */                                                                                 \
+    X(CBM_DOCLINK_CS_SEE, CBM_LANG_CSHARP, "see", false, true, "MENTIONS")                       \
+    X(CBM_DOCLINK_CS_SEEALSO, CBM_LANG_CSHARP, "seealso", false, true, "MENTIONS")               \
+    X(CBM_DOCLINK_CS_EXCEPTION, CBM_LANG_CSHARP, "exception", false, true, "MENTIONS")           \
+    X(CBM_DOCLINK_CS_INHERITDOC, CBM_LANG_CSHARP, "inheritdoc", false, true, "MENTIONS")         \
+    /* go (doclink_go.c): [Name] doc links; held until its held-out audit passes */              \
+    X(CBM_DOCLINK_GO_DOC_LINK, CBM_LANG_GO, "doc_link", false, false, "MENTIONS")                \
+    /* java and kotlin (doclink_jvm.c): Javadoc and KDoc; held until their audit passes */       \
+    X(CBM_DOCLINK_JAVA_LINK, CBM_LANG_JAVA, "link", false, false, "MENTIONS")                    \
+    X(CBM_DOCLINK_JAVA_LINKPLAIN, CBM_LANG_JAVA, "linkplain", false, false, "MENTIONS")          \
+    X(CBM_DOCLINK_JAVA_SEE, CBM_LANG_JAVA, "see", false, false, "MENTIONS")                      \
+    X(CBM_DOCLINK_JAVA_THROWS, CBM_LANG_JAVA, "throws", false, false, "MENTIONS")                \
+    X(CBM_DOCLINK_JAVA_VALUE, CBM_LANG_JAVA, "value", false, false, "MENTIONS")                  \
+    X(CBM_DOCLINK_KT_KDOC_LINK, CBM_LANG_KOTLIN, "kdoc_link", false, false, "MENTIONS")          \
+    X(CBM_DOCLINK_KT_SEE, CBM_LANG_KOTLIN, "see", false, false, "MENTIONS")                      \
+    X(CBM_DOCLINK_KT_THROWS, CBM_LANG_KOTLIN, "throws", false, false, "MENTIONS")                \
+    X(CBM_DOCLINK_KT_SAMPLE, CBM_LANG_KOTLIN, "sample", false, false, "MENTIONS")                \
+    /* rust (doclink_rs.c): intra-doc links; held until their audit passes */                    \
+    X(CBM_DOCLINK_RS_INTRA_DOC, CBM_LANG_RUST, "intra_doc", false, false, "MENTIONS")            \
+    X(CBM_DOCLINK_RS_LINK_DEF, CBM_LANG_RUST, "link_def", false, false, "MENTIONS")              \
+    /* perl (doclink_perl.c): POD L<> codes; held until their audit passes */                    \
+    X(CBM_DOCLINK_PERL_POD_L, CBM_LANG_PERL, "pod_L", false, false, "MENTIONS")                  \
+    /* typescript and javascript (doclink_ts.c): JSDoc/TSDoc; held until their audit */          \
+    X(CBM_DOCLINK_TS_LINK, CBM_LANG_TYPESCRIPT, "link", false, false, "MENTIONS")                \
+    X(CBM_DOCLINK_TS_LINKCODE, CBM_LANG_TYPESCRIPT, "linkcode", false, false, "MENTIONS")        \
+    X(CBM_DOCLINK_TS_SEE, CBM_LANG_TYPESCRIPT, "see", false, false, "MENTIONS")                  \
+    /* php (doclink_php.c): PHPDoc @see and {@see}; held until their audit passes */             \
+    X(CBM_DOCLINK_PHP_SEE, CBM_LANG_PHP, "see", false, false, "MENTIONS")                        \
+    /* c (doclink_c.c): Doxygen @ref and @see in .c and .h files; held until their audit */      \
+    X(CBM_DOCLINK_C_REF, CBM_LANG_C, "doxygen_ref", false, false, "MENTIONS")                    \
+    X(CBM_DOCLINK_C_SEE, CBM_LANG_C, "see", false, false, "MENTIONS")                            \
+    /* markdown (doclink_md.c): what a document's text names explicitly */                       \
+    X(CBM_DOCLINK_MD_LINK, CBM_LANG_MARKDOWN, "link", false, true, "MENTIONS")                   \
+    X(CBM_DOCLINK_MD_PATH, CBM_LANG_MARKDOWN, "path", false, true, "MENTIONS")                   \
+    X(CBM_DOCLINK_MD_CODE_PATH, CBM_LANG_MARKDOWN, "code_path", false, true, "MENTIONS")         \
+    /* a code span naming a file or directory alone (`config.yaml`, `doc/`) */                   \
+    X(CBM_DOCLINK_MD_BARE_PATH, CBM_LANG_MARKDOWN, "bare_path", false, false, "MENTIONS")        \
+    X(CBM_DOCLINK_MD_CODE_NAME, CBM_LANG_MARKDOWN, "code_name", false, true, "MENTIONS")         \
+    /* an ADR's own "supersedes" / "replaces" statement, opening its line or field */            \
+    /* and naming a record directly (doc_adr.c): ADR -> ADR */                                   \
+    X(CBM_DOCLINK_MD_SUPERSEDES, CBM_LANG_MARKDOWN, "supersedes", false, true, "SUPERSEDES")     \
+    /* the same words in running prose ("this record supersedes ADR-3") */                       \
+    X(CBM_DOCLINK_MD_SUPERSEDES_PROSE, CBM_LANG_MARKDOWN, "supersedes_prose", false, false,      \
+      "SUPERSEDES")                                                                              \
+    /* pdf (doc_pdf.c): structural mentions in a page's text; pdf_name (bare      */             \
+    /* names) only decides which line fragments a cross-line join replaces        */             \
+    X(CBM_DOCLINK_PDF_PATH, CBM_LANG_PDF, "pdf_path", false, true, "MENTIONS")                   \
+    X(CBM_DOCLINK_PDF_FILE, CBM_LANG_PDF, "pdf_file", false, true, "MENTIONS")                   \
+    X(CBM_DOCLINK_PDF_QN, CBM_LANG_PDF, "pdf_qn", false, true, "MENTIONS")                       \
+    X(CBM_DOCLINK_PDF_NAME, CBM_LANG_PDF, "pdf_name", false, false, "MENTIONS")                  \
+    /* restructuredtext (doclink_rst.c): Sphinx domain markup, directives, inline literals */    \
+    X(CBM_DOCLINK_RST_ROLE, CBM_LANG_RST, "role", false, true, "MENTIONS")                       \
+    X(CBM_DOCLINK_RST_OBJECT, CBM_LANG_RST, "object", false, true, "MENTIONS")                   \
+    X(CBM_DOCLINK_RST_AUTODOC, CBM_LANG_RST, "autodoc", false, true, "MENTIONS")                 \
+    X(CBM_DOCLINK_RST_INCLUDE, CBM_LANG_RST, "include", false, false, "MENTIONS")                \
+    X(CBM_DOCLINK_RST_LITERALINCLUDE, CBM_LANG_RST, "literalinclude", false, true, "MENTIONS")   \
+    X(CBM_DOCLINK_RST_KERNEL_DOC, CBM_LANG_RST, "kernel_doc", false, false, "MENTIONS")          \
+    X(CBM_DOCLINK_RST_CODE_PATH, CBM_LANG_RST, "code_path", false, true, "MENTIONS")             \
+    X(CBM_DOCLINK_RST_CODE_NAME, CBM_LANG_RST, "code_name", false, true, "MENTIONS")             \
+    /* asciidoc (doc_adoc.c): includes, Antora API attributes, monospace spans */                \
+    X(CBM_DOCLINK_ADOC_INCLUDE, CBM_LANG_ASCIIDOC, "include", false, true, "MENTIONS")           \
+    X(CBM_DOCLINK_ADOC_ATTRIBUTE, CBM_LANG_ASCIIDOC, "attribute", false, false, "MENTIONS")      \
+    X(CBM_DOCLINK_ADOC_CODE_PATH, CBM_LANG_ASCIIDOC, "code_path", false, false, "MENTIONS")      \
+    X(CBM_DOCLINK_ADOC_CODE_NAME, CBM_LANG_ASCIIDOC, "code_name", false, false, "MENTIONS")      \
+    /* diagrams (diagram.c): an element's explicit link (or a PlantUML !include),  */            \
+    /* read as a Markdown link; held until their held-out audit passes             */            \
+    X(CBM_DOCLINK_DG_MERMAID_CLICK, CBM_LANG_MERMAID, "mermaid_click", false, false, "MENTIONS") \
+    X(CBM_DOCLINK_DG_PLANTUML_URL, CBM_LANG_DIAGRAM, "plantuml_url", false, false, "MENTIONS")   \
+    X(CBM_DOCLINK_DG_PLANTUML_INCLUDE, CBM_LANG_DIAGRAM, "plantuml_include", false, false,       \
+      "MENTIONS")                                                                                \
+    X(CBM_DOCLINK_DG_DRAWIO_LINK, CBM_LANG_DIAGRAM, "drawio_link", false, false, "MENTIONS")     \
+    X(CBM_DOCLINK_DG_EXCALIDRAW_LINK, CBM_LANG_DIAGRAM, "excalidraw_link", false, false,         \
+      "MENTIONS")                                                                                \
+    X(CBM_DOCLINK_DG_DOT_URL, CBM_LANG_DIAGRAM, "dot_url", false, false, "MENTIONS")             \
+    X(CBM_DOCLINK_DG_D2_LINK, CBM_LANG_DIAGRAM, "d2_link", false, false, "MENTIONS")             \
+    /* openapi (openapi.c): an operation's operationId, read as a qualified code      */         \
+    /* name; held until its held-out audit passes                                   */           \
+    X(CBM_DOCLINK_OPENAPI_OPERATION_ID, CBM_LANG_OPENAPI, "operation_id", false, false,          \
+      "MENTIONS")                                                                                \
+    /* any language (CBM_LANG_COUNT): a URL is never an edge */                                  \
     X(CBM_DOCLINK_HREF, CBM_LANG_COUNT, "href", true, false, "MENTIONS")
 
 typedef enum {
@@ -158,6 +173,25 @@ typedef enum {
 #undef CBM_DOCLINK_FAMILY_VALUE
         CBM_DOCLINK_SYNTAX_COUNT
 } CBMDocLinkSyntax;
+
+/* The Markdown family a reference of another document reads as, wherever it
+ * is written (CBM_DOCLINK_NONE for none): a diagram's explicit link
+ * (diagram.c) is a link, an OpenAPI operationId (openapi.c) a code name. */
+static inline int cbm_doclink_md_twin(int syntax) {
+    if (syntax >= CBM_DOCLINK_DG_MERMAID_CLICK && syntax <= CBM_DOCLINK_DG_D2_LINK) {
+        return CBM_DOCLINK_MD_LINK;
+    }
+    return syntax == CBM_DOCLINK_OPENAPI_OPERATION_ID ? CBM_DOCLINK_MD_CODE_NAME : CBM_DOCLINK_NONE;
+}
+
+/* What an edge of these families says it came through: the kind of source,
+ * whichever document holds it (NULL: the resolver's own name). */
+static inline const char *cbm_doclink_syntax_via(int syntax) {
+    if (syntax >= CBM_DOCLINK_DG_MERMAID_CLICK && syntax <= CBM_DOCLINK_DG_D2_LINK) {
+        return "diagram";
+    }
+    return syntax == CBM_DOCLINK_OPENAPI_OPERATION_ID ? "openapi" : NULL;
+}
 
 /* CBMDocLink.flags. */
 enum {

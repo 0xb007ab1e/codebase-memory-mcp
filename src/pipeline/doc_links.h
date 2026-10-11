@@ -178,7 +178,7 @@ typedef enum {
                                   * file by file */
 } cbm_doclink_delta_t;
 
-enum { CBM_DOCLINK_RESOLVER_LANGS = 4 };
+enum { CBM_DOCLINK_RESOLVER_LANGS = 6 };
 
 /* Everything the resolving half needs from a language leg: one of these, and
  * its pointer in doc_links.c's resolver table. */

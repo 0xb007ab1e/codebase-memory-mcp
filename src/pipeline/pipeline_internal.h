@@ -264,13 +264,7 @@ bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_
  * "no incremental route; continue with a full index" sentinel. */
 #define CBM_PIPELINE_FORCE_FULL_REINDEX (-3)
 
-/* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
- * "${...}") to a single "{}" token so that client call sites and server
- * handlers rendezvous on the same Route QN regardless of framework syntax.
- * Parameter names are intentionally discarded ("/u/{id}" and "/u/{slug}" both
- * canonicalize to "/u/{}"). The result never exceeds the input length, so
- * out_sz >= strlen(in) + 1 always suffices. Returns out. */
-const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz);
+/* cbm_route_canon_path: cbm.h (route_path.c). */
 
 /* True when a graph node is a structural directory container (Folder/Project)
  * rather than a code node. In a directory-based-module language (Java/Go, see
@@ -563,6 +557,15 @@ static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *c
     }
     return 0;
 }
+
+/* Diagrams (pass_diagrams.c). The DEFINES edge from a Diagram's or a
+ * DiagramElement's container (the Section a diagram block sits in, the
+ * Diagram of an element) to the definition's node; nothing for other
+ * definitions. */
+void cbm_pipeline_diagram_parent_edge(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
+                                      int64_t node_id);
+/* The DIAGRAM_ARROW edges of one file's diagrams. */
+void cbm_pipeline_diagram_arrows(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result);
 
 /* Get the current pipeline's package map (NULL if none). */
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
