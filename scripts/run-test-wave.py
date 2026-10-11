@@ -17,6 +17,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -34,11 +35,25 @@ SKIPPED = re.compile(r"(?:^|, )(?P<skipped>[0-9]+) skipped")
 # _probe 2026-08-28 at exactly 900s on a new run checkout, both green on
 # the warm rerun). That state is deterministic, not racy — the stable-state
 # budget rule applies.
+#
+# Suites whose honest runtime does not fit the default per-suite budget, and so
+# get --slow-timeout instead. This is a statement about SIZE, never about
+# flakiness: every suite here is deterministic and simply long, and a racy suite
+# must be made deterministic rather than given more clock.
+#
+# `cli` joined the list because the classification had gone stale, not because
+# anything regressed. It spends 497s of the 900s default on macos-14 -- the
+# FASTEST macOS runner -- while the macos-15-intel runner in the same matrix is
+# 2.4-3.6x slower on comparable suites (daemon_runtime 842s vs 349s,
+# stack_overflow_b 277s vs 76s). 497s at that ratio cannot fit, so the suite was
+# killed at 900s and reported as hung. daemon_runtime, at 842s on that same
+# runner, survives only because it was already listed here.
 SLOW_SUITES = frozenset(
     (
         "incremental",
         "store_arch",
         "daemon_runtime",
+        "cli",
         "node_creation_probe",
         "grammar_probe_b",
     )
@@ -58,6 +73,16 @@ POLL_SECONDS = 0.05
 # unfinished probe rather than as a leaked tree.
 WINDOWS_DESCENDANT_PROBE_SECONDS = 15
 WINDOWS_DESCENDANT_PROBE_ATTEMPTS = 2
+
+# WHY: the same defect as the probe above, one call earlier. `taskkill /F`
+# cannot be resisted -- a live tree is terminated as soon as the tool runs --
+# so what bounding it measures is taskkill.exe's own cold start on the runner,
+# not the tree. Timed with --kill-grace (1s in the harness contract), a slow
+# start was reported as "taskkill could not prove process-tree cleanup" for an
+# ordinary hung suite (#2345). The tree does not change while the tool starts,
+# so this is a stable-state budget; --kill-grace keeps bounding what it names:
+# how long the leader may take to be reaped once taskkill has succeeded.
+WINDOWS_TASKKILL_SECONDS = 15
 
 
 @dataclass
@@ -120,6 +145,31 @@ def append_log(path: pathlib.Path, message: str) -> None:
     with path.open("a", encoding="utf-8", newline="\n") as stream:
         stream.write(message)
         stream.write("\n")
+
+
+def publish_barrier_file(path: pathlib.Path, text: str) -> None:
+    """Publish a barrier file so a poller sees either no file or its content.
+
+    Path.write_text creates and truncates before it writes, so a reader that
+    polls for existence and then parses the content can observe the zero-byte
+    window in between.  Write next to the destination and rename into place.
+    """
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as temporary:
+        temporary.write(text)
+        temporary.flush()
+        temporary_path = pathlib.Path(temporary.name)
+    try:
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def start_suite(
@@ -204,6 +254,27 @@ def windows_tree_cleanup_blocker(pid: int) -> str | None:
     return unproven
 
 
+def windows_taskkill_tree(pid: int) -> bool:
+    """Force-terminate `pid` and its whole tree; True only on proven success.
+
+    A tool that cannot start, cannot finish within its own budget, or reports
+    failure is never read as success -- the caller refuses to call the tree
+    clean.
+    """
+    try:
+        completed = subprocess.run(
+            ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=WINDOWS_TASKKILL_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
 def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
     process = active.process
     leader_exited = process.poll() is not None
@@ -222,24 +293,7 @@ def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
                     f"could not be proven: {blocker}"
                 )
             return
-        try:
-            completed = subprocess.run(
-                [
-                    "taskkill.exe",
-                    "/PID",
-                    str(process.pid),
-                    "/T",
-                    "/F",
-                ],
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=kill_grace,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            completed = None
-        if completed is None or completed.returncode != 0:
+        if not windows_taskkill_tree(process.pid):
             if process.poll() is None:
                 process.kill()
                 try:
@@ -305,12 +359,12 @@ def wait_for_test_pre_terminate_barrier(
     ready = barrier_dir / f"{active.name}.ready"
     leader_exited = barrier_dir / f"{active.name}.leader-exited"
     release = barrier_dir / f"{active.name}.release"
-    ready.write_text(f"{active.process.pid}\n", encoding="utf-8")
+    publish_barrier_file(ready, f"{active.process.pid}\n")
     deadline = time.monotonic() + 10
     while not release.exists():
         returncode = active.process.poll()
         if returncode is not None and not leader_exited.exists():
-            leader_exited.write_text(f"{returncode}\n", encoding="utf-8")
+            publish_barrier_file(leader_exited, f"{returncode}\n")
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 f"test pre-terminate barrier for {active.name!r} was not released"
@@ -329,7 +383,7 @@ def wait_for_test_post_exit_barrier(
         return
     ready = barrier_dir / f"{suite}.ready"
     release = barrier_dir / f"{suite}.release"
-    ready.write_text("child exited; result intentionally not recorded\n", encoding="utf-8")
+    publish_barrier_file(ready, "child exited; result intentionally not recorded\n")
     deadline = time.monotonic() + 10
     while not release.exists():
         if time.monotonic() >= deadline:

@@ -13,6 +13,8 @@
 enum {
     USE_PREFIX_LEN = 4, /* strlen("use ") */
     MIN_WOLFRAM_CHILDREN = 2,
+    /* Nested `#if` branches followed while collecting C includes. */
+    C_INCLUDE_NEST_LIMIT = 64,
     SECOND_IDX = 1,
 };
 
@@ -45,7 +47,7 @@ static void parse_lisp_imports(CBMExtractCtx *ctx);
 static void parse_starlark_imports(CBMExtractCtx *ctx);
 static void parse_tcl_imports(CBMExtractCtx *ctx);
 static void parse_teal_imports(CBMExtractCtx *ctx);
-static void parse_zsh_imports(CBMExtractCtx *ctx);
+static void parse_shell_source_imports(CBMExtractCtx *ctx);
 static void parse_css_imports(CBMExtractCtx *ctx);
 static void parse_html_imports(CBMExtractCtx *ctx);
 static void parse_cmake_imports(CBMExtractCtx *ctx);
@@ -130,6 +132,19 @@ static void parse_go_import_spec(CBMExtractCtx *ctx, TSNode spec) {
     }
     char *path = strip_quotes(a, cbm_node_text(a, path_node, ctx->source));
     if (!path || !path[0]) {
+        return;
+    }
+
+    /* cgo: `import "C"` names the cgo PSEUDO-package, not a real one — "C" is
+     * reserved by go/build and no package with that import path can exist.
+     * Emitting it as an ordinary import makes the import resolver fall through
+     * to its symbol-name fallback (cbm_pipeline_resolve_import_node Strategy 3,
+     * pass_pkgmap.c), which matches the literal name "C" against every project
+     * node called C and picks the lexicographically smallest: on a real Go repo
+     * all 27 cgo files pointed their IMPORTS edge at the same unrelated `C`
+     * member of a test helper. Drop it — the C side is not a graph package, and
+     * the file's remaining imports are unaffected. */
+    if (strcmp(path, "C") == 0) {
         return;
     }
 
@@ -381,7 +396,7 @@ static bool process_import_clause(CBMExtractCtx *ctx, TSNode clause, const char 
         const char *sk = ts_node_type(sub);
         if (strcmp(sk, "identifier") == 0) {
             char *name = cbm_node_text(a, sub, ctx->source);
-            CBMImport imp = {.local_name = name, .module_path = path};
+            CBMImport imp = {.local_name = name, .module_path = path, .is_default = true};
             cbm_imports_push(&ctx->result->imports, a, imp);
             found = true;
         } else if (strcmp(sk, "namespace_import") == 0) {
@@ -650,10 +665,22 @@ static char *strip_angle_brackets(CBMArena *a, char *path) {
     return path;
 }
 
-static void parse_c_imports(CBMExtractCtx *ctx) {
+/* Node kinds that only group file-level items: the branches of `#if` /
+ * `#ifdef` (an include guard is one) and the body of `extern "C" { ... }`. */
+static bool is_c_include_container(const char *kind) {
+    return strcmp(kind, "preproc_if") == 0 || strcmp(kind, "preproc_ifdef") == 0 ||
+           strcmp(kind, "preproc_else") == 0 || strcmp(kind, "preproc_elif") == 0 ||
+           strcmp(kind, "preproc_elifdef") == 0 || strcmp(kind, "linkage_specification") == 0 ||
+           strcmp(kind, "declaration_list") == 0;
+}
+
+/* Collect the includes among `parent`'s children, descending into
+ * preprocessor branches: every header keeps its includes inside its include
+ * guard, so the top level alone gave a guarded header no imports at all. */
+static void parse_c_imports_in(CBMExtractCtx *ctx, TSNode parent, int depth) {
     CBMArena *a = ctx->arena;
 
-    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    TSTreeCursor cursor = ts_tree_cursor_new(parent);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
         return;
@@ -662,6 +689,9 @@ static void parse_c_imports(CBMExtractCtx *ctx) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *kind = ts_node_type(node);
         if (strcmp(kind, "preproc_include") != 0 && strcmp(kind, "preproc_import") != 0) {
+            if (depth < C_INCLUDE_NEST_LIMIT && is_c_include_container(kind)) {
+                parse_c_imports_in(ctx, node, depth + SKIP_ONE);
+            }
             continue;
         }
 
@@ -680,6 +710,10 @@ static void parse_c_imports(CBMExtractCtx *ctx) {
         cbm_imports_push(&ctx->result->imports, a, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+}
+
+static void parse_c_imports(CBMExtractCtx *ctx) {
+    parse_c_imports_in(ctx, ctx->root, 0);
 }
 
 // --- Ruby imports ---
@@ -1192,7 +1226,29 @@ static void parse_wolfram_imports(CBMExtractCtx *ctx) {
 // require/include forms remain `expression_statement`s and are still handled by
 // the text fallback.  Take the first qualified_name/name descendant of each
 // clause as the module path.
-static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *group_prefix) {
+// `use function` / `use const` carry the keyword as an anonymous direct child
+// of the declaration (flat form) or of the clause (grouped form
+// `use A\{function f, const C, K}`). DEFAULT when neither is present.
+static CBMImportKind php_use_kind(TSNode node) {
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_child(node, i);
+        if (ts_node_is_named(c)) {
+            continue;
+        }
+        const char *k = ts_node_type(c);
+        if (strcmp(k, "function") == 0) {
+            return CBM_IMPORT_KIND_FUNCTION;
+        }
+        if (strcmp(k, "const") == 0) {
+            return CBM_IMPORT_KIND_CONST;
+        }
+    }
+    return CBM_IMPORT_KIND_DEFAULT;
+}
+
+static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *group_prefix,
+                                CBMImportKind decl_kind) {
     CBMArena *a = ctx->arena;
     // The path node is the qualified_name / namespace_name / name child.
     TSNode path_node = clause;
@@ -1217,12 +1273,14 @@ static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *g
     TSNode alias = ts_node_child_by_field_name(clause, TS_FIELD("alias"));
     const char *local =
         !ts_node_is_null(alias) ? cbm_node_text(a, alias, ctx->source) : path_last(a, path);
-    CBMImport imp = {.local_name = local, .module_path = path};
+    CBMImportKind kind = decl_kind != CBM_IMPORT_KIND_DEFAULT ? decl_kind : php_use_kind(clause);
+    CBMImport imp = {.local_name = local, .module_path = path, .kind = kind};
     cbm_imports_push(&ctx->result->imports, a, imp);
 }
 
 static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
     CBMArena *a = ctx->arena;
+    const CBMImportKind decl_kind = php_use_kind(decl);
     // Grouped form: namespace_use_group with a leading prefix qualified_name.
     TSNode group = decl;
     if (find_first_descendant_of(decl, "namespace_use_group", &group)) {
@@ -1244,7 +1302,7 @@ static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
             const char *ck = ts_node_type(clause);
             if (strcmp(ck, "namespace_use_group_clause") == 0 ||
                 strcmp(ck, "namespace_use_clause") == 0) {
-                emit_php_use_clause(ctx, clause, prefix);
+                emit_php_use_clause(ctx, clause, prefix, decl_kind);
             }
         }
         return;
@@ -1255,13 +1313,13 @@ static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
     for (uint32_t i = 0; i < dc; i++) {
         TSNode clause = ts_node_named_child(decl, i);
         if (strcmp(ts_node_type(clause), "namespace_use_clause") == 0) {
-            emit_php_use_clause(ctx, clause, NULL);
+            emit_php_use_clause(ctx, clause, NULL, decl_kind);
             any = true;
         }
     }
     if (!any) {
         // Some grammar versions inline the path directly under the declaration.
-        emit_php_use_clause(ctx, decl, NULL);
+        emit_php_use_clause(ctx, decl, NULL, decl_kind);
     }
 }
 
@@ -1383,12 +1441,13 @@ static void parse_spec_imports(CBMExtractCtx *ctx) {
     ts_tree_cursor_delete(&cursor);
 }
 
-// --- Embedded-language imports ---
-// Generic walker for host grammars (Svelte, Vue, HTML, Astro, ...) whose AST
-// keeps embedded sub-language source as raw_text (or similar) without parsing
-// it.  The host's CBMLangSpec.embedded_imports declares which content nodes
-// hold which sub-language; we re-parse each match with the embedded grammar
-// and run the standard ES import walker over the inner AST.
+// --- Embedded-language structure and imports ---
+// Generic walker for host grammars (Svelte, Vue, HTML, Astro, CFML, ...) whose
+// AST keeps embedded sub-language source as raw_text (or similar) without
+// parsing it.  The host's CBMLangSpec.embedded_imports declares which content
+// nodes hold which sub-language; we re-parse each match with the embedded
+// grammar and run the definition, import and call extractors over the inner
+// AST, so a component's script contributes symbols like a standalone file.
 //
 // No grammar symbols are referenced here — the embedded TSLanguage is
 // resolved through cbm_ts_language(spec->embedded_language), the same hook
@@ -1458,66 +1517,94 @@ static bool ascii_trimmed_equals(const char *value, const char *expected) {
     return true;
 }
 
-/* Vue is the only host that opts into structural embedded extraction. Restrict
- * its inline programs to the language forms whose parsers we can select
- * exactly. A src attribute always denotes an external program and therefore
- * suppresses any inline extraction, even for malformed mixed markup. */
-static bool vue_embedded_language(CBMExtractCtx *ctx, TSNode script, CBMLanguage *language) {
-    enum { VUE_ATTR_STACK_CAP = 128 };
-    TSNode stack[VUE_ATTR_STACK_CAP];
+/* The text of a <script> attribute's value, or "" when it carries none
+ * (`<script type>`), so every attribute reads through one path. */
+static const char *script_attribute_value(CBMExtractCtx *ctx, TSNode attribute) {
+    TSNode value_node = attribute;
+    if (!find_first_descendant_of(attribute, "attribute_value", &value_node)) {
+        return "";
+    }
+    return cbm_node_text(ctx->arena, value_node, ctx->source);
+}
+
+/* Apply one <script> attribute to the parse decision. Returns false when the
+ * attribute rules the block out of inline extraction:
+ *   src=   always names an external program, so nothing inline is extracted,
+ *          even for malformed mixed markup;
+ *   lang=  selects the JavaScript or TypeScript grammar; any other language
+ *          has no parser here;
+ *   type=  plain HTML routinely carries non-program blocks (application/json,
+ *          importmap, text/x-template, application/ld+json) that would parse
+ *          into garbage definitions and calls. Only the JavaScript forms in
+ *          current use pass — absent or empty, module, text/javascript,
+ *          application/javascript — and the rest bail. */
+static bool apply_script_attribute(CBMExtractCtx *ctx, TSNode attribute, CBMLanguage *language) {
+    if (ts_node_named_child_count(attribute) == 0) {
+        return false;
+    }
+    const char *name = cbm_node_text(ctx->arena, ts_node_named_child(attribute, 0), ctx->source);
+    if (ascii_trimmed_equals(name, "src")) {
+        return false;
+    }
+    if (ascii_trimmed_equals(name, "lang")) {
+        const char *value = script_attribute_value(ctx, attribute);
+        if (ascii_trimmed_equals(value, "js") || ascii_trimmed_equals(value, "javascript")) {
+            *language = CBM_LANG_JAVASCRIPT;
+            return true;
+        }
+        if (ascii_trimmed_equals(value, "ts") || ascii_trimmed_equals(value, "typescript")) {
+            *language = CBM_LANG_TYPESCRIPT;
+            return true;
+        }
+        return false;
+    }
+    if (ascii_trimmed_equals(name, "type")) {
+        const char *value = script_attribute_value(ctx, attribute);
+        return ascii_trimmed_equals(value, "") || ascii_trimmed_equals(value, "module") ||
+               ascii_trimmed_equals(value, "text/javascript") ||
+               ascii_trimmed_equals(value, "application/javascript");
+    }
+    return true;
+}
+
+/* Markup hosts (Vue, Svelte, HTML, Astro) hang the attributes that decide
+ * whether and how an inline program is parsed off the <script> start tag.
+ * *language enters holding the spec row's default and leaves holding the
+ * grammar to parse with; an attribute-free block (Astro's frontmatter fence)
+ * keeps the row's language rather than falling through to JavaScript. */
+static bool script_embedded_language(CBMExtractCtx *ctx, TSNode script, CBMLanguage *language) {
+    enum { SCRIPT_ATTR_STACK_CAP = 128 };
+    TSNode stack[SCRIPT_ATTR_STACK_CAP];
     int top = 0;
-    bool has_lang = false;
-    bool lang_supported = true;
-    CBMLanguage selected = CBM_LANG_JAVASCRIPT;
     stack[top++] = script;
     while (top > 0) {
         TSNode node = stack[--top];
         if (strcmp(ts_node_type(node), "attribute") == 0) {
-            uint32_t named_count = ts_node_named_child_count(node);
-            if (named_count == 0) {
+            if (!apply_script_attribute(ctx, node, language)) {
                 return false;
-            }
-            TSNode name_node = ts_node_named_child(node, 0);
-            char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
-            if (ascii_trimmed_equals(name, "src")) {
-                return false;
-            }
-            if (ascii_trimmed_equals(name, "lang")) {
-                TSNode value_node = node;
-                if (!find_first_descendant_of(node, "attribute_value", &value_node)) {
-                    return false;
-                }
-                char *value = cbm_node_text(ctx->arena, value_node, ctx->source);
-                has_lang = true;
-                if (ascii_trimmed_equals(value, "js") ||
-                    ascii_trimmed_equals(value, "javascript")) {
-                    selected = CBM_LANG_JAVASCRIPT;
-                } else if (ascii_trimmed_equals(value, "ts") ||
-                           ascii_trimmed_equals(value, "typescript")) {
-                    selected = CBM_LANG_TYPESCRIPT;
-                } else {
-                    lang_supported = false;
-                }
             }
             continue;
         }
         uint32_t count = ts_node_named_child_count(node);
-        if ((int)count > VUE_ATTR_STACK_CAP - top) {
+        if ((int)count > SCRIPT_ATTR_STACK_CAP - top) {
             return false;
         }
         for (int i = (int)count - 1; i >= 0; i--) {
             stack[top++] = ts_node_named_child(node, (uint32_t)i);
         }
     }
-    if (has_lang && !lang_supported) {
-        return false;
-    }
-    *language = selected;
     return true;
 }
 
+/* CFML's <cfscript> carries no attributes and its embedded language is fixed
+ * by the spec row; only the markup hosts consult the <script> tag. */
+static bool markup_script_host(CBMLanguage language) {
+    return language == CBM_LANG_VUE || language == CBM_LANG_SVELTE || language == CBM_LANG_HTML ||
+           language == CBM_LANG_ASTRO;
+}
+
 static void parse_one_embedded_block(CBMExtractCtx *ctx, const CBMEmbeddedBlock *block,
-                                     CBMLanguage embedded_language, bool extract_structure) {
+                                     CBMLanguage embedded_language) {
     const TSLanguage *language = cbm_ts_language(embedded_language);
     if (!language || ctx->source_len < 0) {
         return;
@@ -1564,13 +1651,9 @@ static void parse_one_embedded_block(CBMExtractCtx *ctx, const CBMEmbeddedBlock 
         .macro_table = ctx->macro_table,
         .return_type_table = ctx->return_type_table,
     };
-    if (extract_structure) {
-        cbm_extract_definitions_without_module(&sub_ctx);
-    }
+    cbm_extract_definitions_without_module(&sub_ctx);
     walk_es_imports(&sub_ctx, sub_ctx.root);
-    if (extract_structure) {
-        cbm_extract_unified(&sub_ctx);
-    }
+    cbm_extract_unified(&sub_ctx);
 
     ts_tree_delete(tree);
     ts_parser_delete(parser);
@@ -1588,22 +1671,11 @@ static void parse_embedded_imports(CBMExtractCtx *ctx) {
         embedded_collect_content_nodes(ctx->root, e, hits, &hit_count, MAX_EMBEDDED_BLOCKS);
         for (int i = 0; i < hit_count; i++) {
             CBMLanguage embedded_language = e->embedded_language;
-            /* Structure (defs + calls), not just imports, for hosts whose
-             * embedded language carries real code. Vue since #1852; CFML's
-             * <cfscript> since the #1412 distillation. */
-            bool extract_structure =
-                ctx->language == CBM_LANG_VUE || ctx->language == CBM_LANG_CFML;
-            /* The attribute resolver is Vue's: it inspects <script lang=/src=>
-             * and OVERRIDES the spec's embedded language (JS default, TS on
-             * lang="ts", bail on src=). CFML's cf_script_tag carries no such
-             * attributes and its embedded language is fixed by the spec row
-             * (CFSCRIPT) — running the resolver would silently rewrite it to
-             * JavaScript. Resolve only for Vue. */
-            if (ctx->language == CBM_LANG_VUE &&
-                !vue_embedded_language(ctx, hits[i].script, &embedded_language)) {
+            if (markup_script_host(ctx->language) &&
+                !script_embedded_language(ctx, hits[i].script, &embedded_language)) {
                 continue;
             }
-            parse_one_embedded_block(ctx, &hits[i], embedded_language, extract_structure);
+            parse_one_embedded_block(ctx, &hits[i], embedded_language);
         }
     }
 }
@@ -2115,10 +2187,13 @@ static void parse_teal_imports(CBMExtractCtx *ctx) {
     }
 }
 
-// --- Zsh imports ---
+// --- Bash / Zsh imports ---
 // source file / . file — `command` nodes whose command_name is "source" or ".".
-// The argument field carries the sourced path.
-static void parse_zsh_imports(CBMExtractCtx *ctx) {
+// The argument field carries the sourced path. Every other command is a call,
+// not an import: read as an import, `set -e` imported "set", which the import
+// resolver then bound to whatever project symbol is named set (a TSX method),
+// and every `set` call in the script followed it.
+static void parse_shell_source_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx, CBM_SZ_512);
@@ -2977,8 +3052,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_generic_imports(ctx, "call");
         break;
     case CBM_LANG_BASH:
-        // source/. commands
-        parse_generic_imports(ctx, "command");
+        parse_shell_source_imports(ctx);
         break;
     case CBM_LANG_ZIG:
         parse_zig_imports(ctx);
@@ -3048,7 +3122,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_teal_imports(ctx);
         break;
     case CBM_LANG_ZSH:
-        parse_zsh_imports(ctx);
+        parse_shell_source_imports(ctx);
         break;
     case CBM_LANG_CMAKE:
         parse_cmake_imports(ctx);

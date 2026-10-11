@@ -2086,6 +2086,28 @@ TEST(clsp_structured_binding_struct) {
     PASS();
 }
 
+/* #1743: a structured binding with more names than the struct has fields
+ * (ill-formed C++, but common in compiler test suites such as LLVM's
+ * dcl.decomp tests) indexed field_types[] past its NULL terminator. The read
+ * landed in the next arena object and bound a garbage pointer (0x9) as the
+ * type, which decltype() then dereferenced: a deterministic SIGSEGV at
+ * address 9 in c_resolve_name_to_type. Extra names must bind as unknown. */
+TEST(clsp_structured_binding_more_names_than_fields) {
+    CBMFileResult *r = extract_cpp("struct A { int x, y; };\n"
+                                   "const auto &[acr0, acr1, acr2] = A();\n"
+                                   "using ConstFloatRef = decltype(acr2);\n"
+                                   "void test() {\n"
+                                   "    auto [b0, b1, b2, b3] = A();\n"
+                                   "    using T = decltype(b3);\n"
+                                   "    for (auto [c0, c1, c2, c3] : (A *)0) {\n"
+                                   "        using U = decltype(c3);\n"
+                                   "    }\n"
+                                   "}\n");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(clsp_ternary_type) {
     CBMFileResult *r = extract_cpp("\n"
                                    "class Widget {\n"
@@ -15250,6 +15272,176 @@ TEST(clsp_tier2_shared_registry_readonly_c) {
     PASS();
 }
 
+/* The method-return refinement in the C++ class walk used to cast the chained
+ * lookup result and write a scratch-arena signature into it. With the entry in
+ * the sealed shared base, every other worker read that signature after the
+ * arena of this file had died (ASan heap-use-after-free in c_adl_resolve on
+ * dotnet/runtime, 2026-09-14). Contract: the refinement is copy-on-write into
+ * the overlay; the base signature pointer never changes. min_params = 7 is a
+ * marker only a COPY of the base entry carries (a fresh registration sets -1),
+ * so the assertion proves the upgrade path ran, not a re-registration. */
+TEST(clsp_method_return_refinement_is_copy_on_write) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry base;
+    cbm_registry_init(&base, &arena);
+    const CBMType *rets[2] = {cbm_type_named(&arena, "test.mod.Item"), NULL};
+    CBMRegisteredFunc f;
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "test.mod.Box.items";
+    f.short_name = "items";
+    f.receiver_type = "test.mod.Box";
+    f.signature = cbm_type_func(&arena, NULL, NULL, rets);
+    f.min_params = 7;
+    cbm_registry_add_func(&base, f);
+    cbm_registry_finalize(&base);
+    base.read_only = true;
+    const CBMRegisteredFunc *base_entry = cbm_registry_lookup_func(&base, "test.mod.Box.items");
+    ASSERT_NOT_NULL(base_entry);
+    const CBMType *base_sig = base_entry->signature;
+    ASSERT_EQ(base_sig->data.func.return_types[0]->kind, CBM_TYPE_NAMED);
+
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    CBMTypeRegistry overlay;
+    cbm_registry_init(&overlay, &scratch);
+    overlay.fallback = &base;
+    /* The in-class declaration refines the NAMED return to a POINTER. */
+    const char *src = "struct Item { int v; };\n"
+                      "struct Box {\n"
+                      "    Item *items();\n"
+                      "};\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_c_lsp_cross_with_registry(&scratch, src, (int)strlen(src), "test.mod",
+                                      /*cpp_mode=*/true, &overlay, NULL, NULL, 0, NULL, &out);
+
+    ASSERT(base_entry->signature == base_sig);
+    ASSERT_EQ(base_sig->data.func.return_types[0]->kind, CBM_TYPE_NAMED);
+    const CBMRegisteredFunc *refined = cbm_registry_lookup_func(&overlay, "test.mod.Box.items");
+    ASSERT_NOT_NULL(refined);
+    ASSERT(refined >= overlay.funcs && refined < overlay.funcs + overlay.func_count);
+    ASSERT_EQ(refined->min_params, 7);
+    ASSERT_EQ(refined->signature->data.func.return_types[0]->kind, CBM_TYPE_POINTER);
+    cbm_arena_destroy(&scratch);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* The per-file overlay contract (type_registry.c chain API): a walk is handed
+ * an overlay chained to a sealed base. Lookups and iterators see the base
+ * through the overlay, every yielded index belongs to it.reg, a refinement is
+ * copy-on-write into the overlay (the base never changes), and an overlay copy
+ * shadows its base original in chained iteration. */
+TEST(registry_overlay_chain_iterates_and_copies_on_write) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry base;
+    cbm_registry_init(&base, &arena);
+    CBMRegisteredFunc f;
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.alpha";
+    f.short_name = "alpha";
+    f.min_params = -1;
+    cbm_registry_add_func(&base, f);
+    f.qualified_name = "pkg.beta";
+    f.short_name = "beta";
+    cbm_registry_add_func(&base, f);
+    CBMRegisteredType t;
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.T";
+    t.short_name = "T";
+    const char *field_names[] = {"untyped", "typed", NULL};
+    const CBMType *field_types[] = {NULL, cbm_type_named(&arena, "pkg.Value"), NULL};
+    t.field_names = field_names;
+    t.field_types = field_types;
+    cbm_registry_add_type(&base, t);
+    cbm_registry_finalize(&base);
+    base.read_only = true;
+
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    CBMTypeRegistry overlay;
+    cbm_registry_init(&overlay, &scratch);
+    overlay.fallback = &base;
+
+    /* Lookups chain through the empty overlay. */
+    ASSERT_NOT_NULL(cbm_registry_lookup_func(&overlay, "pkg.alpha"));
+    ASSERT_NOT_NULL(cbm_registry_lookup_type(&overlay, "pkg.T"));
+
+    /* Chained iteration reaches the base; it.reg names where the index lives. */
+    CBMFreeFuncIter it;
+    cbm_registry_free_funcs_by_short_name_chain(&overlay, "alpha", &it);
+    int i = cbm_free_func_iter_next(&it);
+    ASSERT(i >= 0);
+    ASSERT(it.reg == &base);
+    ASSERT(strcmp(it.reg->funcs[i].qualified_name, "pkg.alpha") == 0);
+    ASSERT_EQ(cbm_free_func_iter_next(&it), -1);
+    /* The plain iterator on the overlay alone sees nothing -- unchanged. */
+    cbm_registry_free_funcs_by_short_name(&overlay, "alpha", &it);
+    ASSERT_EQ(cbm_free_func_iter_next(&it), -1);
+
+    /* Copy-on-write: the refinement lands in the overlay, the base is untouched,
+     * and chained lookup now returns the refined copy. */
+    CBMRegisteredFunc *w = cbm_registry_func_for_update(&overlay, "pkg.alpha");
+    ASSERT_NOT_NULL(w);
+    ASSERT(w >= overlay.funcs && w < overlay.funcs + overlay.func_count);
+    w->min_params = 2;
+    ASSERT_EQ(base.funcs[0].min_params, -1);
+    ASSERT_EQ(cbm_registry_lookup_func(&overlay, "pkg.alpha")->min_params, 2);
+    ASSERT(cbm_registry_func_for_update(&overlay, "pkg.alpha") ==
+           w); /* own entry, no second copy */
+    ASSERT_EQ(overlay.func_count, 1);
+
+    /* The base original is shadowed: chained iteration yields exactly one alpha,
+     * from the overlay. */
+    cbm_registry_free_funcs_by_short_name_chain(&overlay, "alpha", &it);
+    int seen = 0;
+    while (cbm_free_func_iter_next(&it) >= 0) {
+        ASSERT(it.reg == &overlay);
+        seen++;
+    }
+    ASSERT_EQ(seen, 1);
+    /* Linear chain over everything: alpha (overlay copy) + beta (base). */
+    cbm_registry_all_funcs_chain(&overlay, &it);
+    seen = 0;
+    while (cbm_free_func_iter_next(&it) >= 0) {
+        seen++;
+    }
+    ASSERT_EQ(seen, 2);
+
+    /* Types: same contract. */
+    CBMTypeShortIter ti;
+    cbm_registry_types_by_short_name_chain(&overlay, "T", &ti);
+    int k = cbm_type_short_iter_next(&ti);
+    ASSERT(k >= 0);
+    ASSERT(ti.reg == &base);
+    CBMRegisteredType *wt = cbm_registry_type_for_update(&overlay, "pkg.T");
+    ASSERT_NOT_NULL(wt);
+    ASSERT_EQ(overlay.type_count, 1);
+    /* A missing type for an earlier named field must not truncate the copy. */
+    bool field_slots_preserved = wt->field_types && wt->field_types != field_types &&
+                                 wt->field_types[0] == NULL &&
+                                 wt->field_types[1] == field_types[1] && wt->field_types[2] == NULL;
+    cbm_registry_all_types_chain(&overlay, &ti);
+    seen = 0;
+    while (cbm_type_short_iter_next(&ti) >= 0) {
+        seen++;
+    }
+    ASSERT_EQ(seen, 1);
+
+    /* A sealed head refuses refinement; an unknown QN yields nothing. */
+    overlay.read_only = true;
+    ASSERT(cbm_registry_func_for_update(&overlay, "pkg.beta") == NULL);
+    overlay.read_only = false;
+    ASSERT(cbm_registry_func_for_update(&overlay, "pkg.nope") == NULL);
+    ASSERT_EQ(base.func_count, 2);
+
+    cbm_arena_destroy(&scratch);
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(field_slots_preserved);
+    PASS();
+}
+
 /* Direct guard for the type-name / embedded-type / free-function registry
  * indexes and their iterators (type_registry.c). Verifies that every iterator
  * preserves ascending registry order, which is part of resolver tie-breaking. */
@@ -15618,6 +15810,111 @@ TEST(seal_py_shared_registry_readonly_fields) {
     ASSERT_TRUE(rt->field_names == names_before);
 
     cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* #1277: the production resolver receives a writable overlay, so refining an
+ * existing field must detach its pointer array from the sealed fallback. */
+TEST(seal_py_overlay_existing_field_keeps_shared_type) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[4] = {0};
+    defs[0].qualified_name = "test.mod.Foo";
+    defs[0].short_name = "Foo";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "test.mod";
+    defs[0].field_defs = "x:test.contracts.Contract";
+    defs[1].qualified_name = "test.mod.Foo.m";
+    defs[1].short_name = "m";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.mod.Foo";
+    defs[1].def_module_qn = "test.mod";
+    defs[2].qualified_name = "test.contracts.Contract";
+    defs[2].short_name = "Contract";
+    defs[2].label = "Class";
+    defs[2].def_module_qn = "test.contracts";
+    defs[3].qualified_name = "test.contracts.Contract.process_batch";
+    defs[3].short_name = "process_batch";
+    defs[3].label = "Method";
+    defs[3].receiver_type = "test.contracts.Contract";
+    defs[3].def_module_qn = "test.contracts";
+    for (int i = 0; i < 4; i++) {
+        defs[i].lang = CBM_LANG_PYTHON;
+    }
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, 4);
+    ASSERT_NOT_NULL(reg);
+    ASSERT_TRUE(reg->read_only);
+    const CBMRegisteredType *base = cbm_registry_lookup_type(reg, "test.mod.Foo");
+    ASSERT_NOT_NULL(base);
+    ASSERT_NOT_NULL(base->field_names);
+    ASSERT_NOT_NULL(base->field_types);
+    const char **names_before = base->field_names;
+    const CBMType **types_before = base->field_types;
+    const CBMType *type_before = base->field_types[0];
+    ASSERT_NOT_NULL(type_before);
+    ASSERT_NULL(base->field_types[1]);
+
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    CBMTypeRegistry overlay;
+    cbm_registry_init(&overlay, &scratch);
+    overlay.fallback = reg;
+    const char *writer = "class Foo:\n"
+                         "    def m(self):\n"
+                         "        self.x = 1\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross_with_registry(&scratch, writer, (int)strlen(writer), "test.mod", &overlay,
+                                       NULL, NULL, 0, NULL, &out, NULL);
+
+    /* Observe while scratch is live, then release both arenas before any
+     * failure assertion so the regression also fails cleanly under LSan. */
+    bool shared_names_unchanged = base->field_names == names_before;
+    bool shared_types_unchanged = base->field_types == types_before;
+    bool shared_element_unchanged = base->field_types[0] == type_before;
+    bool shared_terminator_unchanged = base->field_types[1] == NULL;
+    const CBMRegisteredType *refined = cbm_registry_lookup_type(&overlay, "test.mod.Foo");
+    bool local_refined = refined && refined != base && refined->field_types &&
+                         refined->field_types != types_before && refined->field_types[0] &&
+                         refined->field_types[0] != type_before &&
+                         refined->field_types[0]->kind == CBM_TYPE_BUILTIN &&
+                         refined->field_types[1] == NULL;
+    cbm_arena_destroy(&scratch);
+
+    /* Never read a corrupted shared pointer after scratch destruction. When
+     * intact, a later file must still see the original Contract field. */
+    int hits = 0;
+    if (shared_names_unchanged && shared_types_unchanged && shared_element_unchanged &&
+        shared_terminator_unchanged && local_refined) {
+        cbm_arena_init(&scratch);
+        cbm_registry_init(&overlay, &scratch);
+        overlay.fallback = reg;
+        const char *reader = "from mod import Foo\n\n"
+                             "def run(foo: Foo):\n"
+                             "    foo.x.process_batch()\n";
+        const char *import_names[] = {"Foo"};
+        const char *import_qns[] = {"test.mod.Foo"};
+        memset(&out, 0, sizeof(out));
+        cbm_run_py_lsp_cross_with_registry(&scratch, reader, (int)strlen(reader), "test.reader",
+                                           &overlay, import_names, import_qns, 1, NULL, &out, NULL);
+        for (int i = 0; i < out.count; i++) {
+            const CBMResolvedCall *call = &out.items[i];
+            if (call->caller_qn && call->callee_qn &&
+                strcmp(call->caller_qn, "test.reader.run") == 0 &&
+                strcmp(call->callee_qn, "test.contracts.Contract.process_batch") == 0 &&
+                call->kind == CBM_RESOLVED_INVOCATION &&
+                call->confidence >= CBM_LSP_CONFIDENCE_FLOOR) {
+                hits++;
+            }
+        }
+        cbm_arena_destroy(&scratch);
+    }
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(shared_names_unchanged);
+    ASSERT_TRUE(shared_types_unchanged);
+    ASSERT_TRUE(shared_element_unchanged);
+    ASSERT_TRUE(shared_terminator_unchanged);
+    ASSERT_TRUE(local_refined);
+    ASSERT_EQ(hits, 1);
     PASS();
 }
 
@@ -16216,7 +16513,10 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_tier2_shared_registry_readonly_c);
     RUN_TEST(clsp_tier2_shared_registry_readonly_cpp);
     RUN_TEST(seal_py_shared_registry_readonly);
+    RUN_TEST(registry_overlay_chain_iterates_and_copies_on_write);
+    RUN_TEST(clsp_method_return_refinement_is_copy_on_write);
     RUN_TEST(seal_py_shared_registry_readonly_fields);
+    RUN_TEST(seal_py_overlay_existing_field_keeps_shared_type);
     RUN_TEST(seal_cs_shared_registry_readonly);
     RUN_TEST(seal_ts_shared_registry_readonly);
     RUN_TEST(seal_go_shared_registry_readonly);
@@ -16323,6 +16623,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_tad_make_pair_like);
     RUN_TEST(clsp_structured_binding_pair);
     RUN_TEST(clsp_structured_binding_struct);
+    RUN_TEST(clsp_structured_binding_more_names_than_fields);
     RUN_TEST(clsp_ternary_type);
     RUN_TEST(clsp_chained_method_calls);
     RUN_TEST(clsp_std_vector_push_back);
