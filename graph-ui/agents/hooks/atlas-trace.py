@@ -21,12 +21,6 @@ import tempfile
 
 DEFAULT_FILE = os.path.join(os.path.expanduser('~'), '.atlas-trace', 'events.jsonl')
 
-# Was von einem Befehl oder einem Suchmuster aufgeschrieben wird. Laenger waere
-# in einem Instrument von 320 Pixeln ohnehin nicht zu lesen, und kuerzer
-# verloere die Datei, um die es geht.
-DETAIL_CAP = 180
-
-
 def trace_file():
     return os.environ.get('ATLAS_TRACE_FILE') or DEFAULT_FILE
 
@@ -228,12 +222,6 @@ def main():
         if not isinstance(args, dict):
             args = {}
         file_path = args.get('file_path') or args.get('notebook_path') or ''
-        detail = (
-            args.get('command')
-            or args.get('pattern')
-            or args.get('description')
-            or ''
-        )
         run = str(payload.get('session_id') or uuid.uuid4())
         root = str(payload.get('cwd') or os.getcwd())
         project = os.environ.get('ATLAS_PROJECT', os.path.basename(root.rstrip(os.sep)))
@@ -246,7 +234,8 @@ def main():
             'phase': 'end',
             'tool': tool,
             'path': str(file_path or args.get('path') or ''),
-            'detail': str(detail)[:DETAIL_CAP],
+            # Commands, patterns and descriptions may contain credentials.
+            'detail': '',
             'source': 'tool-hook',
         }
         span = line_span(file_path, args) if tool == 'Read' else None

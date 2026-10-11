@@ -65,7 +65,8 @@ typedef struct {
                                        * nonempty (case-insensitive on Windows). NULL or an empty
                                        * list preserves normal inheritance. Executable lookup
                                        * continues to use the caller's PATH. strip_git_repo_env
-                                       * also removes repository-local entries from overrides. */
+                                       * also removes repository-local entries and GIT_DIFF_OPTS
+                                       * from overrides. */
     const char *windows_cmd_payload;  /* Windows-only cmd.exe command text. When set, bin must
                                        * be an absolute path ending in cmd.exe and argv must be
                                        * NULL. The fixed /D /S /V:OFF /C prefix is added while

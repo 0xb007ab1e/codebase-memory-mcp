@@ -878,11 +878,11 @@ typedef struct {
  * for write-side opens (index_repository, manage_adr writes). That is what
  * makes readOnlyHint=true honest for them and lets plan-mode clients expose
  * them (the "read-only analysis tools" surface described in #1100).
- * get_file_outline reads through the same resolve_store() path, and
- * ingest_traces only validates and counts its input (edge creation is not
- * implemented), so both are read-only too (#2118). Only handlers that write
- * user-visible state -- index_repository, manage_adr, delete_project -- may
- * clear readOnlyHint. */
+ * get_file_outline reads through the same resolve_store() path (#2118).
+ * Only handlers that write user-visible state -- index_repository, manage_adr,
+ * delete_project, ingest_traces -- may clear readOnlyHint. Trace ingestion
+ * accumulates observation counts on retries and can evict old runs, so it is
+ * neither read-only nor idempotent and must advertise destructive effects. */
 static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"index_repository", false, false, true, false},
     {"search_graph", true, false, true, false},
@@ -900,7 +900,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"check_index_coverage", true, false, true, false},
     {"detect_changes", true, false, true, false},
     {"manage_adr", false, true, false, false},
-    {"ingest_traces", true, false, true, false},
+    {"ingest_traces", false, true, false, false},
 };
 
 static const tool_annotation_def_t *mcp_tool_annotations(const char *name) {
@@ -19551,8 +19551,34 @@ enum {
  * back so the producer can fix its naming instead of silently losing data. */
 static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
+    bool mutation_held = false;
+    if (project) {
+        mutation_held = mcp_project_mutation_begin(srv, project);
+        if (!mutation_held) {
+            free(project);
+            return cbm_mcp_text_result("project operation cancelled or blocked by an active index",
+                                       true);
+        }
+        if (mcp_request_cancelled(srv)) {
+            mcp_project_mutation_end(srv, project);
+            free(project);
+            return cbm_mcp_text_result("project operation cancelled for this request", true);
+        }
+    }
+
+    /* Hold the lease before resolving a cached generation or opening the
+     * writer, and through both observation updates and retention eviction. */
     cbm_store_t *store = resolve_store(srv, project);
-    REQUIRE_STORE(store, project);
+    if (!store) {
+        char *error = build_no_store_error_checked(srv, project);
+        char *result = cbm_mcp_text_result(error, true);
+        free(error);
+        if (mutation_held) {
+            mcp_project_mutation_end(srv, project);
+        }
+        free(project);
+        return result;
+    }
 
     yyjson_doc *adoc = yyjson_read(args, strlen(args), 0);
     yyjson_val *aroot = adoc ? yyjson_doc_get_root(adoc) : NULL;
@@ -19561,6 +19587,9 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     if (trace_count == 0U || trace_count > INGEST_TRACES_MAX) {
         if (adoc)
             yyjson_doc_free(adoc);
+        if (mutation_held) {
+            mcp_project_mutation_end(srv, project);
+        }
         free(project);
         return cbm_mcp_text_result(
             "traces is required: a non-empty array (max 10000) of {path: [qualified_name, ...]} "
@@ -19578,6 +19607,9 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     store = open_store_for_write(srv, store, &owned_rw);
     if (!store) {
         yyjson_doc_free(adoc);
+        if (mutation_held) {
+            mcp_project_mutation_end(srv, project);
+        }
         free(project);
         return cbm_mcp_text_result("could not open the project store for writing", true);
     }
@@ -19591,6 +19623,9 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
         if (owned_rw)
             cbm_store_close(owned_rw);
         yyjson_doc_free(adoc);
+        if (mutation_held) {
+            mcp_project_mutation_end(srv, project);
+        }
         free(project);
         return cbm_mcp_text_result("store is not queryable", true);
     }
@@ -19720,6 +19755,9 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     yyjson_doc_free(adoc);
     if (owned_rw)
         cbm_store_close(owned_rw);
+    if (mutation_held) {
+        mcp_project_mutation_end(srv, project);
+    }
     free(project);
 
     char *result = cbm_mcp_text_result(json, false);

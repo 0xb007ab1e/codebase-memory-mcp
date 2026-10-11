@@ -103,9 +103,6 @@ static const setting_t settings[] = {
         "integer", NULL, 0, INT_MAX, NULL, "internal/cbm/lsp/ts_lsp.c"),
     ENV("CBM_LSP_MAX_WALK_DEPTH", "Resolver walk depth", "Maximum recursive resolver walk depth.",
         "Indexing", "integer", "512", 1, INT_MAX, NULL, "internal/cbm/lsp/scope.h"),
-    ENV("CBM_WALK_DEFS_MAX", "Definition walk frame limit",
-        "Maximum extraction definition-walk frames.", "Indexing", "integer", "8388608", 1, INT_MAX,
-        NULL, "internal/cbm/extract_defs.c"),
     ENV("CBM_INDEX_MAX_RESTARTS", "Index worker restart limit",
         "Maximum worker restarts. Values start at one to preserve the daemon and MCP consumers' "
         "shared behavior.",

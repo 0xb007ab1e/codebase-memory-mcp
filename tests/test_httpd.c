@@ -2236,6 +2236,41 @@ TEST(ui_server_mutations_require_json_content_type) {
     PASS();
 }
 
+TEST(ui_server_rpc_rejects_duplicate_adr_arguments) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    static const struct {
+        const char *params;
+        int expected_status;
+    } cases[] = {
+        {"{\"name\":\"manage_adr\"}", 200},
+        {"{\"name\":\"manage_adr\",\"arguments\":{\"mode\":\"update\"},"
+         "\"arguments\":{\"mode\":\"get\"}}",
+         403},
+        {"{\"name\":\"manage_adr\",\"arguments\":{\"mode\":\"get\"},"
+         "\"arguments\":{\"mode\":\"update\"}}",
+         403},
+    };
+    int statuses[sizeof(cases) / sizeof(cases[0])] = {0};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char body[512], request[1024], response[8192];
+        snprintf(body, sizeof(body),
+                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":%s}",
+                 cases[i].params);
+        snprintf(request, sizeof(request),
+                 "POST /rpc HTTP/1.1\r\nContent-Type: application/json\r\n"
+                 "Content-Length: %zu\r\n\r\n%s",
+                 strlen(body), body);
+        int received = th_http(cbm_http_server_port(ts.srv), request, response, sizeof(response));
+        statuses[i] = received > 0 ? th_status(response) : 0;
+    }
+    th_server_stop(&ts);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT_EQ(statuses[i], cases[i].expected_status);
+    }
+    PASS();
+}
+
 TEST(ui_server_rpc_allows_only_ui_read_tools) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -3992,6 +4027,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_same_origin_request_is_allowed);
     RUN_TEST(ui_server_rejects_foreign_and_null_origins);
     RUN_TEST(ui_server_mutations_require_json_content_type);
+    RUN_TEST(ui_server_rpc_rejects_duplicate_adr_arguments);
     RUN_TEST(ui_server_rpc_allows_only_ui_read_tools);
     RUN_TEST(ui_server_atlas_routes_are_wired);
     RUN_TEST(ui_server_oversized_body_rejected);

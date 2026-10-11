@@ -1427,10 +1427,9 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"check_index_coverage", true, false, true, false},
         {"detect_changes", true, false, true, false},
         {"manage_adr", false, true, false, false},
-        /* ingest_traces only validates and counts its input; it writes
-         * nothing, so it is read-only and idempotent until edge creation
-         * actually lands (#2118). */
-        {"ingest_traces", true, false, true, false},
+        /* Observation counts accumulate on retries, and ingestion can evict
+         * old runs to enforce retention. Both effects change stored data. */
+        {"ingest_traces", false, true, false, false},
     };
 
     char *json = cbm_mcp_tools_list();
@@ -1513,10 +1512,12 @@ static bool tool_in_list(const char *name, const char *const *list, size_t count
 TEST(mcp_tool_annotations_only_mutators_are_writable_issue2118) {
     /* Handlers that write user-visible state: index_repository (builds the
      * index), manage_adr (writes/overwrites ADR sections), delete_project
-     * (removes the index). Everything else must be read-only. */
-    static const char *const mutating[] = {"index_repository", "manage_adr", "delete_project"};
+     * (removes the index), ingest_traces (accumulates observations and evicts
+     * old runs). Everything else must be read-only. */
+    static const char *const mutating[] = {"index_repository", "manage_adr", "delete_project",
+                                           "ingest_traces"};
     /* Of those, only the ones that can remove/overwrite existing data. */
-    static const char *const destructive[] = {"manage_adr", "delete_project"};
+    static const char *const destructive[] = {"manage_adr", "delete_project", "ingest_traces"};
     const size_t n_mut = sizeof(mutating) / sizeof(mutating[0]);
     const size_t n_des = sizeof(destructive) / sizeof(destructive[0]);
 
@@ -6025,6 +6026,195 @@ TEST(tool_index_status_no_project) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+static const char *const mcp_ingest_guard_request =
+    "{\"project\":\"guard-traces\",\"label\":\"guarded\",\"traces\":["
+    "{\"path\":[\"guard-traces::alpha\",\"guard-traces::beta\"]}]}";
+
+static cbm_mcp_server_t *mcp_ingest_guard_server(void) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *store = srv ? cbm_mcp_server_store(srv) : NULL;
+    if (!store ||
+        cbm_store_upsert_project(store, "guard-traces", "/tmp/guard-traces") != CBM_STORE_OK) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    cbm_mcp_server_set_project(srv, "guard-traces");
+    static const char *const names[] = {"alpha", "beta"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "guard-traces::%s", names[i]);
+        cbm_node_t node = {.project = "guard-traces",
+                           .label = "Function",
+                           .name = names[i],
+                           .qualified_name = qn,
+                           .file_path = "trace.c",
+                           .start_line = 1,
+                           .end_line = 2};
+        if (cbm_store_upsert_node(store, &node) <= 0) {
+            cbm_mcp_server_free(srv);
+            return NULL;
+        }
+    }
+    return srv;
+}
+
+static long long mcp_ingest_guard_observed_count(cbm_mcp_server_t *srv) {
+    long long count = -1;
+    if (cbm_store_observed_lookup(cbm_mcp_server_store(srv), "guard-traces", "guard-traces::alpha",
+                                  "guard-traces::beta", &count, NULL, 0, NULL, 0) != CBM_STORE_OK) {
+        return -1;
+    }
+    return count;
+}
+
+TEST(tool_ingest_traces_mutation_guard_denial_prevents_writes) {
+    cbm_mcp_server_t *srv = mcp_ingest_guard_server();
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {.deny_begin_call = 1};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+    bool blocked = resp && strstr(resp, "\"isError\":true") && strstr(resp, "blocked");
+    long long count = mcp_ingest_guard_observed_count(srv);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(blocked);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 0);
+    ASSERT_STR_EQ(probe.begin_projects[0], "guard-traces");
+    PASS();
+}
+
+TEST(tool_ingest_traces_mutation_guard_balances_repeated_writes) {
+    cbm_mcp_server_t *srv = mcp_ingest_guard_server();
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    bool stored = true;
+    for (int i = 0; i < 2; i++) {
+        char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+        char *inner = resp ? extract_text_content(resp) : NULL;
+        stored = stored && inner && strstr(inner, "\"status\":\"stored\"") &&
+                 strstr(inner, "\"pairs_stored\":1") && strstr(inner, "\"paths_stored\":1");
+        free(inner);
+        free(resp);
+    }
+    long long count = mcp_ingest_guard_observed_count(srv);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(stored);
+    ASSERT_EQ(count, 2);
+    ASSERT_EQ(probe.begin_count, 2);
+    ASSERT_EQ(probe.end_count, 2);
+    for (int i = 0; i < 2; i++) {
+        ASSERT_STR_EQ(probe.begin_projects[i], "guard-traces");
+        ASSERT_STR_EQ(probe.end_projects[i], "guard-traces");
+    }
+    PASS();
+}
+
+TEST(tool_ingest_traces_mutation_guard_cancel_releases_without_writes) {
+    cbm_mcp_server_t *srv = mcp_ingest_guard_server();
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {.cancel_on_begin_call = 1, .cancel_server = srv};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+    bool cancelled = resp && strstr(resp, "\"isError\":true") && strstr(resp, "cancelled");
+    long long count = mcp_ingest_guard_observed_count(srv);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(cancelled);
+    ASSERT_TRUE(probe.cancel_attempted);
+    ASSERT_TRUE(probe.cancel_accepted);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[0], "guard-traces");
+    ASSERT_STR_EQ(probe.end_projects[0], "guard-traces");
+    PASS();
+}
+
+TEST(tool_ingest_traces_mutation_guard_missing_store_releases) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-traces-guard-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+    char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+    bool missing = resp && strstr(resp, "\"isError\":true") &&
+                   (strstr(resp, "not found") || strstr(resp, "not indexed"));
+    char path[512];
+    snprintf(path, sizeof(path), "%s/guard-traces.db", cache);
+    bool created = cbm_file_exists(path);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, "guard-traces");
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(missing);
+    ASSERT_FALSE(created);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[0], "guard-traces");
+    ASSERT_STR_EQ(probe.end_projects[0], "guard-traces");
+    PASS();
+}
+
+/* Reject exactly the endpoint lookup at prepare time; this exercises the
+ * handler's query failure exit without corrupting a database or timing a lock. */
+static int mcp_ingest_guard_deny_nodes(void *context, int action, const char *table,
+                                       const char *column, const char *database,
+                                       const char *trigger) {
+    (void)context;
+    (void)column;
+    (void)database;
+    (void)trigger;
+    return action == SQLITE_READ && table && strcmp(table, "nodes") == 0 ? SQLITE_DENY : SQLITE_OK;
+}
+
+TEST(tool_ingest_traces_mutation_guard_query_failure_releases) {
+    cbm_mcp_server_t *srv = mcp_ingest_guard_server();
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+    sqlite3 *db = cbm_store_get_db(cbm_mcp_server_store(srv));
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(sqlite3_set_authorizer(db, mcp_ingest_guard_deny_nodes, NULL), SQLITE_OK);
+    char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+    int reset_result = sqlite3_set_authorizer(db, NULL, NULL);
+    bool failed = resp && strstr(resp, "\"isError\":true") && strstr(resp, "not queryable");
+    long long count = mcp_ingest_guard_observed_count(srv);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_EQ(reset_result, SQLITE_OK);
+    ASSERT_TRUE(failed);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[0], "guard-traces");
+    ASSERT_STR_EQ(probe.end_projects[0], "guard-traces");
     PASS();
 }
 
@@ -24473,6 +24663,11 @@ SUITE(mcp) {
 /* Kept separate so daemon-coordination regressions can be iterated without
  * running the much larger MCP behavior suite. */
 SUITE(mcp_mutation_guard) {
+    RUN_TEST(tool_ingest_traces_mutation_guard_denial_prevents_writes);
+    RUN_TEST(tool_ingest_traces_mutation_guard_balances_repeated_writes);
+    RUN_TEST(tool_ingest_traces_mutation_guard_cancel_releases_without_writes);
+    RUN_TEST(tool_ingest_traces_mutation_guard_missing_store_releases);
+    RUN_TEST(tool_ingest_traces_mutation_guard_query_failure_releases);
     RUN_TEST(tool_delete_project_mutation_guard_blocks_then_releases);
     RUN_TEST(tool_index_repository_mutation_guard_blocks_before_local_worker);
     RUN_TEST(tool_manage_adr_mutation_guard_balances_success);

@@ -114,6 +114,7 @@ TEST(runtime_settings_strict_allowlist_and_types) {
     settings_fixture_t fixture;
     ASSERT_TRUE(fixture_open(&fixture));
     const char *invalid[] = {"{\"CBM_TEST_CRASH_ON\":\"1\"}",
+                             "{\"CBM_WALK_DEFS_MAX\":\"1024\"}",
                              "{\"CBM_CACHE_DIR\":\"/tmp/no\"}",
                              "{\"CBM_WORKERS\":4}",
                              "{\"CBM_WORKERS\":\"4\",\"CBM_WORKERS\":\"8\"}",
@@ -132,6 +133,7 @@ TEST(runtime_settings_strict_allowlist_and_types) {
     yyjson_doc *snapshot = read_snapshot(fixture.path);
     ASSERT_NOT_NULL(snapshot);
     ASSERT_NULL(item(snapshot, "CBM_TEST_CRASH_ON"));
+    ASSERT_NULL(item(snapshot, "CBM_WALK_DEFS_MAX"));
     ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(item(snapshot, "CBM_CACHE_DIR"), "editable")));
     yyjson_doc_free(snapshot);
     fixture_close(&fixture);

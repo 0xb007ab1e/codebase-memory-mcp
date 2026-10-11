@@ -2990,7 +2990,8 @@ static bool rpc_tool_is_read_only(const char *name) {
 static bool rpc_manage_adr_is_read(yyjson_val *params) {
     yyjson_val *arguments = json_unique_member(params, "arguments");
     if (!arguments)
-        return true; /* no arguments → default mode "get" */
+        /* Only an absent arguments member defaults to "get". A duplicate is ambiguous. */
+        return yyjson_obj_get(params, "arguments") == NULL;
     if (!yyjson_is_obj(arguments))
         return false;
     bool mode_seen = false;

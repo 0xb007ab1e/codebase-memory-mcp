@@ -506,7 +506,7 @@ static bool cbm_subprocess_copy_environment(cbm_subprocess_t *process, const cha
         entries[index++] = entry;
     }
     for (size_t i = 0; i < override_count; i++) {
-        if (process->strip_git_repo_env && cbm_git_env_entry_is_repo_local(overrides[i])) {
+        if (process->strip_git_repo_env && cbm_git_env_entry_should_strip(overrides[i])) {
             continue;
         }
         converted[i] = cbm_utf8_to_wide(overrides[i]);
@@ -583,7 +583,7 @@ static bool cbm_subprocess_copy_environment(cbm_subprocess_t *process, const cha
         }
     }
     for (size_t i = 0; i < override_count; i++) {
-        if (process->strip_git_repo_env && cbm_git_env_entry_is_repo_local(overrides[i])) {
+        if (process->strip_git_repo_env && cbm_git_env_entry_should_strip(overrides[i])) {
             continue;
         }
         size_t name_length = (size_t)(strchr(overrides[i], '=') - overrides[i]);

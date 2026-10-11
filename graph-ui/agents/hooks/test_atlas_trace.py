@@ -1,6 +1,7 @@
 """Reproducible local producer tests; no external network or agent accounts."""
 import concurrent.futures
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -30,6 +31,66 @@ class TraceTests(unittest.TestCase):
         with hook.open_outbox() as db:
             hook.enqueue(db, 'fixture', {'run': 'concurrent-run', 'seq': 0, 'ts': number,
                                         'agent': 'fixture', 'tool': 'Read', 'phase': 'end'})
+
+    def assert_private_tool_input_is_omitted(self, tool, field, value, private_marker):
+        root = Path(self.directory.name)
+        source = root / 'src' / 'example.py'
+        payload = {'tool_name': tool, 'session_id': 'privacy-run', 'cwd': str(root),
+                   'tool_input': {field: value, 'file_path': str(source)}}
+        generated = []
+        original_enqueue = hook.enqueue
+
+        def capture_enqueue(db, project, row):
+            generated.append(json.loads(json.dumps(row)))
+            original_enqueue(db, project, row)
+
+        with patch.dict(os.environ, {'ATLAS_PROJECT': 'fixture', 'ATLAS_AGENT_NAME': 'fixture'}), \
+                patch.object(hook.sys, 'argv', ['atlas-trace.py']), \
+                patch.object(hook.sys, 'stdin', io.StringIO(json.dumps(payload))), \
+                patch.object(hook.time, 'time', return_value=1234.5), \
+                patch.object(hook, 'enqueue', side_effect=capture_enqueue), \
+                patch.object(hook.urllib.request, 'build_opener') as transport:
+            transport.return_value.open.side_effect = OSError('offline fixture')
+            self.assertEqual(hook.main(), 0)
+            transport.return_value.open.assert_called_once()
+            request = transport.return_value.open.call_args.args[0]
+
+        with hook.open_outbox() as db:
+            pending = db.execute('SELECT project,payload FROM pending').fetchall()
+        self.assertEqual(len(generated), 1)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0][0], 'fixture')
+        outbound = json.loads(request.data)
+        self.assertEqual(outbound['project'], 'fixture')
+        self.assertEqual(len(outbound['events']), 1)
+        for surface, event, serialized in (
+                ('generated', generated[0], json.dumps(generated[0])),
+                ('persisted', json.loads(pending[0][1]), pending[0][1]),
+                ('outgoing', outbound['events'][0], request.data.decode())):
+            with self.subTest(surface=surface):
+                self.assertEqual(event['tool'], tool)
+                self.assertEqual(event['path'], os.path.join('src', 'example.py'))
+                self.assertEqual(event['agent'], 'fixture')
+                self.assertEqual(event['run'], 'privacy-run')
+                self.assertEqual(event['phase'], 'end')
+                self.assertEqual(event['source'], 'tool-hook')
+                self.assertEqual(event['ts'], 1234500)
+                self.assertNotIn(private_marker, serialized)
+                self.assertNotIn(value, serialized)
+
+    def test_command_private_values_never_enter_event_payloads(self):
+        marker = 'SYNTHETIC_COMMAND_PRIVATE_VALUE_71E5'
+        self.assert_private_tool_input_is_omitted(
+            'Bash', 'command', 'AUTH_TOKEN=' + marker + ' example-tool --quiet', marker)
+
+    def test_search_patterns_never_enter_event_payloads(self):
+        marker = 'SYNTHETIC_PATTERN_PRIVATE_VALUE_83A6'
+        self.assert_private_tool_input_is_omitted('Grep', 'pattern', marker, marker)
+
+    def test_description_private_values_never_enter_event_payloads(self):
+        marker = 'SYNTHETIC_DESCRIPTION_PRIVATE_VALUE_92B7'
+        self.assert_private_tool_input_is_omitted(
+            'Bash', 'description', 'Inspect the value ' + marker, marker)
 
     def test_concurrent_hooks_allocate_unique_sequences_and_keep_pending_after_failure(self):
         with hook.open_outbox():
