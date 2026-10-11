@@ -564,6 +564,24 @@ TEST(lang_fn_dockerfile_variants) {
     ASSERT_NEQ(cbm_language_for_filename("Dockerfiles"), CBM_LANG_DOCKERFILE);
     PASS();
 }
+/* A name shorter than "Dockerfile" / "Containerfile" is read no further than
+ * its end: each name sits in a heap block of exactly its size, so a sanitizer
+ * sees the overread the variant check once made (GCC ASan, doc-link code
+ * asking for the language of `a.go`). */
+TEST(lang_fn_short_names_read_in_bounds) {
+    static const char *const NAMES[] = {"a",    "a.go",       "go.mod", "Dock",
+                                        "Dockerf", "Containe", "x.yaml"};
+    for (size_t i = 0; i < sizeof(NAMES) / sizeof(NAMES[0]); i++) {
+        size_t n = strlen(NAMES[i]) + 1;
+        char *exact = malloc(n);
+        ASSERT_NOT_NULL(exact);
+        memcpy(exact, NAMES[i], n);
+        CBMLanguage lang = cbm_language_for_filename(exact);
+        free(exact);
+        ASSERT_NEQ(lang, CBM_LANG_DOCKERFILE);
+    }
+    PASS();
+}
 TEST(lang_fn_meson_build) {
     ASSERT_EQ(cbm_language_for_filename("meson.build"), CBM_LANG_MESON);
     PASS();
@@ -1651,6 +1669,7 @@ SUITE(language) {
     RUN_TEST(lang_fn_cmake);
     RUN_TEST(lang_fn_dockerfile);
     RUN_TEST(lang_fn_dockerfile_variants);
+    RUN_TEST(lang_fn_short_names_read_in_bounds);
     RUN_TEST(lang_fn_meson_build);
     RUN_TEST(lang_fn_meson_opts);
     RUN_TEST(lang_fn_meson_opts_txt);

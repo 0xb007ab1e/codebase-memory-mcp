@@ -983,9 +983,12 @@ static bool lang_dockerfile_variant(const cbm_userconfig_t *ucfg, const char *fi
     static const char DOCKERIGNORE[] = ".dockerignore";
     for (size_t i = 0; i < sizeof(BASES) / sizeof(BASES[0]); i++) {
         size_t bl = strlen(BASES[i]);
+        /* the base first: only a name that holds it has a character after it */
+        if (strncmp(filename, BASES[i], bl) != 0) {
+            continue;
+        }
         char sep = filename[bl];
-        if (strncmp(filename, BASES[i], bl) != 0 || (sep != '.' && sep != '-' && sep != '_') ||
-            !filename[bl + SKIP_ONE]) {
+        if ((sep != '.' && sep != '-' && sep != '_') || !filename[bl + SKIP_ONE]) {
             continue;
         }
         size_t fl = strlen(filename);
