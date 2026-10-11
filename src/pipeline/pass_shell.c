@@ -376,6 +376,7 @@ typedef struct {
     const char *job;  /* pass-arena: its job; NULL: none */
     bool chart;
     bool spawn; /* SPAWNS the script `tgt` / the Process `ext`, not DEPLOYS */
+    bool make;  /* SPAWNS the rule of target `ext` that makefile `path` reads */
 } sh_hit_t;
 
 typedef struct {
@@ -1767,6 +1768,24 @@ static int64_t sh_repo_file_id(const sh_t *s, const char *path) {
 
 static const char *const SH_SHELLS[] = {"bash", "sh", "zsh", "ksh", "dash", NULL};
 
+/* The one candidate of `path` that names a File of the repository (its
+ * File node in *id); NULL: none, or two. */
+static const char *sh_unique_file(sh_t *s, const char *path, int64_t *id) {
+    const char *c[PAIR_LEN] = {NULL, NULL};
+    int n = sh_candidates(s, path, c);
+    const char *hit = NULL;
+    int found = 0;
+    for (int i = 0; i < n; i++) {
+        int64_t f = sh_repo_file_id(s, c[i]);
+        if (f > 0) {
+            found++;
+            *id = f;
+            hit = c[i];
+        }
+    }
+    return found == SKIP_ONE ? hit : NULL;
+}
+
 /* The program is a script of the repository -- its path names a file of it,
  * or a shell runs one (bash [-opts] FILE; -c TEXT is no file) -- resolved to
  * exactly one file: that script is spawned. */
@@ -1785,26 +1804,186 @@ static void sh_spawn_script(sh_t *s, TSNode cmd, const sh_argv_t *a, int p) {
     if (!path) {
         return;
     }
-    const char *c[PAIR_LEN] = {NULL, NULL};
-    int n = sh_candidates(s, path, c);
-    const char *hit = NULL;
     int64_t id = 0;
-    int found = 0;
-    for (int i = 0; i < n; i++) {
-        int64_t f = sh_repo_file_id(s, c[i]);
-        if (f > 0) {
-            found++;
-            id = f;
-            hit = c[i];
-        }
-    }
-    if (found == SKIP_ONE) {
+    const char *hit = sh_unique_file(s, path, &id);
+    if (hit) {
         sh_hit_push(s, cmd,
                     (sh_hit_t){.via = s->exec ? "exec" : "shell",
                                .tgt = id,
                                .ext = sh_basename(hit),
                                .path = hit,
                                .spawn = true});
+    }
+}
+
+/* ── make TARGET (P3.5b) ───────────────────────────────────────────── */
+
+static const char *const SH_MAKES[] = {"make", "gmake", NULL};
+static const char *const SH_MAKEFILES[] = {"GNUmakefile", "makefile", "Makefile", NULL};
+
+typedef enum { MK_OPT_NONE, MK_OPT_DIR, MK_OPT_FILE, MK_OPT_ARG } mk_opt_t;
+
+/* A long option of make that takes a value (v: n bytes, no `=...`). */
+static mk_opt_t sh_make_long(const char *v, size_t n) {
+    static const struct {
+        const char *name;
+        mk_opt_t kind;
+    } opts[] = {
+        {"--directory", MK_OPT_DIR},   {"--file", MK_OPT_FILE},    {"--makefile", MK_OPT_FILE},
+        {"--include-dir", MK_OPT_ARG}, {"--old-file", MK_OPT_ARG}, {"--assume-old", MK_OPT_ARG},
+        {"--what-if", MK_OPT_ARG},     {"--new-file", MK_OPT_ARG}, {"--assume-new", MK_OPT_ARG}};
+    for (size_t i = 0; i < sizeof(opts) / sizeof(opts[0]); i++) {
+        if (strlen(opts[i].name) == n && strncmp(v, opts[i].name, n) == 0) {
+            return opts[i].kind;
+        }
+    }
+    return MK_OPT_NONE;
+}
+
+/* A command-line variable: NAME=, NAME:=, NAME::=, NAME+=, NAME?=, NAME!=. */
+static bool sh_make_assignment(const char *v) {
+    if (!(v[0] == '_' || ((v[0] | ' ') >= 'a' && (v[0] | ' ') <= 'z'))) {
+        return false;
+    }
+    size_t i = SKIP_ONE;
+    while (v[i] && (v[i] == '_' || v[i] == '.' || v[i] == '-' || (v[i] >= '0' && v[i] <= '9') ||
+                    ((v[i] | ' ') >= 'a' && (v[i] | ' ') <= 'z'))) {
+        i++;
+    }
+    while (v[i] == ' ' || v[i] == '\t') {
+        i++;
+    }
+    if (v[i] == ':') {
+        while (v[i] == ':') {
+            i++;
+        }
+        return v[i] == '=';
+    }
+    return v[i] == '=' || (v[i] && strchr("+?!", v[i]) && v[i + SKIP_ONE] == '=');
+}
+
+/* -j N / -l N: N is a count. */
+static bool sh_make_count(const char *v) {
+    if (!v || !v[0]) {
+        return false;
+    }
+    for (const char *p = v; *p; p++) {
+        if (!(*p == '.' || (*p >= '0' && *p <= '9'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* -C DIR after `base`: DIR from base, an absolute (anchored) DIR alone. */
+static const char *sh_make_join(CBMArena *a, const char *base, const char *dir) {
+    if (dir[0] == SH_ANCHOR || dir[0] == '/' || sh_eq(base, ".")) {
+        return dir;
+    }
+    return cbm_arena_sprintf(a, "%s/%s", base, dir);
+}
+
+/* The makefile make reads in directory `dir` (GNUmakefile, makefile,
+ * Makefile, the first there is), for the one candidate of `dir` that has
+ * one; NULL otherwise. */
+static const char *sh_make_default(sh_t *s, const char *dir) {
+    const char *c[PAIR_LEN] = {NULL, NULL};
+    int n = sh_candidates(s, dir, c);
+    const char *hit = NULL;
+    int found = 0;
+    for (int i = 0; i < n; i++) {
+        for (int k = 0; SH_MAKEFILES[k]; k++) {
+            const char *p = sh_join(s->a, c[i], SH_MAKEFILES[k]);
+            if (p && sh_repo_file_id(s, p) > 0) {
+                found++;
+                hit = p;
+                break;
+            }
+        }
+    }
+    return found == SKIP_ONE ? hit : NULL;
+}
+
+/* make [-C DIR] [-f FILE] [VAR=V] TARGET...: each TARGET SPAWNS the rule of
+ * that name the makefile reads -- the first -f, else the directory's (-C is
+ * cumulative) -- resolved when linking, through its includes. An unknown -C
+ * or -f value is no edge, an unknown word no target; no target (the default
+ * goal) is no edge. */
+static void sh_make(sh_t *s, TSNode cmd, const sh_argv_t *a, int p) {
+    const char *dir = ".";
+    const char *file = NULL;
+    const char **targets = cbm_arena_alloc(s->a, (size_t)(a->n + SKIP_ONE) * sizeof(*targets));
+    if (!targets) {
+        return;
+    }
+    int nt = 0;
+    bool rest = false;
+    for (int j = p + SKIP_ONE; j < a->n; j++) {
+        const char *v = a->v[j];
+        if (!v) {
+            continue;
+        }
+        if (rest || v[0] != '-' || sh_eq(v, "-")) {
+            if (rest || !sh_make_assignment(v)) {
+                targets[nt++] = v;
+            }
+            continue;
+        }
+        if (sh_eq(v, "--")) {
+            rest = true;
+            continue;
+        }
+        const char *arg = NULL;
+        mk_opt_t kind = MK_OPT_NONE;
+        if (v[SKIP_ONE] == '-') {
+            const char *eq = strchr(v, '=');
+            kind = sh_make_long(v, eq ? (size_t)(eq - v) : strlen(v));
+            arg = eq ? eq + SKIP_ONE : NULL;
+            if (kind != MK_OPT_NONE && !eq) {
+                j++;
+                arg = j < a->n ? a->v[j] : NULL;
+            }
+        } else {
+            for (size_t k = SKIP_ONE; v[k]; k++) {
+                if (strchr("CfIoW", v[k])) {
+                    kind = v[k] == 'C' ? MK_OPT_DIR : v[k] == 'f' ? MK_OPT_FILE : MK_OPT_ARG;
+                    arg = v[k + SKIP_ONE] ? v + k + SKIP_ONE : NULL;
+                    if (!arg) {
+                        j++;
+                        arg = j < a->n ? a->v[j] : NULL;
+                    }
+                    break;
+                }
+                if (v[k] == 'j' || v[k] == 'l') {
+                    if (!v[k + SKIP_ONE] && j + SKIP_ONE < a->n &&
+                        sh_make_count(a->v[j + SKIP_ONE])) {
+                        j++;
+                    }
+                    break;
+                }
+            }
+        }
+        if (kind == MK_OPT_DIR || kind == MK_OPT_FILE) {
+            if (!arg) {
+                return;
+            }
+            if (kind == MK_OPT_DIR) {
+                dir = sh_make_join(s->a, dir, arg);
+            } else if (!file) {
+                file = arg;
+            }
+        }
+    }
+    int64_t id = 0;
+    const char *mkfile =
+        file ? sh_unique_file(s, sh_make_join(s->a, dir, file), &id) : sh_make_default(s, dir);
+    for (int i = 0; mkfile && i < nt; i++) {
+        sh_hit_push(s, cmd,
+                    (sh_hit_t){.via = s->exec ? "exec" : "shell",
+                               .ext = targets[i],
+                               .path = mkfile,
+                               .spawn = true,
+                               .make = true});
     }
 }
 
@@ -1820,6 +1999,9 @@ static void sh_spawn(sh_t *s, TSNode cmd, const sh_argv_t *a) {
     const char *v = a->v[p];
     const char *name = NULL;
     if (v) {
+        if (sh_in(sh_basename(v), SH_MAKES)) {
+            sh_make(s, cmd, a, p);
+        }
         sh_spawn_script(s, cmd, a, p);
         if (!strchr(v, '/') || strpbrk(v, "*?[")) {
             return;
@@ -2349,7 +2531,12 @@ typedef struct {
     uint32_t row; /* 0-based row of b */
 } mk_line_t;
 
-typedef struct {
+typedef struct mk mk_t;
+
+/* An include directive's expanded file names (mk_closure). */
+typedef void (*mk_include_fn)(mk_t *m, const char *names);
+
+struct mk {
     CBMArena *a;
     const char *src;
     CBMHashTable *vars; /* name -> mk_var_t */
@@ -2357,7 +2544,9 @@ typedef struct {
     mk_line_t *lines;
     int nlines;
     int cap_lines;
-} mk_t;
+    mk_include_fn on_include; /* NULL: includes are not followed */
+    void *ud;
+};
 
 static const char MK_UNKNOWN[] = "${__cbm_unknown}";
 
@@ -2368,6 +2557,9 @@ static const char *mk_lookup(mk_t *m, const char *name) {
         return m->makefile ? "${__cbm_curdir}" : MK_UNKNOWN;
     }
     mk_var_t *v = cbm_ht_get(m->vars, name);
+    if (!v && strcmp(name, "MAKE") == 0) {
+        return "make"; /* make's own command, unless the makefile sets it */
+    }
     if (!v || !v->known || v->busy) {
         return MK_UNKNOWN;
     }
@@ -2494,6 +2686,34 @@ static const char *mk_expand(mk_t *m, const char *text) {
     return sh_str_done(&b);
 }
 
+/* A variable's value as make reads it: each backslash-newline, with the
+ * blanks around it, is one space (a value expanded into a recipe line adds
+ * no lines). */
+static const char *mk_fold(CBMArena *a, const char *p, size_t n) {
+    char *out = cbm_arena_alloc(a, n + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t k = i + SKIP_ONE;
+        k += k < n && p[k] == '\r';
+        if (p[i] != '\\' || k >= n || p[k] != '\n') {
+            out[o++] = p[i];
+            continue;
+        }
+        while (o > 0 && (out[o - SKIP_ONE] == ' ' || out[o - SKIP_ONE] == '\t')) {
+            o--;
+        }
+        out[o++] = ' ';
+        i = k;
+        while (i + SKIP_ONE < n && (p[i + SKIP_ONE] == ' ' || p[i + SKIP_ONE] == '\t')) {
+            i++;
+        }
+    }
+    return mk_trim(a, out, o);
+}
+
 static void mk_assign(mk_t *m, TSNode n, bool cond) {
     TSNode name = ts_node_child_by_field_name(n, TS_FIELD("name"));
     TSNode value = ts_node_child_by_field_name(n, TS_FIELD("value"));
@@ -2505,7 +2725,7 @@ static void mk_assign(mk_t *m, TSNode n, bool cond) {
     const char *raw = "";
     if (!ts_node_is_null(value)) {
         uint32_t vb = ts_node_start_byte(value);
-        raw = mk_trim(m->a, m->src + vb, ts_node_end_byte(value) - vb);
+        raw = mk_fold(m->a, m->src + vb, ts_node_end_byte(value) - vb);
     }
     const char *op = "=";
     for (uint32_t i = 0; i < ts_node_child_count(n); i++) {
@@ -2608,6 +2828,16 @@ static void mk_collect_one(mk_t *m, TSNode c, bool cond) {
     } else if (strstr(t, "conditional") || strstr(t, "if") == t ||
                strcmp(t, "else_directive") == 0 || strcmp(t, "elsif_directive") == 0) {
         mk_collect(m, c, true);
+    } else if (strcmp(t, "include_directive") == 0) {
+        TSNode names = ts_node_child_by_field_name(c, TS_FIELD("filenames"));
+        if (m->on_include && !ts_node_is_null(names)) {
+            uint32_t nb = ts_node_start_byte(names);
+            const char *raw = mk_trim(m->a, m->src + nb, ts_node_end_byte(names) - nb);
+            const char *v = raw ? mk_expand(m, raw) : NULL;
+            if (v) {
+                m->on_include(m, v);
+            }
+        }
     } else if (strstr(t, "directive")) {
         mk_collect(m, c, cond);
     }
@@ -2692,9 +2922,9 @@ static void sh_makefile(sh_pass_t *p, const char *rel, const char *src, size_t l
         uint32_t e = m.lines[r].e;
         const char *raw = cbm_arena_strndup(&a, src + b, e - b);
         const char *text = raw ? mk_expand(&m, raw) : NULL;
-        if (!text || (!strchr(text, '/') && !strstr(text, "sh") &&
+        if (!text || (!strchr(text, '/') && !strstr(text, "sh") && !strstr(text, "make") &&
                       !sh_mentions_deploy_tool(text, strlen(text)))) {
-            continue; /* neither a deploy, a program started by a path, nor a shell */
+            continue; /* no deploy, program by path, shell or make */
         }
         size_t tl = strlen(text);
         char *buf = cbm_arena_alloc(&a, tl + CBM_SZ_16);
@@ -2728,6 +2958,171 @@ static void sh_makefile(sh_pass_t *p, const char *rel, const char *src, size_t l
     cbm_free(CBM_MEM_CLASS_OTHER, m.lines);
     cbm_arena_destroy(&a);
     ts_tree_delete(tree);
+}
+
+/* ── make targets: the rules a makefile reads (P3.5b) ──────────────── */
+
+typedef struct {
+    sh_pass_t *p;
+    cbm_pipeline_ctx_t *ctx;
+    CBMArena *a;
+    CBMHashTable *seen; /* the files read */
+    CBMHashTable *vars; /* shared by them, as make shares them */
+    const char **order; /* the files, in reading order */
+    int n;
+    int cap;
+    const char *mkdir; /* make's directory ("" = the root) */
+} mk_closure_t;
+
+static void mk_closure_file(mk_closure_t *cl, const char *rel);
+
+/* An include directive: each name -- from make's directory ($(CURDIR) is
+ * it), or the root ($(shell git rev-parse --show-toplevel)) -- is read in
+ * turn, recursively, where the directive stands. A name not fully known is
+ * skipped. */
+static void mk_closure_include(mk_t *m, const char *names) {
+    static const char curdir[] = "${__cbm_curdir}";
+    static const char root[] = "${__cbm_root}";
+    mk_closure_t *cl = m->ud;
+    const char *p = names;
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+            p++;
+        }
+        size_t wl = strcspn(p, " \t\r\n");
+        if (!wl) {
+            return;
+        }
+        const char *w = cbm_arena_strndup(cl->a, p, wl);
+        p += wl;
+        const char *base = cl->mkdir;
+        if (w && strncmp(w, curdir, sizeof(curdir) - SKIP_ONE) == 0) {
+            w += sizeof(curdir) - SKIP_ONE;
+        } else if (w && strncmp(w, root, sizeof(root) - SKIP_ONE) == 0) {
+            w += sizeof(root) - SKIP_ONE;
+            base = "";
+        } else if (w && w[0] == '/') {
+            continue;
+        }
+        const char *path = w && !strchr(w, '$') ? sh_join(cl->a, base, w) : NULL;
+        if (path) {
+            mk_closure_file(cl, path);
+        }
+    }
+}
+
+static void mk_closure_file(mk_closure_t *cl, const char *rel) {
+    if (cbm_ht_get(cl->seen, rel) ||
+        !sh_grow((void **)&cl->order, &cl->cap, cl->n, sizeof(*cl->order))) {
+        return;
+    }
+    cbm_ht_set(cl->seen, rel, (void *)rel);
+    cl->order[cl->n++] = rel;
+    const char *abs = cbm_arena_sprintf(cl->a, "%s/%s", cl->ctx->repo_path, rel);
+    size_t len = 0;
+    char *src = abs ? sh_read(abs, &len) : NULL;
+    if (!src) {
+        return;
+    }
+    TSTree *tree = NULL;
+    if (ts_parser_set_language(cl->p->parser, cbm_ts_language(CBM_LANG_MAKEFILE))) {
+        tree = ts_parser_parse_string(cl->p->parser, NULL, src, (uint32_t)len);
+    }
+    if (tree) {
+        mk_t m = {.a = cl->a,
+                  .src = src,
+                  .vars = cl->vars,
+                  .makefile = true,
+                  .on_include = mk_closure_include,
+                  .ud = cl};
+        mk_collect(&m, ts_tree_root_node(tree), false);
+        cbm_free(CBM_MEM_CLASS_OTHER, m.lines);
+        ts_tree_delete(tree);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, src);
+}
+
+static const char *mk_rule_key(CBMArena *a, const char *file, const char *name) {
+    return cbm_arena_sprintf(a, "%s\x1f%s", file, name);
+}
+
+/* Each make hit's target: the rule node of that name in the makefile, else
+ * in the files it includes, in reading order (the first rule of a file).
+ * Read here, when linking, so an unchanged makefile is read too. */
+static void sh_make_resolve(sh_pass_t *p, cbm_pipeline_ctx_t *ctx, sh_hits_t *h) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMHashTable *closures = cbm_ht_create(0); /* makefile -> mk_closure_t */
+    CBMHashTable *want = cbm_ht_create(0);     /* every file a closure reads */
+    CBMHashTable *rules = cbm_ht_create(0);    /* file \x1f name -> rule node */
+    for (int i = 0; closures && want && i < h->count; i++) {
+        const sh_hit_t *x = &h->items[i];
+        if (!x->make || cbm_ht_get(closures, x->path)) {
+            continue;
+        }
+        mk_closure_t *cl = cbm_arena_alloc(&a, sizeof(*cl));
+        if (!cl) {
+            continue;
+        }
+        const char *dir = sh_dirname(&a, x->path);
+        *cl = (mk_closure_t){.p = p,
+                             .ctx = ctx,
+                             .a = &a,
+                             .seen = cbm_ht_create(0),
+                             .vars = cbm_ht_create(0),
+                             .mkdir = dir && strcmp(dir, ".") != 0 ? dir : ""};
+        if (cl->seen && cl->vars) {
+            mk_closure_file(cl, x->path);
+        }
+        for (int k = 0; k < cl->n; k++) {
+            cbm_ht_set(want, cl->order[k], (void *)cl->order[k]);
+        }
+        cbm_ht_set(closures, x->path, cl);
+    }
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (rules && want && cbm_ht_count(want) > 0 &&
+        cbm_gbuf_find_by_label(ctx->gbuf, "Function", &nodes, &count) == 0) {
+        for (int i = 0; i < count; i++) {
+            const char *fp = nodes[i]->file_path;
+            if (!fp || !nodes[i]->name || !cbm_ht_get(want, fp)) {
+                continue;
+            }
+            const char *key = mk_rule_key(&a, fp, nodes[i]->name);
+            const cbm_gbuf_node_t *old = key ? cbm_ht_get(rules, key) : NULL;
+            if (key && (!old || nodes[i]->start_line < old->start_line)) {
+                cbm_ht_set(rules, key, (void *)nodes[i]);
+            }
+        }
+    }
+    for (int i = 0; rules && closures && i < h->count; i++) {
+        sh_hit_t *x = &h->items[i];
+        const mk_closure_t *cl = x->make ? cbm_ht_get(closures, x->path) : NULL;
+        for (int k = 0; cl && k < cl->n && x->tgt <= 0; k++) {
+            const char *key = mk_rule_key(&a, cl->order[k], x->ext);
+            const cbm_gbuf_node_t *rule = key ? cbm_ht_get(rules, key) : NULL;
+            x->tgt = rule ? rule->id : 0;
+        }
+    }
+    for (int i = 0; closures && i < h->count; i++) {
+        mk_closure_t *cl = h->items[i].make ? cbm_ht_get(closures, h->items[i].path) : NULL;
+        if (cl) {
+            cbm_ht_delete(closures, h->items[i].path);
+            cbm_ht_free(cl->seen);
+            cbm_ht_free(cl->vars);
+            cbm_free(CBM_MEM_CLASS_OTHER, (void *)cl->order);
+        }
+    }
+    if (closures) {
+        cbm_ht_free(closures);
+    }
+    if (want) {
+        cbm_ht_free(want);
+    }
+    if (rules) {
+        cbm_ht_free(rules);
+    }
+    cbm_arena_destroy(&a);
 }
 
 /* ── Edges ─────────────────────────────────────────────────────────── */
@@ -2809,16 +3204,24 @@ static void sh_ci_props(const sh_hit_t *x, char *out, size_t sz) {
     }
 }
 
-/* SPAWNS to the script `x->tgt` (its Module, else its File) or to the
- * Process of `x->ext`, as pass_spawns.c draws it. */
+/* SPAWNS to the rule `x->tgt` of a make target, the script `x->tgt` (its
+ * Module, else its File) or the Process of `x->ext`, as pass_spawns.c draws
+ * it. */
 static int sh_link_spawn(cbm_pipeline_ctx_t *ctx, int64_t src, const sh_hit_t *x,
                          CBMHashTable *modules) {
     char program[CBM_SZ_128];
-    cbm_json_escape(program, (int)sizeof(program), x->ext);
-    char path[CBM_SZ_1K + CBM_SZ_16];
+    cbm_json_escape(program, (int)sizeof(program), x->make ? "make" : x->ext);
+    char path[CBM_SZ_2K];
     path[0] = '\0';
     int64_t tgt = 0;
-    if (x->tgt > 0) {
+    if (x->make) {
+        char esc[CBM_SZ_1K];
+        char target[CBM_SZ_512];
+        cbm_json_escape(esc, (int)sizeof(esc), x->path);
+        cbm_json_escape(target, (int)sizeof(target), x->ext);
+        snprintf(path, sizeof(path), ",\"path\":\"%s\",\"target\":\"%s\"", esc, target);
+        tgt = x->tgt;
+    } else if (x->tgt > 0) {
         int64_t mod = (int64_t)(intptr_t)cbm_ht_get(modules, x->path);
         tgt = mod > 0 ? mod : x->tgt;
         char esc[CBM_SZ_1K];
@@ -3030,6 +3433,9 @@ void cbm_pipeline_pass_shell(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
     }
     if (prow) {
         cbm_ht_free(prow);
+    }
+    if (hits.count > 0 && p.ix_ok && p.parser) {
+        sh_make_resolve(&p, ctx, &hits);
     }
     int edges = hits.count > 0 ? sh_link(ctx, &hits) : 0;
     if (p.parser) {

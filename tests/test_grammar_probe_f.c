@@ -1778,7 +1778,8 @@ static char *gpf_spawns(const GpfFile *files, int nfiles) {
 
 /* Every SPAWNS and DEPLOYS edge as "source -> target (TYPE api|via[
  * ci[/job]])", sorted, one per line: top-level code as "@<file>"; a script
- * as "script:<path>", a Process as "proc:<name>", a Chart as "chart:<name>". */
+ * as "script:<path>", a Process as "proc:<name>", a Chart as "chart:<name>",
+ * a Make rule as "rule:<file>:<target>". */
 static char *gpf_runs(const GpfFile *files, int nfiles) {
     GpfProj lp;
     cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
@@ -1790,7 +1791,8 @@ static char *gpf_runs(const GpfFile *files, int nfiles) {
             "CASE WHEN s.label IN ('Module','File') THEN '@' || s.file_path ELSE s.name END "
             "|| ' -> ' || CASE WHEN t.label IN ('Module','File') THEN 'script:' || t.file_path "
             "WHEN t.label='Process' THEN 'proc:' || t.name WHEN t.label='Chart' THEN "
-            "'chart:' || t.name ELSE t.label || ':' || t.file_path END "
+            "'chart:' || t.name WHEN t.label='Function' THEN 'rule:' || t.file_path || ':' || "
+            "t.name ELSE t.label || ':' || t.file_path END "
             "|| ' (' || e.type || ' ' || coalesce(json_extract(e.properties,'$.api'), "
             "json_extract(e.properties,'$.via')) || coalesce(' ' || "
             "json_extract(e.properties,'$.ci') || coalesce('/' || "
@@ -2114,6 +2116,64 @@ TEST(probe_ci_and_scripts_run_scripts) {
         "test -> proc:bash (SPAWNS shell)\n"
         "test -> script:hack/lint.sh (SPAWNS shell)\n"
         "test -> script:hack/test.sh (SPAWNS shell)");
+    PASS();
+}
+
+/* make TARGET SPAWNS the rule of TARGET the makefile reads: the
+ * directory's Makefile (-C, --directory=), a -f file, a rule of a file it
+ * includes; from scripts, CI steps and recipes ($(MAKE)), on the line of
+ * the command (a multi-line variable expanded before it adds no lines). No
+ * edge for an unknown target or -C value, a target no rule has, a rule only
+ * inside a conditional (no node), or no target. */
+TEST(probe_make_targets_spawn_their_rules) {
+    static const GpfFile files[] = {
+        {"Makefile", "include mk/common.mk\n"
+                     "VERSION := 1\n"
+                     "KEYS = a \\\n"
+                     "       b \\\n"
+                     "       c\n\n"
+                     "build:\n"
+                     "\tgo build ./...\n\n"
+                     "test: build\n"
+                     "\t$(MAKE) lint\n"
+                     "\t$(MAKE) -C sub check\n\n"
+                     "ifeq ($(CI),true)\n"
+                     "cond:\n"
+                     "\techo ci\n"
+                     "endif\n\n"
+                     "keys:\n"
+                     "\t@for k in $(KEYS); do \\\n"
+                     "\t  echo $$k; \\\n"
+                     "\tdone; \\\n"
+                     "\t$(MAKE) build\n\n"
+                     "after:\n"
+                     "\techo one\n"},
+        {"mk/common.mk", "lint:\n\techo lint\n"},
+        {"sub/Makefile", "check:\n\techo check\n"},
+        {"hack/ci.sh", "#!/bin/sh\n"
+                       "make test VERBOSE=1\n"
+                       "make -C sub -j 4 check\n"
+                       "make -f Makefile build unknown-target\n"
+                       "make \"$TARGET\"\n"
+                       "make -C \"$DIR\" build\n"
+                       "make cond\n"
+                       "make\n"
+                       "gmake --directory=sub check\n"},
+        {".github/workflows/ci.yml", "on: [push]\n"
+                                     "jobs:\n"
+                                     "  ci:\n"
+                                     "    runs-on: ubuntu-latest\n"
+                                     "    steps:\n"
+                                     "      - run: make -j8 build\n"}};
+    GPF_ASSERT_RUNS(
+        files, 5,
+        "@.github/workflows/ci.yml -> rule:Makefile:build (SPAWNS shell github-actions/ci)\n"
+        "@hack/ci.sh -> rule:Makefile:build (SPAWNS shell)\n"
+        "@hack/ci.sh -> rule:Makefile:test (SPAWNS shell)\n"
+        "@hack/ci.sh -> rule:sub/Makefile:check (SPAWNS shell)\n"
+        "keys -> rule:Makefile:build (SPAWNS shell)\n"
+        "test -> rule:mk/common.mk:lint (SPAWNS shell)\n"
+        "test -> rule:sub/Makefile:check (SPAWNS shell)");
     PASS();
 }
 
@@ -3923,6 +3983,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_shell_programs_by_path_spawn);
     RUN_TEST(probe_make_programs_by_path_spawn);
     RUN_TEST(probe_ci_and_scripts_run_scripts);
+    RUN_TEST(probe_make_targets_spawn_their_rules);
     RUN_TEST(probe_go_installer_deploys_charts);
     RUN_TEST(probe_terraform_helm_release_deploys_its_chart);
     RUN_TEST(probe_helm_templated_objects_are_resources);
