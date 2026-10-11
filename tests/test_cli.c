@@ -1309,9 +1309,19 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         test_rmdir_r(tmpdir);
         FAIL("pipe failed");
     }
+    /* The parent closes the write end once its install has returned, so the
+     * child's watch for the maintenance request ends on a definite event. */
+    int install_done_pipe[2] = {-1, -1};
+    if (pipe(install_done_pipe) != 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        test_rmdir_r(tmpdir);
+        FAIL("pipe failed");
+    }
     pid_t child = fork();
     if (child == 0) {
         close(ready_pipe[0]);
+        close(install_done_pipe[1]);
         cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(runtime_parent);
         cbm_version_cohort_manager_t *manager =
             endpoint ? cbm_version_cohort_manager_new(endpoint) : NULL;
@@ -1330,21 +1340,21 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         bool setup =
             endpoint && manager &&
             cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), fingerprint) &&
-            cbm_version_cohort_acquire(manager, &identity, cbm_now_ms() + 45000U, &lease,
-                                       &conflict) == CBM_VERSION_COHORT_OK &&
+            /* UINT64_MAX: wait as long as a lock is held, never for a
+             * conflicting holder, so no deadline decides the join. */
+            cbm_version_cohort_acquire(manager, &identity, UINT64_MAX, &lease, &conflict) ==
+                CBM_VERSION_COHORT_OK &&
             cbm_daemon_ipc_startup_lock_try_acquire(endpoint, &startup) == 1 && startup;
         char ready = setup ? 'R' : 'E';
         (void)write(ready_pipe[1], &ready, 1);
         bool saw_maintenance = false;
         /* The installer only reaches the cohort barrier after STAGING the
-         * candidate — three tamper-defense SHA-256 passes over the whole
-         * binary. The candidate here is this test runner itself (~1 GB with
-         * sanitizers), which costs ~40 s on container/CI I/O, so the
-         * observation window must cover worst-case staging. On success the
-         * child exits the moment it observes the request, so the fast path
-         * stays fast. */
-        uint64_t maintenance_deadline = cbm_now_ms() + 120000U;
-        while (setup && cbm_now_ms() < maintenance_deadline) {
+         * candidate, three tamper-defense SHA-256 passes over this test runner
+         * itself (~1 GB with sanitizers), which can take long on loaded I/O.
+         * No deadline decides the watch (USER RULE: no timeout decides a test).
+         * It ends on the request, on a definite UNSAFE/IO answer, or when the
+         * parent's install has returned without requesting maintenance. */
+        while (setup) {
             cbm_version_cohort_maintenance_presence_t presence =
                 cbm_version_cohort_maintenance_presence(manager);
             if (presence == CBM_VERSION_COHORT_MAINTENANCE_REQUESTED) {
@@ -1353,6 +1363,11 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
             }
             if (presence == CBM_VERSION_COHORT_MAINTENANCE_UNSAFE ||
                 presence == CBM_VERSION_COHORT_MAINTENANCE_IO) {
+                break;
+            }
+            struct pollfd install_done = {
+                .fd = install_done_pipe[0], .events = POLLIN, .revents = 0};
+            if (poll(&install_done, 1, 0) > 0) {
                 break;
             }
             /* REQUESTED is level-triggered: the installer holds maintenance EX
@@ -1377,9 +1392,11 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         }
         cbm_daemon_ipc_endpoint_free(endpoint);
         close(ready_pipe[1]);
+        close(install_done_pipe[0]);
         _exit(setup && saw_maintenance ? 0 : 1);
     }
     close(ready_pipe[1]);
+    close(install_done_pipe[0]);
     char ready = 0;
     bool child_ready = child > 0 && read(ready_pipe[0], &ready, 1) == 1 && ready == 'R';
     close(ready_pipe[0]);
@@ -1405,6 +1422,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
     char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
     int install_rc = child_ready ? cli_test_cmd_install(4, install_argv) : -1;
+    close(install_done_pipe[1]); /* the child's watch ends here at the latest */
     cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
     cbm_set_auto_answer_for_test(0);
 
@@ -1590,23 +1608,6 @@ TEST(cli_install_recovers_markerless_stale_rendezvous) {
  * give-up point if one unexpectedly does not. The undrained path keeps the
  * full 2 x CLI_SCOPE_TIMEOUT_MS, which is where a wedged teardown is real. */
 #define CLI_SCOPE_CLEANUP_DRAINED_MS 1000U
-/* Budget for probing that an ALREADY-drained host has stopped serving.
- *
- * The positive question -- "is this daemon still up?" -- repeats a mute
- * attempt until the daemon answers (cli_scope_host_serving), because a slow
- * reply on a loaded runner must not be misread as drained. Asked in the
- * negative it inverts:
- * there is no reply coming, so the whole budget is spent proving silence, and
- * the assertion is decided by a timeout expiring rather than by the system's
- * own behaviour. That was 15 s of the drain test's wall clock and the largest
- * single idle block in the cli suite.
- *
- * The drain is proven POSITIVELY elsewhere in that test: install returns 0
- * only after the activation completed, and the host child exits with
- * CLI_SCOPE_HOST_DRAINED. By the time this probe runs the daemon is already
- * gone, so a short budget confirms the same fact a long one would -- it just
- * stops charging the suite for the wait. */
-#define CLI_SCOPE_HOST_DRAINED_PROBE_MS 2000U
 
 typedef struct {
     char tmpdir[256];
@@ -1903,14 +1904,6 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     return true;
 }
 
-static bool cli_scope_host_serving_within(const cli_scope_fixture_t *fixture, uint32_t timeout_ms) {
-    cbm_daemon_runtime_status_t status = {0};
-    return fixture->endpoint &&
-           cbm_daemon_runtime_request_status(fixture->endpoint, &fixture->identity, timeout_ms,
-                                             &status) &&
-           !status.stopping && status.committed_clients == 1;
-}
-
 typedef struct {
     const cli_scope_fixture_t *fixture;
     cbm_daemon_runtime_status_t status;
@@ -2081,10 +2074,13 @@ TEST(cli_install_into_host_namespace_still_drains_host_cohort) {
     int install_rc =
         ready ? cli_scope_install(&fixture, fixture.host_home, fixture.host_cache, host_bin, false)
               : -1;
-    /* Negative probe: see CLI_SCOPE_HOST_DRAINED_PROBE_MS. The drain itself is
-     * asserted positively below via host_exit == CLI_SCOPE_HOST_DRAINED. */
-    bool host_serving =
-        ready && cli_scope_host_serving_within(&fixture, CLI_SCOPE_HOST_DRAINED_PROBE_MS);
+    /* Negative probe, decided by a definite answer like the positive one: a
+     * drained host is unreachable or reports stopping at once, while a slow
+     * host that still serves is asked again until it answers, so it can no
+     * longer pass as drained when its reply misses a short budget. The drain
+     * itself is asserted positively below via host_exit ==
+     * CLI_SCOPE_HOST_DRAINED. */
+    bool host_serving = ready && cli_scope_host_serving(&fixture);
     const char *events = read_test_file(activation_log);
     bool drained_in_log = events && strstr(events, "cohort drained") != NULL &&
                           strstr(events, "\"daemon_active_clients\":1") != NULL;
