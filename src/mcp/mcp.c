@@ -622,9 +622,11 @@ static const tool_def_t TOOLS[] = {
      "\"cursor\":{\"type\":\"string\",\"description\":\"Pass next/next_cursor with traversal "
      "args unchanged; budget may increase.\"},"
      "\"mode\":{"
-     "\"type\":\"string\",\"enum\":[\"calls\",\"data_flow\",\"cross_service\",\"topology\"],"
+     "\"type\":\"string\",\"enum\":[\"calls\",\"data_flow\",\"cross_service\",\"topology\","
+     "\"deploy\"],"
      "\"default\":\"calls\",\"description\":\"calls, argument-aware data_flow, service edges, "
-     "or topology: infra objects, routes and controllers (start at a Resource or Route).\"},"
+     "topology: infra objects, routes and controllers (start at a Resource or Route), or "
+     "deploy: scripts, make targets and charts a CI job, script or rule runs and deploys.\"},"
      "\"parameter_name\":{\"type\":\"string\",\"description\":\"data_flow parameter filter.\"},"
      "\"edge_types\":{\"type\":\"array\",\"items\":{"
      "\"type\":\"string\"}},\"risk_labels\":{\"type\":\"boolean\",\"default\":false,"
@@ -8660,10 +8662,15 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
         "CROSS_HTTP_CALLS",    "CROSS_ASYNC_CALLS", "CROSS_CHANNEL", "CROSS_GRPC_CALLS",
         "CROSS_GRAPHQL_CALLS", "CROSS_TRPC_CALLS"};
     /* topology: traffic (INFRA_MAPS), object references (USAGE), ordering
-     * (DEPENDS_ON), controllers (HANDLES) and what an object declares
-     * (DEFINES: an Ingress's routes) */
-    static const char *mode_topology[] = {"INFRA_MAPS", "USAGE", "DEPENDS_ON", "HANDLES",
-                                          "DEFINES"};
+     * (DEPENDS_ON), controllers (HANDLES), what an object declares
+     * (DEFINES: an Ingress's routes) and what it deploys (DEPLOYS: a Flux
+     * Kustomization's path, a HelmRelease's chart) */
+    static const char *mode_topology[] = {"INFRA_MAPS", "USAGE",   "DEPENDS_ON",
+                                          "HANDLES",    "DEFINES", "DEPLOYS"};
+    /* deploy: what a CI job, script or Make rule starts (SPAWNS: scripts,
+     * make targets, programs), calls (CALLS: shell functions) and puts on a
+     * cluster (DEPLOYS) -- outbound from the job, inbound from a chart */
+    static const char *mode_deploy[] = {"DEPLOYS", "SPAWNS", "CALLS"};
 
     *out_count = 0;
 
@@ -8699,6 +8706,9 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
     } else if (mode && strcmp(mode, "topology") == 0) {
         defaults = mode_topology;
         n_defaults = (int)(sizeof(mode_topology) / sizeof(mode_topology[0]));
+    } else if (mode && strcmp(mode, "deploy") == 0) {
+        defaults = mode_deploy;
+        n_defaults = (int)(sizeof(mode_deploy) / sizeof(mode_deploy[0]));
     }
     for (int i = 0; i < n_defaults; i++) {
         out_types[i] = defaults[i];

@@ -1655,6 +1655,64 @@ TEST(probe_mcp_trace_topology) {
     PASS();
 }
 
+/* trace_path mode=topology also follows DEPLOYS: from a Flux Kustomization
+ * out to the kustomization its path applies. */
+TEST(probe_mcp_trace_topology_follows_deploys) {
+    static const GpfFile files[] = {
+        {"clusters/sync.yaml",
+         "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n"
+         "  name: sync\n  namespace: flux-system\nspec:\n  path: ./apps\n"},
+        {"apps/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
+         "resources:\n  - cm.yaml\n"},
+        {"apps/cm.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n"}};
+    char *r = gpf_tool_on(files, 3, "trace_path",
+                          "{\"function_name\":\"Kustomization/sync\",\"project\":\"%s\","
+                          "\"direction\":\"outbound\",\"mode\":\"topology\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, ".apps.kustomization\"")); /* the kustomization's Resource */
+    free(r);
+    PASS();
+}
+
+/* trace_path mode=deploy walks deploy chains: in from a chart to the shell
+ * function that installs it (DEPLOYS), the script calling the function
+ * (CALLS) and the CI job running the script (SPAWNS). The call graph mode
+ * stops at the chart. */
+TEST(probe_mcp_trace_deploy) {
+    static const GpfFile files[] = {
+        {"charts/web/Chart.yaml", "apiVersion: v2\nname: web-app\nversion: 0.1.0\n"},
+        {"hack/deploy.sh", "#!/bin/sh\n"
+                           "cd \"$(dirname \"$0\")/..\"\n"
+                           "install_web() {\n"
+                           "  helm upgrade --install web charts/web\n"
+                           "}\n"
+                           "install_web\n"},
+        {".github/workflows/release.yml", "on: [push]\n"
+                                          "jobs:\n"
+                                          "  ship:\n"
+                                          "    runs-on: ubuntu-latest\n"
+                                          "    steps:\n"
+                                          "      - run: ./hack/deploy.sh\n"}};
+    char *r = gpf_tool_on(files, 3, "trace_path",
+                          "{\"function_name\":\"web-app\",\"project\":\"%s\","
+                          "\"direction\":\"inbound\",\"mode\":\"deploy\",\"depth\":4,"
+                          "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "install_web"));
+    ASSERT_NOT_NULL(strstr(r, ".hack\""));             /* the script's Module: hack.deploy */
+    ASSERT_NOT_NULL(strstr(r, ".github.workflows\"")); /* the workflow's Module: release */
+    ASSERT_NOT_NULL(strstr(r, "\"release\""));
+    free(r);
+    r = gpf_tool_on(files, 3, "trace_path",
+                    "{\"function_name\":\"web-app\",\"project\":\"%s\","
+                    "\"direction\":\"inbound\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(strstr(r, "install_web"));
+    free(r);
+    PASS();
+}
+
 /* ── DEPLOYS (Phase 3) ──────────────────────────────────────────────── */
 
 /* A Flux Kustomization deploys what its path applies: the outermost
@@ -4083,6 +4141,8 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_ingress_and_httproute_expose_routes);
     RUN_TEST(probe_mcp_search_filters_kind_and_namespace);
     RUN_TEST(probe_mcp_trace_topology);
+    RUN_TEST(probe_mcp_trace_topology_follows_deploys);
+    RUN_TEST(probe_mcp_trace_deploy);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
     RUN_TEST(probe_shell_helm_deploys_its_chart);
