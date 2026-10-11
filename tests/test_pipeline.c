@@ -16051,7 +16051,9 @@ TEST(githistory_coupling_limits_output) {
     int idx = 0;
     char *pair_files[2450][2]; /* 50*49/2 pairs * 3 repetitions = 3675 commits */
     char pair_bufs[2450][2][32];
-    cbm_commit_files_t commits[3675];
+    /* Zeroed: the loop sets only files/count, and cbm_compute_change_coupling
+     * also reads each commit's timestamp (MSan found it uninitialized). */
+    cbm_commit_files_t commits[3675] = {0};
     int ci = 0;
     for (int i = 0; i < 50 && ci < 3675; i++) {
         for (int j = i + 1; j < 50 && ci < 3675; j++) {
