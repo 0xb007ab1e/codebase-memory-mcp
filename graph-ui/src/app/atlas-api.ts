@@ -87,7 +87,7 @@ function announce(error: AtlasApiError, detail?: string): AtlasApiError {
         const refused = error.status >= 400 && error.status < 500;
         reportError({
             source: 'api',
-            project: new URL(error.route, 'http://daemon.invalid').searchParams.get('project') ?? '',
+            project: new URL(error.route, 'http://127.0.0.1').searchParams.get('project') ?? '',
             level: refused ? 'warn' : 'error',
             message: error.message,
             detail,

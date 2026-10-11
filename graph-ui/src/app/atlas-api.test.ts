@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { AtlasApi, AtlasApiError } from './atlas-api';
+import { observeErrors, type ErrorReport } from '../provider/error-observer';
 
 interface FetchCall {
     url: string;
@@ -34,6 +35,37 @@ function api(reply: { ok?: boolean; status?: number; body: string }): { api: Atl
 }
 
 describe('AtlasApi, the projects routes', () => {
+    it.each(['', 'http://127.0.0.1:9749'])('attributes failed requests to their decoded project with base %s', async (base) => {
+        const reports: ErrorReport[] = [];
+        const stopObserving = observeErrors((report) => reports.push(report));
+        const calls: FetchCall[] = [];
+        const client = new AtlasApi({
+            base,
+            fetch: recordingFetch({ ok: false, status: 503, body: '{"error":"unavailable"}' }, calls),
+        });
+        try {
+            await expect(client.logs(20, 'warn', 'a repo&revision=2')).rejects.toBeInstanceOf(AtlasApiError);
+            expect(calls[0]?.url).toBe(`${base}/api/logs?lines=20&min_level=warn&project=a+repo%26revision%3D2`);
+            expect(reports).toEqual([expect.objectContaining({
+                source: 'api', level: 'error', project: 'a repo&revision=2',
+            })]);
+        } finally {
+            stopObserving();
+        }
+    });
+
+    it('does not invent a project for failed requests without one', async () => {
+        const reports: ErrorReport[] = [];
+        const stopObserving = observeErrors((report) => reports.push(report));
+        const { api: client } = api({ ok: false, status: 503, body: '{"error":"unavailable"}' });
+        try {
+            await expect(client.logs(20)).rejects.toBeInstanceOf(AtlasApiError);
+            expect(reports).toEqual([expect.objectContaining({ project: '' })]);
+        } finally {
+            stopObserving();
+        }
+    });
+
     it('encodes history filters without interpreting search as URL parameters', async () => {
         const { api: client, calls } = api({ body: '{"lines":[],"total":0,"query":"path&level=info"}' });
         const result = await client.logs(200, 'error', undefined, { scope: 'unattributed', query: 'path&level=info' });

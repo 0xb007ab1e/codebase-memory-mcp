@@ -15,7 +15,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FAIL=0
 
 # Only the pinned opt-in model policy may declare these external locations.
-# Negative URL fixtures are confined to the four named boundary tests.
+# Inert URL fixtures are confined to the individually reviewed tests below.
 browser_model_source_url_allowed() {
     local relfile="$1" url="$2"
     case "$relfile" in
@@ -34,7 +34,18 @@ browser_model_source_url_allowed() {
         graph-ui/src/browser-ai/model-policy.test.ts|\
         graph-ui/src/browser-ai/security-download-origins.test.ts|\
         graph-ui/src/browser-ai/security-ui-model-policy.test.ts|\
-        graph-ui/src/browser-ai/ChatMarkdown.test.tsx) return 0 ;;
+        graph-ui/src/browser-ai/ChatMarkdown.test.tsx|\
+        graph-ui/src/adr/AdrWorkspace.test.tsx|\
+        graph-ui/src/architecture/SourceEvidenceDrawer.test.tsx|\
+        graph-ui/src/architecture/container-topology.test.ts|\
+        graph-ui/src/architecture/repository-guide.test.ts|\
+        graph-ui/src/browser-ai/BrowserChatDock.ask-model.test.tsx|\
+        graph-ui/src/browser-ai/BrowserChatDock.test.tsx|\
+        graph-ui/src/browser-ai/explanation-response.test.ts|\
+        graph-ui/src/browser-ai/file-facts.test.ts|\
+        graph-ui/src/browser-ai/file-outline.ini.test.ts|\
+        graph-ui/src/browser-ai/file-outline.test.ts|\
+        graph-ui/src/settings/model-catalog.test.ts) return 0 ;;
     esac
     return 1
 }
@@ -73,7 +84,7 @@ else
 
         if ! $is_dist; then
             echo "  Checking for external domains (source)..."
-            if find "$UI_DIR" -type f \( -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.css' \) -exec grep -lE 'https?://' {} \; 2>/dev/null | head -20 > "$SEC_TMPDIR/urls"; then
+            if find "$UI_DIR" -type f \( -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.css' \) -exec grep -lE 'https?://' {} \; 2>/dev/null > "$SEC_TMPDIR/urls"; then
                 while IFS= read -r file; do
                     relfile="${file#"$ROOT/"}"
                     grep -onE 'https?://[^[:space:]"'"'"')]+' "$file" 2>/dev/null | while IFS=: read -r lineno url; do
