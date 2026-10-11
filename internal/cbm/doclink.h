@@ -89,32 +89,33 @@
     X(CBM_DOCLINK_CS_SEEALSO, CBM_LANG_CSHARP, "seealso", false, true, "MENTIONS")               \
     X(CBM_DOCLINK_CS_EXCEPTION, CBM_LANG_CSHARP, "exception", false, true, "MENTIONS")           \
     X(CBM_DOCLINK_CS_INHERITDOC, CBM_LANG_CSHARP, "inheritdoc", false, true, "MENTIONS")         \
-    /* go (doclink_go.c): [Name] doc links; held until its held-out audit passes */              \
-    X(CBM_DOCLINK_GO_DOC_LINK, CBM_LANG_GO, "doc_link", false, false, "MENTIONS")                \
-    /* java and kotlin (doclink_jvm.c): Javadoc and KDoc; held until their audit passes */       \
-    X(CBM_DOCLINK_JAVA_LINK, CBM_LANG_JAVA, "link", false, false, "MENTIONS")                    \
-    X(CBM_DOCLINK_JAVA_LINKPLAIN, CBM_LANG_JAVA, "linkplain", false, false, "MENTIONS")          \
-    X(CBM_DOCLINK_JAVA_SEE, CBM_LANG_JAVA, "see", false, false, "MENTIONS")                      \
-    X(CBM_DOCLINK_JAVA_THROWS, CBM_LANG_JAVA, "throws", false, false, "MENTIONS")                \
-    X(CBM_DOCLINK_JAVA_VALUE, CBM_LANG_JAVA, "value", false, false, "MENTIONS")                  \
-    X(CBM_DOCLINK_KT_KDOC_LINK, CBM_LANG_KOTLIN, "kdoc_link", false, false, "MENTIONS")          \
-    X(CBM_DOCLINK_KT_SEE, CBM_LANG_KOTLIN, "see", false, false, "MENTIONS")                      \
-    X(CBM_DOCLINK_KT_THROWS, CBM_LANG_KOTLIN, "throws", false, false, "MENTIONS")                \
-    X(CBM_DOCLINK_KT_SAMPLE, CBM_LANG_KOTLIN, "sample", false, false, "MENTIONS")                \
-    /* rust (doclink_rs.c): intra-doc links; held until their audit passes */                    \
-    X(CBM_DOCLINK_RS_INTRA_DOC, CBM_LANG_RUST, "intra_doc", false, false, "MENTIONS")            \
-    X(CBM_DOCLINK_RS_LINK_DEF, CBM_LANG_RUST, "link_def", false, false, "MENTIONS")              \
-    /* perl (doclink_perl.c): POD L<> codes; held until their audit passes */                    \
-    X(CBM_DOCLINK_PERL_POD_L, CBM_LANG_PERL, "pod_L", false, false, "MENTIONS")                  \
-    /* typescript and javascript (doclink_ts.c): JSDoc/TSDoc; held until their audit */          \
-    X(CBM_DOCLINK_TS_LINK, CBM_LANG_TYPESCRIPT, "link", false, false, "MENTIONS")                \
+    /* go (doclink_go.c): [Name] doc links; held-out audit passed */                             \
+    X(CBM_DOCLINK_GO_DOC_LINK, CBM_LANG_GO, "doc_link", false, true, "MENTIONS")                 \
+    /* java and kotlin (doclink_jvm.c): Javadoc and KDoc; held-out audit passed */               \
+    X(CBM_DOCLINK_JAVA_LINK, CBM_LANG_JAVA, "link", false, true, "MENTIONS")                     \
+    X(CBM_DOCLINK_JAVA_LINKPLAIN, CBM_LANG_JAVA, "linkplain", false, true, "MENTIONS")           \
+    X(CBM_DOCLINK_JAVA_SEE, CBM_LANG_JAVA, "see", false, true, "MENTIONS")                       \
+    X(CBM_DOCLINK_JAVA_THROWS, CBM_LANG_JAVA, "throws", false, true, "MENTIONS")                 \
+    X(CBM_DOCLINK_JAVA_VALUE, CBM_LANG_JAVA, "value", false, true, "MENTIONS")                   \
+    X(CBM_DOCLINK_KT_KDOC_LINK, CBM_LANG_KOTLIN, "kdoc_link", false, true, "MENTIONS")           \
+    X(CBM_DOCLINK_KT_SEE, CBM_LANG_KOTLIN, "see", false, true, "MENTIONS")                       \
+    X(CBM_DOCLINK_KT_THROWS, CBM_LANG_KOTLIN, "throws", false, true, "MENTIONS")                 \
+    X(CBM_DOCLINK_KT_SAMPLE, CBM_LANG_KOTLIN, "sample", false, true, "MENTIONS")                 \
+    /* rust (doclink_rs.c): intra-doc links; held-out audit passed */                            \
+    X(CBM_DOCLINK_RS_INTRA_DOC, CBM_LANG_RUST, "intra_doc", false, true, "MENTIONS")             \
+    X(CBM_DOCLINK_RS_LINK_DEF, CBM_LANG_RUST, "link_def", false, true, "MENTIONS")               \
+    /* perl (doclink_perl.c): POD L<> codes; held-out audit passed */                            \
+    X(CBM_DOCLINK_PERL_POD_L, CBM_LANG_PERL, "pod_L", false, true, "MENTIONS")                   \
+    /* typescript and javascript (doclink_ts.c): JSDoc/TSDoc; {@link} passed its held-out */     \
+    /* audit; {@linkcode} (10) and @see (18) had too few held-out links to pass: held */         \
+    X(CBM_DOCLINK_TS_LINK, CBM_LANG_TYPESCRIPT, "link", false, true, "MENTIONS")                 \
     X(CBM_DOCLINK_TS_LINKCODE, CBM_LANG_TYPESCRIPT, "linkcode", false, false, "MENTIONS")        \
     X(CBM_DOCLINK_TS_SEE, CBM_LANG_TYPESCRIPT, "see", false, false, "MENTIONS")                  \
-    /* php (doclink_php.c): PHPDoc @see and {@see}; held until their audit passes */             \
-    X(CBM_DOCLINK_PHP_SEE, CBM_LANG_PHP, "see", false, false, "MENTIONS")                        \
-    /* c (doclink_c.c): Doxygen @ref and @see in .c and .h files; held until their audit */      \
-    X(CBM_DOCLINK_C_REF, CBM_LANG_C, "doxygen_ref", false, false, "MENTIONS")                    \
-    X(CBM_DOCLINK_C_SEE, CBM_LANG_C, "see", false, false, "MENTIONS")                            \
+    /* php (doclink_php.c): PHPDoc @see and {@see}; held-out audit passed */                     \
+    X(CBM_DOCLINK_PHP_SEE, CBM_LANG_PHP, "see", false, true, "MENTIONS")                         \
+    /* c (doclink_c.c): Doxygen @ref and @see in .c and .h files; held-out audit passed */       \
+    X(CBM_DOCLINK_C_REF, CBM_LANG_C, "doxygen_ref", false, true, "MENTIONS")                     \
+    X(CBM_DOCLINK_C_SEE, CBM_LANG_C, "see", false, true, "MENTIONS")                             \
     /* markdown (doclink_md.c): what a document's text names explicitly */                       \
     X(CBM_DOCLINK_MD_LINK, CBM_LANG_MARKDOWN, "link", false, true, "MENTIONS")                   \
     X(CBM_DOCLINK_MD_PATH, CBM_LANG_MARKDOWN, "path", false, true, "MENTIONS")                   \

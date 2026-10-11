@@ -2556,14 +2556,14 @@ TEST(doc_mentions_jvm_family_names) {
         ASSERT_STR_EQ(cbm_doclink_syntax_name(families[i].syntax), families[i].name);
         ASSERT_FALSE(cbm_doclink_syntax_is_external(families[i].syntax));
     }
-    /* held in production until their held-out audit passes; the suite ships them */
+    /* all ship in production: their held-out audit passed */
     cbm_doclink_test_reset_ships();
     int shipping_in_production = 0;
     for (size_t i = 0; i < sizeof(families) / sizeof(families[0]); i++) {
         shipping_in_production += cbm_doclink_syntax_ships(families[i].syntax) ? 1 : 0;
     }
     dm_ship_held_families();
-    ASSERT_EQ(shipping_in_production, 0);
+    ASSERT_EQ(shipping_in_production, (int)(sizeof(families) / sizeof(families[0])));
     for (size_t i = 0; i < sizeof(families) / sizeof(families[0]); i++) {
         ASSERT_TRUE(cbm_doclink_syntax_ships(families[i].syntax));
     }

@@ -176,11 +176,11 @@ TEST(doc_mentions_go_tokens) {
     const CBMDocLinkFamily *f = cbm_doclink_family(CBM_DOCLINK_GO_DOC_LINK);
     ASSERT_NOT_NULL(f);
     ASSERT_EQ(f->lang, CBM_LANG_GO);
-    /* held in production until its held-out audit passes; the suite ships it */
+    /* ships in production: its held-out audit passed */
     cbm_doclink_test_reset_ships();
     bool ships_in_production = cbm_doclink_syntax_ships(CBM_DOCLINK_GO_DOC_LINK);
     dm_ship_held_families();
-    ASSERT_FALSE(ships_in_production);
+    ASSERT_TRUE(ships_in_production);
     ASSERT_TRUE(cbm_doclink_syntax_ships(CBM_DOCLINK_GO_DOC_LINK));
     PASS();
 }
@@ -1748,6 +1748,7 @@ TEST(doc_mentions_go_ship_gate) {
     char db[512];
     cbm_doclink_test_set_ships(CBM_DOCLINK_GO_DOC_LINK, false);
     int rc = go_index_lookup(tmp, sizeof(tmp), db, sizeof(db));
+    cbm_doclink_test_reset_ships(); /* production gates again for the tests after this one */
     dm_ship_held_families();
     ASSERT_EQ(rc, 0);
     /* a resolved doc link is a row with the gate's reason and no edge */
