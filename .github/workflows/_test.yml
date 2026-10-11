@@ -370,16 +370,19 @@ jobs:
   # artifact — the local ladder cannot answer that, having no faithful x86-64
   # emulation. It has now answered it, and the answer SPLIT the list:
   #
-  #   - the five deep-recursion suites overflow their thread stacks on x86-64
-  #     too, so that limit is NOT architectural;
+  #   - five suites aborted with "stack-overflow ... nested bug" on both
+  #     architectures. That was not deep recursion: it was MSan crashing while
+  #     it reported real uninitialized reads (reporting with the slow unwinder
+  #     exhausted the main thread's stack). scripts/msan.sh now unwinds with
+  #     frame pointers, the
+  #     reports print, the reads are fixed, and the five suites run again;
   #   - `cli` does not overflow here at all — it fails in the install path for
   #     an unrelated, still-undiagnosed reason;
   #   - `incremental` was a shadow-memory RSS artifact, now fixed in the test
   #     itself rather than skipped, so it stays in the lane.
   #
   # Per-cause detail lives in scripts/msan.sh, which is the single authoritative
-  # list both venues now share. Zero use-of-uninitialized-value findings were
-  # reported across the lane on either architecture.
+  # list both venues now share.
   test-msan:
     if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'msan') }}
     runs-on: ubuntu-latest
