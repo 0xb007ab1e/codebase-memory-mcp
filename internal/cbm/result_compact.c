@@ -375,6 +375,14 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
         cr_str(c, &r->infra_bindings.items[i].target_url);
         cr_str(c, &r->infra_bindings.items[i].broker);
     }
+    cr_array(c, (void **)&r->diagram_arrows.items, r->diagram_arrows.count,
+             sizeof(CBMDiagramArrow));
+    for (int i = 0; i < r->diagram_arrows.count && r->diagram_arrows.items; i++) {
+        cr_str(c, &r->diagram_arrows.items[i].from_qn);
+        cr_str(c, &r->diagram_arrows.items[i].to_qn);
+        cr_str(c, &r->diagram_arrows.items[i].label);
+        cr_str(c, &r->diagram_arrows.items[i].style);
+    }
     cr_array(c, (void **)&r->channels.items, r->channels.count, sizeof(CBMChannel));
     for (int i = 0; i < r->channels.count && r->channels.items; i++) {
         cr_str(c, &r->channels.items[i].channel_name);
@@ -540,6 +548,7 @@ void cbm_result_compact(CBMFileResult *result) {
     tmp.string_refs.cap = tmp.string_refs.count;
     tmp.infra_bindings.cap = tmp.infra_bindings.count;
     tmp.channels.cap = tmp.channels.count;
+    tmp.diagram_arrows.cap = tmp.diagram_arrows.count;
     tmp.field_types.cap = tmp.field_types.count;
     tmp.doc_links.cap = tmp.doc_links.count;
 

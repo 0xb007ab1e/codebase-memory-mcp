@@ -83,6 +83,9 @@ static const char *ALWAYS_IGNORED_SUFFIXES[] = {
     ".webp",   ".svg",     ".wasm", ".node",  ".exe", ".bin", ".dat", ".db",
     ".sqlite", ".sqlite3", ".woff", ".woff2", ".ttf", ".eot", ".otf", NULL};
 
+/* SVG files that carry a diagram (diagram.c): read, not ignored as images. */
+static const char *DIAGRAM_SVG_SUFFIXES[] = {".drawio.svg", ".excalidraw.svg", NULL};
+
 static const char *FAST_IGNORED_SUFFIXES[] = {
     ".zip", ".tar",  ".gz",       ".bz2",  ".xz",  ".rar",    ".7z",      ".jar",
     ".war", ".ear",  ".mp3",      ".mp4",  ".avi", ".mov",    ".wav",     ".flac",
@@ -381,6 +384,11 @@ bool cbm_has_ignored_suffix(const char *filename, cbm_index_mode_t mode) {
     }
 
     size_t filename_length = strlen(filename);
+    for (int i = 0; DIAGRAM_SVG_SUFFIXES[i]; i++) {
+        if (ends_with(filename, filename_length, DIAGRAM_SVG_SUFFIXES[i])) {
+            return false;
+        }
+    }
     for (int i = 0; ALWAYS_IGNORED_SUFFIXES[i]; i++) {
         if (ends_with(filename, filename_length, ALWAYS_IGNORED_SUFFIXES[i])) {
             return true;

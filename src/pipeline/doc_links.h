@@ -178,7 +178,7 @@ typedef enum {
                                   * file by file */
 } cbm_doclink_delta_t;
 
-enum { CBM_DOCLINK_RESOLVER_LANGS = 4 };
+enum { CBM_DOCLINK_RESOLVER_LANGS = 6 };
 
 /* Everything the resolving half needs from a language leg: one of these, and
  * its pointer in doc_links.c's resolver table. */
@@ -295,6 +295,13 @@ void cbm_doclink_cs_test_unit_memo(bool on);
  * names but can move what those lines hold, so an incremental run
  * re-resolves such documents with the edited file. */
 bool cbm_doclinks_binds_lines(CBMLanguage lang);
+extern const cbm_doclink_resolver_t cbm_doclink_go_resolver;
+extern const cbm_doclink_resolver_t cbm_doclink_jvm_resolver;
+extern const cbm_doclink_resolver_t cbm_doclink_rs_resolver;
+extern const cbm_doclink_resolver_t cbm_doclink_perl_resolver;
+extern const cbm_doclink_resolver_t cbm_doclink_ts_resolver;
+extern const cbm_doclink_resolver_t cbm_doclink_php_resolver;
+extern const cbm_doclink_resolver_t cbm_doclink_c_resolver;
 
 /* True when `rel_path` is a scope input of some language (scope_input). */
 bool cbm_doclinks_is_scope_input(const char *rel_path);
@@ -305,6 +312,25 @@ bool cbm_doclinks_is_scope_input(const char *rel_path);
  * language is GLOBAL; otherwise the language's scope_delta hook decides. */
 int cbm_doclinks_scope_delta(const char *stored, const char *fresh, cbm_doclink_name_fn removed,
                              void *ud);
+
+/* A record of a scope blob that declares one name other files may reference
+ * and nothing others resolve THROUGH: true, with that name. */
+typedef bool (*cbm_doclink_removable_fn)(const char *line, size_t len, const char **name,
+                                         size_t *name_len);
+
+/* A scope_delta over the lines of two blobs, in order (a record may belong to
+ * the one above it): the same line in both is unchanged; a stored line the
+ * fresh blob dropped is LOCAL when `removable` names it -- the name goes to
+ * `removed` -- and GLOBAL otherwise; a line only the fresh blob has, new or
+ * changed, is GLOBAL. A cbm_doclink_delta_t, or CBM_NOT_FOUND when a name
+ * could not be recorded. */
+int cbm_doclinks_scope_delta_lines(const char *stored, const char *fresh,
+                                   cbm_doclink_removable_fn removable, cbm_doclink_name_fn removed,
+                                   void *ud);
+
+/* Field k (0: the record's kind) of a tab-separated scope line. */
+bool cbm_doclinks_scope_field(const char *line, size_t len, int k, const char **field,
+                              size_t *field_len);
 
 /* What is stored for a scope blob written in this run (the surface row's
  * `dl`, lsp_surface.c): the blob itself, or its language's rejected-scope

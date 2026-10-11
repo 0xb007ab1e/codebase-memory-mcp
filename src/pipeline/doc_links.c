@@ -46,7 +46,9 @@ const char *cbm_doclink_reason_name(int reason) {
  * to this file. */
 static const cbm_doclink_resolver_t *const DOCLINK_RESOLVERS[] = {
     &cbm_doclink_cs_resolver,  &cbm_doclink_md_resolver,   &cbm_doclink_pdf_resolver,
-    &cbm_doclink_rst_resolver, &cbm_doclink_adoc_resolver,
+    &cbm_doclink_rst_resolver, &cbm_doclink_adoc_resolver, &cbm_doclink_go_resolver,
+    &cbm_doclink_jvm_resolver, &cbm_doclink_rs_resolver,   &cbm_doclink_perl_resolver,
+    &cbm_doclink_ts_resolver,  &cbm_doclink_php_resolver,  &cbm_doclink_c_resolver,
 };
 
 enum { DOCLINK_RESOLVER_COUNT = sizeof(DOCLINK_RESOLVERS) / sizeof(DOCLINK_RESOLVERS[0]) };
@@ -116,6 +118,64 @@ int cbm_doclinks_scope_delta(const char *stored, const char *fresh, cbm_doclink_
         return CBM_DOCLINK_DELTA_GLOBAL;
     }
     return R->scope_delta(stored, fresh, removed, ud);
+}
+
+/* One line of a scope blob at *p, without its newline; false at the end. */
+static bool scope_next_line(const char **p, const char **line, size_t *len) {
+    if (!*p || !**p) {
+        return false;
+    }
+    const char *nl = strchr(*p, '\n');
+    *line = *p;
+    *len = nl ? (size_t)(nl - *p) : strlen(*p);
+    *p = nl ? nl + SKIP_ONE : *p + *len;
+    return true;
+}
+
+int cbm_doclinks_scope_delta_lines(const char *stored, const char *fresh,
+                                   cbm_doclink_removable_fn removable, cbm_doclink_name_fn removed,
+                                   void *ud) {
+    const char *sp = stored;
+    const char *fp = fresh;
+    const char *sl = NULL;
+    const char *fl = NULL;
+    size_t slen = 0;
+    size_t flen = 0;
+    bool hs = scope_next_line(&sp, &sl, &slen);
+    bool hf = scope_next_line(&fp, &fl, &flen);
+    while (hs || hf) {
+        if (hs && hf && slen == flen && memcmp(sl, fl, slen) == 0) {
+            hs = scope_next_line(&sp, &sl, &slen);
+            hf = scope_next_line(&fp, &fl, &flen);
+            continue;
+        }
+        const char *name = NULL;
+        size_t nlen = 0;
+        if (!hs || !removable(sl, slen, &name, &nlen) || nlen == 0) {
+            return CBM_DOCLINK_DELTA_GLOBAL; /* new, changed, or resolved through */
+        }
+        if (!removed || !removed(ud, name, nlen)) {
+            return CBM_NOT_FOUND;
+        }
+        hs = scope_next_line(&sp, &sl, &slen);
+    }
+    return CBM_DOCLINK_DELTA_LOCAL;
+}
+
+bool cbm_doclinks_scope_field(const char *line, size_t len, int k, const char **field,
+                              size_t *field_len) {
+    size_t s = 0;
+    for (int f = 0; f < k; f++) {
+        const char *tab = memchr(line + s, '\t', len - s);
+        if (!tab) {
+            return false;
+        }
+        s = (size_t)(tab - line) + SKIP_ONE;
+    }
+    const char *tab = memchr(line + s, '\t', len - s);
+    *field = line + s;
+    *field_len = tab ? (size_t)(tab - line) - s : len - s;
+    return true;
 }
 
 const char *cbm_doclinks_storable_scope(const char *scope, char **owned) {
@@ -510,14 +570,18 @@ void cbm_doclinks_resolve_file(cbm_doclinks_t *dl, int file_idx, const CBMFileRe
             }
             if (cbm_doclink_syntax_ships(link->syntax)) {
                 atomic_fetch_add_explicit(&dl->mentions, 1, memory_order_relaxed);
-                mentions[nm++] = (doclink_mention_t){.src = src->id,
-                                                     .tgt = out.target->id,
-                                                     .line = link->line,
-                                                     .target_first = out.target_first,
-                                                     .target_last = out.target_last,
-                                                     .via = R->via ? R->via : "doc_comment",
-                                                     .syntax = link->syntax,
-                                                     .exact = out.exact};
+                mentions[nm++] =
+                    (doclink_mention_t){.src = src->id,
+                                        .tgt = out.target->id,
+                                        .line = link->line,
+                                        .target_first = out.target_first,
+                                        .target_last = out.target_last,
+                                        .via = cbm_doclink_syntax_via(link->syntax)
+                                                   ? cbm_doclink_syntax_via(link->syntax)
+                                               : R->via ? R->via
+                                                        : "doc_comment",
+                                        .syntax = link->syntax,
+                                        .exact = out.exact};
                 continue;
             }
             /* the ship gate: resolved, but this link family is below the

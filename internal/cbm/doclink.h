@@ -22,6 +22,12 @@
  *                       identical on full and incremental runs. Optional.
  *       scope_tag,      the blob's tag line and its persisted form (line
  *       portable_scope  numbers dropped). Optional.
+ *       loose_docs      after the definitions and the file's own doc: the
+ *                       file's other doc comments, which the graph keeps no
+ *                       node for. What it pushes with the file stand-in
+ *                       belongs to the file (C: a prototype's doc); it may push
+ *                       with a definition of the file instead (PHP: a
+ *                       property's doc belongs to its class). Optional.
  *       scan_file       instead of parse_doc, for a DOCUMENT language whose
  *                       text is the documentation (Markdown): one pass over
  *                       the file's bytes pushes every reference, with the
@@ -77,46 +83,88 @@
  *
  * The enum below and the family table (doclink.c) are both generated from this
  * list, so a value cannot exist without its name and its gate. */
-#define CBM_DOCLINK_FAMILY_LIST(X)                                                             \
-    /* csharp */                                                                               \
-    X(CBM_DOCLINK_CS_SEE, CBM_LANG_CSHARP, "see", false, true, "MENTIONS")                     \
-    X(CBM_DOCLINK_CS_SEEALSO, CBM_LANG_CSHARP, "seealso", false, true, "MENTIONS")             \
-    X(CBM_DOCLINK_CS_EXCEPTION, CBM_LANG_CSHARP, "exception", false, true, "MENTIONS")         \
-    X(CBM_DOCLINK_CS_INHERITDOC, CBM_LANG_CSHARP, "inheritdoc", false, true, "MENTIONS")       \
-    /* markdown (doclink_md.c): what a document's text names explicitly */                     \
-    X(CBM_DOCLINK_MD_LINK, CBM_LANG_MARKDOWN, "link", false, true, "MENTIONS")                 \
-    X(CBM_DOCLINK_MD_PATH, CBM_LANG_MARKDOWN, "path", false, true, "MENTIONS")                 \
-    X(CBM_DOCLINK_MD_CODE_PATH, CBM_LANG_MARKDOWN, "code_path", false, true, "MENTIONS")       \
-    /* a code span naming a file or directory alone (`config.yaml`, `doc/`) */                 \
-    X(CBM_DOCLINK_MD_BARE_PATH, CBM_LANG_MARKDOWN, "bare_path", false, false, "MENTIONS")      \
-    X(CBM_DOCLINK_MD_CODE_NAME, CBM_LANG_MARKDOWN, "code_name", false, true, "MENTIONS")       \
-    /* an ADR's own "supersedes" / "replaces" statement, opening its line or field */          \
-    /* and naming a record directly (doc_adr.c): ADR -> ADR */                                 \
-    X(CBM_DOCLINK_MD_SUPERSEDES, CBM_LANG_MARKDOWN, "supersedes", false, true, "SUPERSEDES")   \
-    /* the same words in running prose ("this record supersedes ADR-3") */                     \
-    X(CBM_DOCLINK_MD_SUPERSEDES_PROSE, CBM_LANG_MARKDOWN, "supersedes_prose", false, false,    \
-      "SUPERSEDES")                                                                            \
-    /* pdf (doc_pdf.c): structural mentions in a page's text; pdf_name (bare      */           \
-    /* names) only decides which line fragments a cross-line join replaces        */           \
-    X(CBM_DOCLINK_PDF_PATH, CBM_LANG_PDF, "pdf_path", false, true, "MENTIONS")                 \
-    X(CBM_DOCLINK_PDF_FILE, CBM_LANG_PDF, "pdf_file", false, true, "MENTIONS")                 \
-    X(CBM_DOCLINK_PDF_QN, CBM_LANG_PDF, "pdf_qn", false, true, "MENTIONS")                     \
-    X(CBM_DOCLINK_PDF_NAME, CBM_LANG_PDF, "pdf_name", false, false, "MENTIONS")                \
-    /* restructuredtext (doclink_rst.c): Sphinx domain markup, directives, inline literals */  \
-    X(CBM_DOCLINK_RST_ROLE, CBM_LANG_RST, "role", false, true, "MENTIONS")                     \
-    X(CBM_DOCLINK_RST_OBJECT, CBM_LANG_RST, "object", false, true, "MENTIONS")                 \
-    X(CBM_DOCLINK_RST_AUTODOC, CBM_LANG_RST, "autodoc", false, true, "MENTIONS")               \
-    X(CBM_DOCLINK_RST_INCLUDE, CBM_LANG_RST, "include", false, false, "MENTIONS")              \
-    X(CBM_DOCLINK_RST_LITERALINCLUDE, CBM_LANG_RST, "literalinclude", false, true, "MENTIONS") \
-    X(CBM_DOCLINK_RST_KERNEL_DOC, CBM_LANG_RST, "kernel_doc", false, false, "MENTIONS")        \
-    X(CBM_DOCLINK_RST_CODE_PATH, CBM_LANG_RST, "code_path", false, true, "MENTIONS")           \
-    X(CBM_DOCLINK_RST_CODE_NAME, CBM_LANG_RST, "code_name", false, true, "MENTIONS")           \
-    /* asciidoc (doc_adoc.c): includes, Antora API attributes, monospace spans */              \
-    X(CBM_DOCLINK_ADOC_INCLUDE, CBM_LANG_ASCIIDOC, "include", false, true, "MENTIONS")         \
-    X(CBM_DOCLINK_ADOC_ATTRIBUTE, CBM_LANG_ASCIIDOC, "attribute", false, false, "MENTIONS")    \
-    X(CBM_DOCLINK_ADOC_CODE_PATH, CBM_LANG_ASCIIDOC, "code_path", false, false, "MENTIONS")    \
-    X(CBM_DOCLINK_ADOC_CODE_NAME, CBM_LANG_ASCIIDOC, "code_name", false, false, "MENTIONS")    \
-    /* any language (CBM_LANG_COUNT): a URL is never an edge */                                \
+#define CBM_DOCLINK_FAMILY_LIST(X)                                                               \
+    /* csharp */                                                                                 \
+    X(CBM_DOCLINK_CS_SEE, CBM_LANG_CSHARP, "see", false, true, "MENTIONS")                       \
+    X(CBM_DOCLINK_CS_SEEALSO, CBM_LANG_CSHARP, "seealso", false, true, "MENTIONS")               \
+    X(CBM_DOCLINK_CS_EXCEPTION, CBM_LANG_CSHARP, "exception", false, true, "MENTIONS")           \
+    X(CBM_DOCLINK_CS_INHERITDOC, CBM_LANG_CSHARP, "inheritdoc", false, true, "MENTIONS")         \
+    /* go (doclink_go.c): [Name] doc links; held-out audit passed */                             \
+    X(CBM_DOCLINK_GO_DOC_LINK, CBM_LANG_GO, "doc_link", false, true, "MENTIONS")                 \
+    /* java and kotlin (doclink_jvm.c): Javadoc and KDoc; held-out audit passed */               \
+    X(CBM_DOCLINK_JAVA_LINK, CBM_LANG_JAVA, "link", false, true, "MENTIONS")                     \
+    X(CBM_DOCLINK_JAVA_LINKPLAIN, CBM_LANG_JAVA, "linkplain", false, true, "MENTIONS")           \
+    X(CBM_DOCLINK_JAVA_SEE, CBM_LANG_JAVA, "see", false, true, "MENTIONS")                       \
+    X(CBM_DOCLINK_JAVA_THROWS, CBM_LANG_JAVA, "throws", false, true, "MENTIONS")                 \
+    X(CBM_DOCLINK_JAVA_VALUE, CBM_LANG_JAVA, "value", false, true, "MENTIONS")                   \
+    X(CBM_DOCLINK_KT_KDOC_LINK, CBM_LANG_KOTLIN, "kdoc_link", false, true, "MENTIONS")           \
+    X(CBM_DOCLINK_KT_SEE, CBM_LANG_KOTLIN, "see", false, true, "MENTIONS")                       \
+    X(CBM_DOCLINK_KT_THROWS, CBM_LANG_KOTLIN, "throws", false, true, "MENTIONS")                 \
+    X(CBM_DOCLINK_KT_SAMPLE, CBM_LANG_KOTLIN, "sample", false, true, "MENTIONS")                 \
+    /* rust (doclink_rs.c): intra-doc links; held-out audit passed */                            \
+    X(CBM_DOCLINK_RS_INTRA_DOC, CBM_LANG_RUST, "intra_doc", false, true, "MENTIONS")             \
+    X(CBM_DOCLINK_RS_LINK_DEF, CBM_LANG_RUST, "link_def", false, true, "MENTIONS")               \
+    /* perl (doclink_perl.c): POD L<> codes; held-out audit passed */                            \
+    X(CBM_DOCLINK_PERL_POD_L, CBM_LANG_PERL, "pod_L", false, true, "MENTIONS")                   \
+    /* typescript and javascript (doclink_ts.c): JSDoc/TSDoc; {@link} passed its held-out */     \
+    /* audit; {@linkcode} (10) and @see (18) had too few held-out links to pass: held */         \
+    X(CBM_DOCLINK_TS_LINK, CBM_LANG_TYPESCRIPT, "link", false, true, "MENTIONS")                 \
+    X(CBM_DOCLINK_TS_LINKCODE, CBM_LANG_TYPESCRIPT, "linkcode", false, false, "MENTIONS")        \
+    X(CBM_DOCLINK_TS_SEE, CBM_LANG_TYPESCRIPT, "see", false, false, "MENTIONS")                  \
+    /* php (doclink_php.c): PHPDoc @see and {@see}; held-out audit passed */                     \
+    X(CBM_DOCLINK_PHP_SEE, CBM_LANG_PHP, "see", false, true, "MENTIONS")                         \
+    /* c (doclink_c.c): Doxygen @ref and @see in .c and .h files; held-out audit passed */       \
+    X(CBM_DOCLINK_C_REF, CBM_LANG_C, "doxygen_ref", false, true, "MENTIONS")                     \
+    X(CBM_DOCLINK_C_SEE, CBM_LANG_C, "see", false, true, "MENTIONS")                             \
+    /* markdown (doclink_md.c): what a document's text names explicitly */                       \
+    X(CBM_DOCLINK_MD_LINK, CBM_LANG_MARKDOWN, "link", false, true, "MENTIONS")                   \
+    X(CBM_DOCLINK_MD_PATH, CBM_LANG_MARKDOWN, "path", false, true, "MENTIONS")                   \
+    X(CBM_DOCLINK_MD_CODE_PATH, CBM_LANG_MARKDOWN, "code_path", false, true, "MENTIONS")         \
+    /* a code span naming a file or directory alone (`config.yaml`, `doc/`) */                   \
+    X(CBM_DOCLINK_MD_BARE_PATH, CBM_LANG_MARKDOWN, "bare_path", false, false, "MENTIONS")        \
+    X(CBM_DOCLINK_MD_CODE_NAME, CBM_LANG_MARKDOWN, "code_name", false, true, "MENTIONS")         \
+    /* an ADR's own "supersedes" / "replaces" statement, opening its line or field */            \
+    /* and naming a record directly (doc_adr.c): ADR -> ADR */                                   \
+    X(CBM_DOCLINK_MD_SUPERSEDES, CBM_LANG_MARKDOWN, "supersedes", false, true, "SUPERSEDES")     \
+    /* the same words in running prose ("this record supersedes ADR-3") */                       \
+    X(CBM_DOCLINK_MD_SUPERSEDES_PROSE, CBM_LANG_MARKDOWN, "supersedes_prose", false, false,      \
+      "SUPERSEDES")                                                                              \
+    /* pdf (doc_pdf.c): structural mentions in a page's text; pdf_name (bare      */             \
+    /* names) only decides which line fragments a cross-line join replaces        */             \
+    X(CBM_DOCLINK_PDF_PATH, CBM_LANG_PDF, "pdf_path", false, true, "MENTIONS")                   \
+    X(CBM_DOCLINK_PDF_FILE, CBM_LANG_PDF, "pdf_file", false, true, "MENTIONS")                   \
+    X(CBM_DOCLINK_PDF_QN, CBM_LANG_PDF, "pdf_qn", false, true, "MENTIONS")                       \
+    X(CBM_DOCLINK_PDF_NAME, CBM_LANG_PDF, "pdf_name", false, false, "MENTIONS")                  \
+    /* restructuredtext (doclink_rst.c): Sphinx domain markup, directives, inline literals */    \
+    X(CBM_DOCLINK_RST_ROLE, CBM_LANG_RST, "role", false, true, "MENTIONS")                       \
+    X(CBM_DOCLINK_RST_OBJECT, CBM_LANG_RST, "object", false, true, "MENTIONS")                   \
+    X(CBM_DOCLINK_RST_AUTODOC, CBM_LANG_RST, "autodoc", false, true, "MENTIONS")                 \
+    X(CBM_DOCLINK_RST_INCLUDE, CBM_LANG_RST, "include", false, false, "MENTIONS")                \
+    X(CBM_DOCLINK_RST_LITERALINCLUDE, CBM_LANG_RST, "literalinclude", false, true, "MENTIONS")   \
+    X(CBM_DOCLINK_RST_KERNEL_DOC, CBM_LANG_RST, "kernel_doc", false, false, "MENTIONS")          \
+    X(CBM_DOCLINK_RST_CODE_PATH, CBM_LANG_RST, "code_path", false, true, "MENTIONS")             \
+    X(CBM_DOCLINK_RST_CODE_NAME, CBM_LANG_RST, "code_name", false, true, "MENTIONS")             \
+    /* asciidoc (doc_adoc.c): includes, Antora API attributes, monospace spans */                \
+    X(CBM_DOCLINK_ADOC_INCLUDE, CBM_LANG_ASCIIDOC, "include", false, true, "MENTIONS")           \
+    X(CBM_DOCLINK_ADOC_ATTRIBUTE, CBM_LANG_ASCIIDOC, "attribute", false, false, "MENTIONS")      \
+    X(CBM_DOCLINK_ADOC_CODE_PATH, CBM_LANG_ASCIIDOC, "code_path", false, false, "MENTIONS")      \
+    X(CBM_DOCLINK_ADOC_CODE_NAME, CBM_LANG_ASCIIDOC, "code_name", false, false, "MENTIONS")      \
+    /* diagrams (diagram.c): an element's explicit link (or a PlantUML !include),  */            \
+    /* read as a Markdown link; held until their held-out audit passes             */            \
+    X(CBM_DOCLINK_DG_MERMAID_CLICK, CBM_LANG_MERMAID, "mermaid_click", false, false, "MENTIONS") \
+    X(CBM_DOCLINK_DG_PLANTUML_URL, CBM_LANG_DIAGRAM, "plantuml_url", false, false, "MENTIONS")   \
+    X(CBM_DOCLINK_DG_PLANTUML_INCLUDE, CBM_LANG_DIAGRAM, "plantuml_include", false, false,       \
+      "MENTIONS")                                                                                \
+    X(CBM_DOCLINK_DG_DRAWIO_LINK, CBM_LANG_DIAGRAM, "drawio_link", false, false, "MENTIONS")     \
+    X(CBM_DOCLINK_DG_EXCALIDRAW_LINK, CBM_LANG_DIAGRAM, "excalidraw_link", false, false,         \
+      "MENTIONS")                                                                                \
+    X(CBM_DOCLINK_DG_DOT_URL, CBM_LANG_DIAGRAM, "dot_url", false, false, "MENTIONS")             \
+    X(CBM_DOCLINK_DG_D2_LINK, CBM_LANG_DIAGRAM, "d2_link", false, false, "MENTIONS")             \
+    /* openapi (openapi.c): an operation's operationId, read as a qualified code      */         \
+    /* name; held until its held-out audit passes                                   */           \
+    X(CBM_DOCLINK_OPENAPI_OPERATION_ID, CBM_LANG_OPENAPI, "operation_id", false, false,          \
+      "MENTIONS")                                                                                \
+    /* any language (CBM_LANG_COUNT): a URL is never an edge */                                  \
     X(CBM_DOCLINK_HREF, CBM_LANG_COUNT, "href", true, false, "MENTIONS")
 
 typedef enum {
@@ -126,6 +174,25 @@ typedef enum {
 #undef CBM_DOCLINK_FAMILY_VALUE
         CBM_DOCLINK_SYNTAX_COUNT
 } CBMDocLinkSyntax;
+
+/* The Markdown family a reference of another document reads as, wherever it
+ * is written (CBM_DOCLINK_NONE for none): a diagram's explicit link
+ * (diagram.c) is a link, an OpenAPI operationId (openapi.c) a code name. */
+static inline int cbm_doclink_md_twin(int syntax) {
+    if (syntax >= CBM_DOCLINK_DG_MERMAID_CLICK && syntax <= CBM_DOCLINK_DG_D2_LINK) {
+        return CBM_DOCLINK_MD_LINK;
+    }
+    return syntax == CBM_DOCLINK_OPENAPI_OPERATION_ID ? CBM_DOCLINK_MD_CODE_NAME : CBM_DOCLINK_NONE;
+}
+
+/* What an edge of these families says it came through: the kind of source,
+ * whichever document holds it (NULL: the resolver's own name). */
+static inline const char *cbm_doclink_syntax_via(int syntax) {
+    if (syntax >= CBM_DOCLINK_DG_MERMAID_CLICK && syntax <= CBM_DOCLINK_DG_D2_LINK) {
+        return "diagram";
+    }
+    return syntax == CBM_DOCLINK_OPENAPI_OPERATION_ID ? "openapi" : NULL;
+}
 
 /* CBMDocLink.flags. */
 enum {
@@ -385,5 +452,254 @@ void cbm_pdf_test_scan_page(CBMExtractCtx *ctx, const char *text, size_t len, ui
 /* candidates the scanner's joins have compared so far (a cost counter) */
 size_t cbm_pdf_test_join_steps(void);
 #endif
+/* ── Go (doclink_go.c) ─────────────────────────────────────────────── */
+
+void cbm_doclink_go_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                              uint32_t doc_line);
+const char *cbm_doclink_go_scan_scope(CBMExtractCtx *ctx);
+char *cbm_doclink_go_portable_scope(const char *scope);
+
+/* A go.mod file has no doc links; its scope is the module path, in the Go
+ * scope format, so that import paths map to the repository's directories. */
+void cbm_doclink_gomod_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                                 uint32_t doc_line);
+const char *cbm_doclink_gomod_scan_scope(CBMExtractCtx *ctx);
+
+/* The parts of a Go doc link as go/doc/comment splits it (docLink,
+ * splitDocName): `pkg`, `recv` and `name` are slices of the reference text,
+ * each possibly empty. [Name] {name}; [Recv.Name] {recv, name}; [pkg] {pkg};
+ * [pkg.Name] {pkg, name}; [pkg.Recv.Name] {pkg, recv, name}. */
+typedef struct {
+    const char *pkg; /* a package name, or an import path when it has a '/' */
+    size_t pkg_len;
+    const char *recv;
+    size_t recv_len;
+    const char *name;
+    size_t name_len;
+} CBMDocLinkGoRef;
+
+/* The longest reference text, and the longest name, the Go leg handles. A
+ * longer bracket text made of doc-link characters is harvested clipped to at
+ * most one byte more than this, and the resolver reports it as unparseable:
+ * a reference is never resolved by its beginning. */
+enum { CBM_DOCLINK_GO_REF_MAX = 512 };
+
+/* Split the text between the brackets (a leading `*` is skipped). False for
+ * text that go/doc/comment could not take for a doc link whatever the package
+ * declares or imports (nothing is harvested from it), and for text longer than
+ * CBM_DOCLINK_GO_REF_MAX. */
+bool cbm_doclink_go_parse_ref(const char *raw, size_t len, CBMDocLinkGoRef *out);
+
+/* The Go scope blob (Go files and go.mod files) starts with this tag line. */
+#define CBM_DOCLINK_GO_SCOPE_TAG "go1"
+/* ── Java and Kotlin (doclink_jvm.c) ───────────────────────────────── */
+
+void cbm_doclink_java_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                                uint32_t doc_line);
+void cbm_doclink_kotlin_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                                  uint32_t doc_line);
+const char *cbm_doclink_java_scan_scope(CBMExtractCtx *ctx);
+const char *cbm_doclink_kotlin_scan_scope(CBMExtractCtx *ctx);
+char *cbm_doclink_jvm_portable_scope(const char *scope);
+
+/* Normalize one Java parameter type as written in a declaration or in a
+ * Javadoc `#member(...)` list: annotations, `final`, type arguments, package
+ * and outer-type qualifiers and a trailing parameter name are dropped,
+ * `...` becomes `[]`, array brackets stay. "?" when nothing is left. Writes a
+ * NUL-terminated string into `out` (truncated at cap) and returns its
+ * length. */
+size_t cbm_doclink_java_norm_type(const char *in, size_t len, char *out, size_t cap);
+
+/* Java and Kotlin files share one scope tag: one resolver indexes both. */
+#define CBM_DOCLINK_JVM_SCOPE_TAG "jvm1"
+
+/* The longest reference a Java or Kotlin token may carry: a longer one is cut
+ * just past this length at extraction and reported as unparseable. */
+#define CBM_DOCLINK_JVM_REF_MAX 1000
+/* ── Rust (doclink_rs.c) ───────────────────────────────────────────── */
+
+void cbm_doclink_rs_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                              uint32_t doc_line);
+const char *cbm_doclink_rs_scan_scope(CBMExtractCtx *ctx);
+char *cbm_doclink_rs_portable_scope(const char *scope);
+
+/* A Cargo manifest is a TOML file the indexer extracts anyway: its scope blob
+ * (package, targets, dependencies) is what the Rust resolver knows of crates,
+ * so nothing is read from disk when references are resolved. Any other TOML
+ * file has no scope, and no TOML file has references. */
+void cbm_doclink_rs_manifest_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def,
+                                       const char *doc, uint32_t doc_line);
+const char *cbm_doclink_rs_manifest_scan_scope(CBMExtractCtx *ctx);
+
+/* The Rust scope blob (a source file's and a manifest's) starts with this tag
+ * line. */
+#define CBM_DOCLINK_RS_SCOPE_TAG "rs1"
+
+enum {
+    CBM_DOCLINK_RS_MAX_SEGS = 16, /* path segments of one reference */
+    CBM_DOCLINK_RS_SEG_CAP = 96,  /* bytes of one segment, NUL included */
+    CBM_DOCLINK_RS_RAW_CAP = 512, /* bytes of a reference as stored, NUL included */
+};
+
+/* What a rustdoc disambiguator (`struct@`, `fn@` ...) or suffix (`()`, `!`)
+ * asks of the entity a path names. */
+typedef enum {
+    CBM_DOCLINK_RS_DIS_NONE = 0,
+    CBM_DOCLINK_RS_DIS_STRUCT,
+    CBM_DOCLINK_RS_DIS_ENUM,
+    CBM_DOCLINK_RS_DIS_TRAIT,
+    CBM_DOCLINK_RS_DIS_UNION,
+    CBM_DOCLINK_RS_DIS_TYALIAS,
+    CBM_DOCLINK_RS_DIS_MOD,
+    CBM_DOCLINK_RS_DIS_CONST,
+    CBM_DOCLINK_RS_DIS_STATIC,
+    CBM_DOCLINK_RS_DIS_FN,         /* `fn@`, `function@`, `method@`, and the `()` suffix */
+    CBM_DOCLINK_RS_DIS_DERIVE,     /* a derive macro */
+    CBM_DOCLINK_RS_DIS_FIELD,      /* a struct or union field */
+    CBM_DOCLINK_RS_DIS_VARIANT,    /* an enum variant */
+    CBM_DOCLINK_RS_DIS_MACRO_BANG, /* the `!` suffix: a function-like macro */
+    CBM_DOCLINK_RS_DIS_TYPE_NS,    /* `type@`: anything of the type namespace */
+    CBM_DOCLINK_RS_DIS_VALUE_NS,   /* `value@` */
+    CBM_DOCLINK_RS_DIS_MACRO_NS,   /* `macro@` */
+    CBM_DOCLINK_RS_DIS_PRIM,       /* `prim@`, `primitive@` */
+} CBMDocLinkRsDis;
+
+/* One intra-doc link destination, taken apart. */
+typedef struct {
+    char segs[CBM_DOCLINK_RS_MAX_SEGS][CBM_DOCLINK_RS_SEG_CAP];
+    int nsegs;
+    bool global; /* a leading `::`: the first segment names a crate */
+    int dis;     /* CBMDocLinkRsDis */
+} CBMDocLinkRsPath;
+
+typedef enum {
+    CBM_DOCLINK_RS_PATH_OK = 0,
+    CBM_DOCLINK_RS_PATH_NOT_LINK, /* rustdoc does not treat this text as an intra-doc link */
+    CBM_DOCLINK_RS_PATH_MALFORMED /* a link rustdoc reports as broken syntax */
+} CBMDocLinkRsPathStatus;
+
+/* Take a link destination apart the way rustdoc's `preprocess_link` does
+ * (backticks and `#fragment` already removed): disambiguator or suffix,
+ * generics stripped, `::` segments. `lenient` is rustdoc's rule for text that
+ * may be an ordinary link or plain brackets (an inline or defined
+ * destination, or an undefined shortcut without backticks): there a character
+ * no path can hold means NOT_LINK instead of MALFORMED. `len` bytes of `raw`
+ * are read. */
+CBMDocLinkRsPathStatus cbm_doclink_rs_parse_path(const char *raw, size_t len, bool lenient,
+                                                 CBMDocLinkRsPath *out);
+/* ── TypeScript and JavaScript (doclink_ts.c) ──────────────────────── */
+
+void cbm_doclink_ts_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                              uint32_t doc_line);
+const char *cbm_doclink_ts_scan_scope(CBMExtractCtx *ctx);
+char *cbm_doclink_ts_portable_scope(const char *scope);
+
+/* TS, TSX and JS files share one scope tag: one resolver indexes them all. */
+#define CBM_DOCLINK_TS_SCOPE_TAG "ts1"
+
+/* The longest reference a TS/JS token keeps; a longer one is cut just past
+ * this length and the resolver reports it as unparseable. */
+enum { CBM_DOCLINK_TS_REF_MAX = 512 };
+
+/* Asked by a loose_docs hook for a doc comment on lines [first, last]: true
+ * when a definition's doc or the file's own doc there was already taken. */
+typedef bool (*cbm_doclink_taken_fn)(const CBMExtractCtx *ctx, uint32_t first, uint32_t last);
+
+/* ── PHP (doclink_php.c) ───────────────────────────────────────────── */
+
+void cbm_doclink_php_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                               uint32_t doc_line);
+const char *cbm_doclink_php_scan_scope(CBMExtractCtx *ctx);
+char *cbm_doclink_php_portable_scope(const char *scope);
+/* Doc blocks on properties, class constants and enum cases (they have no
+ * node): their references belong to the type around them. */
+void cbm_doclink_php_loose_docs(CBMExtractCtx *ctx, const CBMDefinition *file_def,
+                                cbm_doclink_taken_fn taken);
+
+#define CBM_DOCLINK_PHP_SCOPE_TAG "php1"
+
+/* The longest reference a PHP token keeps; a longer one is cut just past this
+ * length and the resolver reports it as unparseable. */
+enum { CBM_DOCLINK_PHP_REF_MAX = 512 };
+
+/* One `use` import of a PHP namespace block: kind 'c' (a class or namespace),
+ * 'f' (a function), 'k' (a constant); the name without a leading backslash. */
+typedef struct {
+    const char *alias;
+    size_t alias_len;
+    const char *name;
+    size_t name_len;
+    char kind;
+} cbm_doclink_php_use_t;
+
+/* The fully qualified name (no leading backslash) of a type name `ref` (n
+ * bytes) written in namespace `ns` (ns_len 0: the global one) under these
+ * imports, as PHP resolves it: a leading backslash is taken as written,
+ * `namespace\` stands for the current namespace, else the first segment is
+ * replaced when it is the alias of a class import (compared without case),
+ * else the namespace is put in front. Writes NUL-terminated into out (cap
+ * bytes); returns the length, 0 when it does not fit. */
+size_t cbm_doclink_php_qualify(char *out, size_t cap, const char *ns, size_t ns_len,
+                               const cbm_doclink_php_use_t *uses, int nuses, const char *ref,
+                               size_t n);
+
+/* ── C (doclink_c.c) ───────────────────────────────────────────────── */
+
+void cbm_doclink_c_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                             uint32_t doc_line);
+void cbm_doclink_c_loose_docs(CBMExtractCtx *ctx, const CBMDefinition *file_def,
+                              cbm_doclink_taken_fn taken);
+const char *cbm_doclink_c_scan_scope(CBMExtractCtx *ctx);
+
+/* C files and the headers C++ parses share one scope tag: one resolver
+ * indexes them. The blob holds no line: it is its own persisted form. */
+#define CBM_DOCLINK_C_SCOPE_TAG "c1"
+
+/* The longest reference a C token keeps; a longer one is cut just past this
+ * length and the resolver reports it as unparseable. */
+enum { CBM_DOCLINK_C_REF_MAX = 256 };
+
+/* ── Perl POD (doclink_perl.c) ─────────────────────────────────────── */
+
+void cbm_doclink_perl_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                                uint32_t doc_line);
+const char *cbm_doclink_perl_scan_scope(CBMExtractCtx *ctx);
+
+/* The Perl scope blob starts with this tag line. */
+#define CBM_DOCLINK_PERL_SCOPE_TAG "perl1"
+
+enum {
+    /* Longest L<> content kept as a token's raw text; a longer one is cut and
+     * marked malformed (its raw text then starts with `L<`). */
+    CBM_DOCLINK_PERL_RAW_MAX = 512,
+    /* Buffer for a page name, a section text or a heading key. */
+    CBM_DOCLINK_PERL_KEY_MAX = 256,
+};
+
+/* A POD text as it renders: formatting codes replaced by their content
+ * (X<> and Z<> by nothing, E<> by its character), white-space runs as one
+ * space, none at the ends. Headings and the section part of a link are
+ * compared in this form. Writes a NUL-terminated string into `out` (cut at
+ * cap - 1, never inside a UTF-8 character) and returns its length. */
+size_t cbm_doclink_perl_plain_text(const char *in, size_t len, char *out, size_t cap);
+
+typedef enum {
+    CBM_PERL_LINK_UNPARSEABLE = 0, /* malformed, nested L<>, or no page name */
+    CBM_PERL_LINK_PAGE,            /* L<Module::Name> or L<Module::Name/section> */
+    CBM_PERL_LINK_SECTION,         /* L</section>, L<"section">: the same page */
+    CBM_PERL_LINK_MAN,             /* L<name(3)>: a man page */
+} CBMPerlLinkKind;
+
+/* One pod_L token's raw text, split the way perlpodspec splits it. */
+typedef struct {
+    CBMPerlLinkKind kind;
+    char page[CBM_DOCLINK_PERL_KEY_MAX];    /* "" for a section of the same page */
+    char section[CBM_DOCLINK_PERL_KEY_MAX]; /* "" when only a page is named */
+} CBMPerlLink;
+
+/* Split a pod_L token's raw text: the first top-level `|` ends the link text,
+ * the first top-level `/` after it separates page and section, quotes around
+ * a section are dropped. False (kind UNPARSEABLE) for anything else. */
+bool cbm_doclink_perl_parse_link(const char *raw, CBMPerlLink *out);
 
 #endif /* CBM_DOCLINK_H */
