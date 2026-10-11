@@ -731,6 +731,17 @@ static void k8s_deploy_leaf(k8s_walk_t *w, const char *path, const char *value) 
         }
         return;
     }
+    /* the chart an OCIRepository fetches (a HelmRelease's chartRef) */
+    if (k8s_source_is(w, K8S_FLUX_SRC, "|OCIRepository|") && strcmp(path, "spec.url") == 0) {
+        if (!strstr(value, "{{") && !strstr(value, "${")) {
+            CBMK8sFact f = {.fact = CBM_K8S_FACT_SOURCE,
+                            .def_index = w->def_index,
+                            .name = cbm_arena_strdup(w->ctx->arena, value),
+                            .via = "ocirepository"};
+            cbm_k8sfact_push(&w->ctx->result->k8s_facts, w->ctx->arena, f);
+        }
+        return;
+    }
     if ((flux && strcmp(path, "spec.path") == 0) ||
         (argo &&
          (strcmp(path, "spec.source.path") == 0 || strcmp(path, "spec.sources[].path") == 0))) {

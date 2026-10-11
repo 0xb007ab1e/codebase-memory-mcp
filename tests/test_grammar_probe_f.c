@@ -1825,6 +1825,36 @@ static char *gpf_runs(const GpfFile *files, int nfiles) {
 #define GPF_CM(name) "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " name "\n"
 #define GPF_KUST "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
 
+/* A HelmRelease whose chartRef names an OCIRepository deploys the chart that
+ * repository fetches: the external chart of the oci:// URL's last segment.
+ * No edge for a URL with a variable, nor for a chartRef naming nothing. */
+TEST(probe_helmrelease_chartref_deploys_its_oci_chart) {
+    static const GpfFile files[] = {
+        {"apps/web/kustomization.yaml",
+         GPF_KUST "namespace: web\nresources:\n  - ocirepository.yaml\n  - helmrelease.yaml\n"},
+        {"apps/web/ocirepository.yaml",
+         "apiVersion: source.toolkit.fluxcd.io/v1\nkind: OCIRepository\nmetadata:\n"
+         "  name: web-chart\nspec:\n  interval: 15m\n  ref:\n    tag: 1.2.3\n"
+         "  url: oci://ghcr.io/acme/charts/web-app\n"},
+        {"apps/web/helmrelease.yaml",
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: web\n"
+         "spec:\n  chartRef:\n    kind: OCIRepository\n    name: web-chart\n  values:\n"
+         "    fullnameOverride: '{{ .Release.Name }}'\n"},
+        {"apps/db/kustomization.yaml",
+         GPF_KUST "namespace: db\nresources:\n  - ocirepository.yaml\n  - helmrelease.yaml\n"},
+        {"apps/db/ocirepository.yaml",
+         "apiVersion: source.toolkit.fluxcd.io/v1\nkind: OCIRepository\nmetadata:\n"
+         "  name: db-chart\nspec:\n  url: oci://ghcr.io/acme/charts/${CHART}\n"},
+        {"apps/db/helmrelease.yaml",
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: db\n"
+         "spec:\n  chartRef:\n    kind: OCIRepository\n    name: db-chart\n"},
+        {"apps/x/helmrelease.yaml",
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: x\n"
+         "spec:\n  chartRef:\n    kind: OCIRepository\n    name: missing\n"}};
+    GPF_ASSERT_DEPLOYS(files, 7, "HelmRelease/web -> chart:web-app(ext) (helmrelease)");
+    PASS();
+}
+
 /* kubectl apply -f deploys a manifest, a directory's manifests (-R: below
  * it too; not a file holding no objects), a glob's; -k and a kustomize build
  * piped into kubectl a Kustomization. The source is the function running the
@@ -4063,6 +4093,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_ci_and_scripts_run_scripts);
     RUN_TEST(probe_make_targets_spawn_their_rules);
     RUN_TEST(probe_make_rules_have_a_node_per_target);
+    RUN_TEST(probe_helmrelease_chartref_deploys_its_oci_chart);
     RUN_TEST(probe_go_installer_deploys_charts);
     RUN_TEST(probe_terraform_helm_release_deploys_its_chart);
     RUN_TEST(probe_helm_templated_objects_are_resources);

@@ -1156,6 +1156,9 @@ typedef struct {
     k8s_hr_t *hrs;
     int hr_n;
     int hr_cap;
+    k8s_hr_t *srcs; /* an OCIRepository (node) and the URL it fetches (chart) */
+    int src_n;
+    int src_cap;
 } k8s_facts_t;
 
 static void k8s_facts_free(k8s_facts_t *f) {
@@ -1177,7 +1180,11 @@ static void k8s_facts_free(k8s_facts_t *f) {
         cbm_free(CBM_MEM_CLASS_OTHER, f->hrs[i].chart);
         cbm_free(CBM_MEM_CLASS_OTHER, f->hrs[i].source);
     }
+    for (int i = 0; i < f->src_n; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, f->srcs[i].chart);
+    }
     cbm_free(CBM_MEM_CLASS_OTHER, f->hrs);
+    cbm_free(CBM_MEM_CLASS_OTHER, f->srcs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->refs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->crds);
     cbm_free(CBM_MEM_CLASS_OTHER, f->deploys);
@@ -1249,6 +1256,11 @@ static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64
                 f->deploys[f->dep_n++] = (k8s_deploy_t){
                     node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, dir),
                     x->ns ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->ns) : NULL, x->via};
+            }
+        } else if (x->fact == CBM_K8S_FACT_SOURCE) {
+            if (x->name && k8s_grow((void **)&f->srcs, &f->src_cap, f->src_n, sizeof(*f->srcs))) {
+                f->srcs[f->src_n++] =
+                    (k8s_hr_t){node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name), NULL};
             }
         } else if (x->fact == CBM_K8S_FACT_CRD) {
             if (k8s_grow((void **)&f->crds, &f->crd_cap, f->crd_n, sizeof(*f->crds))) {
@@ -3219,9 +3231,49 @@ static int64_t k8s_external_chart(k8s_dep_link_t *l, const char *name, const cha
                                 "{\"source\":\"helm\",\"external\":true}");
 }
 
+/* A HelmRelease whose chartRef names OCIRepository `oci` (its USAGE edge
+ * {"ref":"chartRef"}, resolved with the references) deploys the chart that
+ * repository fetches: the shared external Chart of the URL's last segment. */
+static void k8s_link_chart_refs(k8s_dep_link_t *l, const k8s_hr_t *oci) {
+    const char *url = oci->chart;
+    size_t end = strlen(url);
+    while (end > 0 && url[end - SKIP_ONE] == '/') {
+        end--;
+    }
+    size_t start = end;
+    while (start > 0 && url[start - SKIP_ONE] != '/') {
+        start--;
+    }
+    if (start == 0 || start == end || end - start >= CBM_SZ_256) {
+        return;
+    }
+    char name[CBM_SZ_256];
+    snprintf(name, sizeof(name), "%.*s", (int)(end - start), url + start);
+    char esc_name[CBM_SZ_512];
+    char esc_url[CBM_SZ_1K];
+    cbm_json_escape(esc_name, (int)sizeof(esc_name), name);
+    cbm_json_escape(esc_url, (int)sizeof(esc_url), url);
+    char props[CBM_SZ_2K];
+    snprintf(props, sizeof(props),
+             "{\"via\":\"helmrelease\",\"chart\":\"%s\",\"external\":true,\"url\":\"%s\"}",
+             esc_name, esc_url);
+    const cbm_gbuf_edge_t **in = NULL;
+    int n = 0;
+    if (cbm_gbuf_find_edges_by_target_type(l->ctx->gbuf, oci->node, "USAGE", &in, &n) != 0) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        const char *p = in[i]->properties_json;
+        const cbm_gbuf_node_t *hr = cbm_gbuf_find_by_id(l->ctx->gbuf, in[i]->source_id);
+        if (p && strstr(p, "\"ref\":\"chartRef\"") && hr && hr->file_path) {
+            k8s_deploys_edge(l, hr->id, k8s_external_chart(l, name, hr->file_path), props);
+        }
+    }
+}
+
 static void k8s_link_deploys(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundles_t *b,
                              const k8s_facts_t *f) {
-    if (f->dep_n == 0 && f->hr_n == 0) {
+    if (f->dep_n == 0 && f->hr_n == 0 && f->src_n == 0) {
         return;
     }
     k8s_dep_link_t l = {.ctx = ctx,
@@ -3291,6 +3343,9 @@ static void k8s_link_deploys(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundl
             k8s_deploys_edge(&l, hr->node, k8s_external_chart(&l, hr->chart, src->file_path),
                              props);
         }
+    }
+    for (int s = 0; l.files && l.charts && s < f->src_n; s++) {
+        k8s_link_chart_refs(&l, &f->srcs[s]);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)members.items);
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)units.items);
