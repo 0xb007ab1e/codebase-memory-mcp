@@ -37,7 +37,7 @@ static void hd_put(hd_buf_t *b, const char *s) {
         size_t nc = b->cap ? b->cap * 2 : 16384;
         while (nc < b->len + n + 1)
             nc *= 2;
-        char *grown = realloc(b->data, nc);
+        char *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, b->data, nc);
         if (!grown) {
             b->oom = true;
             return;
@@ -294,13 +294,13 @@ char *cbm_atlas_handout_html(cbm_store_t *store, const char *project) {
         yyjson_doc_free(flows_doc);
     if (bridges_doc)
         yyjson_doc_free(bridges_doc);
-    free(regions_json);
-    free(metrics_json);
-    free(flows_json);
-    free(bridges_json);
+    cbm_free(CBM_MEM_CLASS_OTHER, regions_json);
+    cbm_free(CBM_MEM_CLASS_OTHER, metrics_json);
+    cbm_free(CBM_MEM_CLASS_OTHER, flows_json);
+    cbm_free(CBM_MEM_CLASS_OTHER, bridges_json);
 
     if (b.oom) {
-        free(b.data);
+        cbm_free(CBM_MEM_CLASS_OTHER, b.data);
         return NULL;
     }
     return b.data;

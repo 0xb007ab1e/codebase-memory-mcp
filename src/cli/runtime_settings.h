@@ -10,7 +10,8 @@
 bool cbm_runtime_settings_init(const char *cache_dir);
 bool cbm_runtime_settings_initialized(void);
 
-/* JSON API. Returned strings are heap-owned by the caller. HTTP status is
+/* JSON API. Returned strings use CBM_MEM_CLASS_OTHER; the caller releases them
+ * with cbm_free(CBM_MEM_CLASS_OTHER, json). HTTP status is
  * 200, 400 (invalid batch), 409 (stale revision), or 500 (storage failure).
  * A batch either commits completely or changes nothing. */
 char *cbm_runtime_settings_get_json(const char *cache_dir);

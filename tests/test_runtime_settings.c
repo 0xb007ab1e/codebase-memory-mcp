@@ -1,4 +1,5 @@
 #include "test_framework.h"
+#include "foundation/mem_core.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
@@ -60,7 +61,7 @@ static yyjson_val *item(yyjson_doc *document, const char *key) {
 static yyjson_doc *read_snapshot(const char *path) {
     char *json = cbm_runtime_settings_get_json(path);
     yyjson_doc *document = json ? yyjson_read(json, strlen(json), 0) : NULL;
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     return document;
 }
 static char *apply(const char *path, const char *changes, int *status) {
@@ -87,7 +88,7 @@ TEST(runtime_settings_atomic_validation_and_conflict) {
     char *result =
         apply(fixture.path, "{\"auto_index\":\"true\",\"CBM_WORKERS\":\"999\"}", &status);
     ASSERT_EQ(status, 400);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     yyjson_doc *after = read_snapshot(fixture.path);
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(item(after, "auto_index"), "value")), "false");
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(after), "revision")), revision);
@@ -96,13 +97,13 @@ TEST(runtime_settings_atomic_validation_and_conflict) {
                    "{\"auto_index\":\"true\",\"CBM_WORKERS\":\"4\",\"CBM_SQLITE_MMAP_SIZE\":\"0\"}",
                    &status);
     ASSERT_EQ(status, 200);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     char request[256];
     snprintf(request, sizeof(request),
              "{\"revision\":\"%s\",\"changes\":{\"auto_index\":\"false\"}}", revision);
     result = cbm_runtime_settings_apply_json(fixture.path, request, strlen(request), &status);
     ASSERT_EQ(status, 409);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     cbm_config_t *config = cbm_config_open(fixture.path);
     ASSERT_TRUE(cbm_config_get_bool(config, "auto_index", false));
     cbm_config_close(config);
@@ -128,7 +129,7 @@ TEST(runtime_settings_strict_allowlist_and_types) {
         int status = 0;
         char *result = apply(fixture.path, invalid[i], &status);
         ASSERT_EQ(status, 400);
-        free(result);
+        cbm_free(CBM_MEM_CLASS_OTHER, result);
     }
     yyjson_doc *snapshot = read_snapshot(fixture.path);
     ASSERT_NOT_NULL(snapshot);
@@ -151,7 +152,7 @@ TEST(runtime_settings_snapshot_false_mask_reset_and_real_consumer) {
                          "FILE_BYTES\":\"4096\"}",
                          &status);
     ASSERT_EQ(status, 200);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     ASSERT_TRUE(cbm_runtime_settings_init(fixture.path));
     ASSERT_STR_EQ(cbm_runtime_getenv("CBM_WORKERS"), "4");
     ASSERT_NULL(cbm_runtime_getenv("CBM_DISABLE_LSP_CROSS"));
@@ -162,7 +163,7 @@ TEST(runtime_settings_snapshot_false_mask_reset_and_real_consumer) {
     ASSERT_STR_EQ(getenv("CBM_DISABLE_LSP_CROSS"), "0");
     result = apply(fixture.path, "{\"CBM_WORKERS\":\"8\",\"CBM_DISABLE_LSP_CROSS\":null}", &status);
     ASSERT_EQ(status, 200);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     ASSERT_STR_EQ(cbm_runtime_getenv("CBM_WORKERS"), "4");
     yyjson_doc *snapshot = read_snapshot(fixture.path);
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(item(snapshot, "CBM_WORKERS"), "effective")), "4");
@@ -173,7 +174,7 @@ TEST(runtime_settings_snapshot_false_mask_reset_and_real_consumer) {
     yyjson_doc_free(snapshot);
     result = apply(fixture.path, "{\"CBM_WORKERS\":null}", &status);
     ASSERT_EQ(status, 200);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     cbm_runtime_settings_reset_for_tests();
     ASSERT_TRUE(cbm_runtime_settings_init(fixture.path));
     ASSERT_STR_EQ(cbm_runtime_getenv("CBM_WORKERS"), "2");
@@ -193,7 +194,7 @@ TEST(runtime_settings_cli_revision_and_ui_last_writer) {
         apply(fixture.path,
               "{\"ui_enabled\":\"true\",\"ui_port\":\"8222\",\"auto_index\":\"true\"}", &status);
     ASSERT_EQ(status, 200);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     cbm_ui_config_t actual;
     cbm_ui_config_load(&actual);
     ASSERT_TRUE(actual.ui_enabled);
@@ -218,7 +219,7 @@ TEST(runtime_settings_cli_revision_and_ui_last_writer) {
     ASSERT_EQ(actual.ui_port, 8333);
     result = apply(fixture.path, "{\"ui_enabled\":null,\"ui_port\":null}", &status);
     ASSERT_EQ(status, 200);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     cbm_ui_config_load(&actual);
     ASSERT_FALSE(actual.ui_enabled);
     ASSERT_EQ(actual.ui_port, 8111);
@@ -246,7 +247,7 @@ TEST(runtime_settings_sql_failure_rolls_back_whole_batch) {
     int status = 0;
     char *result = apply(fixture.path, "{\"auto_index\":\"true\",\"CBM_WORKERS\":\"3\"}", &status);
     ASSERT_EQ(status, 500);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     yyjson_doc *snapshot = read_snapshot(fixture.path);
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(item(snapshot, "auto_index"), "value")), "false");
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(snapshot), "revision")), "0");
@@ -263,12 +264,12 @@ TEST(runtime_settings_canonical_alias_and_actual_listener) {
     int status = 0;
     char *result = apply(alias, "{\"CBM_WORKERS\":\"4\"}", &status);
     ASSERT_EQ(status, 200);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     ASSERT_TRUE(cbm_runtime_settings_init(alias));
     ASSERT_TRUE(cbm_runtime_settings_init(fixture.path));
     result = apply(fixture.path, "{\"CBM_WORKERS\":\"8\",\"ui_port\":\"9768\"}", &status);
     ASSERT_EQ(status, 200);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     cbm_runtime_settings_note_http_port(9768);
     yyjson_doc *snapshot = read_snapshot(fixture.path);
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(item(snapshot, "CBM_WORKERS"), "effective")), "4");
@@ -332,7 +333,7 @@ TEST(runtime_settings_preserves_unknown_inherited_values_and_reset) {
     int status = 0;
     char *result = apply(fixture.path, "{\"CBM_WORKERS\":\"5\"}", &status);
     ASSERT_EQ(status, 200);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     snapshot = read_snapshot(fixture.path);
     workers = item(snapshot, "CBM_WORKERS");
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(workers, "value")), "5");
@@ -342,7 +343,7 @@ TEST(runtime_settings_preserves_unknown_inherited_values_and_reset) {
     yyjson_doc_free(snapshot);
     result = apply(fixture.path, "{\"CBM_WORKERS\":null}", &status);
     ASSERT_EQ(status, 200);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     snapshot = read_snapshot(fixture.path);
     workers = item(snapshot, "CBM_WORKERS");
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(workers, "value")), "3junk");
@@ -353,7 +354,7 @@ TEST(runtime_settings_preserves_unknown_inherited_values_and_reset) {
 
     result = apply(fixture.path, "{\"CBM_WORKERS\":\"5\"}", &status);
     ASSERT_EQ(status, 200);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     cbm_runtime_settings_reset_for_tests();
     ASSERT_TRUE(cbm_runtime_settings_init(fixture.path));
     snapshot = read_snapshot(fixture.path);
@@ -368,7 +369,36 @@ TEST(runtime_settings_preserves_unknown_inherited_values_and_reset) {
     PASS();
 }
 
+TEST(runtime_settings_response_memory_returns_to_caller_baseline) {
+    settings_fixture_t fixture;
+    ASSERT_TRUE(fixture_open(&fixture));
+    size_t blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    size_t bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+    for (int request = 0; request < 3; request++) {
+        int status = 0;
+        char *json;
+        if (request == 0)
+            json = cbm_runtime_settings_get_json(fixture.path);
+        else if (request == 1) {
+            json = cbm_runtime_settings_apply_json(fixture.path, "{}", 2, &status);
+            ASSERT_EQ(status, 400);
+        } else {
+            json = apply(fixture.path, "{\"CBM_WORKERS\":\"4\"}", &status);
+            ASSERT_EQ(status, 200);
+        }
+        ASSERT_NOT_NULL(json);
+        ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks + 1);
+        ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), bytes + cbm_mem_usable_size(json));
+        cbm_free(CBM_MEM_CLASS_OTHER, json);
+        ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks);
+        ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), bytes);
+    }
+    fixture_close(&fixture);
+    PASS();
+}
+
 SUITE(runtime_settings) {
+    RUN_TEST(runtime_settings_response_memory_returns_to_caller_baseline);
     RUN_TEST(runtime_settings_preserves_unknown_inherited_values_and_reset);
     RUN_TEST(runtime_settings_canonical_alias_and_actual_listener);
     RUN_TEST(runtime_settings_inherited_clamps_and_unbuilt_features);

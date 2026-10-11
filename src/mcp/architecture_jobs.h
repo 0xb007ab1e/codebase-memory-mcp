@@ -12,7 +12,9 @@ typedef struct cbm_architecture_jobs cbm_architecture_jobs_t;
 cbm_architecture_jobs_t *cbm_architecture_jobs_new(void);
 void cbm_architecture_jobs_free(cbm_architecture_jobs_t *jobs);
 
-/* Returns owned JSON: {status, generation, retry_after_ms?, result?, error?}.
+/* Returns CBM_MEM_CLASS_OTHER-owned JSON; release it with
+ * cbm_free(CBM_MEM_CLASS_OTHER, json).
+ * Payload: {status, generation, retry_after_ms?, result?, error?}.
  * The supplied store is inspected only on the calling thread. */
 char *cbm_architecture_jobs_request(cbm_architecture_jobs_t *jobs, cbm_store_t *store,
                                     const char *project, int64_t entry_node_id);

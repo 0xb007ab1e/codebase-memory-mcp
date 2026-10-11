@@ -1234,7 +1234,8 @@ typedef struct {
  * the partition can no longer be coarsened. Refinement guarantees every
  * reported community is internally connected. The resolution parameter
  * controls granularity (higher -> more, smaller communities); 1.0 is standard.
- * Allocates *out (length *out_count == node_count); the caller frees it. */
+ * Allocates *out (length *out_count == node_count) in CBM_MEM_CLASS_OTHER;
+ * the caller releases it with cbm_free(CBM_MEM_CLASS_OTHER, *out). */
 int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                int edge_count, double resolution, cbm_louvain_result_t **out, int *out_count);
 

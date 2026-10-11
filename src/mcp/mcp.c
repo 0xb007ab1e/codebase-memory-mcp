@@ -73,6 +73,7 @@ enum {
 #include "watcher/watcher.h"
 #include "foundation/mem.h"
 #include "foundation/mem_core.h"
+#include "foundation/json_writer.h"
 #include "foundation/arena.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
@@ -7948,16 +7949,16 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
      * caught by the clang-analyzer unix.Malloc lane). */
     REQUIRE_STORE(store, project);
     char *scope_path = cbm_mcp_get_string_arg(args, "path");
+    yyjson_doc *aspects_doc = NULL;
+    char *result = NULL;
 
     char *not_indexed = verify_project_indexed(store, project);
     if (not_indexed) {
-        free(project);
-        free(scope_path);
-        return not_indexed;
+        result = not_indexed;
+        goto release_arguments;
     }
 
     /* Parse aspects array from args */
-    yyjson_doc *aspects_doc = NULL;
     yyjson_val *aspects_arr = NULL;
     bool include_behavior_evidence = false;
     {
@@ -7967,9 +7968,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                 yyjson_obj_get(yyjson_doc_get_root(args_doc), "include_behavior_evidence");
             if (evidence && !yyjson_is_bool(evidence)) {
                 yyjson_doc_free(args_doc);
-                free(project);
-                free(scope_path);
-                return cbm_mcp_text_result("include_behavior_evidence must be a boolean.", true);
+                result = cbm_mcp_text_result("include_behavior_evidence must be a boolean.", true);
+                goto release_arguments;
             }
             include_behavior_evidence = yyjson_get_bool(evidence);
             yyjson_val *aval = yyjson_obj_get(yyjson_doc_get_root(args_doc), "aspects");
@@ -7983,11 +7983,9 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
 
     if (include_behavior_evidence && !aspect_explicitly_named(aspects_arr, "system_structure")) {
-        yyjson_doc_free(aspects_doc);
-        free(project);
-        free(scope_path);
-        return cbm_mcp_text_result(
+        result = cbm_mcp_text_result(
             "include_behavior_evidence=true requires aspects:[\"system_structure\"].", true);
+        goto release_arguments;
     }
 
     /* Build a C string array from aspects for cbm_store_get_architecture.
@@ -8025,13 +8023,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
             char msg[CBM_SZ_512];
             snprintf(msg, sizeof(msg), "Unknown aspect '%s'. Valid: %s.", aspects_strs[i],
                      valid_list);
-            char *err = cbm_mcp_text_result(msg, true);
-            free(project);
-            free(scope_path);
-            if (aspects_doc) {
-                yyjson_doc_free(aspects_doc);
-            }
-            return err;
+            result = cbm_mcp_text_result(msg, true);
+            goto release_arguments;
         }
     }
 
@@ -8063,11 +8056,9 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
             reply = cbm_mcp_text_result(json ? json : "Architecture request allocation failed.",
                                         json == NULL);
         }
-        free(json);
-        free(project);
-        free(scope_path);
-        yyjson_doc_free(aspects_doc);
-        return reply;
+        cbm_free(CBM_MEM_CLASS_OTHER, json);
+        result = reply;
+        goto release_arguments;
     }
 
     /* Default (no aspects) = compact summary. The old default rendered ALL
@@ -8384,16 +8375,11 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
         cbm_store_architecture_free(&arch);
         cbm_store_schema_free(&schema);
-        if (aspects_doc) {
-            yyjson_doc_free(aspects_doc);
-        }
-        free(project);
-        free(scope_path);
         free(norm_path);
         char *text = cbm_sb_finish(&sb);
-        char *result = cbm_mcp_text_result(text ? text : "out of memory", text == NULL);
+        result = cbm_mcp_text_result(text ? text : "out of memory", text == NULL);
         free(text);
-        return result;
+        goto release_arguments;
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -8641,15 +8627,14 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_free(doc);
     cbm_store_architecture_free(&arch);
     cbm_store_schema_free(&schema);
-    if (aspects_doc) {
-        yyjson_doc_free(aspects_doc);
-    }
-    free(project);
-    free(scope_path);
     free(norm_path);
 
-    char *result = cbm_mcp_text_result(json, false);
+    result = cbm_mcp_text_result(json, false);
     free(json);
+release_arguments:
+    yyjson_doc_free(aspects_doc);
+    free(project);
+    free(scope_path);
     return result;
 }
 
@@ -19552,17 +19537,19 @@ enum {
 static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     bool mutation_held = false;
+    yyjson_doc *adoc = NULL;
+    cbm_store_t *owned_rw = NULL;
+    char *result = NULL;
     if (project) {
         mutation_held = mcp_project_mutation_begin(srv, project);
         if (!mutation_held) {
-            free(project);
-            return cbm_mcp_text_result("project operation cancelled or blocked by an active index",
-                                       true);
+            result = cbm_mcp_text_result(
+                "project operation cancelled or blocked by an active index", true);
+            goto release_request;
         }
         if (mcp_request_cancelled(srv)) {
-            mcp_project_mutation_end(srv, project);
-            free(project);
-            return cbm_mcp_text_result("project operation cancelled for this request", true);
+            result = cbm_mcp_text_result("project operation cancelled for this request", true);
+            goto release_request;
         }
     }
 
@@ -19571,30 +19558,21 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_store(srv, project);
     if (!store) {
         char *error = build_no_store_error_checked(srv, project);
-        char *result = cbm_mcp_text_result(error, true);
+        result = cbm_mcp_text_result(error, true);
         free(error);
-        if (mutation_held) {
-            mcp_project_mutation_end(srv, project);
-        }
-        free(project);
-        return result;
+        goto release_request;
     }
 
-    yyjson_doc *adoc = yyjson_read(args, strlen(args), 0);
+    adoc = yyjson_read_opts((char *)args, strlen(args), 0, cbm_json_writer_allocator(), NULL);
     yyjson_val *aroot = adoc ? yyjson_doc_get_root(adoc) : NULL;
     yyjson_val *traces = aroot ? yyjson_obj_get(aroot, "traces") : NULL;
     size_t trace_count = traces && yyjson_is_arr(traces) ? yyjson_arr_size(traces) : 0U;
     if (trace_count == 0U || trace_count > INGEST_TRACES_MAX) {
-        if (adoc)
-            yyjson_doc_free(adoc);
-        if (mutation_held) {
-            mcp_project_mutation_end(srv, project);
-        }
-        free(project);
-        return cbm_mcp_text_result(
+        result = cbm_mcp_text_result(
             "traces is required: a non-empty array (max 10000) of {path: [qualified_name, ...]} "
             "or {caller, callee} entries",
             true);
+        goto release_request;
     }
     const char *label = yyjson_get_str(yyjson_obj_get(aroot, "label"));
     if (!label || !label[0])
@@ -19603,15 +19581,10 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     /* resolve_store opens file-backed projects query-only (and skips schema
      * DDL); observation writes need the dedicated read-write connection —
      * whose open also creates the observed_* tables in pre-existing DBs. */
-    cbm_store_t *owned_rw = NULL;
     store = open_store_for_write(srv, store, &owned_rw);
     if (!store) {
-        yyjson_doc_free(adoc);
-        if (mutation_held) {
-            mcp_project_mutation_end(srv, project);
-        }
-        free(project);
-        return cbm_mcp_text_result("could not open the project store for writing", true);
+        result = cbm_mcp_text_result("could not open the project store for writing", true);
+        goto release_request;
     }
 
     struct sqlite3 *db = cbm_store_get_db(store);
@@ -19620,14 +19593,8 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
                                   "SELECT 1 FROM nodes WHERE project=?1 AND qualified_name=?2 "
                                   "LIMIT 1",
                                   -1, &exists, NULL) != SQLITE_OK) {
-        if (owned_rw)
-            cbm_store_close(owned_rw);
-        yyjson_doc_free(adoc);
-        if (mutation_held) {
-            mcp_project_mutation_end(srv, project);
-        }
-        free(project);
-        return cbm_mcp_text_result("store is not queryable", true);
+        result = cbm_mcp_text_result("store is not queryable", true);
+        goto release_request;
     }
 
     long long pairs_stored = 0, pairs_unmatched = 0, paths_stored = 0, malformed = 0;
@@ -19704,12 +19671,13 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
                 pairs_stored++;
         }
         if (path) {
-            char *path_json = yyjson_val_write(path, 0, NULL);
+            char *path_json =
+                yyjson_val_write_opts(path, 0, cbm_json_writer_allocator(), NULL, NULL);
             if (path_json) {
                 if (cbm_store_observed_upsert_path(store, project, path_json, label, count) ==
                     CBM_STORE_OK)
                     paths_stored++;
-                free(path_json);
+                cbm_free(CBM_MEM_CLASS_OTHER, path_json);
             }
         }
     }
@@ -19732,7 +19700,7 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
             break; /* the current run alone exceeds the cap; stop here */
     }
 
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(cbm_json_writer_allocator());
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "status", "stored");
@@ -19750,8 +19718,13 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     if (evicted_runs > 0)
         yyjson_mut_obj_add_int(doc, root, "evicted_runs", evicted_runs);
 
-    char *json = yy_doc_to_str(doc);
+    char *json = root && yy_mut_normalize_output_text(doc, root, true)
+                     ? yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL)
+                     : NULL;
     yyjson_mut_doc_free(doc);
+    result = cbm_mcp_text_result(json, false);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
+release_request:
     yyjson_doc_free(adoc);
     if (owned_rw)
         cbm_store_close(owned_rw);
@@ -19760,8 +19733,6 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     }
     free(project);
 
-    char *result = cbm_mcp_text_result(json, false);
-    free(json);
     return result;
 }
 

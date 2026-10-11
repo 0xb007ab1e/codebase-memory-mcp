@@ -1,5 +1,6 @@
 /* Semantic repository map, independent of the rendering/layout node budget. */
 #include "ui/atlas.h"
+#include "foundation/json_writer.h"
 #include <sqlite3.h>
 #include <yyjson/yyjson.h>
 #include <math.h>
@@ -139,7 +140,7 @@ char *cbm_atlas_repository_json(cbm_store_t *store, const char *project) {
         "recorded relation types between retained semantic nodes; other endpoints omitted");
     if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK)
         goto fail;
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 fail:

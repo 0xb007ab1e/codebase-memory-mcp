@@ -13,6 +13,7 @@
 #include "foundation/constants.h"
 #include "foundation/arena.h"
 #include "foundation/hash_table.h"
+#include "foundation/mem_core.h"
 #include "foundation/sha256.h"
 
 #include <math.h>
@@ -9616,7 +9617,7 @@ int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *e
     int n = node_count;
     double gamma = resolution > 0.0 ? resolution : 1.0;
 
-    cbm_louvain_result_t *result = malloc((size_t)n * sizeof(*result));
+    cbm_louvain_result_t *result = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)n * sizeof(*result));
     if (!result) {
         return CBM_NOT_FOUND;
     }
@@ -9961,7 +9962,7 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
             }
         }
     }
-    free(res);
+    cbm_free(CBM_MEM_CLASS_OTHER, res);
 
     if (comm && C > 0) {
         /* 4. Members + cohesion (internal vs boundary edges) per community. */

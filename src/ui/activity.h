@@ -12,9 +12,11 @@ bool cbm_activity_log(sqlite3 *db, const char *line);
 /* Canonical frontend writer: 1 inserted/repaired, 0 duplicate, -1 unavailable.
  * Historical import never assigns a project to previously unknown evidence. */
 int cbm_activity_ui_log(sqlite3 *db, const char *line, bool historical);
+/* All JSON replies below use CBM_MEM_CLASS_OTHER; release them with
+ * cbm_free(CBM_MEM_CLASS_OTHER, json). */
 char *cbm_activity_ui_logs(sqlite3 *db, int limit, const char *path, const char *export_path,
                            const char *previous_path);
-/* Returns HTTP status. Replies are heap allocated, caller frees them. */
+/* Returns HTTP status. Replies have the same JSON ownership as above. */
 int cbm_activity_ingest(sqlite3 *db, const char *body, char **reply);
 char *cbm_activity_agents(sqlite3 *db, const char *project, int64_t after, int limit);
 char *cbm_activity_logs(sqlite3 *db, int64_t after, int limit, int min_level);

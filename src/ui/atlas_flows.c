@@ -14,6 +14,7 @@
  *   ratio bonus: callees outweigh callers
  */
 #include "foundation/constants.h"
+#include "foundation/json_writer.h"
 #include "ui/atlas.h"
 #include "foundation/hash_table.h"
 
@@ -88,7 +89,7 @@ static char *fl_strdup(const char *s) {
     if (!s)
         return NULL;
     size_t len = strlen(s) + 1;
-    char *copy = malloc(len);
+    char *copy = cbm_alloc(CBM_MEM_CLASS_OTHER, len);
     if (copy)
         memcpy(copy, s, len);
     return copy;
@@ -96,17 +97,17 @@ static char *fl_strdup(const char *s) {
 
 static void flow_cache_clear_locked(void) {
     for (int i = 0; i < g_flow_cache.node_count; i++) {
-        free(g_flow_cache.nodes[i].name);
-        free(g_flow_cache.nodes[i].file_path);
+        cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.nodes[i].name);
+        cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.nodes[i].file_path);
     }
-    free(g_flow_cache.nodes);
-    free(g_flow_cache.out_edges);
-    free(g_flow_cache.in_first);
-    free(g_flow_cache.in_edges);
-    free(g_flow_cache.data_first);
-    free(g_flow_cache.data_count);
-    free(g_flow_cache.data_edges);
-    free(g_flow_cache.flows);
+    cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.nodes);
+    cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.out_edges);
+    cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.in_first);
+    cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.in_edges);
+    cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.data_first);
+    cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.data_count);
+    cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.data_edges);
+    cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.flows);
     memset(&g_flow_cache, 0, sizeof(g_flow_cache));
 }
 
@@ -223,7 +224,7 @@ static void fl_walk(const flow_cache_t *cache, flow_t *flow, int32_t entry) {
     memset(flow, 0, sizeof(*flow));
     flow->entry = entry;
     flow->terminal = entry;
-    bool *visited = calloc((size_t)cache->node_count, sizeof(bool));
+    bool *visited = cbm_atlas_calloc_array((size_t)cache->node_count, sizeof(bool));
     if (!visited)
         return;
 
@@ -293,7 +294,7 @@ static void fl_walk(const flow_cache_t *cache, flow_t *flow, int32_t entry) {
                 stack[sp++] = (frame_t){picked[m], step, (uint8_t)(frame.depth + 1)};
         }
     }
-    free(visited);
+    cbm_free(CBM_MEM_CLASS_OTHER, visited);
 }
 
 static int fl_rebuild_locked(cbm_store_t *store, const char *project, const char *key) {
@@ -319,7 +320,8 @@ static int fl_rebuild_locked(cbm_store_t *store, const char *project, const char
     while (sqlite3_step(st) == SQLITE_ROW) {
         if (n >= cap) {
             int nc = cap ? cap * 2 : 4096;
-            flow_node_t *grown = realloc(nodes, (size_t)nc * sizeof(flow_node_t));
+            flow_node_t *grown =
+                cbm_realloc(CBM_MEM_CLASS_OTHER, nodes, (size_t)nc * sizeof(flow_node_t));
             if (!grown)
                 break;
             nodes = grown;
@@ -342,17 +344,17 @@ static int fl_rebuild_locked(cbm_store_t *store, const char *project, const char
         g_flow_cache.callable_total = n;
         if (n > FLOW_NODE_CAP) {
             for (int i = 0; i < n; i++) {
-                free(nodes[i].name);
-                free(nodes[i].file_path);
+                cbm_free(CBM_MEM_CLASS_OTHER, nodes[i].name);
+                cbm_free(CBM_MEM_CLASS_OTHER, nodes[i].file_path);
             }
-            free(nodes);
+            cbm_free(CBM_MEM_CLASS_OTHER, nodes);
             g_flow_cache.nodes = NULL;
         }
         snprintf(g_flow_cache.key, sizeof(g_flow_cache.key), "%s", key);
         return 0;
     }
 
-    fl_id_idx_t *idmap = malloc((size_t)n * sizeof(fl_id_idx_t));
+    fl_id_idx_t *idmap = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)n * sizeof(fl_id_idx_t));
     if (!idmap) {
         g_flow_cache.nodes = nodes;
         g_flow_cache.node_count = n;
@@ -379,11 +381,11 @@ static int fl_rebuild_locked(cbm_store_t *store, const char *project, const char
                 continue;
             if (ne >= ecap) {
                 int nc = ecap ? ecap * 2 : 8192;
-                int32_t *ns = realloc(src, (size_t)nc * sizeof(int32_t));
-                int32_t *nd = realloc(dst, (size_t)nc * sizeof(int32_t));
+                int32_t *ns = cbm_realloc(CBM_MEM_CLASS_OTHER, src, (size_t)nc * sizeof(int32_t));
+                int32_t *nd = cbm_realloc(CBM_MEM_CLASS_OTHER, dst, (size_t)nc * sizeof(int32_t));
                 if (!ns || !nd) {
-                    free(ns ? ns : src);
-                    free(nd ? nd : dst);
+                    cbm_free(CBM_MEM_CLASS_OTHER, ns ? ns : src);
+                    cbm_free(CBM_MEM_CLASS_OTHER, nd ? nd : dst);
                     src = dst = NULL;
                     ne = 0;
                     break;
@@ -414,11 +416,11 @@ static int fl_rebuild_locked(cbm_store_t *store, const char *project, const char
                 continue;
             if (dne >= dcap) {
                 int nc = dcap ? dcap * 2 : 1024;
-                int32_t *ns = realloc(dsrc, (size_t)nc * sizeof(int32_t));
-                int32_t *nd = realloc(ddst, (size_t)nc * sizeof(int32_t));
+                int32_t *ns = cbm_realloc(CBM_MEM_CLASS_OTHER, dsrc, (size_t)nc * sizeof(int32_t));
+                int32_t *nd = cbm_realloc(CBM_MEM_CLASS_OTHER, ddst, (size_t)nc * sizeof(int32_t));
                 if (!ns || !nd) {
-                    free(ns ? ns : dsrc);
-                    free(nd ? nd : ddst);
+                    cbm_free(CBM_MEM_CLASS_OTHER, ns ? ns : dsrc);
+                    cbm_free(CBM_MEM_CLASS_OTHER, nd ? nd : ddst);
                     dsrc = ddst = NULL;
                     dne = 0;
                     break;
@@ -433,11 +435,12 @@ static int fl_rebuild_locked(cbm_store_t *store, const char *project, const char
         }
         sqlite3_finalize(st);
     }
-    free(idmap);
+    cbm_free(CBM_MEM_CLASS_OTHER, idmap);
 
-    g_flow_cache.data_first = malloc((size_t)n * sizeof(int32_t));
-    g_flow_cache.data_count = calloc((size_t)n, sizeof(int32_t));
-    g_flow_cache.data_edges = malloc(dne > 0 ? (size_t)dne * sizeof(int32_t) : sizeof(int32_t));
+    g_flow_cache.data_first = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)n * sizeof(int32_t));
+    g_flow_cache.data_count = cbm_atlas_calloc_array((size_t)n, sizeof(int32_t));
+    g_flow_cache.data_edges =
+        cbm_alloc(CBM_MEM_CLASS_OTHER, dne > 0 ? (size_t)dne * sizeof(int32_t) : sizeof(int32_t));
     if (g_flow_cache.data_first && g_flow_cache.data_count && g_flow_cache.data_edges) {
         for (int e = 0; e < dne; e++)
             g_flow_cache.data_count[dsrc[e]]++;
@@ -446,23 +449,24 @@ static int fl_rebuild_locked(cbm_store_t *store, const char *project, const char
             g_flow_cache.data_first[i] = offset;
             offset += g_flow_cache.data_count[i];
         }
-        int32_t *cursor2 = calloc((size_t)n, sizeof(int32_t));
+        int32_t *cursor2 = cbm_atlas_calloc_array((size_t)n, sizeof(int32_t));
         if (cursor2) {
             for (int e = 0; e < dne; e++)
                 g_flow_cache.data_edges[g_flow_cache.data_first[dsrc[e]] + cursor2[dsrc[e]]++] =
                     ddst[e];
         }
-        free(cursor2);
+        cbm_free(CBM_MEM_CLASS_OTHER, cursor2);
     }
-    free(dsrc);
-    free(ddst);
+    cbm_free(CBM_MEM_CLASS_OTHER, dsrc);
+    cbm_free(CBM_MEM_CLASS_OTHER, ddst);
 
     for (int e = 0; e < ne; e++) {
         nodes[src[e]].out_count++;
         nodes[dst[e]].in_count++;
     }
-    int32_t *out_edges = malloc(ne > 0 ? (size_t)ne * sizeof(int32_t) : sizeof(int32_t));
-    int32_t *cursor = calloc((size_t)n, sizeof(int32_t));
+    int32_t *out_edges =
+        cbm_alloc(CBM_MEM_CLASS_OTHER, ne > 0 ? (size_t)ne * sizeof(int32_t) : sizeof(int32_t));
+    int32_t *cursor = cbm_atlas_calloc_array((size_t)n, sizeof(int32_t));
     if (out_edges && cursor) {
         int32_t offset = 0;
         for (int i = 0; i < n; i++) {
@@ -472,12 +476,13 @@ static int fl_rebuild_locked(cbm_store_t *store, const char *project, const char
         for (int e = 0; e < ne; e++)
             out_edges[nodes[src[e]].first_out + cursor[src[e]]++] = dst[e];
     }
-    free(cursor);
+    cbm_free(CBM_MEM_CLASS_OTHER, cursor);
 
     /* Reverse CSR over the same edge list (in_count already tallied). */
-    g_flow_cache.in_first = malloc((size_t)n * sizeof(int32_t));
-    g_flow_cache.in_edges = malloc(ne > 0 ? (size_t)ne * sizeof(int32_t) : sizeof(int32_t));
-    int32_t *rcursor = calloc((size_t)n, sizeof(int32_t));
+    g_flow_cache.in_first = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)n * sizeof(int32_t));
+    g_flow_cache.in_edges =
+        cbm_alloc(CBM_MEM_CLASS_OTHER, ne > 0 ? (size_t)ne * sizeof(int32_t) : sizeof(int32_t));
+    int32_t *rcursor = cbm_atlas_calloc_array((size_t)n, sizeof(int32_t));
     if (g_flow_cache.in_first && g_flow_cache.in_edges && rcursor) {
         int32_t offset = 0;
         for (int i = 0; i < n; i++) {
@@ -487,22 +492,22 @@ static int fl_rebuild_locked(cbm_store_t *store, const char *project, const char
         for (int e = 0; e < ne; e++)
             g_flow_cache.in_edges[g_flow_cache.in_first[dst[e]] + rcursor[dst[e]]++] = src[e];
     } else {
-        free(g_flow_cache.in_first);
-        free(g_flow_cache.in_edges);
+        cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.in_first);
+        cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.in_edges);
         g_flow_cache.in_first = NULL;
         g_flow_cache.in_edges = NULL;
     }
-    free(rcursor);
-    free(src);
-    free(dst);
+    cbm_free(CBM_MEM_CLASS_OTHER, rcursor);
+    cbm_free(CBM_MEM_CLASS_OTHER, src);
+    cbm_free(CBM_MEM_CLASS_OTHER, dst);
     if (!out_edges) {
         for (int i = 0; i < n; i++) {
-            free(nodes[i].name);
-            free(nodes[i].file_path);
+            cbm_free(CBM_MEM_CLASS_OTHER, nodes[i].name);
+            cbm_free(CBM_MEM_CLASS_OTHER, nodes[i].file_path);
         }
-        free(nodes);
-        free(g_flow_cache.in_first);
-        free(g_flow_cache.in_edges);
+        cbm_free(CBM_MEM_CLASS_OTHER, nodes);
+        cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.in_first);
+        cbm_free(CBM_MEM_CLASS_OTHER, g_flow_cache.in_edges);
         g_flow_cache.in_first = NULL;
         g_flow_cache.in_edges = NULL;
         return -1;
@@ -514,7 +519,7 @@ static int fl_rebuild_locked(cbm_store_t *store, const char *project, const char
     g_flow_cache.callable_total = n;
 
     /* 3. Score candidates, walk flows, dedup by (entry, terminal). */
-    fl_candidate_t *cands = malloc((size_t)n * sizeof(fl_candidate_t));
+    fl_candidate_t *cands = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)n * sizeof(fl_candidate_t));
     if (!cands)
         return -1;
     int ncand = 0;
@@ -527,9 +532,9 @@ static int fl_rebuild_locked(cbm_store_t *store, const char *project, const char
     int considered = ncand < FLOW_MAX_CANDIDATES ? ncand : FLOW_MAX_CANDIDATES;
     g_flow_cache.candidates_dropped = ncand - considered;
 
-    flow_t *flows = malloc(sizeof(flow_t) * FLOW_MAX_FLOWS * 2);
+    flow_t *flows = cbm_alloc(CBM_MEM_CLASS_OTHER, sizeof(flow_t) * FLOW_MAX_FLOWS * 2);
     CBMHashTable *seen_pair = cbm_ht_create(256);
-    char **pair_keys = calloc(FLOW_MAX_FLOWS * 2, sizeof(char *));
+    char **pair_keys = cbm_atlas_calloc_array(FLOW_MAX_FLOWS * 2, sizeof(char *));
     int nflows = 0;
     if (flows && seen_pair && pair_keys) {
         for (int c = 0; c < considered && nflows < FLOW_MAX_FLOWS * 2; c++) {
@@ -564,10 +569,10 @@ static int fl_rebuild_locked(cbm_store_t *store, const char *project, const char
         }
     }
     for (int i = 0; i < FLOW_MAX_FLOWS * 2; i++)
-        free(pair_keys ? pair_keys[i] : NULL);
-    free(pair_keys);
+        cbm_free(CBM_MEM_CLASS_OTHER, pair_keys ? pair_keys[i] : NULL);
+    cbm_free(CBM_MEM_CLASS_OTHER, pair_keys);
     cbm_ht_free(seen_pair);
-    free(cands);
+    cbm_free(CBM_MEM_CLASS_OTHER, cands);
     if (!flows)
         return -1;
     qsort(flows, (size_t)nflows, sizeof(flow_t), fl_flow_cmp);
@@ -659,7 +664,7 @@ char *cbm_atlas_flows_json(cbm_store_t *store, const char *project) {
     }
     yyjson_mut_obj_add_val(doc, root, "flows", arr);
     pthread_mutex_unlock(&g_flow_mu);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -727,7 +732,7 @@ char *cbm_atlas_flow_json(cbm_store_t *store, const char *project, int flow_id) 
         sqlite3_finalize(conf_st);
     yyjson_mut_obj_add_val(doc, root, "steps", steps);
     pthread_mutex_unlock(&g_flow_mu);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -793,16 +798,16 @@ char *cbm_atlas_trace_json(cbm_store_t *store, const char *project, int64_t from
                                from < 0 ? "source is not an indexed callable"
                                         : "target is not an indexed callable");
         pthread_mutex_unlock(&g_flow_mu);
-        char *json = yyjson_mut_write(doc, 0, NULL);
+        char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
         yyjson_mut_doc_free(doc);
         return json;
     }
 
     /* BFS with parent tracking, bounded depth. */
     int n = g_flow_cache.node_count;
-    int32_t *parent = malloc((size_t)n * sizeof(int32_t));
-    uint8_t *depth = calloc((size_t)n, sizeof(uint8_t));
-    int32_t *queue = malloc((size_t)n * sizeof(int32_t));
+    int32_t *parent = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)n * sizeof(int32_t));
+    uint8_t *depth = cbm_atlas_calloc_array((size_t)n, sizeof(uint8_t));
+    int32_t *queue = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)n * sizeof(int32_t));
     long long explored = 0;
     bool found = from == to;
     if (parent && depth && queue) {
@@ -857,11 +862,11 @@ char *cbm_atlas_trace_json(cbm_store_t *store, const char *project, int64_t from
         yyjson_mut_obj_add_val(doc, root, "path", path);
         yyjson_mut_obj_add_int(doc, root, "hops", chain_len - 1);
     }
-    free(parent);
-    free(depth);
-    free(queue);
+    cbm_free(CBM_MEM_CLASS_OTHER, parent);
+    cbm_free(CBM_MEM_CLASS_OTHER, depth);
+    cbm_free(CBM_MEM_CLASS_OTHER, queue);
     pthread_mutex_unlock(&g_flow_mu);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -924,7 +929,7 @@ char *cbm_atlas_impact_json(cbm_store_t *store, const char *project, int64_t nod
     if (origin < 0) {
         yyjson_mut_obj_add_str(doc, root, "error", "symbol is not an indexed callable");
         pthread_mutex_unlock(&g_flow_mu);
-        char *json = yyjson_mut_write(doc, 0, NULL);
+        char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
         yyjson_mut_doc_free(doc);
         return json;
     }
@@ -938,9 +943,9 @@ char *cbm_atlas_impact_json(cbm_store_t *store, const char *project, int64_t nod
         yyjson_mut_obj_add_strcpy(doc, node_obj, "file_path", nodes[origin].file_path);
     yyjson_mut_obj_add_val(doc, root, "node", node_obj);
 
-    uint8_t *dist = calloc((size_t)n, sizeof(uint8_t));
-    uint8_t *seen = calloc((size_t)n, sizeof(uint8_t));
-    int32_t *queue = malloc((size_t)n * sizeof(int32_t));
+    uint8_t *dist = cbm_atlas_calloc_array((size_t)n, sizeof(uint8_t));
+    uint8_t *seen = cbm_atlas_calloc_array((size_t)n, sizeof(uint8_t));
+    int32_t *queue = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)n * sizeof(int32_t));
     yyjson_mut_val *nearest = yyjson_mut_arr(doc);
     yyjson_mut_val *tests_nearest = yyjson_mut_arr(doc);
     impact_region_t regions[IMPACT_REGIONS_CAP];
@@ -1016,7 +1021,7 @@ char *cbm_atlas_impact_json(cbm_store_t *store, const char *project, int64_t nod
                                     rname = NULL;
                                 }
                             }
-                            free(rname);
+                            cbm_free(CBM_MEM_CLASS_OTHER, rname);
                             cbm_ht_set(file_region, fp, (void *)(intptr_t)(ridx + 2));
                         }
                     }
@@ -1067,13 +1072,13 @@ char *cbm_atlas_impact_json(cbm_store_t *store, const char *project, int64_t nod
     yyjson_mut_obj_add_val(doc, root, "tests", tests_obj);
 
     for (int r = 0; r < region_count; r++)
-        free(regions[r].name);
+        cbm_free(CBM_MEM_CLASS_OTHER, regions[r].name);
     cbm_ht_free(file_region);
-    free(dist);
-    free(seen);
-    free(queue);
+    cbm_free(CBM_MEM_CLASS_OTHER, dist);
+    cbm_free(CBM_MEM_CLASS_OTHER, seen);
+    cbm_free(CBM_MEM_CLASS_OTHER, queue);
     pthread_mutex_unlock(&g_flow_mu);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }

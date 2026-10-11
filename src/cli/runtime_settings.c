@@ -9,6 +9,8 @@
 #include "ui/config.h"
 #include <sqlite3.h>
 #include <yyjson/yyjson.h>
+#include "foundation/mem_core.h"
+#include "foundation/json_writer.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -599,7 +601,7 @@ static char *snapshot(sqlite3 *db, const char *cache) {
             }
         }
     }
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -627,7 +629,7 @@ static char *error_json(const char *message, int code, int *status) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     json_string(doc, root, "error", message);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -728,7 +730,7 @@ char *cbm_runtime_settings_apply_json(const char *cache, const char *body, size_
     char *result = ok ? snapshot(db, cache) : NULL;
     ok = ok && result && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK;
     if (!ok) {
-        free(result);
+        cbm_free(CBM_MEM_CLASS_OTHER, result);
         result = NULL;
         sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
     }

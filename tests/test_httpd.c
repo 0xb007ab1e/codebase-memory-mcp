@@ -17,6 +17,7 @@
 #include "../src/foundation/compat_fs.h"
 #include "../src/foundation/compat_thread.h"
 #include "../src/foundation/log.h"
+#include "../src/foundation/mem_core.h"
 #include "../src/foundation/platform.h"
 #include "../src/foundation/str_util.h" /* cbm_json_escape: expected index-status fragment */
 #include "../src/cli/cli.h"
@@ -27,6 +28,8 @@
 #include "test_helpers.h"
 #include "ui/httpd.h"
 #include "ui/activity.h"
+#include "ui/atlas.h"
+#include "ui/layout3d.h"
 #include <yyjson/yyjson.h>
 #include "ui/http_server.h"
 #include <store/store.h>
@@ -1125,6 +1128,34 @@ static int activity_interrupt_rows(unsigned kind, void *database, void *statemen
     return 0;
 }
 
+TEST(activity_reply_memory_core_ownership) {
+    sqlite3 *db = cbm_activity_open(":memory:");
+    ASSERT_NOT_NULL(db);
+    size_t before_blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    size_t before_bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+    char *reply = cbm_activity_logs(db, -1, 10, 0);
+    ASSERT_NOT_NULL(reply);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), before_blocks + 1);
+    cbm_free(CBM_MEM_CLASS_OTHER, reply);
+    reply = NULL;
+    ASSERT_EQ(cbm_activity_ingest(db, "{", &reply), 400);
+    ASSERT_NULL(reply);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), before_blocks);
+    reply = NULL;
+    ASSERT_EQ(cbm_activity_ingest(db, "{\"project\":\"memory-test\",\"events\":[]}", &reply), 200);
+    ASSERT_NOT_NULL(reply);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), before_blocks + 1);
+    cbm_free(CBM_MEM_CLASS_OTHER, reply);
+    reply = cbm_activity_agents(db, "memory-test", 0, 10);
+    ASSERT_NOT_NULL(reply);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), before_blocks + 1);
+    cbm_free(CBM_MEM_CLASS_OTHER, reply);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), before_blocks);
+    ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), before_bytes);
+    sqlite3_close(db);
+    PASS();
+}
+
 TEST(activity_preserves_severity_and_reports_interrupted_reads) {
     sqlite3 *db = cbm_activity_open(":memory:");
     ASSERT_NOT_NULL(db);
@@ -1134,7 +1165,7 @@ TEST(activity_preserves_severity_and_reports_interrupted_reads) {
     char *json = cbm_activity_logs(db, -1, 10, 2);
     ASSERT_NOT_NULL(json);
     ASSERT_NOT_NULL(strstr(json, "\"total\":0"));
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     ASSERT_EQ(sqlite3_trace_v2(db, SQLITE_TRACE_STMT, activity_interrupt_rows, db), SQLITE_OK);
     ASSERT_NULL(cbm_activity_logs(db, -1, 10, 0));
     ASSERT_NULL(cbm_activity_agents(db, "test", 0, 10));
@@ -1151,7 +1182,7 @@ TEST(activity_pruned_start_events_do_not_resurrect_on_retry) {
         "\"Read\",\"seq\":1,\"ts\":1000,\"phase\":\"start\"}]}";
     char *reply = NULL;
     ASSERT_EQ(cbm_activity_ingest(db, batch, &reply), 200);
-    free(reply);
+    cbm_free(CBM_MEM_CLASS_OTHER, reply);
     ASSERT_EQ(
         sqlite3_exec(
             db,
@@ -1160,15 +1191,15 @@ TEST(activity_pruned_start_events_do_not_resurrect_on_retry) {
             NULL, NULL, NULL),
         SQLITE_OK);
     ASSERT_EQ(cbm_activity_ingest(db, "{\"project\":\"fixture-b\",\"events\":[]}", &reply), 200);
-    free(reply);
+    cbm_free(CBM_MEM_CLASS_OTHER, reply);
     ASSERT_EQ(cbm_activity_ingest(db, batch, &reply), 200);
     ASSERT_NOT_NULL(strstr(reply, "\"accepted\":0"));
     ASSERT_NOT_NULL(strstr(reply, "\"duplicates\":1"));
-    free(reply);
+    cbm_free(CBM_MEM_CLASS_OTHER, reply);
     reply = cbm_activity_agents(db, "fixture-a", 0, 10);
     ASSERT_NOT_NULL(strstr(reply, "\"events\":[]"));
     ASSERT_NOT_NULL(strstr(reply, "\"truncated\":true"));
-    free(reply);
+    cbm_free(CBM_MEM_CLASS_OTHER, reply);
     sqlite3_close(db);
     PASS();
 }
@@ -1196,14 +1227,14 @@ TEST(activity_migration_preserves_v1_logs_and_rejects_future_schema) {
     ASSERT_NOT_NULL(json);
     ASSERT_NOT_NULL(strstr(json, "preserved failure"));
     ASSERT_NOT_NULL(strstr(json, "\"total\":1"));
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     const char *ui = "{\"session\":\"migration-fixture\",\"seq\":1,\"level\":\"error\",\"source\":"
                      "\"frontend\",\"message\":\"retry-safe\"}";
     ASSERT_TRUE(cbm_activity_log(db, ui));
     ASSERT_TRUE(cbm_activity_log(db, ui));
     json = cbm_activity_logs(db, -1, 10, 2);
     ASSERT_NOT_NULL(strstr(json, "\"total\":2"));
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     ASSERT_EQ(sqlite3_exec(db, "PRAGMA user_version=99", NULL, NULL, NULL), SQLITE_OK);
     sqlite3_close(db);
     ASSERT_NULL(cbm_activity_open(path));
@@ -1252,12 +1283,12 @@ TEST(activity_log_project_scope_preserves_unknown_v2_history_and_filters_before_
     ASSERT_NOT_NULL(strstr(page, "\"scope\":\"project\""));
     ASSERT_NULL(strstr(page, "unrelated flood"));
     ASSERT_NULL(strstr(page, "legacy"));
-    free(page);
+    cbm_free(CBM_MEM_CLASS_OTHER, page);
     page = cbm_activity_logs_scoped(db, 0, 1, 2, "fixture-a", false);
     ASSERT_NOT_NULL(strstr(page, "first-a"));
     ASSERT_NOT_NULL(strstr(page, "\"cursor\":2"));
     ASSERT_NOT_NULL(strstr(page, "\"has_more\":true"));
-    free(page);
+    cbm_free(CBM_MEM_CLASS_OTHER, page);
     sqlite3_close(db);
     db = cbm_activity_open(path);
     ASSERT_NOT_NULL(db);
@@ -1265,17 +1296,17 @@ TEST(activity_log_project_scope_preserves_unknown_v2_history_and_filters_before_
     ASSERT_NOT_NULL(strstr(page, "last-a"));
     ASSERT_NOT_NULL(strstr(page, "\"cursor\":3"));
     ASSERT_NOT_NULL(strstr(page, "\"has_more\":false"));
-    free(page);
+    cbm_free(CBM_MEM_CLASS_OTHER, page);
     page = cbm_activity_logs_scoped(db, -1, 10, 2, NULL, true);
     ASSERT_NOT_NULL(strstr(page, "legacy project=fixture-a"));
     ASSERT_NOT_NULL(strstr(page, "\"total\":3"));
     ASSERT_NOT_NULL(strstr(page, "\"project\":null"));
     ASSERT_NOT_NULL(strstr(page, "\"scope\":\"unattributed\""));
-    free(page);
+    cbm_free(CBM_MEM_CLASS_OTHER, page);
     page = cbm_activity_logs(db, -1, 1, 2);
     ASSERT_NOT_NULL(strstr(page, "\"total\":605"));
     ASSERT_NOT_NULL(strstr(page, "\"scope\":\"daemon\""));
-    free(page);
+    cbm_free(CBM_MEM_CLASS_OTHER, page);
     sqlite3_close(db);
     th_cleanup(dir);
     PASS();
@@ -1350,14 +1381,14 @@ TEST(activity_log_search_and_severity_apply_before_limit_and_survive_reopen) {
     char *json = cbm_activity_logs(db, -1, 200, 0);
     ASSERT_NOT_NULL(json);
     ASSERT_NULL(strstr(json, "10%_broken"));
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     json = cbm_activity_logs_filtered(db, -1, 200, 3, "fixture-a", false, "10%_");
     ASSERT_NOT_NULL(json);
     ASSERT_NOT_NULL(strstr(json, "\"total\":49"));
     ASSERT_NOT_NULL(strstr(json, "\"query\":\"10%_\""));
     ASSERT_NOT_NULL(strstr(json, "10%_broken.c"));
     ASSERT_NULL(strstr(json, "routine"));
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     sqlite3_close(db);
     db = cbm_activity_open(path);
     ASSERT_NOT_NULL(db);
@@ -1366,13 +1397,13 @@ TEST(activity_log_search_and_severity_apply_before_limit_and_survive_reopen) {
     ASSERT_NOT_NULL(strstr(json, "\"cursor\":1"));
     ASSERT_NOT_NULL(strstr(json, "\"has_more\":true"));
     ASSERT_NOT_NULL(strstr(json, "\"total\":49"));
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     json = cbm_activity_logs_filtered(db, 1, 1, 3, "fixture-a", false, "BROKEN");
     ASSERT_NOT_NULL(strstr(json, "\"cursor\":2"));
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     json = cbm_activity_logs_filtered(db, -1, 200, 3, "fixture-b", false, "10%_");
     ASSERT_NOT_NULL(strstr(json, "\"total\":0"));
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     sqlite3_close(db);
     th_cleanup(dir);
     PASS();
@@ -1405,7 +1436,7 @@ TEST(ui_log_retention_prevents_expired_retry_and_preserves_full_json) {
     ASSERT_NOT_NULL(full);
     yyjson_doc_free(full);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     ASSERT_EQ(
         sqlite3_exec(db,
                      "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<3000) "
@@ -1421,7 +1452,7 @@ TEST(ui_log_retention_prevents_expired_retry_and_preserves_full_json) {
     ASSERT_EQ(cbm_activity_ui_log(db, message, false), 0);
     json = cbm_activity_ui_logs(db, 200, path, "", NULL);
     ASSERT_NOT_NULL(strstr(json, "\"total\":0"));
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     sqlite3_close(db);
     th_cleanup(dir);
     PASS();
@@ -1535,10 +1566,10 @@ TEST(activity_journal_reopen_cursor_dedup_and_project_isolation) {
     char *reply = NULL;
     ASSERT_EQ(cbm_activity_ingest(db, batch, &reply), 200);
     ASSERT_NOT_NULL(strstr(reply, "\"accepted\":2"));
-    free(reply);
+    cbm_free(CBM_MEM_CLASS_OTHER, reply);
     ASSERT_EQ(cbm_activity_ingest(db, batch, &reply), 200);
     ASSERT_NOT_NULL(strstr(reply, "\"duplicates\":2"));
-    free(reply);
+    cbm_free(CBM_MEM_CLASS_OTHER, reply);
     char *page = cbm_activity_agents(db, "demo", 0, 1);
     ASSERT_NOT_NULL(page);
     ASSERT_NULL(strstr(page, "never-store-this"));
@@ -1546,17 +1577,17 @@ TEST(activity_journal_reopen_cursor_dedup_and_project_isolation) {
     yyjson_doc *parsed = yyjson_read(page, strlen(page), 0);
     int64_t cursor = yyjson_get_sint(yyjson_obj_get(yyjson_doc_get_root(parsed), "cursor"));
     yyjson_doc_free(parsed);
-    free(page);
+    cbm_free(CBM_MEM_CLASS_OTHER, page);
     sqlite3_close(db);
     db = cbm_activity_open(path);
     ASSERT_NOT_NULL(db);
     page = cbm_activity_agents(db, "demo", cursor, 10);
     ASSERT_NOT_NULL(strstr(page, "\"seq\":1"));
     ASSERT_NULL(strstr(page, "\"seq\":2"));
-    free(page);
+    cbm_free(CBM_MEM_CLASS_OTHER, page);
     page = cbm_activity_agents(db, "other", 0, 10);
     ASSERT_NOT_NULL(strstr(page, "\"events\":[]"));
-    free(page);
+    cbm_free(CBM_MEM_CLASS_OTHER, page);
     ASSERT_EQ(cbm_activity_ingest(db, "{\"events\":[{\"run\":\"bad\"}]}", &reply), 400);
     sqlite3_close(db);
     th_cleanup(dir);
@@ -1580,14 +1611,14 @@ TEST(activity_errors_survive_routine_log_retention_and_reopen) {
     ASSERT_NOT_NULL(strstr(page, "\"level\":\"error\""));
     ASSERT_NOT_NULL(strstr(page, "\"total\":1"));
     ASSERT_NULL(strstr(page, "http.request"));
-    free(page);
+    cbm_free(CBM_MEM_CLASS_OTHER, page);
     sqlite3_close(reader);
     sqlite3_close(db);
     db = cbm_activity_open(path);
     ASSERT_NOT_NULL(db);
     page = cbm_activity_logs(db, -1, 10, 0);
     ASSERT_NOT_NULL(strstr(page, "\"total\":3001"));
-    free(page);
+    cbm_free(CBM_MEM_CLASS_OTHER, page);
     sqlite3_close(db);
     th_cleanup(dir);
     PASS();
@@ -2394,6 +2425,64 @@ TEST(ui_server_atlas_routes_are_wired) {
     PASS();
 }
 
+TEST(ui_server_retained_cache_memory_is_flushed_before_thread_exit) {
+    cbm_atlas_metrics_cache_clear();
+    cbm_atlas_flows_cache_clear();
+    cbm_layout_regions_cache_clear();
+    ui_delete_fixture_t fixture;
+    ASSERT_EQ(ui_delete_fixture_init(&fixture), 0);
+    char path[1024];
+    ui_delete_db_path(&fixture, "http-memory", path, sizeof(path));
+    cbm_store_t *store = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "http-memory", ""), CBM_STORE_OK);
+    /* Settle the independent history cache on the caller before measuring the
+     * HTTP worker. An empty source root does not retain history-scan buffers. */
+    char *warm = cbm_atlas_metrics_json(store, "http-memory");
+    ASSERT_NOT_NULL(warm);
+    cbm_free(CBM_MEM_CLASS_OTHER, warm);
+    cbm_atlas_metrics_cache_clear();
+    cbm_layout_regions_cache_clear();
+    cbm_store_close(store);
+    void *sentinel = cbm_alloc(CBM_MEM_CLASS_OTHER, 64);
+    ASSERT_NOT_NULL(sentinel);
+    th_server_t server;
+    server.srv = cbm_http_server_new(0);
+    ASSERT_NOT_NULL(server.srv);
+    size_t before_blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    size_t before_bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+    ASSERT_EQ(th_server_thread_start(&server.tid, server.srv), 0);
+    char response[16384];
+    int length = th_http(cbm_http_server_port(server.srv),
+                         "GET /api/metrics?project=http-memory HTTP/1.1\r\n\r\n", response,
+                         sizeof(response));
+    bool metrics_ok = length > 0 && th_status(response) == 200;
+    /* Receiving a second reply proves the first request reached its flush
+     * boundary. It avoids asserting the listener's transient idle state. */
+    length = th_http(cbm_http_server_port(server.srv), "GET /missing-memory-probe HTTP/1.1\r\n\r\n",
+                     response, sizeof(response));
+    bool fence_ok = length > 0 && th_status(response) == 404;
+    size_t retained_blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    cbm_http_server_stop(server.srv);
+    int joined = cbm_thread_join(&server.tid);
+    cbm_atlas_metrics_cache_clear();
+    cbm_atlas_flows_cache_clear();
+    cbm_layout_regions_cache_clear();
+    size_t after_blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    size_t after_bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+    bool freed = cbm_http_server_free(server.srv);
+    cbm_free(CBM_MEM_CLASS_OTHER, sentinel);
+    ui_delete_fixture_cleanup(&fixture);
+    ASSERT_TRUE(metrics_ok);
+    ASSERT_TRUE(fence_ok);
+    ASSERT_EQ(joined, 0);
+    ASSERT_TRUE(freed);
+    ASSERT_GT(retained_blocks, before_blocks);
+    ASSERT_EQ(after_blocks, before_blocks);
+    ASSERT_EQ(after_bytes, before_bytes);
+    PASS();
+}
+
 TEST(ui_server_oversized_body_rejected) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -2725,7 +2814,7 @@ TEST(ui_server_delete_project_unlink_failure_keeps_watch) {
 }
 
 static bool ui_health_matches(th_server_t *server, const char *project, const char *status,
-                               const char *indexed_at, bool registered, bool running) {
+                              const char *indexed_at, bool registered, bool running) {
     char request[512], response[4096];
     snprintf(request, sizeof(request), "GET /api/project-health?name=%s HTTP/1.1\r\n\r\n", project);
     int length = th_http(cbm_http_server_port(server->srv), request, response, sizeof(response));
@@ -2744,12 +2833,12 @@ static bool ui_health_matches(th_server_t *server, const char *project, const ch
     yyjson_val *watch = yyjson_obj_get(root, "watch_registered");
     yyjson_val *loop = yyjson_obj_get(root, "watcher_running");
     bool matches = yyjson_is_str(actual_status) &&
-                   strcmp(yyjson_get_str(actual_status), status) == 0 &&
-                   yyjson_is_bool(watch) && yyjson_get_bool(watch) == registered &&
-                   yyjson_is_bool(loop) && yyjson_get_bool(loop) == running;
+                   strcmp(yyjson_get_str(actual_status), status) == 0 && yyjson_is_bool(watch) &&
+                   yyjson_get_bool(watch) == registered && yyjson_is_bool(loop) &&
+                   yyjson_get_bool(loop) == running;
     matches = matches && (indexed_at ? yyjson_is_str(timestamp) &&
-                                          strcmp(yyjson_get_str(timestamp), indexed_at) == 0
-                                    : yyjson_is_null(timestamp));
+                                           strcmp(yyjson_get_str(timestamp), indexed_at) == 0
+                                     : yyjson_is_null(timestamp));
     if (strcmp(status, "healthy") == 0) {
         matches = matches && yyjson_is_int(yyjson_obj_get(root, "nodes")) &&
                   yyjson_get_int(yyjson_obj_get(root, "nodes")) == 0 &&
@@ -2785,8 +2874,8 @@ TEST(ui_server_project_health_timestamp_and_no_watcher) {
 
     th_server_t server;
     ASSERT_EQ(th_server_start(&server), 0);
-    bool healthy = ui_health_matches(&server, "health-indexed", "healthy", project.indexed_at,
-                                    false, false);
+    bool healthy =
+        ui_health_matches(&server, "health-indexed", "healthy", project.indexed_at, false, false);
     bool missing = ui_health_matches(&server, "health-missing", "missing", NULL, false, false);
     bool corrupt = ui_health_matches(&server, "health-unreadable", "corrupt", NULL, false, false);
     th_server_stop(&server);
@@ -3236,7 +3325,7 @@ TEST(repo_info_web_base_normalizes_to_https) {
         /* Never leak credentials into the web base. */
         ASSERT_NULL(strstr(got, "token"));
         ASSERT_NULL(strstr(got, "@"));
-        free(got);
+        cbm_free(CBM_MEM_CLASS_OTHER, got);
     }
     /* Unrecognized shapes yield NULL, not a bogus link. */
     ASSERT_NULL(cbm_ui_git_web_base(""));
@@ -4005,6 +4094,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_free_never_joins_active_index_worker);
     RUN_TEST(ui_csp_connect_src_has_explicit_download_hosts);
     RUN_TEST(activity_preserves_severity_and_reports_interrupted_reads);
+    RUN_TEST(activity_reply_memory_core_ownership);
     RUN_TEST(activity_pruned_start_events_do_not_resurrect_on_retry);
     RUN_TEST(activity_migration_preserves_v1_logs_and_rejects_future_schema);
     RUN_TEST(activity_log_project_scope_preserves_unknown_v2_history_and_filters_before_limit);
@@ -4030,6 +4120,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_rpc_rejects_duplicate_adr_arguments);
     RUN_TEST(ui_server_rpc_allows_only_ui_read_tools);
     RUN_TEST(ui_server_atlas_routes_are_wired);
+    RUN_TEST(ui_server_retained_cache_memory_is_flushed_before_thread_exit);
     RUN_TEST(ui_server_oversized_body_rejected);
     RUN_TEST(ui_server_encoded_slash_not_routed);
     RUN_TEST(ui_server_nul_in_target_rejected);

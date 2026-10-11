@@ -12,6 +12,7 @@
  * cache dir, so the dashboard can show trends across reindexes.
  */
 #include "foundation/constants.h"
+#include "foundation/json_writer.h"
 #include "ui/atlas.h"
 #include "ui/http_server.h"
 #include "foundation/compat_fs.h"
@@ -62,9 +63,9 @@ static void mx_top_offer2(mx_top_t *top, const char *qn, const char *name, const
     if (pos >= MX_TOP_N)
         return;
     mx_entry_t incoming;
-    incoming.qn = qn ? strdup(qn) : NULL;
-    incoming.name = name ? strdup(name) : NULL;
-    incoming.file = file ? strdup(file) : NULL;
+    incoming.qn = qn ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, qn) : NULL;
+    incoming.name = name ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, name) : NULL;
+    incoming.file = file ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, file) : NULL;
     incoming.value = value;
     incoming.value2 = value2;
     mx_entry_t last = {0};
@@ -76,9 +77,9 @@ static void mx_top_offer2(mx_top_t *top, const char *qn, const char *name, const
     for (int i = top->count - 1; i > pos; i--)
         top->items[i] = top->items[i - 1];
     top->items[pos] = incoming;
-    free(last.qn);
-    free(last.name);
-    free(last.file);
+    cbm_free(CBM_MEM_CLASS_OTHER, last.qn);
+    cbm_free(CBM_MEM_CLASS_OTHER, last.name);
+    cbm_free(CBM_MEM_CLASS_OTHER, last.file);
 }
 
 static void mx_top_offer(mx_top_t *top, const char *qn, const char *name, const char *file,
@@ -88,9 +89,9 @@ static void mx_top_offer(mx_top_t *top, const char *qn, const char *name, const 
 
 static void mx_top_free(mx_top_t *top) {
     for (int i = 0; i < top->count; i++) {
-        free(top->items[i].qn);
-        free(top->items[i].name);
-        free(top->items[i].file);
+        cbm_free(CBM_MEM_CLASS_OTHER, top->items[i].qn);
+        cbm_free(CBM_MEM_CLASS_OTHER, top->items[i].name);
+        cbm_free(CBM_MEM_CLASS_OTHER, top->items[i].file);
     }
     top->count = 0;
 }
@@ -126,7 +127,7 @@ static pthread_mutex_t g_mx_mu = PTHREAD_MUTEX_INITIALIZER;
 
 void cbm_atlas_metrics_cache_clear(void) {
     pthread_mutex_lock(&g_mx_mu);
-    free(g_mx_cache.json);
+    cbm_free(CBM_MEM_CLASS_OTHER, g_mx_cache.json);
     memset(&g_mx_cache, 0, sizeof(g_mx_cache));
     pthread_mutex_unlock(&g_mx_mu);
 }
@@ -203,7 +204,7 @@ static void mx_churn_scan(const char *root_path, mx_churn_t *churn) {
     FILE *fp = cbm_popen_git(cmd);
     if (!fp)
         return;
-    churn->commits = malloc((size_t)MX_COMMIT_CAP * sizeof(mx_commit_t));
+    churn->commits = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)MX_COMMIT_CAP * sizeof(mx_commit_t));
     int current_commit = -1;
     char line[CBM_SZ_1K];
     while (fgets(line, sizeof(line), fp)) {
@@ -251,16 +252,17 @@ static void mx_churn_scan(const char *root_path, mx_churn_t *churn) {
         if (!stat) {
             if (churn->key_count >= churn->key_cap) {
                 int nc = churn->key_cap ? churn->key_cap * 2 : 1024;
-                char **grown = realloc(churn->keys, (size_t)nc * sizeof(char *));
+                char **grown =
+                    cbm_realloc(CBM_MEM_CLASS_OTHER, churn->keys, (size_t)nc * sizeof(char *));
                 if (!grown)
                     break;
                 churn->keys = grown;
                 churn->key_cap = nc;
             }
-            churn->keys[churn->key_count] = strdup(line);
-            stat = calloc(1, sizeof(mx_file_stat_t));
+            churn->keys[churn->key_count] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, line);
+            stat = cbm_atlas_calloc_array(1, sizeof(mx_file_stat_t));
             if (!churn->keys[churn->key_count] || !stat) {
-                free(stat);
+                cbm_free(CBM_MEM_CLASS_OTHER, stat);
                 break;
             }
             canon = churn->keys[churn->key_count];
@@ -289,7 +291,7 @@ static void mx_churn_free_stat(const char *key, void *value, void *userdata) {
     mx_file_stat_t *stat = value;
     if (stat) {
         cbm_ht_free(stat->authors);
-        free(stat);
+        cbm_free(CBM_MEM_CLASS_OTHER, stat);
     }
 }
 
@@ -298,9 +300,9 @@ static void mx_churn_free(mx_churn_t *churn) {
         cbm_ht_foreach(churn->counts, mx_churn_free_stat, NULL);
     cbm_ht_free(churn->counts);
     for (int i = 0; i < churn->key_count; i++)
-        free(churn->keys[i]);
-    free(churn->keys);
-    free(churn->commits);
+        cbm_free(CBM_MEM_CLASS_OTHER, churn->keys[i]);
+    cbm_free(CBM_MEM_CLASS_OTHER, churn->keys);
+    cbm_free(CBM_MEM_CLASS_OTHER, churn->commits);
     memset(churn, 0, sizeof(*churn));
 }
 
@@ -331,11 +333,11 @@ static void mx_history_append_and_emit(yyjson_mut_doc *doc, yyjson_mut_val *root
             if (strstr(buf, stamp))
                 stamp_present = true;
             if (line_count == MX_HISTORY_MAX) {
-                free(lines[0]);
+                cbm_free(CBM_MEM_CLASS_OTHER, lines[0]);
                 memmove(lines, lines + 1, (size_t)(MX_HISTORY_MAX - 1) * sizeof(char *));
                 line_count--;
             }
-            lines[line_count] = strdup(buf);
+            lines[line_count] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, buf);
             if (!lines[line_count])
                 break;
             line_count++;
@@ -365,7 +367,7 @@ static void mx_history_append_and_emit(yyjson_mut_doc *doc, yyjson_mut_val *root
                 yyjson_mut_arr_append(history, copy);
             yyjson_doc_free(entry);
         }
-        free(lines[i]);
+        cbm_free(CBM_MEM_CLASS_OTHER, lines[i]);
     }
     yyjson_mut_obj_add_val(doc, root, "history", history);
 }
@@ -439,14 +441,15 @@ static char *mx_build_json(cbm_store_t *store, const char *project, const char *
                 if (!canon) {
                     if (file_key_count >= file_key_cap) {
                         int nc = file_key_cap ? file_key_cap * 2 : 1024;
-                        char **grown = realloc(file_keys, (size_t)nc * sizeof(char *));
+                        char **grown = cbm_realloc(CBM_MEM_CLASS_OTHER, file_keys,
+                                                   (size_t)nc * sizeof(char *));
                         if (grown) {
                             file_keys = grown;
                             file_key_cap = nc;
                         }
                     }
                     if (file_key_count < file_key_cap) {
-                        file_keys[file_key_count] = strdup(file);
+                        file_keys[file_key_count] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, file);
                         if (file_keys[file_key_count]) {
                             canon = file_keys[file_key_count];
                             file_key_count++;
@@ -614,10 +617,10 @@ static char *mx_build_json(cbm_store_t *store, const char *project, const char *
     mx_history_cache_store(project, stamp, &churn); /* takes ownership */
     cbm_ht_free(file_cplx);
     for (int i = 0; i < file_key_count; i++)
-        free(file_keys[i]);
-    free(file_keys);
+        cbm_free(CBM_MEM_CLASS_OTHER, file_keys[i]);
+    cbm_free(CBM_MEM_CLASS_OTHER, file_keys);
 
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -679,7 +682,7 @@ char *cbm_atlas_file_history_json(cbm_store_t *store, const char *project, const
     if (!fresh) {
         /* The metrics build populates the cache; run it if needed. */
         char *metrics = cbm_atlas_metrics_json(store, project);
-        free(metrics);
+        cbm_free(CBM_MEM_CLASS_OTHER, metrics);
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -730,7 +733,7 @@ char *cbm_atlas_file_history_json(cbm_store_t *store, const char *project, const
     }
     pthread_mutex_unlock(&g_hist_mu);
 
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -745,7 +748,7 @@ char *cbm_atlas_metrics_json(cbm_store_t *store, const char *project) {
     snprintf(key, sizeof(key), "%s|%s", project, stamp);
     pthread_mutex_lock(&g_mx_mu);
     if (g_mx_cache.json && strcmp(g_mx_cache.key, key) == 0) {
-        char *copy = strdup(g_mx_cache.json);
+        char *copy = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, g_mx_cache.json);
         pthread_mutex_unlock(&g_mx_mu);
         return copy;
     }
@@ -755,8 +758,8 @@ char *cbm_atlas_metrics_json(cbm_store_t *store, const char *project) {
     if (!json)
         return NULL;
     pthread_mutex_lock(&g_mx_mu);
-    free(g_mx_cache.json);
-    g_mx_cache.json = strdup(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, g_mx_cache.json);
+    g_mx_cache.json = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, json);
     snprintf(g_mx_cache.key, sizeof(g_mx_cache.key), "%s", key);
     pthread_mutex_unlock(&g_mx_mu);
     return json;
@@ -832,7 +835,7 @@ char *cbm_atlas_who_json(cbm_store_t *store, const char *project, const char *fi
     pthread_mutex_unlock(&g_hist_mu);
     if (!fresh) {
         char *metrics = cbm_atlas_metrics_json(store, project);
-        free(metrics);
+        cbm_free(CBM_MEM_CLASS_OTHER, metrics);
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -884,7 +887,7 @@ char *cbm_atlas_who_json(cbm_store_t *store, const char *project, const char *fi
     }
     pthread_mutex_unlock(&g_hist_mu);
 
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -928,7 +931,7 @@ static void mx_remote_url(const char *root_path, char *out, size_t cap) {
     if (!https)
         return;
     snprintf(out, cap, "%s", https);
-    free(https);
+    cbm_free(CBM_MEM_CLASS_OTHER, https);
 }
 
 char *cbm_atlas_symbol_history_json(cbm_store_t *store, const char *project, const char *file_path,
@@ -951,7 +954,7 @@ char *cbm_atlas_symbol_history_json(cbm_store_t *store, const char *project, con
     if (!root_path[0] || !cbm_validate_shell_path_arg(root_path) ||
         !cbm_validate_shell_path_arg(file_path) || strstr(file_path, "..")) {
         yyjson_mut_obj_add_bool(doc, root, "available", false);
-        char *json = yyjson_mut_write(doc, 0, NULL);
+        char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
         yyjson_mut_doc_free(doc);
         return json;
     }
@@ -976,7 +979,7 @@ char *cbm_atlas_symbol_history_json(cbm_store_t *store, const char *project, con
     FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         yyjson_mut_obj_add_bool(doc, root, "available", false);
-        char *json = yyjson_mut_write(doc, 0, NULL);
+        char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
         yyjson_mut_doc_free(doc);
         return json;
     }
@@ -1020,7 +1023,7 @@ char *cbm_atlas_symbol_history_json(cbm_store_t *store, const char *project, con
     yyjson_mut_obj_add_bool(doc, root, "available", status == 0 || count > 0);
     yyjson_mut_obj_add_val(doc, root, "commits", commits);
     yyjson_mut_obj_add_bool(doc, root, "truncated", count >= 12);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }

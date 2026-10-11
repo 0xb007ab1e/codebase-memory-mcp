@@ -11,6 +11,7 @@
 #include "foundation/log.h"
 #include "foundation/mem.h"
 #include "foundation/mem_core.h"
+#include "foundation/json_writer.h"
 #include "foundation/platform.h"
 #include "foundation/secure_random.h"
 #include "foundation/sha256.h"
@@ -335,6 +336,8 @@ typedef struct {
 } application_default_worker_t;
 
 static char *application_index_project_key(const char *root_path, const char *args_json);
+static void application_worker_destroy_default(void *context,
+                                               cbm_daemon_application_worker_t opaque);
 
 /* Reuse the supervisor's bounded completed-line relay. Only actionable worker
  * diagnostics enter the daemon journal; ordinary progress stays in worker logs. */
@@ -359,19 +362,20 @@ static int application_worker_start_default(void *context, const char *args_json
                                             const char *quarantine_file,
                                             cbm_daemon_application_worker_t *worker_out) {
     (void)context;
-    application_default_worker_t *worker = calloc(1, sizeof(*worker));
+    application_default_worker_t *worker = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*worker));
     if (!worker) {
         return -1;
     }
-    char *root = cbm_mcp_get_string_arg(args_json, "repo_path");
+    yyjson_doc *args_doc = yyjson_read_opts((char *)args_json, strlen(args_json), 0,
+                                            cbm_json_writer_allocator(), NULL);
+    const char *root = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(args_doc), "repo_path"));
     worker->project = application_index_project_key(root, args_json);
-    free(root);
+    yyjson_doc_free(args_doc);
     int result = cbm_index_worker_start_with_log(args_json, memory_budget_bytes, false, marker_file,
                                                  quarantine_file, application_worker_diagnostic,
                                                  worker, &worker->handle);
     if (result != 0) {
-        free(worker->project);
-        free(worker);
+        application_worker_destroy_default(NULL, worker);
         *worker_out = NULL;
         return result;
     }
@@ -407,7 +411,7 @@ static void application_worker_destroy_default(void *context,
     application_default_worker_t *worker = opaque;
     cbm_index_worker_destroy(worker->handle);
     free(worker->project);
-    free(worker);
+    cbm_free(CBM_MEM_CLASS_OTHER, worker);
 }
 
 static uint32_t application_get_u32(const uint8_t *bytes) {
@@ -1537,7 +1541,9 @@ static void application_job_execution_cancel(application_job_execution_t *execut
  * callers, but do not publish a successful UI/background job or retry it as a
  * crashed worker. Older successful responses may omit isError. */
 static bool application_index_response_succeeded(const char *response) {
-    yyjson_doc *document = response ? yyjson_read(response, strlen(response), 0) : NULL;
+    yyjson_doc *document = response ? yyjson_read_opts((char *)response, strlen(response), 0,
+                                                       cbm_json_writer_allocator(), NULL)
+                                    : NULL;
     yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
     yyjson_val *error = yyjson_obj_get(root, "isError");
     bool succeeded = yyjson_is_obj(root) && yyjson_is_arr(yyjson_obj_get(root, "content")) &&
@@ -1799,6 +1805,7 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
         }
     }
     application_auto_index_retry_pending_locked(application);
+    cbm_mem_class_flush_thread();
     cbm_mutex_unlock(&application->mutex);
 }
 
@@ -1865,9 +1872,11 @@ static cbm_daemon_application_job_t *application_find_active_job_locked(
 }
 
 static char *application_index_project_key(const char *root_path, const char *args_json) {
-    char *override = cbm_mcp_get_string_arg(args_json, "name");
+    yyjson_doc *doc = yyjson_read_opts((char *)args_json, strlen(args_json), 0,
+                                       cbm_json_writer_allocator(), NULL);
+    const char *override = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "name"));
     char *key = cbm_project_name_from_path(override && override[0] ? override : root_path);
-    free(override);
+    yyjson_doc_free(doc);
     return key;
 }
 

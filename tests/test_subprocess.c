@@ -15,6 +15,7 @@
 #include "../src/foundation/platform.h"
 #include "../src/foundation/compat_fs.h"
 #include "../src/foundation/git_env.h"
+#include "../src/foundation/mem_core.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -230,6 +231,43 @@ TEST(subprocess_environment_overrides_preserve_git_isolation) {
     ASSERT_EQ(result.exit_code, 0);
     ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
     ASSERT_TRUE(parent_unchanged);
+    PASS();
+}
+
+/* Environment ownership outlives spawn, even if the child already exited.
+ * Count while the handle is retained, then release only after terminal poll.
+ * This also catches a libc/core mismatch on production mimalloc builds. */
+TEST(subprocess_environment_core_ownership) {
+    const char *args[] = {cbm_test_program_path, "__cbm_env_values", "CBM_CORE_ENV_TEST", "child",
+                          NULL};
+    const char *overrides[] = {"CBM_CORE_ENV_TEST=first", "CBM_CORE_ENV_TEST=child", NULL};
+    cbm_proc_opts_t opts = {.bin = cbm_test_program_path,
+                            .argv = args,
+                            .env_overrides = overrides,
+                            .quiet_timeout_ms = 5000};
+    size_t before = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    cbm_subprocess_t *process = NULL;
+    int rc = cbm_subprocess_spawn(&opts, &process);
+    bool tracked = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER) > before;
+    cbm_proc_result_t result = {0};
+    cbm_proc_poll_t poll = CBM_PROC_POLL_ERROR;
+    if (rc == 0) {
+        do {
+            poll = cbm_subprocess_poll(process, &result);
+            if (poll == CBM_PROC_POLL_RUNNING) {
+                cbm_usleep(1000);
+            }
+        } while (poll == CBM_PROC_POLL_RUNNING);
+    }
+    if (poll == CBM_PROC_POLL_TERMINAL) {
+        cbm_subprocess_destroy(process);
+    }
+    size_t after = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(poll, CBM_PROC_POLL_TERMINAL);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_TRUE(tracked);
+    ASSERT_EQ(after, before);
     PASS();
 }
 
@@ -2586,6 +2624,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_classify_timeout_dominates);
     RUN_TEST(subprocess_outcome_str);
     RUN_TEST(subprocess_environment_is_child_local);
+    RUN_TEST(subprocess_environment_core_ownership);
     RUN_TEST(subprocess_environment_rejects_invalid_override);
     RUN_TEST(subprocess_environment_overrides_preserve_git_isolation);
 #ifndef _WIN32

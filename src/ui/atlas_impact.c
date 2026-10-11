@@ -5,6 +5,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
 #include "foundation/constants.h"
+#include "foundation/json_writer.h"
 #include "ui/atlas.h"
 #include "foundation/compat_fs.h"
 #include "foundation/subprocess.h"
@@ -111,7 +112,7 @@ static void ia_structural(cbm_store_t *store, const char *project, const char *f
     yyjson_mut_obj_add_int(doc, out, "max_depth", IA_DEPTH);
     yyjson_mut_obj_add_int(doc, out, "visit_cap", IA_VISITS);
     yyjson_mut_obj_add_int(doc, out, "result_cap", IA_SHOWN);
-    ia_node_t *nodes = calloc(IA_VISITS, sizeof(*nodes));
+    ia_node_t *nodes = cbm_atlas_calloc_array(IA_VISITS, sizeof(*nodes));
     sqlite3_stmt *st = NULL, *edges = NULL;
     int count = 0, seed_count = 0, visited_edges = 0, direct = 0, test_count = 0;
     bool capped = false, failed = false;
@@ -208,7 +209,7 @@ finish:
      * evidence list is shortened. Tests remain visible among the first rows. */
     for (int i = seed_count; i < count && i < seed_count + IA_SHOWN; i++)
         yyjson_mut_arr_append(findings, ia_finding(doc, nodes, i));
-    free(nodes);
+    cbm_free(CBM_MEM_CLASS_OTHER, nodes);
 }
 
 enum { IA_HASH = 64, IA_OUTPUT_CAP = 8 * 1024 * 1024 };
@@ -276,23 +277,23 @@ static char *ia_git(const char *root, const char *const *args, size_t *size, tim
     FILE *fp = cbm_fopen(log, "rb");
     if (!fp)
         goto cleanup;
-    output = malloc((size_t)length + 1);
+    output = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)length + 1);
     if (output && fread(output, 1, (size_t)length, fp) == (size_t)length) {
         output[length] = '\0';
         *size = (size_t)length;
     } else {
-        free(output);
+        cbm_free(CBM_MEM_CLASS_OTHER, output);
         output = NULL;
     }
     if (fclose(fp) != 0) {
-        free(output);
+        cbm_free(CBM_MEM_CLASS_OTHER, output);
         output = NULL;
         *size = 0;
     }
 cleanup:
     cbm_subprocess_destroy(process);
     if (remove(log) != 0 && errno != ENOENT) {
-        free(output);
+        cbm_free(CBM_MEM_CLASS_OTHER, output);
         output = NULL;
         *size = 0;
     }
@@ -336,7 +337,7 @@ static void ia_history(const char *root_path, const char *file, yyjson_mut_doc *
     yyjson_mut_obj_add_str(doc, out, "meaning",
                            "Co-changes are historical association, not functional dependencies or "
                            "defect probabilities.");
-    ia_cofile_t *cofiles = calloc(IA_COFILES, sizeof(*cofiles));
+    ia_cofile_t *cofiles = cbm_atlas_calloc_array(IA_COFILES, sizeof(*cofiles));
     int scanned = 0, considered = 0, merges = 0, mass = 0, touching = 0, cocount = 0, errors = 0;
     bool available = false, truncated = false;
     char *raw = NULL;
@@ -348,20 +349,20 @@ static void ia_history(const char *root_path, const char *file, yyjson_mut_doc *
     if (!cofiles || !head || !ia_hash(head)) {
         yyjson_mut_obj_add_str(doc, out, "error",
                                "No readable committed Git HEAD is available locally.");
-        free(head);
+        cbm_free(CBM_MEM_CLASS_OTHER, head);
         goto finish;
     }
     yyjson_mut_obj_add_strcpy(doc, out, "head", head);
     char revision[IA_HASH + 1];
     snprintf(revision, sizeof(revision), "%s", head);
-    free(head);
+    cbm_free(CBM_MEM_CLASS_OTHER, head);
     const char *shallow_args[] = {"rev-parse", "--is-shallow-repository", NULL};
     char *shallow = ia_git(root_path, shallow_args, &size, deadline, &truncated);
     if (shallow)
         yyjson_mut_obj_add_bool(doc, out, "shallow", strncmp(shallow, "true", 4) == 0);
     else
         errors++;
-    free(shallow);
+    cbm_free(CBM_MEM_CLASS_OTHER, shallow);
     const char *status_args[] = {"--literal-pathspecs",
                                  "status",
                                  "--porcelain=v1",
@@ -374,7 +375,7 @@ static void ia_history(const char *root_path, const char *file, yyjson_mut_doc *
     yyjson_mut_obj_add_bool(doc, out, "worktree_status_known", status != NULL);
     if (status)
         yyjson_mut_obj_add_bool(doc, out, "selection_uncommitted", size > 0);
-    free(status);
+    cbm_free(CBM_MEM_CLASS_OTHER, status);
     const char *log_args[] = {"log",
                               "--max-count=201",
                               "--since=548.days",
@@ -486,7 +487,7 @@ static void ia_history(const char *root_path, const char *file, yyjson_mut_doc *
                     truncated = true;
                     continue;
                 }
-                cofiles[slot].file = strdup(other);
+                cofiles[slot].file = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, other);
                 if (!cofiles[slot].file) {
                     errors++;
                     continue;
@@ -529,9 +530,9 @@ finish:
     yyjson_mut_obj_add_int(doc, out, "read_errors", errors);
     yyjson_mut_obj_add_int(doc, out, "cochanges_omitted", cocount > 15 ? cocount - 15 : 0);
     for (int i = 0; i < cocount; i++)
-        free(cofiles[i].file);
-    free(cofiles);
-    free(raw);
+        cbm_free(CBM_MEM_CLASS_OTHER, cofiles[i].file);
+    cbm_free(CBM_MEM_CLASS_OTHER, cofiles);
+    cbm_free(CBM_MEM_CLASS_OTHER, raw);
 }
 
 char *cbm_atlas_impact_analysis_json(cbm_store_t *store, const char *project, const char *file,
@@ -598,7 +599,7 @@ char *cbm_atlas_impact_analysis_json(cbm_store_t *store, const char *project, co
     sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
     ia_history(info.root_path ? info.root_path : "", file, doc, root, deadline);
     cbm_project_free_fields(&info);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -626,7 +627,11 @@ static void *ia_worker(void *unused) {
     pthread_mutex_lock(&ia_mu);
     ia_job.json =
         json ? json
-             : strdup("{\"status\":\"failed\",\"error\":\"Impact snapshot could not be read.\"}");
+             : cbm_mem_strdup(
+                   CBM_MEM_CLASS_OTHER,
+                   "{\"status\":\"failed\",\"error\":\"Impact snapshot could not be read.\"}");
+    /* Include fallback output before another thread can release the cache. */
+    cbm_mem_class_flush_thread();
     ia_job.running = false;
     ia_job.completed = time(NULL);
     pthread_mutex_unlock(&ia_mu);
@@ -636,19 +641,20 @@ static void *ia_worker(void *unused) {
 static void ia_clear_completed_locked(void) {
     if (ia_job.started)
         cbm_thread_join(&ia_job.thread);
-    free(ia_job.key);
-    free(ia_job.json);
-    free(ia_job.db_path);
-    free(ia_job.project);
-    free(ia_job.file);
-    free(ia_job.qn);
+    cbm_free(CBM_MEM_CLASS_OTHER, ia_job.key);
+    cbm_free(CBM_MEM_CLASS_OTHER, ia_job.json);
+    cbm_free(CBM_MEM_CLASS_OTHER, ia_job.db_path);
+    cbm_free(CBM_MEM_CLASS_OTHER, ia_job.project);
+    cbm_free(CBM_MEM_CLASS_OTHER, ia_job.file);
+    cbm_free(CBM_MEM_CLASS_OTHER, ia_job.qn);
     memset(&ia_job, 0, sizeof(ia_job));
 }
 
 char *cbm_atlas_impact_analysis_request(cbm_store_t *store, const char *project, const char *file,
                                         int64_t node_id, const char *qn, bool refresh) {
     if (!store || !project || !ia_path_valid(file))
-        return strdup(
+        return cbm_mem_strdup(
+            CBM_MEM_CLASS_OTHER,
             "{\"status\":\"failed\",\"error\":\"A relative indexed file path is required.\"}");
     char generation[80] = {0};
     cbm_store_generation(store, generation, sizeof(generation));
@@ -658,11 +664,12 @@ char *cbm_atlas_impact_analysis_request(cbm_store_t *store, const char *project,
     const char *db_path = cbm_store_db_path(store);
     if (!db_path || !*db_path) {
         cbm_project_free_fields(&info);
-        return strdup("{\"status\":\"failed\",\"error\":\"Persistent index required.\"}");
+        return cbm_mem_strdup(CBM_MEM_CLASS_OTHER,
+                              "{\"status\":\"failed\",\"error\":\"Persistent index required.\"}");
     }
     size_t key_size = strlen(db_path) + strlen(project) + strlen(file) + strlen(indexed_at) +
                       (qn ? strlen(qn) : 0) + sizeof(generation) + 64;
-    char *key = malloc(key_size);
+    char *key = cbm_alloc(CBM_MEM_CLASS_OTHER, key_size);
     if (!key) {
         cbm_project_free_fields(&info);
         return NULL;
@@ -674,32 +681,34 @@ char *cbm_atlas_impact_analysis_request(cbm_store_t *store, const char *project,
     bool same = ia_job.key && strcmp(ia_job.key, key) == 0;
     if (ia_job.running) {
         pthread_mutex_unlock(&ia_mu);
-        free(key);
-        return strdup(same ? "{\"status\":\"pending\"}" : "{\"status\":\"busy\"}");
+        cbm_free(CBM_MEM_CLASS_OTHER, key);
+        return cbm_mem_strdup(CBM_MEM_CLASS_OTHER,
+                              same ? "{\"status\":\"pending\"}" : "{\"status\":\"busy\"}");
     }
     if (same && !refresh && time(NULL) - ia_job.completed < IA_CACHE_SECONDS) {
-        char *json = ia_job.json ? strdup(ia_job.json) : NULL;
+        char *json = ia_job.json ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, ia_job.json) : NULL;
         pthread_mutex_unlock(&ia_mu);
-        free(key);
+        cbm_free(CBM_MEM_CLASS_OTHER, key);
         return json;
     }
     ia_clear_completed_locked();
     ia_job.key = key;
-    ia_job.db_path = strdup(db_path);
-    ia_job.project = strdup(project);
-    ia_job.file = strdup(file);
-    ia_job.qn = strdup(qn ? qn : "");
+    ia_job.db_path = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, db_path);
+    ia_job.project = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, project);
+    ia_job.file = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, file);
+    ia_job.qn = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, qn ? qn : "");
     ia_job.node_id = node_id;
     ia_job.running = true;
     if (!ia_job.db_path || !ia_job.project || !ia_job.file || !ia_job.qn ||
         cbm_thread_create(&ia_job.thread, 0, ia_worker, NULL) != 0) {
         ia_clear_completed_locked();
         pthread_mutex_unlock(&ia_mu);
-        return strdup("{\"status\":\"failed\",\"error\":\"Analysis worker unavailable.\"}");
+        return cbm_mem_strdup(CBM_MEM_CLASS_OTHER,
+                              "{\"status\":\"failed\",\"error\":\"Analysis worker unavailable.\"}");
     }
     ia_job.started = true;
     pthread_mutex_unlock(&ia_mu);
-    return strdup("{\"status\":\"pending\"}");
+    return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, "{\"status\":\"pending\"}");
 }
 
 void cbm_atlas_impact_analysis_shutdown(void) {

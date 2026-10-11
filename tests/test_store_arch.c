@@ -22,6 +22,7 @@
  */
 #include "test_framework.h"
 #include <store/store.h>
+#include "foundation/mem_core.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -1354,7 +1355,7 @@ TEST(louvain_basic) {
     /* Triangle and pair different */
     ASSERT_TRUE(comm[1] != comm[4]);
 
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     PASS();
 }
 
@@ -1363,7 +1364,7 @@ TEST(louvain_empty) {
     int count = 0;
     ASSERT_EQ(cbm_louvain(NULL, 0, NULL, 0, &result, &count), CBM_STORE_OK);
     ASSERT_EQ(count, 0);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     PASS();
 }
 
@@ -1374,7 +1375,7 @@ TEST(louvain_single_node) {
     ASSERT_EQ(cbm_louvain(nodes, 1, NULL, 0, &result, &count), CBM_STORE_OK);
     ASSERT_EQ(count, 1);
     ASSERT_EQ(result[0].node_id, 42);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     PASS();
 }
 
@@ -1437,7 +1438,45 @@ TEST(louvain_converges) {
     }
     ASSERT_TRUE(same_count >= 8);
 
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
+    PASS();
+}
+
+/* Both the populated graph and isolated-node path return exactly one owned
+ * output block. The Louvain compatibility entry point shares this contract. */
+TEST(leiden_result_memory_core_ownership) {
+    int64_t nodes[] = {1, 2, 3};
+    cbm_louvain_edge_t edges[] = {{1, 2}, {2, 3}};
+    for (int wrapper = 0; wrapper < 2; wrapper++) {
+        for (int connected = 0; connected < 2; connected++) {
+            size_t bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+            size_t blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+            cbm_louvain_result_t *result = NULL;
+            int count = 0;
+            const cbm_louvain_edge_t *input = connected ? edges : NULL;
+            int edge_count = connected ? 2 : 0;
+            int rc = wrapper ? cbm_louvain(nodes, 3, input, edge_count, &result, &count)
+                             : cbm_leiden(nodes, 3, input, edge_count, 1.0, &result, &count);
+            ASSERT_EQ(rc, CBM_STORE_OK);
+            ASSERT_EQ(count, 3);
+            ASSERT_NOT_NULL(result);
+            ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks + 1);
+            ASSERT_TRUE(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER) >=
+                        bytes + 3 * sizeof(*result));
+            cbm_free(CBM_MEM_CLASS_OTHER, result);
+            ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), bytes);
+            ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks);
+        }
+    }
+    size_t bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+    size_t blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    cbm_louvain_result_t *result = NULL;
+    int count = -1;
+    ASSERT_EQ(cbm_leiden(NULL, 0, NULL, 0, 1.0, &result, &count), CBM_STORE_OK);
+    ASSERT_NULL(result);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), bytes);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks);
     PASS();
 }
 
@@ -1571,7 +1610,7 @@ TEST(leiden_multilevel_collapses_noise) {
         }
         ASSERT_TRUE(same >= SZ - 1);
     }
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     PASS();
 }
 
@@ -1603,8 +1642,8 @@ TEST(leiden_resolution_controls_granularity) {
     ASSERT_TRUE(n_hi > n_lo);
     ASSERT_TRUE(leiden_all_communities_connected(lo, N, edges, ne));
     ASSERT_TRUE(leiden_all_communities_connected(hi, N, edges, ne));
-    free(lo);
-    free(hi);
+    cbm_free(CBM_MEM_CLASS_OTHER, lo);
+    cbm_free(CBM_MEM_CLASS_OTHER, hi);
     PASS();
 }
 
@@ -1874,6 +1913,7 @@ SUITE(store_arch) {
     RUN_TEST(louvain_empty);
     RUN_TEST(louvain_single_node);
     RUN_TEST(louvain_converges);
+    RUN_TEST(leiden_result_memory_core_ownership);
     RUN_TEST(leiden_multilevel_collapses_noise);
     RUN_TEST(leiden_resolution_controls_granularity);
     RUN_TEST(arch_clusters_basic);

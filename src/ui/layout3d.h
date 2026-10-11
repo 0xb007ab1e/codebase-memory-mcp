@@ -66,7 +66,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
                                         cbm_layout_level_t level, const char *center_node,
                                         int radius, int max_nodes);
 
-/* Free a layout result. */
+/* Release a computed layout result and its fields through their matching allocators. */
 void cbm_layout_free(cbm_layout_result_t *result);
 
 /* Serialize layout result to JSON string. Caller must free(). */
@@ -77,7 +77,8 @@ char *cbm_layout_to_json(const cbm_layout_result_t *result);
 /* level=regions payload: one body per region (Leiden communities voted per
  * file, folder groups as fallback), aggregated region→region edge weights,
  * deterministic positions. Cached per (project, indexed_at). Returns a
- * heap-allocated JSON document; caller frees. NULL on error. */
+ * OTHER-owned JSON document; release with cbm_free(CBM_MEM_CLASS_OTHER, result).
+ * NULL on error. */
 char *cbm_layout_regions_json(cbm_store_t *store, const char *project);
 
 /* scope=region:<id> — full-detail layout restricted to one region's files.

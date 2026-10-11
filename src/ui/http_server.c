@@ -34,6 +34,7 @@
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
+#include "foundation/json_writer.h"
 #include "foundation/platform.h"
 #include "foundation/secure_random.h"
 #include "foundation/sha256.h"
@@ -283,8 +284,8 @@ char *cbm_ui_git_strip_credentials(const char *url) {
 
 /* Normalize a git remote URL (scp-style, ssh://, https://) to a canonical
  * "https://host/org/repo" web base with any trailing ".git" and any embedded
- * credentials removed. Returns a malloc'd string or NULL if the shape isn't
- * recognized. Caller frees. */
+ * credentials removed. Returns an OTHER-owned string or NULL if the shape isn't
+ * recognized. Release with cbm_free(CBM_MEM_CLASS_OTHER, result). */
 char *cbm_ui_git_web_base(const char *url) {
     if (!url || !url[0])
         return NULL;
@@ -312,7 +313,7 @@ char *cbm_ui_git_web_base(const char *url) {
     if (l > 0 && host_path[l - 1] == '/')
         host_path[l - 1] = '\0';
     size_t out_sz = strlen(host_path) + 9; /* "https://" (8) + NUL */
-    char *out = malloc(out_sz);
+    char *out = cbm_alloc(CBM_MEM_CLASS_OTHER, out_sz);
     if (!out)
         return NULL;
     /* Legitimate GitHub blob-URL construction, not a network call — the scheme
@@ -415,7 +416,7 @@ static void handle_repo_info(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
     free(remote);
     free(remote_safe);
-    free(web_base);
+    cbm_free(CBM_MEM_CLASS_OTHER, web_base);
 }
 
 /* ── Log ring buffer ──────────────────────────────────────────── */
@@ -588,7 +589,7 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     cbm_mutex_unlock(&g_log_mutex);
     if (persistent) {
         cbm_http_replyf(c, 200, g_cors_json, "%s", persistent);
-        free(persistent);
+        cbm_free(CBM_MEM_CLASS_OTHER, persistent);
         return;
     }
     /* The legacy memory ring has no trustworthy project provenance. Never
@@ -688,7 +689,7 @@ static void handle_agent_events(cbm_http_conn_t *c, const cbm_http_req_t *req, b
                     json            ? json
                     : status == 400 ? "{\"error\":\"invalid event batch\"}"
                                     : "{\"error\":\"activity storage unavailable\"}");
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 }
 
 /* ── Frontend log file ────────────────────────────────────────── */
@@ -758,10 +759,10 @@ static bool ui_log_import_legacy(sqlite3 *db, const char *cache) {
             break;
         }
         size_t length = size > UI_LOG_TAIL_READ_BYTES ? UI_LOG_TAIL_READ_BYTES : (size_t)size;
-        char *data = malloc(length + 1);
+        char *data = cbm_alloc(CBM_MEM_CLASS_OTHER, length + 1);
         if (!data || (size > (int64_t)length &&
                       fseek(file, (long)(size - (int64_t)length), SEEK_SET) != 0)) {
-            free(data);
+            cbm_free(CBM_MEM_CLASS_OTHER, data);
             fclose(file);
             ok = false;
             break;
@@ -794,7 +795,7 @@ static bool ui_log_import_legacy(sqlite3 *db, const char *cache) {
             yyjson_doc_free(record);
             line = end + 1;
         }
-        free(data);
+        cbm_free(CBM_MEM_CLASS_OTHER, data);
     }
     if (ok)
         ok = sqlite3_exec(db,
@@ -896,10 +897,10 @@ static void handle_ui_log_post(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
-    ui_log_scratch_t *s = calloc(1, sizeof(*s));
+    ui_log_scratch_t *s = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*s));
     char path[CBM_SZ_1K];
     if (!s || !cbm_ui_log_file_path(path, sizeof(path))) {
-        free(s);
+        cbm_free(CBM_MEM_CLASS_OTHER, s);
         yyjson_doc_free(doc);
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"no log path\"}");
         return;
@@ -929,7 +930,7 @@ static void handle_ui_log_post(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     sqlite3 *db = activity_db_locked();
     if (!db) {
         cbm_mutex_unlock(&g_log_mutex);
-        free(s);
+        cbm_free(CBM_MEM_CLASS_OTHER, s);
         yyjson_doc_free(doc);
         cbm_http_replyf(c, 503, g_cors_json, "{\"error\":\"activity storage unavailable\"}");
         return;
@@ -1027,7 +1028,7 @@ static void handle_ui_log_post(cbm_http_conn_t *c, const cbm_http_req_t *req) {
                     "\"persistent\":true,\"storage_error\":%s,\"file_error\":%s}",
                     accepted, dropped, duplicates, s->esc, storage_error ? "true" : "false",
                     file_error ? "true" : "false");
-    free(s);
+    cbm_free(CBM_MEM_CLASS_OTHER, s);
     yyjson_doc_free(doc);
 }
 
@@ -1055,7 +1056,7 @@ static void handle_ui_log_get(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     cbm_mutex_unlock(&g_log_mutex);
     cbm_http_replyf(c, json ? 200 : 503, g_cors_json, "%s",
                     json ? json : "{\"error\":\"activity storage unavailable\"}");
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 }
 
 /* ── Process monitoring ───────────────────────────────────────── */
@@ -1222,7 +1223,6 @@ static void handle_processes(cbm_http_conn_t *c) {
 }
 
 /* ── Directory browser ────────────────────────────────────────── */
-
 
 static void append_roots_json(char *buf, size_t bufsz, int *pos) {
     http_appendf(buf, bufsz, pos, ",\"roots\":[");
@@ -1899,7 +1899,7 @@ static void handle_project_health(cbm_http_conn_t *c, const cbm_http_req_t *req,
     char db_path[1024];
     db_path_for_project(name, db_path, sizeof(db_path));
 
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(cbm_json_writer_allocator());
     yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
     if (!doc || !root) {
         yyjson_mut_doc_free(doc);
@@ -1936,11 +1936,11 @@ static void handle_project_health(cbm_http_conn_t *c, const cbm_http_req_t *req,
     }
     cbm_project_free_fields(&project);
 
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     if (json) {
         cbm_http_replyf(c, 200, g_cors_json, "%s", json);
-        free(json);
+        cbm_free(CBM_MEM_CLASS_OTHER, json);
     } else {
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"out of memory\"}");
     }
@@ -2123,7 +2123,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
             return;
         }
         cbm_http_replyf(c, 200, g_cors_json, "%s", regions_json);
-        free(regions_json);
+        cbm_free(CBM_MEM_CLASS_OTHER, regions_json);
         return;
     }
 
@@ -2397,7 +2397,7 @@ static void atlas_reply_json(cbm_http_conn_t *c, char *json, int missing_status,
         return;
     }
     cbm_http_replyf(c, 200, g_cors_json, "%s", json);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 }
 
 /* GET /api/tree?project=X&path=src/foo — Modules aggregates. */
@@ -2460,7 +2460,7 @@ static void handle_atlas_repository(cbm_http_conn_t *c, const cbm_http_req_t *re
     if (length > 1024 * 1024)
         cbm_http_conn_set_send_deadline_ms(c, 5000);
     cbm_http_reply_buf(c, 200, g_cors_json, json, length);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 }
 
 static void handle_atlas_impact_analysis(cbm_http_conn_t *c, const cbm_http_req_t *req) {
@@ -2503,7 +2503,7 @@ static char *atlas_trace_attach_guards(cbm_store_t *store, const char *project, 
         yyjson_doc_free(doc);
         return json;
     }
-    yyjson_mut_doc *mut = yyjson_doc_mut_copy(doc, NULL);
+    yyjson_mut_doc *mut = yyjson_doc_mut_copy(doc, cbm_json_writer_allocator());
     yyjson_doc_free(doc);
     if (!mut)
         return json;
@@ -2544,7 +2544,7 @@ static char *atlas_trace_attach_guards(cbm_store_t *store, const char *project, 
         if (!gj)
             continue;
         yyjson_doc *gd = yyjson_read(gj, strlen(gj), 0);
-        free(gj);
+        cbm_free(CBM_MEM_CLASS_OTHER, gj);
         if (!gd)
             continue;
         yyjson_val *garr = yyjson_obj_get(yyjson_doc_get_root(gd), "guards");
@@ -2555,11 +2555,11 @@ static char *atlas_trace_attach_guards(cbm_store_t *store, const char *project, 
         }
         yyjson_doc_free(gd);
     }
-    char *out = yyjson_mut_write(mut, 0, NULL);
+    char *out = yyjson_mut_write_opts(mut, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(mut);
     if (!out)
         return json;
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     return out;
 }
 
@@ -2611,7 +2611,7 @@ char *cbm_atlas_attach_observed(cbm_store_t *store, const char *project, char *j
         yyjson_doc_free(doc);
         return json;
     }
-    yyjson_mut_doc *mut = yyjson_doc_mut_copy(doc, NULL);
+    yyjson_mut_doc *mut = yyjson_doc_mut_copy(doc, cbm_json_writer_allocator());
     yyjson_doc_free(doc);
     if (!mut)
         return json;
@@ -2680,11 +2680,11 @@ char *cbm_atlas_attach_observed(cbm_store_t *store, const char *project, char *j
         }
         sqlite3_finalize(qn_stmt);
     }
-    char *out = yyjson_mut_write(mut, 0, NULL);
+    char *out = yyjson_mut_write_opts(mut, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(mut);
     if (!out)
         return json;
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     return out;
 }
 
@@ -2766,7 +2766,7 @@ static char *atlas_flow_attach_guards(cbm_store_t *store, const char *project, c
         yyjson_doc_free(doc);
         return json;
     }
-    yyjson_mut_doc *mut = yyjson_doc_mut_copy(doc, NULL);
+    yyjson_mut_doc *mut = yyjson_doc_mut_copy(doc, cbm_json_writer_allocator());
     yyjson_doc_free(doc);
     if (!mut)
         return json;
@@ -2810,7 +2810,7 @@ static char *atlas_flow_attach_guards(cbm_store_t *store, const char *project, c
         if (!gj)
             continue;
         yyjson_doc *gd = yyjson_read(gj, strlen(gj), 0);
-        free(gj);
+        cbm_free(CBM_MEM_CLASS_OTHER, gj);
         if (!gd)
             continue;
         yyjson_val *garr = yyjson_obj_get(yyjson_doc_get_root(gd), "guards");
@@ -2821,11 +2821,11 @@ static char *atlas_flow_attach_guards(cbm_store_t *store, const char *project, c
         }
         yyjson_doc_free(gd);
     }
-    char *out = yyjson_mut_write(mut, 0, NULL);
+    char *out = yyjson_mut_write_opts(mut, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(mut);
     if (!out)
         return json;
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     return out;
 }
 
@@ -2866,7 +2866,7 @@ static void handle_atlas_handout(cbm_http_conn_t *c, const cbm_http_req_t *req) 
         return;
     }
     cbm_http_replyf(c, 200, g_cors_html, "%s", html);
-    free(html);
+    cbm_free(CBM_MEM_CLASS_OTHER, html);
 }
 
 /* GET /api/blast?project=X&files=a,b,c — bucket a file list by region. */
@@ -3201,15 +3201,15 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         cbm_runtime_settings_note_http_port(srv->port);
         const char *cache = cbm_resolve_cache_dir();
         int status = 200;
-        char *json = is_post ? cbm_runtime_settings_apply_json(cache, req->body, req->body_len, &status)
-                             : cbm_runtime_settings_get_json(cache);
+        char *json = is_post
+                         ? cbm_runtime_settings_apply_json(cache, req->body, req->body_len, &status)
+                         : cbm_runtime_settings_get_json(cache);
         if (!json) {
             status = 500;
         }
-        cbm_http_replyf(c, status,
-                        "Content-Type: application/json\r\nCache-Control: no-store\r\n",
+        cbm_http_replyf(c, status, "Content-Type: application/json\r\nCache-Control: no-store\r\n",
                         "%s", json ? json : "{\"error\":\"Configuration storage unavailable.\"}");
-        free(json);
+        cbm_free(CBM_MEM_CLASS_OTHER, json);
         return;
     }
 
@@ -3553,6 +3553,7 @@ void cbm_http_server_run(cbm_http_server_t *srv) {
                                                  memory_order_acq_rel, memory_order_acquire))
         return;
     if (!srv->listener_ok) {
+        cbm_mem_class_flush_thread();
         atomic_store_explicit(&srv->run_state, HTTP_RUN_COMPLETED, memory_order_release);
         return;
     }
@@ -3585,7 +3586,10 @@ void cbm_http_server_run(cbm_http_server_t *srv) {
                                  cbm_http_conn_response_bytes(conn));
         }
         cbm_httpd_conn_close(conn);
+        /* Retained response caches can be released by a different thread. */
+        cbm_mem_class_flush_thread();
     }
+    cbm_mem_class_flush_thread();
     atomic_store_explicit(&srv->run_state, HTTP_RUN_COMPLETED, memory_order_release);
 }
 

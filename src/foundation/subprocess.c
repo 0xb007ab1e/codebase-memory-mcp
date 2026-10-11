@@ -10,6 +10,7 @@
 #include "compat_fs.h"
 #include "git_env.h" /* strip_git_repo_env: scrubbed child environment for git */
 #include "log.h"
+#include "mem_core.h"
 #include "platform.h"  /* cbm_now_ms */
 #include "sanitized.h" /* CBM_SANITIZED — spawn-retry budget */
 
@@ -495,9 +496,15 @@ static bool cbm_subprocess_copy_environment(cbm_subprocess_t *process, const cha
     for (const wchar_t *entry = inherited; *entry; entry += wcslen(entry) + 1) {
         count++;
     }
-    wchar_t **entries = calloc(count + override_count, sizeof(*entries));
-    wchar_t **converted = calloc(override_count, sizeof(*converted));
+    wchar_t **entries = NULL;
+    wchar_t **converted = NULL;
     bool ok = false;
+    if (override_count > SIZE_MAX / sizeof(*entries) ||
+        count > SIZE_MAX / sizeof(*entries) - override_count) {
+        goto done;
+    }
+    entries = cbm_calloc(CBM_MEM_CLASS_OTHER, (count + override_count) * sizeof(*entries));
+    converted = cbm_calloc(CBM_MEM_CLASS_OTHER, override_count * sizeof(*converted));
     if (!entries || !converted) {
         goto done;
     }
@@ -509,7 +516,7 @@ static bool cbm_subprocess_copy_environment(cbm_subprocess_t *process, const cha
         if (process->strip_git_repo_env && cbm_git_env_entry_should_strip(overrides[i])) {
             continue;
         }
-        converted[i] = cbm_utf8_to_wide(overrides[i]);
+        converted[i] = cbm_utf8_to_wide_in(CBM_MEM_CLASS_OTHER, overrides[i]);
         if (!converted[i]) {
             goto done;
         }
@@ -531,7 +538,7 @@ static bool cbm_subprocess_copy_environment(cbm_subprocess_t *process, const cha
         }
         length += entry_length;
     }
-    process->environment = calloc(length, sizeof(*process->environment));
+    process->environment = cbm_calloc(CBM_MEM_CLASS_OTHER, length * sizeof(*process->environment));
     if (!process->environment) {
         goto done;
     }
@@ -545,11 +552,11 @@ static bool cbm_subprocess_copy_environment(cbm_subprocess_t *process, const cha
 done:
     if (converted) {
         for (size_t i = 0; i < override_count; i++) {
-            free(converted[i]);
+            cbm_free(CBM_MEM_CLASS_OTHER, converted[i]);
         }
     }
-    free(converted);
-    free(entries);
+    cbm_free(CBM_MEM_CLASS_OTHER, converted);
+    cbm_free(CBM_MEM_CLASS_OTHER, entries);
     if (process->strip_git_repo_env) {
         cbm_git_child_env_free(inherited);
     } else {
@@ -562,7 +569,8 @@ static bool cbm_subprocess_copy_environment(cbm_subprocess_t *process, const cha
                                             size_t override_count) {
 #ifdef __APPLE__
     const char *search_path = getenv("PATH");
-    process->search_path = cbm_strdup(search_path ? search_path : _PATH_DEFPATH);
+    process->search_path =
+        cbm_mem_strdup(CBM_MEM_CLASS_OTHER, search_path ? search_path : _PATH_DEFPATH);
     if (!process->search_path) {
         return false;
     }
@@ -572,12 +580,17 @@ static bool cbm_subprocess_copy_environment(cbm_subprocess_t *process, const cha
     while (inherited && inherited[count]) {
         count++;
     }
-    process->environment = calloc(count + override_count + 1, sizeof(*process->environment));
+    if (override_count >= SIZE_MAX / sizeof(*process->environment) ||
+        count > SIZE_MAX / sizeof(*process->environment) - override_count - 1) {
+        return false;
+    }
+    process->environment = cbm_calloc(CBM_MEM_CLASS_OTHER,
+                                      (count + override_count + 1) * sizeof(*process->environment));
     if (!process->environment) {
         return false;
     }
     for (size_t i = 0; i < count; i++) {
-        process->environment[i] = cbm_strdup(inherited[i]);
+        process->environment[i] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, inherited[i]);
         if (!process->environment[i]) {
             return false;
         }
@@ -593,11 +606,11 @@ static bool cbm_subprocess_copy_environment(cbm_subprocess_t *process, const cha
                  process->environment[slot][name_length] == '=')) {
             slot++;
         }
-        char *entry = cbm_strdup(overrides[i]);
+        char *entry = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, overrides[i]);
         if (!entry) {
             return false;
         }
-        free(process->environment[slot]);
+        cbm_free(CBM_MEM_CLASS_OTHER, process->environment[slot]);
         process->environment[slot] = entry;
         if (slot == count) {
             count++;
@@ -620,13 +633,13 @@ static void cbm_subprocess_free_config(cbm_subprocess_t *process) {
 #ifndef _WIN32
     if (process->environment) {
         for (size_t i = 0; process->environment[i]; i++) {
-            free(process->environment[i]);
+            cbm_free(CBM_MEM_CLASS_OTHER, process->environment[i]);
         }
     }
 #endif
-    free(process->environment);
+    cbm_free(CBM_MEM_CLASS_OTHER, process->environment);
 #ifdef __APPLE__
-    free(process->search_path);
+    cbm_free(CBM_MEM_CLASS_OTHER, process->search_path);
 #endif
     free(process->bin);
     free(process->windows_cmd_payload);
