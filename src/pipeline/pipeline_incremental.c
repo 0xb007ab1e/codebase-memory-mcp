@@ -2082,7 +2082,8 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
                             const cbm_coverage_row_t *cov, int cov_count,
                             const cbm_coverage_meta_t *meta_template,
                             const cbm_lsp_surface_row_t *surface_rows, int surface_row_count,
-                            legacy_doc_rows_t doc) {
+                            legacy_doc_rows_t doc, const cbm_doc_candidate_t *doc_candidates,
+                            int doc_candidate_count) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_pipeline_generation_t generation = {
@@ -2101,6 +2102,8 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         .doc_link_rows = doc.rows,
         .doc_link_row_count = doc.count,
         .doc_links_failed = doc.failed,
+        .doc_candidates = doc_candidates,
+        .doc_candidate_count = doc_candidate_count,
     };
     int rc = cbm_pipeline_publish_generation(&generation);
     cbm_log_info("incremental.dump", "rc", itoa_buf(rc), "elapsed_ms",
@@ -3169,6 +3172,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             .doc_link_rows = doc_rows,
             .doc_link_row_count = doc_row_count,
             .doc_links_failed = doc_failed,
+            .doc_candidates_in_place = true, /* the clone keeps the previous rows */
         };
         cbm_store_close(staging);
         staging = NULL;
@@ -3796,9 +3800,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * would satisfy a future closure plan with yesterday's surface; an
      * empty table just routes the next incremental to a full rebuild. */
     legacy_doc_rows_t doc_out = {.rows = doc_rows, .count = doc_row_count, .failed = doc_failed};
-    int persist_rc =
-        dump_and_persist(existing, db_path, project, cbm_pipeline_cancelled_ptr(p), manifest,
-                         manifest_count, saved_adr, cov, cov_n, &coverage_meta, NULL, 0, doc_out);
+    /* Doc candidates: the post-passes ran the semantic pass over the whole
+     * rehydrated project, so this run's rows are complete. */
+    int doc_cand_n = 0;
+    const cbm_doc_candidate_t *doc_cands = cbm_pipeline_doc_candidates(p, &doc_cand_n);
+    int persist_rc = dump_and_persist(existing, db_path, project, cbm_pipeline_cancelled_ptr(p),
+                                      manifest, manifest_count, saved_adr, cov, cov_n,
+                                      &coverage_meta, NULL, 0, doc_out, doc_cands, doc_cand_n);
     cbm_doclinks_free_rows(doc_rows, doc_row_count);
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
     free(saved_adr);

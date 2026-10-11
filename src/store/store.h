@@ -1083,6 +1083,41 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
                                   const char **values, int count, cbm_adr_t *out);
 void cbm_store_adr_free(cbm_adr_t *adr);
 
+/* ── Doc -> code candidates (for the agent to verify) ───────────── */
+
+/* One documentation section -> function candidate, with the calibrated
+ * probability that the section is about the function. Candidates, not links:
+ * never graph edges; a short ranked list per section for the agent to judge. */
+typedef struct {
+    const char *section_qn;
+    const char *target_qn;
+    int rank;
+    double score;
+    double p;
+    const char *evidence; /* JSON: {"terms":n,"name_tokens":m} */
+} cbm_doc_candidate_t;
+
+/* Replace the project's candidates. The table is created here, at publish
+ * (not in the schema): a database written by an older build has none, and
+ * readers treat that as "no candidates". */
+int cbm_store_doc_candidates_replace(cbm_store_t *s, const char *project,
+                                     const cbm_doc_candidate_t *rows, int count);
+
+/* The candidates of one section (section_qn) or for one function (target_qn;
+ * pass the other NULL), highest p first, then score, at most limit. *out is
+ * allocated in CBM_MEM_CLASS_STORE (cbm_store_doc_candidates_free).
+ * CBM_STORE_NOT_FOUND: no table. */
+int cbm_store_doc_candidates_get(cbm_store_t *s, const char *project, const char *section_qn,
+                                 const char *target_qn, int limit, cbm_doc_candidate_t **out,
+                                 int *count);
+
+/* The candidates that point at a file as a whole: at its File node, or at a
+ * Folder node that holds it (a doc's home folder), highest p first, then
+ * score, at most limit. Allocation and CBM_STORE_NOT_FOUND as above. */
+int cbm_store_doc_candidates_for_path(cbm_store_t *s, const char *project, const char *file_path,
+                                      int limit, cbm_doc_candidate_t **out, int *count);
+void cbm_store_doc_candidates_free(cbm_doc_candidate_t *rows, int count);
+
 /* ADR section parsing/rendering (pure functions, no store needed) */
 
 enum { PROPS_MAX = 16 };

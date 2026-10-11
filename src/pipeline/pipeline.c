@@ -273,6 +273,11 @@ struct cbm_pipeline {
     int doc_link_row_count;
     bool doc_links_failed;
     bool doc_links_ran;
+    /* Doc -> code candidates from pass_semantic_edges, published with the
+     * generation (heap rows, cbm_store_doc_candidates_free in
+     * cbm_pipeline_free). NULL when the pass found none or did not run. */
+    cbm_doc_candidate_t *doc_candidates;
+    int doc_candidate_count;
 
     /* Deterministic test-only seam at the final publication boundary. Kept
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
@@ -915,6 +920,23 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
     p->surface_row_count = count;
 }
 
+void cbm_pipeline_set_doc_candidates(cbm_pipeline_t *p, cbm_doc_candidate_t *rows, int count) {
+    if (!p) {
+        cbm_store_doc_candidates_free(rows, count);
+        return;
+    }
+    cbm_store_doc_candidates_free(p->doc_candidates, p->doc_candidate_count);
+    p->doc_candidates = rows;
+    p->doc_candidate_count = rows ? count : 0;
+}
+
+const cbm_doc_candidate_t *cbm_pipeline_doc_candidates(const cbm_pipeline_t *p, int *count) {
+    if (count) {
+        *count = p ? p->doc_candidate_count : 0;
+    }
+    return p ? p->doc_candidates : NULL;
+}
+
 static void pipeline_release_test_config(cbm_pipeline_t *p) {
     if (!p) {
         return;
@@ -995,6 +1017,9 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     p->surface_rows = NULL;
     p->surface_row_count = 0;
     pipeline_reset_doc_links(p);
+    cbm_store_doc_candidates_free(p->doc_candidates, p->doc_candidate_count);
+    p->doc_candidates = NULL;
+    p->doc_candidate_count = 0;
     cbm_git_context_free(&p->git_ctx);
     /* gbuf, store, registry freed during/after run */
     /* Defensive owner cleanup; normal runs release after publication. */
@@ -3077,6 +3102,14 @@ static int publish_staged_impl(char *stage_path, const cbm_pipeline_generation_t
         ok = cbm_store_adr_store(store, generation->project, generation->adr_content) ==
              CBM_STORE_OK;
     }
+    /* Doc -> code candidates belong to the generation too: replaced inside
+     * the staging store (the table is created here), so a reader never sees
+     * candidates of another graph. */
+    if (ok && !generation->doc_candidates_in_place) {
+        ok =
+            cbm_store_doc_candidates_replace(store, generation->project, generation->doc_candidates,
+                                             generation->doc_candidate_count) == CBM_STORE_OK;
+    }
 
     if (ok) {
         ok = cbm_store_set_format_version(store, CBM_INDEX_FORMAT_VERSION) == CBM_STORE_OK;
@@ -3368,6 +3401,8 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
         .doc_link_row_count = p->doc_link_row_count,
         /* every full route runs a doc-link phase; none having run is a fault */
         .doc_links_failed = p->doc_links_failed || !p->doc_links_ran,
+        .doc_candidates = p->doc_candidates,
+        .doc_candidate_count = p->doc_candidate_count,
     };
 
     free(db_dir);
