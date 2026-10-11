@@ -791,6 +791,7 @@ extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
+extern void suite_pipeline_objectscript_timeout(void);
 extern void suite_importance(void);
 extern void suite_pipeline_semantic_manifest_repro(void);
 extern void suite_cross_repo(void);
@@ -895,7 +896,19 @@ extern void suite_dump_verify_io(void);
  * caches at thread teardown (pass_parallel.c). */
 extern void cbm_kind_in_set_free_cache(void);
 
+const char *cbm_test_program_path;
+
 int main(int argc, char **argv) {
+    cbm_test_program_path = argv[0];
+    if (argc >= 4 && argc % 2 == 0 && strcmp(argv[1], "__cbm_env_values") == 0) {
+        for (int i = 2; i < argc; i += 2) {
+            const char *value = getenv(argv[i]);
+            if (!value || strcmp(value, argv[i + 1]) != 0) {
+                return 61;
+            }
+        }
+        return 0;
+    }
     /* Skip the multi-hundred-MB executable-image hash that computes the exact
      * build fingerprint: it is tens of seconds per spawned worker/daemon under
      * ASan on constrained CI runners and the sole cause of the daemon-family
@@ -1067,6 +1080,7 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(pipeline_objectscript_timeout);
     RUN_SELECTED_SUITE(importance);
     RUN_SELECTED_SUITE(index_format);
     RUN_SELECTED_SUITE(pipeline_semantic_manifest_repro);

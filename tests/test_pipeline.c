@@ -1498,6 +1498,67 @@ static bool test_buffer_appendf(char *buffer, size_t capacity, size_t *used, con
     return true;
 }
 
+static CBM_TLS int objectscript_timeout_calls;
+static CBM_TLS int64_t objectscript_expected_timeout;
+static CBM_TLS bool objectscript_timeout_mismatch;
+
+static CBMFileResult *test_objectscript_timeout_extractor(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, int64_t timeout_micros, const char **extra_defines,
+    const char **include_paths, const CBMMacroTable *macro_table,
+    const CBMReturnTypeTable *return_type_table) {
+    (void)source;
+    (void)source_len;
+    (void)language;
+    (void)project;
+    (void)rel_path;
+    (void)extra_defines;
+    (void)include_paths;
+    (void)macro_table;
+    (void)return_type_table;
+    objectscript_timeout_calls++;
+    objectscript_timeout_mismatch |= timeout_micros != objectscript_expected_timeout;
+    CBMFileResult *result = calloc(1, sizeof(*result));
+    if (result) {
+        cbm_arena_init(&result->arena);
+    }
+    return result;
+}
+
+TEST(pipeline_objectscript_export_forwards_parse_timeout) {
+    const char *xml =
+        "<Export generator=\"Cache\"><Class name=\"Timeout.First\">"
+        "<Method name=\"Run\"><ClassMethod>1</ClassMethod>"
+        "<Implementation><![CDATA[ Quit ]]></Implementation></Method></Class>"
+        "<Class name=\"Timeout.Second\">"
+        "<Method name=\"Run\"><ClassMethod>1</ClassMethod>"
+        "<Implementation><![CDATA[ Quit ]]></Implementation></Method></Class></Export>";
+    const int64_t timeouts[] = {0, 17, 5000000};
+    for (size_t i = 0; i < sizeof(timeouts) / sizeof(timeouts[0]); i++) {
+        objectscript_timeout_calls = 0;
+        objectscript_expected_timeout = timeouts[i];
+        objectscript_timeout_mismatch = false;
+        cbm_pipeline_set_objectscript_export_extractor_for_tests(
+            test_objectscript_timeout_extractor);
+        CBMFileResult *result =
+            i == 2 ? cbm_pipeline_extract_objectscript_export(xml, (int)strlen(xml), "timeout",
+                                                              "export.xml", NULL, NULL)
+                   : cbm_pipeline_extract_objectscript_export_with_timeout(
+                         xml, (int)strlen(xml), "timeout", "export.xml", NULL, NULL, timeouts[i]);
+        cbm_pipeline_set_objectscript_export_extractor_for_tests(NULL);
+        bool complete = result && result->owned_result_count == 2;
+        cbm_free_result(result);
+        ASSERT_TRUE(complete);
+        ASSERT_EQ(objectscript_timeout_calls, 2);
+        ASSERT_FALSE(objectscript_timeout_mismatch);
+    }
+    PASS();
+}
+
+SUITE(pipeline_objectscript_timeout) {
+    RUN_TEST(pipeline_objectscript_export_forwards_parse_timeout);
+}
+
 /* Each extracted class owns a separate arena. A CBMCall includes eight argument
  * slots, so growing its call array through the 513th item requires at least four
  * arena blocks per class. Sixty-four classes therefore exceed the aggregate's

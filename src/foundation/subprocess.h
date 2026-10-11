@@ -53,22 +53,28 @@ typedef struct {
 typedef void (*cbm_proc_log_cb)(const char *line, void *ud);
 
 typedef struct {
-    const char *bin;                 /* executable path or literal PATH name;
-                                      * also argv[0] when argv is NULL */
-    const char *const *argv;         /* NULL-terminated argv; NULL => { bin, NULL } */
-    const char *windows_cmd_payload; /* Windows-only cmd.exe command text. When set, bin must
-                                      * be an absolute path ending in cmd.exe and argv must be
-                                      * NULL. The fixed /D /S /V:OFF /C prefix is added while
-                                      * this payload is copied verbatim for cmd.exe to parse. */
-    const char *log_file;            /* child stdout+stderr are redirected here and tailed;
-                                      * NULL => discard child output, no tailing */
-    cbm_proc_log_cb on_log_line;     /* optional per-line callback */
-    void *log_ud;                    /* user data for on_log_line */
-    int quiet_timeout_ms;            /* <= 0 => no timeout; else kill+HANG after this many
-                                      * ms with no new completed log line */
-    int cancel_grace_ms;             /* graceful tree-termination window; <= 0 uses the finite
-                                      * CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS */
-    bool delete_log_on_exit;         /* unlink log_file after reaping */
+    const char *bin;                  /* executable path or literal PATH name;
+                                       * also argv[0] when argv is NULL */
+    const char *const *argv;          /* NULL-terminated argv; NULL => { bin, NULL } */
+    const char *const *env_overrides; /* NULL-terminated NAME=value entries, merged with the
+                                       * inherited environment for this child only. NAME= keeps
+                                       * an empty value; the last duplicate wins. Names must be
+                                       * nonempty (case-insensitive on Windows). NULL or an empty
+                                       * list preserves normal inheritance. Executable lookup
+                                       * continues to use the caller's PATH. */
+    const char *windows_cmd_payload;  /* Windows-only cmd.exe command text. When set, bin must
+                                       * be an absolute path ending in cmd.exe and argv must be
+                                       * NULL. The fixed /D /S /V:OFF /C prefix is added while
+                                       * this payload is copied verbatim for cmd.exe to parse. */
+    const char *log_file;             /* child stdout+stderr are redirected here and tailed;
+                                       * NULL => discard child output, no tailing */
+    cbm_proc_log_cb on_log_line;      /* optional per-line callback */
+    void *log_ud;                     /* user data for on_log_line */
+    int quiet_timeout_ms;             /* <= 0 => no timeout; else kill+HANG after this many
+                                       * ms with no new completed log line */
+    int cancel_grace_ms;              /* graceful tree-termination window; <= 0 uses the finite
+                                       * CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS */
+    bool delete_log_on_exit;          /* unlink log_file after reaping */
 } cbm_proc_opts_t;
 
 #define CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS 1000
