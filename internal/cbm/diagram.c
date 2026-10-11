@@ -2813,24 +2813,31 @@ static bool dg_kind(TSNode n, const char *k) {
     return !ts_node_is_null(n) && strcmp(ts_node_type(n), k) == 0;
 }
 
-/* A fenced block of a Markdown file: a diagram when its info string says so. */
-static void dg_markdown_fence(CBMExtractCtx *ctx, TSNode block, dg_ordinal_t *ords, int *nords) {
+/* The diagram format a Markdown fenced block's info string names, NULL for
+ * none; *content is the block's text. */
+static const char *dg_fence_format(const char *source, TSNode block, TSNode *content) {
     TSNode info = {0};
-    TSNode content = {0};
+    *content = (TSNode){0};
     uint32_t nc = ts_node_named_child_count(block);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_named_child(block, i);
         info = dg_kind(c, "info_string") ? c : info;
-        content = dg_kind(c, "code_fence_content") ? c : content;
+        *content = dg_kind(c, "code_fence_content") ? c : *content;
     }
-    if (ts_node_is_null(info) || ts_node_is_null(content)) {
-        return;
+    if (ts_node_is_null(info) || ts_node_is_null(*content)) {
+        return NULL;
     }
     TSNode lang = ts_node_named_child(info, 0);
     TSNode word = dg_kind(lang, "language") ? lang : info;
     uint32_t wb = ts_node_start_byte(word);
     uint32_t we = ts_node_end_byte(word);
-    const char *format = dg_format_of(ctx->source + wb, we - wb);
+    return dg_format_of(source + wb, we - wb);
+}
+
+/* A fenced block of a Markdown file: a diagram when its info string says so. */
+static void dg_markdown_fence(CBMExtractCtx *ctx, TSNode block, dg_ordinal_t *ords, int *nords) {
+    TSNode content;
+    const char *format = dg_fence_format(ctx->source, block, &content);
     if (!format) {
         return;
     }
@@ -3506,6 +3513,77 @@ void cbm_extract_diagram_file(CBMExtractCtx *ctx) {
     } else if (dg_ends(path, ".drawio") || dg_ends(path, ".dio")) {
         dg_file_drawio(ctx, ctx->source, len);
     }
+}
+
+/* ── What a Markdown section's text keeps of its diagram fences ───── */
+
+bool cbm_diagram_fence_is_diagram(const char *source, TSNode block) {
+    TSNode content;
+    return dg_kind(block, "fenced_code_block") && dg_fence_format(source, block, &content);
+}
+
+/* The labels of one Markdown diagram fence, space-joined in source order: the
+ * DiagramElement names and arrow texts its parser produces, without the
+ * format's syntax. The parse runs into a scratch result, so the file's own
+ * definitions are untouched. NULL when the fence says nothing. */
+const char *cbm_diagram_fence_labels(CBMExtractCtx *ctx, TSNode block) {
+    TSNode content;
+    const char *format = dg_fence_format(ctx->source, block, &content);
+    if (!format) {
+        return NULL;
+    }
+    CBMFileResult scratch;
+    memset(&scratch, 0, sizeof(scratch));
+    CBMExtractCtx sc = *ctx;
+    sc.result = &scratch;
+    uint32_t cb = ts_node_start_byte(content);
+    dg_source_t src = {
+        .format = format,
+        .parent_qn = "e1",
+        .ordinal = SKIP_ONE,
+        .text = ctx->source + cb,
+        .len = ts_node_end_byte(content) - cb,
+        .first_line = ts_node_start_point(content).row + SKIP_ONE,
+        .start_line = ts_node_start_point(block).row + SKIP_ONE,
+        .end_line = ts_node_end_point(block).row + SKIP_ONE,
+    };
+    dg_build(&sc, &src);
+    size_t total = 0;
+    for (int i = 0; i < scratch.defs.count; i++) {
+        const CBMDefinition *d = &scratch.defs.items[i];
+        if (d->name && d->label && strcmp(d->label, "DiagramElement") == 0) {
+            total += strlen(d->name) + SKIP_ONE;
+        }
+    }
+    for (int i = 0; i < scratch.diagram_arrows.count; i++) {
+        const char *l = scratch.diagram_arrows.items[i].label;
+        total += l ? strlen(l) + SKIP_ONE : 0;
+    }
+    char *out = total ? (char *)cbm_arena_alloc(ctx->arena, total + SKIP_ONE) : NULL;
+    if (!out) {
+        return NULL;
+    }
+    size_t w = 0;
+    for (int i = 0; i < scratch.defs.count; i++) {
+        const CBMDefinition *d = &scratch.defs.items[i];
+        if (d->name && d->label && strcmp(d->label, "DiagramElement") == 0) {
+            size_t l = strlen(d->name);
+            memcpy(out + w, d->name, l);
+            w += l;
+            out[w++] = ' ';
+        }
+    }
+    for (int i = 0; i < scratch.diagram_arrows.count; i++) {
+        const char *l = scratch.diagram_arrows.items[i].label;
+        if (l) {
+            size_t n = strlen(l);
+            memcpy(out + w, l, n);
+            w += n;
+            out[w++] = ' ';
+        }
+    }
+    out[w] = '\0';
+    return out;
 }
 
 void cbm_extract_diagrams(CBMExtractCtx *ctx) {

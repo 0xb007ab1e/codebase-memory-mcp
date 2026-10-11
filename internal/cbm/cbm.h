@@ -1167,6 +1167,11 @@ void cbm_extract_channels(CBMExtractCtx *ctx);
  * or AsciiDoc block, or a diagram file -- with a DiagramElement definition per
  * element and the arrows between them. */
 void cbm_extract_diagrams(CBMExtractCtx *ctx);
+/* Is a Markdown block a diagram fence, and the labels its parser reads from
+ * it (space-joined; NULL for none): a Section's text keeps those labels in
+ * place of the fence (extract_markdown_section_body). */
+bool cbm_diagram_fence_is_diagram(const char *source, TSNode block);
+const char *cbm_diagram_fence_labels(CBMExtractCtx *ctx, TSNode block);
 /* A diagram file (CBM_LANG_DIAGRAM): its format comes from its extension. */
 void cbm_extract_diagram_file(CBMExtractCtx *ctx);
 

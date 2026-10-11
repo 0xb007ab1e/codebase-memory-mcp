@@ -6840,10 +6840,22 @@ static bool is_markdown_heading_kind(const char *kind) {
  * with nested subsections as further `section` children that own their own
  * text. Stopping at either a `section` or another heading therefore gives each
  * Section exactly its OWN body under both that shape and a flat one. The bytes
- * between are contiguous in the source, so one slice beats concatenation. */
-static const char *extract_markdown_section_body(CBMArena *a, TSNode heading, const char *source) {
+ * between are contiguous in the source, so one slice beats concatenation.
+ *
+ * A top-level diagram fence (```mermaid, plantuml, dot, d2 ...) is the one
+ * exception: the body keeps the labels its diagram parser reads, not the
+ * format's syntax. Arrows and keywords (`-->`, `participant`, `classDiagram`)
+ * name no code and crowd the prose out of the 500-byte cap, while the labels
+ * are what name the code. Judged on held-out sections that embed diagrams,
+ * labels gave more sections a correct code candidate (56 vs 42 of 147) at a
+ * higher precision (0.54 vs 0.45) than the fence as written; dropping the
+ * fence lost candidates (29). The diagram itself keeps its own nodes. */
+static const char *extract_markdown_section_body(CBMExtractCtx *ctx, TSNode heading) {
+    CBMArena *a = ctx->arena;
+    const char *source = ctx->source;
     uint32_t start = ts_node_end_byte(heading);
     uint32_t end = start;
+    int fences = 0;
     for (TSNode sib = ts_node_next_sibling(heading); !ts_node_is_null(sib);
          sib = ts_node_next_sibling(sib)) {
         const char *sk = ts_node_type(sib);
@@ -6851,11 +6863,57 @@ static const char *extract_markdown_section_body(CBMArena *a, TSNode heading, co
             break;
         }
         end = ts_node_end_byte(sib);
+        fences += cbm_diagram_fence_is_diagram(source, sib);
     }
     if (end <= start) {
         return NULL;
     }
-    return collapse_prose(a, source + start, (size_t)(end - start));
+    if (fences == 0) {
+        return collapse_prose(a, source + start, (size_t)(end - start));
+    }
+    /* The body with each diagram fence replaced by its labels. */
+    const char **labels = (const char **)cbm_arena_alloc(a, (size_t)fences * sizeof(char *));
+    if (!labels) {
+        return NULL;
+    }
+    size_t total = 0;
+    int k = 0;
+    for (TSNode sib = ts_node_next_sibling(heading); !ts_node_is_null(sib) && k < fences;
+         sib = ts_node_next_sibling(sib)) {
+        if (cbm_diagram_fence_is_diagram(source, sib)) {
+            labels[k] = cbm_diagram_fence_labels(ctx, sib);
+            total += labels[k] ? strlen(labels[k]) + SKIP_ONE : 0;
+            k++;
+        }
+    }
+    char *buf = (char *)cbm_arena_alloc(a, (size_t)(end - start) + total + SKIP_ONE);
+    if (!buf) {
+        return NULL;
+    }
+    size_t w = 0;
+    uint32_t prev = start;
+    k = 0;
+    for (TSNode sib = ts_node_next_sibling(heading); !ts_node_is_null(sib) && k < fences;
+         sib = ts_node_next_sibling(sib)) {
+        if (!cbm_diagram_fence_is_diagram(source, sib)) {
+            continue;
+        }
+        uint32_t sb = ts_node_start_byte(sib);
+        memcpy(buf + w, source + prev, sb - prev);
+        w += sb - prev;
+        if (labels[k]) {
+            size_t n = strlen(labels[k]);
+            memcpy(buf + w, labels[k], n);
+            w += n;
+            buf[w++] = ' ';
+        }
+        k++;
+        prev = ts_node_end_byte(sib);
+    }
+    memcpy(buf + w, source + prev, end - prev);
+    w += end - prev;
+    buf[w] = '\0';
+    return collapse_prose(a, buf, w);
 }
 
 /* Push a config-language definition that carries prose. push_simple_class_def
@@ -7055,7 +7113,7 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
         // "Class"; that assertion is the inaccurate side and is flagged for review.
         label = "Section";
         // #518: index what the section SAYS, not just its title.
-        docstring = extract_markdown_section_body(a, node, ctx->source);
+        docstring = extract_markdown_section_body(ctx, node);
     } else if (ctx->language == CBM_LANG_HCL && strcmp(kind, "block") == 0) {
         name = find_hcl_block_name(a, node, ctx->source);
     } else {

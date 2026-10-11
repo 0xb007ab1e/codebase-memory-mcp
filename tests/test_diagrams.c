@@ -136,6 +136,57 @@ TEST(diagrams_markdown_mermaid) {
     PASS();
 }
 
+/* A Section's text keeps a diagram fence's labels, not the format's syntax;
+ * prose around it stays in order, other fences stay as written. */
+TEST(diagrams_section_text_keeps_labels) {
+    CBMFileResult *r = dm_extract(DG_DOC, CBM_LANG_MARKDOWN, "docs/arch.md");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *arch = dg_def(r, ".Arch");
+    ASSERT_NOT_NULL(arch);
+    ASSERT_STR_EQ(arch->label, "Section");
+    const char *doc = arch->docstring;
+    ASSERT_NOT_NULL(doc);
+    const char *kept[] = {"Web app", "API",  "DB",    "Cache", "Backend", "calls",
+                          "retries", "User", "login", "token", NULL};
+    for (int i = 0; kept[i]; i++) {
+        if (!strstr(doc, kept[i])) {
+            printf("  label %s missing from: %s\n", kept[i], doc);
+        }
+        ASSERT(strstr(doc, kept[i]) != NULL);
+    }
+    const char *dropped[] = {"```",         "mermaid",  "flowchart", "-->", "sequenceDiagram",
+                             "participant", "subgraph", NULL};
+    for (int i = 0; dropped[i]; i++) {
+        if (strstr(doc, dropped[i])) {
+            printf("  syntax %s kept in: %s\n", dropped[i], doc);
+        }
+        ASSERT(strstr(doc, dropped[i]) == NULL);
+    }
+    ASSERT_STR_EQ(dg_def(r, ".Doc")->docstring, "Intro."); /* no fence: as before */
+    cbm_free_result(r);
+
+    r = dm_extract("# Mixed\n"
+                   "\n"
+                   "Before.\n"
+                   "\n"
+                   "```mermaid\n"
+                   "flowchart LR\n"
+                   "  A[Login] --> B[Session]\n"
+                   "```\n"
+                   "\n"
+                   "```python\n"
+                   "x = 1\n"
+                   "```\n"
+                   "\n"
+                   "After.\n",
+                   CBM_LANG_MARKDOWN, "docs/mixed.md");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(dg_def(r, ".Mixed")->docstring,
+                  "Before. Login Session ```python x = 1 ``` After.");
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(diagrams_mermaid_kinds) {
     CBMFileResult *r = dm_extract("erDiagram\n"
                                   "  CUSTOMER ||--o{ ORDER : places\n"
@@ -1046,6 +1097,7 @@ TEST(diagrams_incremental_equals_full) {
 
 SUITE(diagrams) {
     RUN_TEST(diagrams_markdown_mermaid);
+    RUN_TEST(diagrams_section_text_keeps_labels);
     RUN_TEST(diagrams_mermaid_kinds);
     RUN_TEST(diagrams_other_fences);
     RUN_TEST(diagrams_plantuml);
