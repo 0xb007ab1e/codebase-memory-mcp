@@ -3746,6 +3746,73 @@ TEST(incremental_env_edit_replaces_scoped_envvars) {
     PASS();
 }
 
+/* A repository split by component (pass_docker.c P4.2b). `rename`: component
+ * b becomes bee -- the split changes, and the reference in compose.run.yaml,
+ * a file this run does not repair, must leave the old Image `*-b`: a closure
+ * repair cannot re-point it, so the run rebuilds. Else an edit keeping the
+ * split: a closure repair. Returns "repo=N b=M bimg=K" (runner's references
+ * to the repository Image / to `*-b`, `*-b` Images), or NULL. */
+static char *incremental_image_split(bool rename, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_imagesplit_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    write_temp_file(tmp, "svc/a/Dockerfile", "FROM alpine:3.20\n");
+    write_temp_file(tmp, "svc/b/Dockerfile", "FROM alpine:3.20\n");
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  a:\n    image: acme/demo:1-a\n    build: ./svc/a\n"
+                    "  b:\n    image: acme/demo:1-b\n    build: ./svc/b\n");
+    write_temp_file(tmp, "compose.run.yaml", "services:\n  runner:\n    image: acme/demo:2-b\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/imagesplit.db", tmp);
+    static const char to_repo[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id WHERE e.type='USAGE' AND s.name='Service/runner' AND "
+        "t.name='docker.io/acme/demo'";
+    static const char to_b[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id WHERE e.type='USAGE' AND s.name='Service/runner' AND "
+        "t.name='docker.io/acme/demo:*-b'";
+    static const char b_img[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Image' AND name='docker.io/acme/demo:*-b'";
+    if (k8s_inc_index(tmp, db_path) != 0 || k8s_inc_count(db_path, to_b) != 1) {
+        th_rmtree(tmp);
+        return NULL;
+    }
+    write_temp_file(tmp, "compose.yaml",
+                    rename ? "services:\n  a:\n    image: acme/demo:1-a\n    build: ./svc/a\n"
+                             "  b:\n    image: acme/demo:1-bee\n    build: ./svc/b\n"
+                           : "services:\n  a:\n    image: acme/demo:1-a\n    build: ./svc/a\n"
+                             "    environment:\n      - MODE\n"
+                             "  b:\n    image: acme/demo:1-b\n    build: ./svc/b\n");
+    char *out = NULL;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "repo=%d b=%d bimg=%d", k8s_inc_count(db_path, to_repo),
+                 k8s_inc_count(db_path, to_b), k8s_inc_count(db_path, b_img));
+        out = strdup(buf);
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return out;
+}
+
+TEST(incremental_image_split_change_rebuilds) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    char *got = incremental_image_split(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "repo=1 b=0 bimg=0");
+    free(got);
+    got = incremental_image_split(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "repo=0 b=1 bimg=1");
+    free(got);
+    PASS();
+}
+
 /* A compose project's .env feeds its compose file (variables in image,
  * build): changing it is no closure repair -- the unchanged compose file's
  * services would keep the old image. It rebuilds; no stale image remains. */
@@ -19513,6 +19580,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);
     RUN_TEST(incremental_compose_edit_replaces_build_edges);
     RUN_TEST(incremental_env_edit_replaces_scoped_envvars);
+    RUN_TEST(incremental_image_split_change_rebuilds);
     RUN_TEST(incremental_compose_dotenv_change_rebuilds);
     RUN_TEST(incremental_dockerfile_edit_keeps_docker_build_edges);
     RUN_TEST(incremental_second_build_declarer_keeps_the_edge);

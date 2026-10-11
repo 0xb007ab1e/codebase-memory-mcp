@@ -3607,6 +3607,9 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (check_cancel(p)) {
         return CBM_NOT_FOUND;
     }
+    /* A repository Image whose edges all went to its components (pass_docker.c
+     * P4.2b) is left without any: it goes, as on the incremental routes. */
+    (void)cbm_gbuf_delete_unreferenced(p->gbuf, "Image", DK_IMAGE_EDGES);
     return rc;
 }
 

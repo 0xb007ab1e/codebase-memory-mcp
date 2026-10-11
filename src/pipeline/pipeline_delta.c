@@ -283,18 +283,16 @@ int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const c
     return rc == SQLITE_DONE ? sqlite3_changes(db) : CBM_NOT_FOUND;
 }
 
-int cbm_delta_build_decl_files(cbm_store_t *store, const char *project, CBMArena *a,
-                               const char ***out) {
+/* The first column of `sql` (?1 = the project) as arena strings in *out. */
+static int delta_query_strings(cbm_store_t *store, const char *project, const char *sql,
+                               CBMArena *a, const char ***out) {
     *out = NULL;
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
         return CBM_NOT_FOUND;
     }
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db,
-                           "SELECT file_path FROM nodes WHERE project = ?1 AND label = 'File'"
-                           " AND json_extract(properties, '$.declares_build') = 1",
-                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         return CBM_NOT_FOUND;
     }
     sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
@@ -323,6 +321,23 @@ int cbm_delta_build_decl_files(cbm_store_t *store, const char *project, CBMArena
     sqlite3_finalize(stmt);
     *out = items;
     return n;
+}
+
+int cbm_delta_build_decl_files(cbm_store_t *store, const char *project, CBMArena *a,
+                               const char ***out) {
+    return delta_query_strings(store, project,
+                               "SELECT file_path FROM nodes WHERE project = ?1 AND label = 'File'"
+                               " AND json_extract(properties, '$.declares_build') = 1",
+                               a, out);
+}
+
+int cbm_delta_image_components(cbm_store_t *store, const char *project, CBMArena *a,
+                               const char ***out) {
+    return delta_query_strings(store, project,
+                               "SELECT qualified_name FROM nodes WHERE project = ?1 AND"
+                               " label = 'Image' AND json_extract(properties, '$.component')"
+                               " IS NOT NULL ORDER BY qualified_name",
+                               a, out);
 }
 
 int cbm_delta_drop_edges_from_label(cbm_store_t *store, const char *project, const char *type,

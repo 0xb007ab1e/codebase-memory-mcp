@@ -162,6 +162,10 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type);
 /* Delete the edges of `type` whose source node has label `label`. */
 int cbm_gbuf_delete_edges_from_label(cbm_gbuf_t *gb, const char *type, const char *label);
 
+/* Delete edges[0..n) (pointers found in this buffer; the array is sorted in
+ * place). */
+int cbm_gbuf_delete_edges(cbm_gbuf_t *gb, const cbm_gbuf_edge_t **edges, int n);
+
 /* ── Vector storage (for semantic embeddings) ───────────────────── */
 
 /* Store an int8-quantized vector for a node. The vector data is copied.

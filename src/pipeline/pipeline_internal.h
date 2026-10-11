@@ -1383,6 +1383,14 @@ int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const c
 int cbm_delta_build_decl_files(cbm_store_t *store, const char *project, CBMArena *a,
                                const char ***out);
 
+/* The QNs of the component Images a split repository gave its components
+ * (pass_docker.c P4.2b: Images with a `component` property), sorted, into
+ * arena `a`; returns how many, or -1 on failure. A closure repair compares
+ * them with the run's own: references in files it does not repair point at
+ * the old ones. */
+int cbm_delta_image_components(cbm_store_t *store, const char *project, CBMArena *a,
+                               const char ***out);
+
 /* Delete the project's `type` edges whose source node has label `label`;
  * returns how many, or -1 on failure. */
 int cbm_delta_drop_edges_from_label(cbm_store_t *store, const char *project, const char *type,

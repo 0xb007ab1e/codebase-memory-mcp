@@ -2205,6 +2205,121 @@ TEST(probe_shell_docker_builds_build_images) {
     PASS();
 }
 
+/* The integer `sql` (?1 = the project) yields on the indexed files; -1 on
+ * failure. */
+static int gpf_query_int(const GpfFile *files, int nfiles, const char *sql) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    int out = -1;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = sqlite3_column_int(st, 0);
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A repository built from several Dockerfiles, one per component tag (otel's
+ * demo:<version>-<service>), is no single image: each component built from
+ * one Dockerfile is an Image of its own (`<repo>:*-<component>`), and a
+ * reference whose tag names a component uses it -- whatever its version. A
+ * tag naming none, a component built from two Dockerfiles, and a repository
+ * built from one Dockerfile stay on the repository Image. */
+TEST(probe_image_hub_splits_by_component) {
+    static const GpfFile files[] = {
+        {"svc/a/Dockerfile", "FROM alpine:3.20\n"},
+        {"svc/b/Dockerfile", "FROM alpine:3.20\n"},
+        {"svc/c/Dockerfile", "FROM alpine:3.20\n"},
+        {"solo/Dockerfile", "FROM alpine:3.20\n"},
+        {"tool/Dockerfile", "FROM alpine:3.20\n"},
+        {"tool/Dockerfile.test", "FROM alpine:3.20\n"},
+        {"w1/Dockerfile", "FROM alpine:3.20\n"},
+        {"w2/Dockerfile.alt", "FROM alpine:3.20\n"},
+        {"v/Dockerfile", "FROM alpine:3.20\n"},
+        {"p/Dockerfile", "FROM alpine:3.20\n"},
+        {"q/Dockerfile", "FROM alpine:3.20\n"},
+        {".env", "V=1.0\n"},
+        {"compose.yaml",
+         "services:\n  a:\n    image: acme/demo:${V}-a\n    build: ./svc/a\n"
+         "  b:\n    image: acme/demo:${V}-b\n    build: ./svc/b\n"
+         "  c:\n    image: acme/demo:${V}-c\n    build: ./svc/c\n"
+         "  solo:\n    image: acme/solo:1\n    build: ./solo\n"
+         "  tool:\n    image: acme/tool\n    build: ./tool\n"
+         "  tooltest:\n    image: acme/tool:test\n    build:\n      context: ./tool\n"
+         "      dockerfile: Dockerfile.test\n"
+         "  w1:\n    image: acme/x:1-w\n    build: ./w1\n"
+         "  w2:\n    image: acme/x:1-w\n    build:\n      context: ./w2\n"
+         "      dockerfile: Dockerfile.alt\n"
+         "  v:\n    image: acme/x:1-v\n    build: ./v\n"
+         "  p:\n    image: acme/y:1-p\n    build: ./p\n"
+         "  q:\n    image: acme/y:1-q\n    build: ./q\n"},
+        {"k8s.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: b\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: b\n          image: acme/demo:0.9-b\n"
+         "---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: z\nspec:\n"
+         "  template:\n    spec:\n      containers:\n        - name: z\n"
+         "          image: acme/demo:0.9-zzz\n"
+         "---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: s\nspec:\n"
+         "  template:\n    spec:\n      containers:\n        - name: s\n"
+         "          image: acme/solo:2\n"}};
+    enum { NF = sizeof(files) / sizeof(files[0]) };
+    char *got = gpf_builds(files, NF);
+    static const char want_builds[] = "docker.io/acme/demo:*-a -> svc/a/Dockerfile (compose)\n"
+                                      "docker.io/acme/demo:*-b -> svc/b/Dockerfile (compose)\n"
+                                      "docker.io/acme/demo:*-c -> svc/c/Dockerfile (compose)\n"
+                                      "docker.io/acme/solo -> solo/Dockerfile (compose)\n"
+                                      "docker.io/acme/tool -> tool/Dockerfile (compose)\n"
+                                      "docker.io/acme/tool:test -> tool/Dockerfile.test (compose)\n"
+                                      "docker.io/acme/x -> w1/Dockerfile (compose)\n"
+                                      "docker.io/acme/x -> w2/Dockerfile.alt (compose)\n"
+                                      "docker.io/acme/x:*-v -> v/Dockerfile (compose)\n"
+                                      "docker.io/acme/y:*-p -> p/Dockerfile (compose)\n"
+                                      "docker.io/acme/y:*-q -> q/Dockerfile (compose)";
+    if (!got || strcmp(got, want_builds) != 0) {
+        fprintf(stderr, "builds got:\n%s\nwant:\n%s\n", got ? got : "(null)", want_builds);
+        free(got);
+        FAIL("component Images' build edges");
+    }
+    free(got);
+    got = gpf_image_users(files, NF);
+    static const char want_users[] = "Deployment/b -> docker.io/acme/demo:*-b\n"
+                                     "Deployment/s -> docker.io/acme/solo\n"
+                                     "Deployment/z -> docker.io/acme/demo\n"
+                                     "Service/a -> docker.io/acme/demo:*-a\n"
+                                     "Service/b -> docker.io/acme/demo:*-b\n"
+                                     "Service/c -> docker.io/acme/demo:*-c\n"
+                                     "Service/p -> docker.io/acme/y:*-p\n"
+                                     "Service/q -> docker.io/acme/y:*-q\n"
+                                     "Service/solo -> docker.io/acme/solo\n"
+                                     "Service/tool -> docker.io/acme/tool\n"
+                                     "Service/tooltest -> docker.io/acme/tool:test\n"
+                                     "Service/v -> docker.io/acme/x:*-v\n"
+                                     "Service/w1 -> docker.io/acme/x\n"
+                                     "Service/w2 -> docker.io/acme/x";
+    if (!got || strcmp(got, want_users) != 0) {
+        fprintf(stderr, "image users got:\n%s\nwant:\n%s\n", got ? got : "(null)", want_users);
+        free(got);
+        FAIL("references on component Images");
+    }
+    free(got);
+    /* acme/y's repository Image lost every edge to its components: none left */
+    int orphans = gpf_query_int(files, NF,
+                                "SELECT COUNT(*) FROM nodes n WHERE n.project=?1 AND "
+                                "n.label='Image' AND NOT EXISTS (SELECT 1 FROM edges e WHERE "
+                                "e.source_id=n.id OR e.target_id=n.id)");
+    if (orphans != 0) {
+        fprintf(stderr, "Images without an edge: %d\n", orphans);
+        FAIL("a repository Image left without edges");
+    }
+    PASS();
+}
+
 /* Every CONFIGURES {strategy:env_set} edge as
  * "<owner> -> <container | ->/<name> (<source>)"; then the joins a scoped
  * EnvVar must not have: "#PORT=<EnvVar nodes named PORT>" and
@@ -4573,6 +4688,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_compose_services_are_resources);
     RUN_TEST(probe_shell_docker_builds_build_images);
     RUN_TEST(probe_container_env_sets_scoped_envvars);
+    RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
     RUN_TEST(probe_shell_helm_deploys_its_chart);

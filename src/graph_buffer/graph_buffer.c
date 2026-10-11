@@ -1919,6 +1919,34 @@ int cbm_gbuf_delete_edges_from_label(cbm_gbuf_t *gb, const char *type, const cha
     return gbuf_delete_edges_if(gb, gbuf_edge_from_label, &tl);
 }
 
+static int gbuf_ptr_cmp(const void *k, const void *v) {
+    uintptr_t a = (uintptr_t)*(const cbm_gbuf_edge_t *const *)k;
+    uintptr_t b = (uintptr_t)*(const cbm_gbuf_edge_t *const *)v;
+    return (a > b) - (a < b);
+}
+
+typedef struct {
+    const cbm_gbuf_edge_t **edges;
+    int n;
+} gbuf_edge_set_t;
+
+static bool gbuf_edge_in_set(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e, const void *ud) {
+    (void)gb;
+    const gbuf_edge_set_t *s = ud;
+    return bsearch(&e, s->edges, (size_t)s->n, sizeof(*s->edges), gbuf_ptr_cmp) != NULL;
+}
+
+/* By the edges themselves, not their ids: after the parallel resolve merge,
+ * cbm_gbuf_set_next_id can hand an id out twice. */
+int cbm_gbuf_delete_edges(cbm_gbuf_t *gb, const cbm_gbuf_edge_t **edges, int n) {
+    if (!gb || !edges || n <= 0) {
+        return 0;
+    }
+    qsort((void *)edges, (size_t)n, sizeof(*edges), gbuf_ptr_cmp);
+    gbuf_edge_set_t s = {edges, n};
+    return gbuf_delete_edges_if(gb, gbuf_edge_in_set, &s);
+}
+
 /* ── Merge ───────────────────────────────────────────────────────── */
 
 /* Free remap hash table entries (key = heap string, value = heap int64_t*) */

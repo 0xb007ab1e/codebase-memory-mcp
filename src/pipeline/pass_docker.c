@@ -54,6 +54,7 @@
 #include "lang_specs.h"
 
 #include <ctype.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1465,6 +1466,438 @@ static void dk_index_build(cbm_pipeline_ctx_t *ctx, CBMArena *a, dk_index_t *ix)
     }
 }
 
+/* ── Image tag sub-identity (P4.2b) ─────────────────────────────── */
+
+_Atomic uint64_t g_dk_hub_edges = 0; /* complexity guard: Image edges a run examines */
+
+/* A plain JSON string property (an image reference holds no escapes). */
+static bool dk_prop(const char *props, const char *key, char *out, size_t out_sz) {
+    char pat[CBM_SZ_64];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = props ? strstr(props, pat) : NULL;
+    if (!p) {
+        return false;
+    }
+    p += strlen(pat);
+    const char *e = strchr(p, '"');
+    if (!e || (size_t)(e - p) >= out_sz || memchr(p, '\\', (size_t)(e - p))) {
+        return false;
+    }
+    memcpy(out, p, (size_t)(e - p));
+    out[e - p] = '\0';
+    return true;
+}
+
+/* The tag of image reference `ref`: after the ':' that follows its last
+ * '/' (a registry port is no tag), up to a '@' digest; "" for none. */
+static void dk_tag(const char *ref, char *out, size_t sz) {
+    out[0] = '\0';
+    const char *slash = strrchr(ref, '/');
+    const char *colon = strchr(slash ? slash : ref, ':');
+    if (colon) {
+        snprintf(out, sz, "%.*s", (int)strcspn(colon + SKIP_ONE, "@"), colon + SKIP_ONE);
+    }
+}
+
+/* The repository of an Image node's name ("<repo>" or "<repo>:<pattern>"). */
+static void dk_repo_of(const char *name, char *out, size_t sz) {
+    const char *slash = strrchr(name, '/');
+    const char *colon = strchr(slash ? slash : name, ':');
+    snprintf(out, sz, "%.*s", (int)(colon ? (size_t)(colon - name) : strlen(name)), name);
+}
+
+static bool dk_sep(char c) {
+    return c == '-' || c == '_' || c == '.';
+}
+
+/* Does `comp` occur in `tag` as whole separator-delimited parts? */
+static bool dk_tag_has(const char *tag, const char *comp) {
+    size_t cl = strlen(comp);
+    for (const char *p = strstr(tag, comp); p; p = strstr(p + SKIP_ONE, comp)) {
+        if ((p == tag || dk_sep(p[-SKIP_ONE])) && (p[cl] == '\0' || dk_sep(p[cl]))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* An edge of a repository's Images, copied before any edge moves. */
+typedef struct {
+    const cbm_gbuf_edge_t *edge; /* stable until deleted */
+    int64_t src;
+    int64_t tgt;
+    const char *type;
+    const char *props;
+    const char *tag;
+    int comp; /* its component; -1: none */
+} dk_hub_edge_t;
+
+typedef struct {
+    dk_hub_edge_t *v;
+    int n;
+    int cap;
+} dk_hub_edges_t;
+
+typedef struct {
+    const cbm_gbuf_edge_t **v;
+    int n;
+    int cap;
+} dk_drop_t;
+
+typedef struct {
+    int64_t id;
+    const char *name;
+    const char *repo;
+} dk_img_t;
+
+static int dk_img_cmp(const void *x, const void *y) {
+    const dk_img_t *a = x;
+    const dk_img_t *b = y;
+    int c = strcmp(a->repo, b->repo);
+    return c ? c : strcmp(a->name, b->name);
+}
+
+/* Grow an arena array of `n` items of `size` to hold one more. */
+static void *dk_grow(CBMArena *a, void *v, int n, int *cap, size_t size) {
+    if (n < *cap) {
+        return v;
+    }
+    int nc = *cap ? *cap * PAIR_LEN : CBM_SZ_16;
+    void *g = cbm_arena_alloc(a, (size_t)nc * size);
+    if (g && n) {
+        memcpy(g, v, (size_t)n * size);
+    }
+    if (g) {
+        *cap = nc;
+    }
+    return g;
+}
+
+static void dk_hub_push(CBMArena *a, dk_hub_edges_t *l, const cbm_gbuf_edge_t *e, const char *tag) {
+    dk_hub_edge_t *v = dk_grow(a, l->v, l->n, &l->cap, sizeof(*v));
+    if (!v) {
+        return;
+    }
+    l->v = v;
+    l->v[l->n++] = (dk_hub_edge_t){e,
+                                   e->source_id,
+                                   e->target_id,
+                                   cbm_arena_strdup(a, e->type),
+                                   cbm_arena_strdup(a, e->properties_json),
+                                   cbm_arena_strdup(a, tag),
+                                   -1};
+}
+
+/* Is an edge of `type` with properties `p` a reference to an image --
+ * USAGE {ref:image}, or DEPENDS_ON {via:from|copy-from}? */
+static bool dk_hub_ref(const char *type, const char *p) {
+    char v[CBM_SZ_32];
+    if (strcmp(type, "USAGE") == 0) {
+        return dk_prop(p, "ref", v, sizeof(v)) && strcmp(v, "image") == 0;
+    }
+    return dk_prop(p, "via", v, sizeof(v)) &&
+           (strcmp(v, "from") == 0 || strcmp(v, "copy-from") == 0);
+}
+
+/* The edges of Image `img`: build edges out (DEPENDS_ON {via:build}) and
+ * references in, each with the tag of its `image` reference. */
+static void dk_hub_collect(cbm_pipeline_ctx_t *ctx, CBMArena *a, int64_t img,
+                           dk_hub_edges_t *builds, dk_hub_edges_t *refs) {
+    const cbm_gbuf_edge_t **es = NULL;
+    int n = 0;
+    char ref[CBM_SZ_1K];
+    char tag[CBM_SZ_256];
+    if (cbm_gbuf_find_edges_by_source_type(ctx->gbuf, img, "DEPENDS_ON", &es, &n) == 0) {
+        for (int i = 0; i < n; i++) {
+            char via[CBM_SZ_32];
+            if (!dk_prop(es[i]->properties_json, "via", via, sizeof(via)) ||
+                strcmp(via, "build") != 0) {
+                continue;
+            }
+            tag[0] = '\0';
+            if (dk_prop(es[i]->properties_json, "image", ref, sizeof(ref))) {
+                dk_tag(ref, tag, sizeof(tag));
+            }
+            dk_hub_push(a, builds, es[i], tag);
+        }
+        atomic_fetch_add_explicit(&g_dk_hub_edges, (uint64_t)n, memory_order_relaxed);
+    }
+    static const char *const IN[] = {"USAGE", "DEPENDS_ON"};
+    for (size_t t = 0; t < sizeof(IN) / sizeof(IN[0]); t++) {
+        if (cbm_gbuf_find_edges_by_target_type(ctx->gbuf, img, IN[t], &es, &n) != 0) {
+            continue;
+        }
+        atomic_fetch_add_explicit(&g_dk_hub_edges, (uint64_t)n, memory_order_relaxed);
+        for (int i = 0; i < n; i++) {
+            if (dk_hub_ref(IN[t], es[i]->properties_json) &&
+                dk_prop(es[i]->properties_json, "image", ref, sizeof(ref))) {
+                dk_tag(ref, tag, sizeof(tag));
+                dk_hub_push(a, refs, es[i], tag);
+            }
+        }
+    }
+}
+
+/* The number of distinct Dockerfiles the build edges target. */
+static int dk_hub_dockerfiles(CBMArena *a, const dk_hub_edges_t *b) {
+    CBMHashTable *seen = cbm_ht_create(0);
+    int n = 0;
+    for (int i = 0; seen && i < b->n; i++) {
+        const char *k = cbm_arena_sprintf(a, "%lld", (long long)b->v[i].tgt);
+        if (k && !cbm_ht_has(seen, k)) {
+            cbm_ht_set(seen, k, (void *)SKIP_ONE);
+            n++;
+        }
+    }
+    if (seen) {
+        cbm_ht_free(seen);
+    }
+    return n;
+}
+
+/* The common prefix / suffix of the build tags, cut back to a separator and
+ * leaving every tag a non-empty middle where it can: *pre, *suf. */
+static void dk_hub_affixes(const dk_hub_edges_t *b, size_t *pre, size_t *suf) {
+    const char *t0 = b->v[0].tag;
+    size_t l0 = strlen(t0);
+    size_t p = l0;
+    size_t s = l0;
+    for (int i = SKIP_ONE; i < b->n; i++) {
+        const char *t = b->v[i].tag;
+        size_t tl = strlen(t);
+        size_t k = 0;
+        while (k < p && k < tl && t[k] == t0[k]) {
+            k++;
+        }
+        p = k;
+        k = 0;
+        while (k < s && k < tl && t[tl - SKIP_ONE - k] == t0[l0 - SKIP_ONE - k]) {
+            k++;
+        }
+        s = k;
+    }
+    while (p > 0 && !dk_sep(t0[p - SKIP_ONE])) {
+        p--;
+    }
+    while (s > 0 && !dk_sep(t0[l0 - s])) {
+        s--;
+    }
+    for (int i = 0; i < b->n; i++) {
+        size_t tl = strlen(b->v[i].tag);
+        while (s > 0 && p + s >= tl) {
+            for (s--; s > 0 && !dk_sep(t0[l0 - s]); s--) {}
+        }
+        while (p > 0 && p + s >= tl) {
+            for (p--; p > 0 && !dk_sep(t0[p - SKIP_ONE]); p--) {}
+        }
+    }
+    *pre = p;
+    *suf = s;
+}
+
+/* Components of a repository built from several Dockerfiles: each build
+ * tag without the tags' common prefix / suffix (otel's latest-frontend,
+ * latest-cart -> frontend, cart). A component built from exactly one
+ * Dockerfile, holding no unknown part, is kept (comps[k] non-NULL); each
+ * build edge's comp is set. Returns the number of component slots (0:
+ * none kept). */
+static int dk_hub_components(CBMArena *a, dk_hub_edges_t *b, size_t pre, size_t suf,
+                             const char ***comps) {
+    const char **names = cbm_arena_alloc(a, (size_t)b->n * sizeof(*names));
+    int64_t *dfs = cbm_arena_alloc(a, (size_t)b->n * sizeof(*dfs));
+    CBMHashTable *index = cbm_ht_create(0); /* component -> slot + 1 */
+    int nc = 0;
+    for (int i = 0; names && dfs && index && i < b->n; i++) {
+        const char *t = b->v[i].tag;
+        size_t tl = strlen(t);
+        const char *c = tl > pre + suf ? cbm_arena_strndup(a, t + pre, tl - pre - suf) : NULL;
+        if (!c || strpbrk(c, "$*{}()`\"\\")) {
+            continue;
+        }
+        int k = (int)(intptr_t)cbm_ht_get(index, c) - SKIP_ONE;
+        if (k < 0) {
+            k = nc++;
+            names[k] = c;
+            dfs[k] = b->v[i].tgt;
+            cbm_ht_set(index, c, (void *)(intptr_t)(k + SKIP_ONE));
+        } else if (names[k] && dfs[k] != b->v[i].tgt) {
+            names[k] = NULL; /* one name, two Dockerfiles: no identity */
+        }
+        b->v[i].comp = k;
+    }
+    if (index) {
+        cbm_ht_free(index);
+    }
+    if (!names || !dfs) {
+        return 0;
+    }
+    int kept = 0;
+    for (int k = 0; k < nc; k++) {
+        kept += names[k] ? SKIP_ONE : 0;
+    }
+    for (int i = 0; i < b->n; i++) {
+        if (b->v[i].comp >= 0 && !names[b->v[i].comp]) {
+            b->v[i].comp = -1;
+        }
+    }
+    *comps = names;
+    return kept ? nc : 0;
+}
+
+/* The component a reference's tag names: the longest kept one occurring in
+ * it as whole parts; -1 for none, or for two of that length. */
+static int dk_hub_match(const char *tag, const char *const *comps, int nc) {
+    int best = -1;
+    size_t bl = 0;
+    bool tie = false;
+    for (int k = 0; k < nc; k++) {
+        if (!comps[k] || !dk_tag_has(tag, comps[k])) {
+            continue;
+        }
+        size_t l = strlen(comps[k]);
+        if (l > bl) {
+            best = k;
+            bl = l;
+            tie = false;
+        } else if (l == bl) {
+            tie = true;
+        }
+    }
+    return tie ? -1 : best;
+}
+
+/* The Image of a component: `<repo>:<pattern>` (`*-frontend`: the
+ * prefix's version masked) {repository, component, tag_pattern}. */
+static int64_t dk_hub_image(cbm_pipeline_ctx_t *ctx, const char *repo, const char *comp,
+                            char pre_sep, char suf_sep) {
+    char head[PAIR_LEN + SKIP_ONE] = {0};
+    char tail[PAIR_LEN + SKIP_ONE] = {0};
+    if (pre_sep) {
+        head[0] = '*';
+        head[SKIP_ONE] = pre_sep;
+    }
+    if (suf_sep) {
+        tail[0] = suf_sep;
+        tail[SKIP_ONE] = '*';
+    }
+    char pattern[CBM_SZ_512];
+    char name[CBM_SZ_1K];
+    char qn[CBM_SZ_2K];
+    snprintf(pattern, sizeof(pattern), "%s%s%s", head, comp, tail);
+    snprintf(name, sizeof(name), "%s:%s", repo, pattern);
+    snprintf(qn, sizeof(qn), "__image__%s", name);
+    char esc_r[CBM_SZ_1K];
+    char esc_c[CBM_SZ_1K];
+    char esc_p[CBM_SZ_1K];
+    cbm_json_escape(esc_r, (int)sizeof(esc_r), repo);
+    cbm_json_escape(esc_c, (int)sizeof(esc_c), comp);
+    cbm_json_escape(esc_p, (int)sizeof(esc_p), pattern);
+    char props[CBM_SZ_4K];
+    snprintf(props, sizeof(props),
+             "{\"repository\":\"%s\",\"component\":\"%s\",\"tag_pattern\":\"%s\"}", esc_r, esc_c,
+             esc_p);
+    return cbm_gbuf_upsert_node(ctx->gbuf, "Image", name, qn, "", 0, 0, props);
+}
+
+/* Move edge `e` to (src, tgt): insert the copy, queue `e` for deletion. */
+static int dk_hub_move(cbm_pipeline_ctx_t *ctx, CBMArena *a, const dk_hub_edge_t *e, int64_t src,
+                       int64_t tgt, dk_drop_t *drop) {
+    if ((src == e->src && tgt == e->tgt) || src <= 0 || tgt <= 0) {
+        return 0;
+    }
+    const cbm_gbuf_edge_t **v = dk_grow(a, (void *)drop->v, drop->n, &drop->cap, sizeof(*v));
+    if (!v) {
+        return 0;
+    }
+    drop->v = v;
+    drop->v[drop->n++] = e->edge;
+    cbm_gbuf_insert_edge(ctx->gbuf, src, tgt, e->type, e->props);
+    return SKIP_ONE;
+}
+
+/* One repository's Images (imgs[0..n)): split it by component when it is
+ * built from several Dockerfiles, else keep (or bring back) everything on
+ * the repository Image. Returns the edges moved. */
+static int dk_hub_repo(cbm_pipeline_ctx_t *ctx, CBMArena *a, const dk_img_t *imgs, int n,
+                       dk_drop_t *drop) {
+    dk_hub_edges_t builds = {0};
+    dk_hub_edges_t refs = {0};
+    bool has_sub = false;
+    for (int i = 0; i < n; i++) {
+        has_sub = has_sub || strcmp(imgs[i].name, imgs[i].repo) != 0;
+        dk_hub_collect(ctx, a, imgs[i].id, &builds, &refs);
+    }
+    const char **comps = NULL;
+    size_t pre = 0;
+    size_t suf = 0;
+    int nc = 0;
+    if (builds.n > SKIP_ONE && dk_hub_dockerfiles(a, &builds) > SKIP_ONE) {
+        dk_hub_affixes(&builds, &pre, &suf);
+        nc = dk_hub_components(a, &builds, pre, suf, &comps);
+    }
+    if (nc == 0 && !has_sub) {
+        return 0;
+    }
+    int64_t repo_img = cbm_pipeline_image_node(ctx, imgs[0].repo);
+    int64_t *sub = nc ? cbm_arena_alloc(a, (size_t)nc * sizeof(*sub)) : NULL;
+    const char *t0 = builds.n ? builds.v[0].tag : "";
+    char pre_sep = pre ? t0[pre - SKIP_ONE] : '\0';
+    char suf_sep = suf ? t0[strlen(t0) - suf] : '\0';
+    for (int k = 0; k < nc && sub; k++) {
+        sub[k] = comps[k] ? dk_hub_image(ctx, imgs[0].repo, comps[k], pre_sep, suf_sep) : 0;
+    }
+    int moved = 0;
+    for (int i = 0; i < builds.n; i++) {
+        int k = builds.v[i].comp;
+        int64_t src = sub && k >= 0 && sub[k] > 0 ? sub[k] : repo_img;
+        moved += dk_hub_move(ctx, a, &builds.v[i], src, builds.v[i].tgt, drop);
+    }
+    for (int i = 0; i < refs.n; i++) {
+        int k = sub ? dk_hub_match(refs.v[i].tag, comps, nc) : -1;
+        int64_t tgt = k >= 0 && sub[k] > 0 ? sub[k] : repo_img;
+        moved += dk_hub_move(ctx, a, &refs.v[i], refs.v[i].src, tgt, drop);
+    }
+    return moved;
+}
+
+/* P4.2b: a repository built from more than one Dockerfile (otel builds
+ * every service as ghcr.io/open-telemetry/demo:<version>-<service>) is no
+ * single image. Each component of its build tags built from one Dockerfile
+ * becomes an Image of its own, which its build edges leave from; every
+ * reference (K8s container, compose service, FROM) whose tag names a
+ * component uses that Image; all else stays on the repository Image.
+ * Recomputed whole each run from the edges in the buffer. */
+static int dk_image_hubs(cbm_pipeline_ctx_t *ctx, CBMArena *a) {
+    const cbm_gbuf_node_t **nodes = NULL;
+    int n = 0;
+    if (cbm_gbuf_find_by_label(ctx->gbuf, "Image", &nodes, &n) != 0 || n == 0) {
+        return 0;
+    }
+    dk_img_t *imgs = cbm_arena_alloc(a, (size_t)n * sizeof(*imgs));
+    if (!imgs) {
+        return 0;
+    }
+    for (int i = 0; i < n; i++) {
+        char repo[CBM_SZ_1K];
+        dk_repo_of(nodes[i]->name, repo, sizeof(repo));
+        imgs[i] = (dk_img_t){nodes[i]->id, cbm_arena_strdup(a, nodes[i]->name),
+                             cbm_arena_strdup(a, repo)};
+    }
+    qsort(imgs, (size_t)n, sizeof(*imgs), dk_img_cmp);
+    dk_drop_t drop = {0};
+    int moved = 0;
+    for (int g = 0; g < n;) {
+        int h = g + SKIP_ONE;
+        while (h < n && strcmp(imgs[h].repo, imgs[g].repo) == 0) {
+            h++;
+        }
+        moved += dk_hub_repo(ctx, a, imgs + g, h - g, &drop);
+        g = h;
+    }
+    cbm_gbuf_delete_edges(ctx->gbuf, drop.v, drop.n);
+    return moved;
+}
+
 void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                               int file_count) {
     TSParser *parser = NULL;
@@ -1531,6 +1964,7 @@ void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fi
         cbm_ht_free(ix.gomain);
     }
     edges += dk_link_builds(ctx, &arena);
+    edges += dk_image_hubs(ctx, &arena);
     cbm_arena_destroy(&arena);
     if (edges > 0) {
         char buf[CBM_SZ_32];

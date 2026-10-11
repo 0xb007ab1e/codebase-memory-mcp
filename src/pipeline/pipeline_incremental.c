@@ -1164,6 +1164,46 @@ static bool incr_edge_type_is_recomputed(const char *type) {
                     strcmp(type, "FILE_CHANGES_WITH") == 0 || strcmp(type, "DATA_FLOWS") == 0);
 }
 
+static int incr_strcmp(const void *x, const void *y) {
+    return strcmp(*(const char *const *)x, *(const char *const *)y);
+}
+
+/* Are the component Images this run built (pass_docker.c P4.2b: an Image
+ * with a `component` property and a build edge in `gb`) exactly `before`
+ * (sorted QNs)? */
+static bool incr_image_components_equal(const cbm_gbuf_t *gb, const char *const *before, int nb,
+                                        CBMArena *a) {
+    const cbm_gbuf_node_t **nodes = NULL;
+    int n = 0;
+    if (cbm_gbuf_find_by_label(gb, "Image", &nodes, &n) != 0 || n == 0) {
+        return nb == 0;
+    }
+    const char **now = cbm_arena_alloc(a, (size_t)n * sizeof(*now));
+    if (!now) {
+        return false;
+    }
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        const cbm_gbuf_edge_t **out = NULL;
+        int ne = 0;
+        if (nodes[i]->properties_json && strstr(nodes[i]->properties_json, "\"component\":") &&
+            cbm_gbuf_find_edges_by_source_type(gb, nodes[i]->id, "DEPENDS_ON", &out, &ne) == 0 &&
+            ne > 0) {
+            now[k++] = nodes[i]->qualified_name;
+        }
+    }
+    if (k != nb) {
+        return false;
+    }
+    qsort((void *)now, (size_t)k, sizeof(*now), incr_strcmp);
+    for (int i = 0; i < k; i++) {
+        if (strcmp(now[i], before[i]) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* The files whose File node the shell pass marked as running a container
  * build (pass_shell.c), from the full-load buffer, into arena `a`; returns
  * how many. */
@@ -2898,6 +2938,11 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     /* before the purge drops any of their edges */
     decl_count = cbm_delta_build_decl_files(staging, project, &decl_arena, &decl_files);
     decl_count = decl_count > 0 ? decl_count : 0;
+    const char **hub_images = NULL;
+    int hub_count = cbm_delta_image_components(staging, project, &decl_arena, &hub_images);
+    if (hub_count < 0) {
+        goto out;
+    }
 
     /* Purge set = closure files + deleted files. */
     int purge_count = ci + deleted_count;
@@ -3125,6 +3170,13 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         if (phase_rc == CBM_PIPELINE_ABORT_PRESERVE_DB) {
             result = phase_rc;
         }
+        goto out;
+    }
+    /* A repository split differently (pass_docker.c P4.2b) leaves the
+     * references of files not repaired here on the old component Images:
+     * only a full rebuild re-points them. */
+    if (!incr_image_components_equal(gbuf, hub_images, hub_count, &decl_arena)) {
+        cbm_log_info("delta.fallback", "reason", "image_components_changed");
         goto out;
     }
     cbm_log_info("delta.repair", "files", itoa_buf(ci), "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
