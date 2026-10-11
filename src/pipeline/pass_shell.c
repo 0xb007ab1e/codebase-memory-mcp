@@ -377,6 +377,7 @@ typedef struct {
     bool chart;
     bool spawn; /* SPAWNS the script `tgt` / the Process `ext`, not DEPLOYS */
     bool make;  /* SPAWNS the rule of target `ext` that makefile `path` reads */
+    bool build; /* the image `ext` is built from the Dockerfile `path` */
 } sh_hit_t;
 
 typedef struct {
@@ -384,6 +385,7 @@ typedef struct {
     int count;
     int cap;
     CBMArena arena;
+    CBMHashTable *declarers; /* files running a container build: path -> path */
 } sh_hits_t;
 
 typedef struct {
@@ -2158,6 +2160,181 @@ static bool sh_chdir(sh_t *s, const sh_argv_t *a) {
     return true;
 }
 
+/* A container build's flags that take a separate value. */
+static const char *const SH_BUILD_VALUED[] = {"--build-arg",
+                                              "--target",
+                                              "--platform",
+                                              "--label",
+                                              "--cache-from",
+                                              "--cache-to",
+                                              "--secret",
+                                              "--ssh",
+                                              "-o",
+                                              "--output",
+                                              "--network",
+                                              "--add-host",
+                                              "--iidfile",
+                                              "--progress",
+                                              "--builder",
+                                              "--build-context",
+                                              "--shm-size",
+                                              "--ulimit",
+                                              "-m",
+                                              "--memory",
+                                              "--memory-swap",
+                                              "--cpu-shares",
+                                              "-c",
+                                              "--cpuset-cpus",
+                                              "--cpuset-mems",
+                                              "--cgroup-parent",
+                                              "--isolation",
+                                              "--metadata-file",
+                                              "--annotation",
+                                              "--attest",
+                                              "--security-opt",
+                                              "--format",
+                                              "--jobs",
+                                              "--os",
+                                              "--arch",
+                                              "--variant",
+                                              "--manifest",
+                                              "--authfile",
+                                              "--cert-dir",
+                                              "--creds",
+                                              "--allow",
+                                              "--call",
+                                              NULL};
+
+enum { SH_BUILD_TAGS = 16, SH_IMAGE_NEST = 16 };
+
+/* The repository of image word `i` whose value is unknown: the word up to
+ * the ':' of its tag (or '@' of a digest) after its last '/', outside
+ * $( ) ${ } and backticks, evaluated alone -- the repository is the image's
+ * identity, a tag of unknown value keeps it. NULL: no tag to cut, or the
+ * repository is unknown too. */
+static const char *sh_image_repo(sh_t *s, TSNode cmd, const sh_argv_t *a, int i) {
+    uint32_t b = a->span[(size_t)i * PAIR_LEN];
+    uint32_t e = a->span[(size_t)i * PAIR_LEN + SKIP_ONE];
+    char closers[SH_IMAGE_NEST];
+    int depth = 0;
+    uint32_t cut = 0;
+    for (uint32_t k = b; k < e; k++) {
+        char c = s->src[k];
+        bool open2 = k + SKIP_ONE < e && c == '$' &&
+                     (s->src[k + SKIP_ONE] == '(' || s->src[k + SKIP_ONE] == '{');
+        if (depth > 0 && c == closers[depth - SKIP_ONE]) {
+            depth--;
+        } else if ((open2 || c == '`') && depth < SH_IMAGE_NEST) {
+            closers[depth++] = c == '`' ? '`' : (s->src[k + SKIP_ONE] == '(' ? ')' : '}');
+            k += open2 ? SKIP_ONE : 0;
+        } else if (depth == 0 && c == '/') {
+            cut = 0;
+        } else if (depth == 0 && (c == ':' || c == '@') && cut == 0) {
+            cut = k;
+        }
+    }
+    if (cut == 0) {
+        return NULL;
+    }
+    TSNode w = ts_node_descendant_for_byte_range(cmd, b, e);
+    while (!ts_node_is_null(w) && (ts_node_start_byte(w) != b || ts_node_end_byte(w) != e)) {
+        w = ts_node_parent(w);
+    }
+    sh_str_t out = {0};
+    if (sh_type(w, "concatenation")) {
+        sh_concat(s, &out, w, b, cut, false);
+    } else if (sh_type(w, "string")) {
+        sh_concat(s, &out, w, b + SKIP_ONE, cut, true);
+    } else {
+        return NULL;
+    }
+    return sh_str_done(&out);
+}
+
+/* docker / podman / nerdctl [buildx | image | builder] build, buildah bud:
+ * each tagged image is built from the Dockerfile -f names (against the cwd),
+ * else <context>/Dockerfile -- one file of the repository. */
+static void sh_build(sh_t *s, TSNode cmd, const sh_argv_t *a) {
+    int p = sh_program(s, a);
+    const char *tool = p >= 0 && a->v[p] ? sh_basename(a->v[p]) : NULL;
+    int i = p + SKIP_ONE;
+    if (tool && strcmp(tool, "buildah") == 0) {
+        if (i >= a->n || !a->v[i] ||
+            !(sh_eq(a->v[i], "bud") || sh_eq(a->v[i], "build") ||
+              sh_eq(a->v[i], "build-using-dockerfile"))) {
+            return;
+        }
+        i++;
+    } else if (tool && (strcmp(tool, "docker") == 0 || strcmp(tool, "podman") == 0 ||
+                        strcmp(tool, "nerdctl") == 0)) {
+        if (i < a->n && sh_eq(a->v[i], "build")) {
+            i++;
+        } else if (i + SKIP_ONE < a->n &&
+                   (sh_eq(a->v[i], "buildx") || sh_eq(a->v[i], "image") ||
+                    sh_eq(a->v[i], "builder")) &&
+                   sh_eq(a->v[i + SKIP_ONE], "build")) {
+            i += PAIR_LEN;
+        } else {
+            return;
+        }
+    } else {
+        return;
+    }
+    if (s->hits->declarers) {
+        cbm_ht_set(s->hits->declarers, s->file, (void *)s->file);
+    }
+    int tags[SH_BUILD_TAGS];
+    const char *tag_vals[SH_BUILD_TAGS];
+    int nt = 0;
+    const char *dfile = NULL;
+    bool dfile_known = true;
+    const char *ctx = NULL;
+    bool ctx_seen = false;
+    for (; i < a->n; i++) {
+        const char *w = a->v[i];
+        if (w && (sh_eq(w, "-t") || sh_eq(w, "--tag")) && i + SKIP_ONE < a->n) {
+            if (nt < SH_BUILD_TAGS) {
+                tags[nt] = i + SKIP_ONE;
+                tag_vals[nt++] = a->v[i + SKIP_ONE];
+            }
+            i++;
+        } else if (w && (sh_eq(w, "-f") || sh_eq(w, "--file")) && i + SKIP_ONE < a->n) {
+            dfile = a->v[i + SKIP_ONE];
+            dfile_known = dfile != NULL;
+            i++;
+        } else if (w && strncmp(w, "--tag=", strlen("--tag=")) == 0) {
+            if (nt < SH_BUILD_TAGS && w[strlen("--tag=")]) {
+                tags[nt] = -SKIP_ONE;
+                tag_vals[nt++] = w + strlen("--tag=");
+            }
+        } else if (w && strncmp(w, "--file=", strlen("--file=")) == 0) {
+            dfile = w + strlen("--file=");
+        } else if (w && w[0] == '-') {
+            i += !strchr(w, '=') && sh_in(w, SH_BUILD_VALUED) ? SKIP_ONE : 0;
+        } else if (!ctx_seen) {
+            ctx_seen = true;
+            ctx = w;
+        }
+    }
+    if (nt == 0 || !ctx || !dfile_known || strcmp(ctx, "-") == 0 || strstr(ctx, "://") ||
+        strncmp(ctx, "git@", strlen("git@")) == 0) {
+        return;
+    }
+    const char *path = dfile ? dfile : sh_join(s->a, ctx, "Dockerfile");
+    int64_t id = 0;
+    const char *hit = path ? sh_unique_file(s, path, &id) : NULL;
+    for (int k = 0; hit && k < nt; k++) {
+        const char *img = tag_vals[k];
+        if (!img && tags[k] >= 0) {
+            img = sh_image_repo(s, cmd, a, tags[k]);
+        }
+        if (img && img[0]) {
+            sh_hit_push(s, cmd,
+                        (sh_hit_t){.via = "docker-build", .ext = img, .path = hit, .build = true});
+        }
+    }
+}
+
 static void sh_command(sh_t *s, TSNode cmd) {
     sh_walk_substs(s, cmd);
     sh_argv_t a = {0};
@@ -2166,6 +2343,7 @@ static void sh_command(sh_t *s, TSNode cmd) {
         sh_src_t out;
         sh_deploy_command(s, cmd, &a, NULL, &out);
         sh_spawn(s, cmd, &a);
+        sh_build(s, cmd, &a);
     }
     sh_argv_free(&a);
 }
@@ -2213,6 +2391,7 @@ static void sh_pipe_run(sh_t *s, TSNode n, sh_src_t *src) {
             *src = out;
         }
         sh_spawn(s, cmd, &a);
+        sh_build(s, cmd, &a);
         sh_argv_free(&a);
         sh_redirects(s, el);
     }
@@ -2418,10 +2597,11 @@ static void sh_walk(sh_t *s, TSNode n) {
 /* ── Files ─────────────────────────────────────────────────────────── */
 
 static bool sh_mentions_deploy_tool(const char *src, size_t n) {
-    static const char *const tools[] = {"kubectl", "helm", "kustomize"};
+    static const char *const tools[] = {"kubectl", "helm",    "kustomize", "docker",
+                                        "podman",  "buildah", "nerdctl"};
     for (size_t i = 0; i < n; i++) {
         char c = src[i] | ' ';
-        if (c != 'k' && c != 'h') {
+        if (!strchr("khdpbn", c)) {
             continue;
         }
         for (size_t t = 0; t < sizeof(tools) / sizeof(tools[0]); t++) {
@@ -3275,6 +3455,30 @@ static int sh_link_spawn(cbm_pipeline_ctx_t *ctx, int64_t src, const sh_hit_t *x
 }
 
 /* The edge hit `x` draws from source `src`; 1 when drawn. */
+/* An image a build command makes DEPENDS_ON {via:build} the Dockerfile
+ * it is built from (edges recomputed whole every run, as the image belongs
+ * to no file). */
+static int sh_link_build(cbm_pipeline_ctx_t *ctx, const sh_hit_t *x, CBMHashTable *modules) {
+    int64_t mod = (int64_t)(intptr_t)cbm_ht_get(modules, x->path);
+    int64_t img = mod > 0 ? cbm_pipeline_image_node(ctx, x->ext) : 0;
+    if (img <= 0) {
+        return 0;
+    }
+    char esc_file[CBM_SZ_1K];
+    char esc_img[CBM_SZ_1K];
+    char ci[CBM_SZ_1K];
+    char props[CBM_SZ_4K];
+    cbm_json_escape(esc_file, (int)sizeof(esc_file), x->file);
+    cbm_json_escape(esc_img, (int)sizeof(esc_img), x->ext);
+    sh_ci_props(x, ci, sizeof(ci));
+    snprintf(props, sizeof(props),
+             "{\"via\":\"build\",\"tool\":\"docker-build\",\"file\":\"%s\",\"image\":\"%s\"%s,"
+             "\"line\":%d}",
+             esc_file, esc_img, ci, x->line);
+    cbm_gbuf_insert_edge(ctx->gbuf, img, mod, "DEPENDS_ON", props);
+    return SKIP_ONE;
+}
+
 static int sh_link_hit(cbm_pipeline_ctx_t *ctx, const sh_hit_t *x, int64_t src,
                        CBMHashTable *modules) {
     if (x->spawn) {
@@ -3310,8 +3514,9 @@ static int sh_link(cbm_pipeline_ctx_t *ctx, const sh_hits_t *h) {
     for (int i = 0; i < h->count; i++) {
         const sh_hit_t *x = &h->items[i];
         cbm_ht_set(files, x->file, (void *)x->file);
-        if (x->spawn && x->tgt > 0) {
-            cbm_ht_set(files, x->path, (void *)x->path); /* a spawned script's Module */
+        if ((x->spawn && x->tgt > 0) || x->build) {
+            cbm_ht_set(files, x->path,
+                       (void *)x->path); /* a spawned script's / Dockerfile's Module */
         }
     }
     sh_span_t *spans = NULL;
@@ -3344,6 +3549,10 @@ static int sh_link(cbm_pipeline_ctx_t *ctx, const sh_hits_t *h) {
     sh_srcs_t twins = {0};
     for (int i = 0; i < h->count; i++) {
         const sh_hit_t *x = &h->items[i];
+        if (x->build) {
+            edges += sh_link_build(ctx, x, modules);
+            continue;
+        }
         twins.count = 0;
         int64_t one = sh_source(ctx, spans, n, modules, x->file, x->line, &twins);
         for (int k = 0; k < (twins.count ? twins.count : SKIP_ONE); k++) {
@@ -3433,39 +3642,97 @@ static CBMHashTable *sh_prow_files(cbm_pipeline_ctx_t *ctx) {
     return out;
 }
 
+/* One script, Makefile or CI configuration `rel` (on disk at `path`). */
+static void sh_pass_file(sh_pass_t *p, cbm_pipeline_ctx_t *ctx, CBMHashTable *prow, const char *rel,
+                         const char *path, CBMLanguage lang) {
+    bool ci = cbm_ci_path(rel) || (prow && cbm_ht_get(prow, rel));
+    if (lang != CBM_LANG_BASH && lang != CBM_LANG_MAKEFILE && !ci) {
+        return;
+    }
+    size_t len = 0;
+    char *src = sh_read(path, &len);
+    if (!src) {
+        return;
+    }
+    if (!p->ix_ready) {
+        p->ix_ready = true;
+        p->ix_ok = sh_index_build(p->ix, ctx);
+        p->parser = ts_parser_new();
+    }
+    if (p->ix_ok && p->parser) {
+        if (ci) {
+            sh_ci_file(p, rel, src, len);
+        } else if (lang == CBM_LANG_BASH) {
+            sh_script(p, rel, src, len);
+        } else {
+            sh_makefile(p, rel, src, len);
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, src);
+}
+
+/* Mark the File node of each file running a container build
+ * {"declares_build":true} -- resolved or not: an incremental run reads these
+ * files again, as the image build edges are recomputed whole
+ * (pipeline_incremental.c). The mark lives and dies with its file's node. */
+static void sh_mark_declarers(cbm_pipeline_ctx_t *ctx, CBMHashTable *declarers) {
+    static const char MARK[] = "\"declares_build\":true";
+    const cbm_gbuf_node_t **nodes = NULL;
+    int n = 0;
+    if (cbm_ht_count(declarers) == 0 ||
+        cbm_gbuf_find_by_label(ctx->gbuf, "File", &nodes, &n) != 0) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        cbm_gbuf_node_t *f = (cbm_gbuf_node_t *)nodes[i];
+        const char *props = f->properties_json ? f->properties_json : "{}";
+        if (!f->file_path || !cbm_ht_get(declarers, f->file_path) || strstr(props, MARK)) {
+            continue;
+        }
+        size_t pl = strlen(props);
+        char buf[CBM_SZ_4K];
+        bool empty = pl < PAIR_LEN || strcmp(props, "{}") == 0;
+        if (props[pl - SKIP_ONE] != '}' || pl + sizeof(MARK) + PAIR_LEN > sizeof(buf)) {
+            continue;
+        }
+        snprintf(buf, sizeof(buf), "%.*s%s%s}", (int)(pl - SKIP_ONE), empty ? "{" : props,
+                 empty ? "" : ",", MARK);
+        (void)cbm_gbuf_node_set_properties_json(f, buf);
+    }
+}
+
 void cbm_pipeline_pass_shell(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                              int file_count) {
     sh_index_t ix = {0};
     sh_hits_t hits = {0};
     cbm_arena_init(&hits.arena);
+    hits.declarers = cbm_ht_create(0);
     sh_pass_t p = {.ix = &ix, .hits = &hits, .parser = NULL};
     CBMHashTable *prow = sh_prow_files(ctx);
+    CBMHashTable *seen = ctx->build_decl_count > 0 ? cbm_ht_create(0) : NULL;
     for (int i = 0; i < file_count; i++) {
-        CBMLanguage lang = files[i].language;
-        bool ci = cbm_ci_path(files[i].rel_path) || (prow && cbm_ht_get(prow, files[i].rel_path));
-        if (lang != CBM_LANG_BASH && lang != CBM_LANG_MAKEFILE && !ci) {
+        if (seen) {
+            cbm_ht_set(seen, files[i].rel_path, (void *)files[i].rel_path);
+        }
+        sh_pass_file(&p, ctx, prow, files[i].rel_path, files[i].path, files[i].language);
+    }
+    /* An incremental run recomputes every image's build edges: the unchanged
+     * files that declared builds before are read again (pipeline_incremental.c). */
+    for (int i = 0; seen && ctx->repo_path && i < ctx->build_decl_count; i++) {
+        const char *rel = ctx->build_decl_files[i];
+        if (!rel || cbm_ht_get(seen, rel)) {
             continue;
         }
-        size_t len = 0;
-        char *src = sh_read(files[i].path, &len);
-        if (!src) {
-            continue;
-        }
-        if (!p.ix_ready) {
-            p.ix_ready = true;
-            p.ix_ok = sh_index_build(&ix, ctx);
-            p.parser = ts_parser_new();
-        }
-        if (p.ix_ok && p.parser) {
-            if (ci) {
-                sh_ci_file(&p, files[i].rel_path, src, len);
-            } else if (lang == CBM_LANG_BASH) {
-                sh_script(&p, files[i].rel_path, src, len);
-            } else {
-                sh_makefile(&p, files[i].rel_path, src, len);
-            }
-        }
-        cbm_free(CBM_MEM_CLASS_OTHER, src);
+        cbm_ht_set(seen, rel, (void *)rel);
+        const char *slash = strrchr(rel, '/');
+        CBMLanguage lang = cbm_language_for_filename(slash ? slash + SKIP_ONE : rel);
+        char path[CBM_SZ_4K];
+        snprintf(path, sizeof(path), "%s/%s", ctx->repo_path, rel);
+        sh_pass_file(&p, ctx, prow, rel, path,
+                     lang == CBM_LANG_MAKEFILE ? CBM_LANG_MAKEFILE : CBM_LANG_BASH);
+    }
+    if (seen) {
+        cbm_ht_free(seen);
     }
     if (prow) {
         cbm_ht_free(prow);
@@ -3474,6 +3741,10 @@ void cbm_pipeline_pass_shell(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
         sh_make_resolve(&p, ctx, &hits);
     }
     int edges = hits.count > 0 ? sh_link(ctx, &hits) : 0;
+    if (hits.declarers) {
+        sh_mark_declarers(ctx, hits.declarers);
+        cbm_ht_free(hits.declarers);
+    }
     if (p.parser) {
         ts_parser_delete(p.parser);
     }

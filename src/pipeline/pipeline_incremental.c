@@ -1164,6 +1164,28 @@ static bool incr_edge_type_is_recomputed(const char *type) {
                     strcmp(type, "FILE_CHANGES_WITH") == 0 || strcmp(type, "DATA_FLOWS") == 0);
 }
 
+/* The files whose File node the shell pass marked as running a container
+ * build (pass_shell.c), from the full-load buffer, into arena `a`; returns
+ * how many. */
+static int incr_build_decl_files(const cbm_gbuf_t *gb, CBMArena *a, const char ***out) {
+    const cbm_gbuf_node_t **nodes = NULL;
+    int n = 0;
+    *out = NULL;
+    if (cbm_gbuf_find_by_label(gb, "File", &nodes, &n) != 0 || n == 0) {
+        return 0;
+    }
+    const char **items = cbm_arena_alloc(a, (size_t)n * sizeof(*items));
+    int k = 0;
+    for (int i = 0; items && i < n; i++) {
+        const char *p = nodes[i]->properties_json;
+        if (nodes[i]->file_path && p && strstr(p, "\"declares_build\":true")) {
+            items[k++] = cbm_arena_strdup(a, nodes[i]->file_path);
+        }
+    }
+    *out = items;
+    return k;
+}
+
 /* cbm_gbuf_foreach_edge visitor: snapshot inbound cross-file edges into
  * changed files so they survive the purge and can be re-linked afterward. */
 static void incr_capture_inbound_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
@@ -2857,6 +2879,10 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     cbm_doc_link_row_t *doc_rows = NULL;
     int doc_row_count = 0;
     bool doc_failed = false;
+    CBMArena decl_arena; /* the files that declared image builds before */
+    cbm_arena_init_lazy(&decl_arena, CBM_SZ_4K);
+    const char **decl_files = NULL;
+    int decl_count = 0;
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (cbm_delta_stage_clone(db_path, &stage) != 0) {
@@ -2869,6 +2895,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         goto out;
     }
     cbm_log_info("delta.staging_open", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    /* before the purge drops any of their edges */
+    decl_count = cbm_delta_build_decl_files(staging, project, &decl_arena, &decl_files);
+    decl_count = decl_count > 0 ? decl_count : 0;
 
     /* Purge set = closure files + deleted files. */
     int purge_count = ci + deleted_count;
@@ -3052,6 +3081,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         .excluded_count = excluded_count,
         .doc_link_base = doc_base,
         .doc_link_base_count = doc_base_count,
+        .build_decl_files = decl_files,
+        .build_decl_count = decl_count,
     };
     for (int i = 0; i < ci; i++) {
         char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
@@ -3306,6 +3337,7 @@ out:
 #endif
     }
     cbm_delta_free_snapshot(snapshot, snapshot_count);
+    cbm_arena_destroy(&decl_arena);
     surface_name_set_free(stale_surface_set);
     cbm_doclinks_free_scopes(doc_base, doc_base_count);
     cbm_doclinks_free_rows(doc_fresh, doc_fresh_count);
@@ -3641,6 +3673,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * the skaffold / compose file declaring them, not to either end: the K8s
      * pass recomputes them all from every build file, so none is kept (nor
      * captured below). */
+    CBMArena decl_arena; /* the files that declared image builds before */
+    cbm_arena_init_lazy(&decl_arena, CBM_SZ_4K);
+    const char **decl_files = NULL;
+    int decl_count = incr_build_decl_files(existing, &decl_arena, &decl_files);
     (void)cbm_gbuf_delete_edges_from_label(existing, CBM_BUILD_EDGE_TYPE, CBM_BUILD_EDGE_SOURCE);
 
     /* Snapshot inbound cross-file edges into changed files BEFORE purging, so
@@ -3734,6 +3770,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
     }
 
+    ctx.build_decl_files = decl_files;
+    ctx.build_decl_count = decl_count;
     int phase_rc = run_extract_resolve(&ctx, changed_files, ci, NULL);
     if (phase_rc == 0) {
         phase_rc = cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
@@ -3780,6 +3818,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free_mode_skipped(mode_skipped, mode_skipped_count);
         free(saved_adr);
         cbm_gbuf_free(existing);
+        cbm_arena_destroy(&decl_arena);
         legacy_doc_free(&legacy_doc);
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
@@ -3892,6 +3931,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free_mode_skipped(mode_skipped, mode_skipped_count);
         free(saved_adr);
         cbm_gbuf_free(existing);
+        cbm_arena_destroy(&decl_arena);
         cbm_doclinks_free_rows(doc_rows, doc_row_count);
         return manifest_rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT
                                                           : CBM_PIPELINE_ABORT_PRESERVE_DB;
@@ -3931,6 +3971,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
+    cbm_arena_destroy(&decl_arena);
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));
     return persist_rc;

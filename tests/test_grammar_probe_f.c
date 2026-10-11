@@ -2176,6 +2176,35 @@ TEST(probe_compose_services_are_resources) {
     PASS();
 }
 
+/* A container build command (docker / podman [buildx] build, in a script or
+ * a Make recipe) builds each tagged image from the Dockerfile -f names
+ * (against the cwd), else <context>/Dockerfile. A tag of unknown value keeps
+ * its repository ($(TAG), $VERSION; a registry port is no tag); an unknown
+ * context, or another docker command, is no build. */
+TEST(probe_shell_docker_builds_build_images) {
+    static const GpfFile files[] = {
+        {"Dockerfile", "FROM alpine:3.20\n"},
+        {"svc/Dockerfile", "FROM golang:1.22\n"},
+        {"Makefile", "DOCKER_REPO ?= quay.io/acme\nTAG ?= $(shell git describe --tags)\n\n"
+                     "image:\n\tdocker build --label a=b -t $(DOCKER_REPO)/app:$(TAG) .\n"},
+        {"build.sh",
+         "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+         "docker buildx build --platform linux/amd64 --tag ghcr.io/acme/svc:1 -f svc/Dockerfile .\n"
+         "podman build -t \"localhost:5000/team/x:$VERSION\" svc\n"
+         "docker build -t unknown-ctx $CTX\ndocker run -t nope .\n"}};
+    char *got = gpf_builds(files, 4);
+    static const char want[] = "ghcr.io/acme/svc -> svc/Dockerfile (docker-build)\n"
+                               "localhost:5000/team/x -> svc/Dockerfile (docker-build)\n"
+                               "quay.io/acme/app -> Dockerfile (docker-build)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "builds got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("docker build DEPENDS_ON {via:build} edge set");
+    }
+    free(got);
+    PASS();
+}
+
 #define GPF_CM(name) "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " name "\n"
 #define GPF_KUST "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
 
@@ -4445,6 +4474,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_container_images_are_images);
     RUN_TEST(probe_build_configs_build_images_from_dockerfiles);
     RUN_TEST(probe_compose_services_are_resources);
+    RUN_TEST(probe_shell_docker_builds_build_images);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
     RUN_TEST(probe_shell_helm_deploys_its_chart);

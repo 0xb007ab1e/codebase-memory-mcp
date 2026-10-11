@@ -283,6 +283,48 @@ int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const c
     return rc == SQLITE_DONE ? sqlite3_changes(db) : CBM_NOT_FOUND;
 }
 
+int cbm_delta_build_decl_files(cbm_store_t *store, const char *project, CBMArena *a,
+                               const char ***out) {
+    *out = NULL;
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT file_path FROM nodes WHERE project = ?1 AND label = 'File'"
+                           " AND json_extract(properties, '$.declares_build') = 1",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    int n = 0;
+    int cap = 0;
+    const char **items = NULL;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *f = (const char *)sqlite3_column_text(stmt, 0);
+        if (!f) {
+            continue;
+        }
+        if (n == cap) {
+            int ncap = cap ? cap * PAIR_LEN : CBM_SZ_16;
+            const char **grown = cbm_arena_alloc(a, (size_t)ncap * sizeof(*grown));
+            if (!grown) {
+                break;
+            }
+            if (n) {
+                memcpy((void *)grown, items, (size_t)n * sizeof(*grown));
+            }
+            items = grown;
+            cap = ncap;
+        }
+        items[n++] = cbm_arena_strdup(a, f);
+    }
+    sqlite3_finalize(stmt);
+    *out = items;
+    return n;
+}
+
 int cbm_delta_drop_edges_from_label(cbm_store_t *store, const char *project, const char *type,
                                     const char *label) {
     sqlite3 *db = cbm_store_get_db(store);

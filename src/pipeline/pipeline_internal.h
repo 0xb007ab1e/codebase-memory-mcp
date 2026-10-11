@@ -314,6 +314,11 @@ void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
 typedef struct {
     const char *project_name; /* borrowed from pipeline */
     const char *repo_path;    /* borrowed from pipeline */
+    /* An incremental run: the unchanged files whose earlier run declared
+     * image builds (docker build ...), read again by the shell pass, as
+     * those edges are recomputed whole. Borrowed; NULL in a full run. */
+    const char *const *build_decl_files;
+    int build_decl_count;
     cbm_gbuf_t *gbuf;         /* owned by pipeline */
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
@@ -1353,6 +1358,12 @@ int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const c
  * between pre-existing nodes. */
 #define CBM_BUILD_EDGE_TYPE "DEPENDS_ON"
 #define CBM_BUILD_EDGE_SOURCE "Image"
+
+/* The files whose File node the shell pass marked as running a container
+ * build ({"declares_build":true}), into arena `a`; returns how many, or -1
+ * on failure. */
+int cbm_delta_build_decl_files(cbm_store_t *store, const char *project, CBMArena *a,
+                               const char ***out);
 
 /* Delete the project's `type` edges whose source node has label `label`;
  * returns how many, or -1 on failure. */

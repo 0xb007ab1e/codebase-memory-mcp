@@ -3698,6 +3698,97 @@ TEST(incremental_compose_dotenv_change_rebuilds) {
     PASS();
 }
 
+/* Editing a Dockerfile keeps the build edge an unchanged script declares
+ * for it: image build edges are recomputed whole, so the files that declared
+ * builds before are read again. `legacy`: through the full-load route, else
+ * the closure-repair route. Returns "full=N inc=M", or NULL. */
+static char *incremental_docker_build_keep(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dockerbuild_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n");
+    write_temp_file(tmp, "build.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\ndocker build -t ghcr.io/acme/svc:1 svc\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/dockerbuild.db", tmp);
+    static const char builds[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id WHERE e.type='DEPENDS_ON' "
+        "AND s.label='Image' AND json_extract(e.properties,'$.tool')='docker-build'";
+    int full = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, builds) : -1;
+    write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n# edited\n");
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    char *out = NULL;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "full=%d inc=%d", full, k8s_inc_count(db_path, builds));
+        out = strdup(buf);
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return out;
+}
+
+TEST(incremental_dockerfile_edit_keeps_docker_build_edges) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    char *got = incremental_docker_build_keep(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "full=1 inc=1");
+    free(got);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    got = incremental_docker_build_keep(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "full=1 inc=1");
+    free(got);
+#endif
+    PASS();
+}
+
+/* Two files build the same image from one Dockerfile: deleting the one
+ * the edge happened to record keeps the edge -- the other file still
+ * declares it, and it is read again (its File node carries the mark). */
+TEST(incremental_second_build_declarer_keeps_the_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_twodecl_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n");
+    write_temp_file(tmp, "a.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+                                 "docker build -t ghcr.io/acme/svc:1 svc\n");
+    write_temp_file(tmp, "b.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+                                 "docker build -t ghcr.io/acme/svc:2 svc\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/twodecl.db", tmp);
+    static const char builds[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id WHERE e.type='DEPENDS_ON' "
+        "AND s.label='Image' AND json_extract(e.properties,'$.tool')='docker-build'";
+    int full = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, builds) : -1;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/a.sh", tmp);
+    (void)remove(path);
+    int rc_a = k8s_inc_index(tmp, db_path);
+    int after_a = k8s_inc_count(db_path, builds);
+    snprintf(path, sizeof(path), "%s/b.sh", tmp);
+    (void)remove(path);
+    int rc_b = k8s_inc_index(tmp, db_path);
+    int after_b = k8s_inc_count(db_path, builds);
+    th_rmtree(tmp);
+    ASSERT_EQ(full, 1);
+    ASSERT_EQ(rc_a, 0);
+    ASSERT_EQ(after_a, 1);
+    ASSERT_EQ(rc_b, 0);
+    ASSERT_EQ(after_b, 0);
+    PASS();
+}
+
 TEST(incremental_deleted_dockerfile_drops_its_image) {
     cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
     int left = incremental_dockerfile_delete(false, &route);
@@ -19341,6 +19432,8 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);
     RUN_TEST(incremental_compose_edit_replaces_build_edges);
     RUN_TEST(incremental_compose_dotenv_change_rebuilds);
+    RUN_TEST(incremental_dockerfile_edit_keeps_docker_build_edges);
+    RUN_TEST(incremental_second_build_declarer_keeps_the_edge);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);
