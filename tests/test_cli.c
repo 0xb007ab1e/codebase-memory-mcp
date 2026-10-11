@@ -1572,14 +1572,13 @@ TEST(cli_install_recovers_markerless_stale_rendezvous) {
  * install under test and asks the daemon itself afterwards. */
 #define CLI_SCOPE_HOST_DRAINED 3
 #define CLI_SCOPE_TIMEOUT_MS 5000U
-/* Generous, BOUNDED waits so a wedged host child (a fork-time sanitizer
- * allocator stall is the classic cause — see the posix_spawn fix history)
- * fails the test cleanly instead of hanging the whole suite to the CI
- * wall-clock kill. Each comfortably exceeds the child's own 45 s cohort
- * admission deadline plus a multi-second service start/teardown, so none trips
- * for a merely slow-but-healthy runner; they only convert an otherwise
- * unbounded hang into a deterministic pass/fail. */
-#define CLI_SCOPE_READY_TIMEOUT_MS 90000U
+/* The host child's readiness has NO deadline (USER RULE: no timeout decides a
+ * test). The child answers 'R' or 'E', or the pipe reaches EOF when it dies,
+ * and the fixture names the failing step in every case. A child that wedges
+ * before answering is left to the harness's per-suite ceiling. A 90 s bound
+ * used to decide this wait, and on a starved machine (2026-10-09, during a
+ * kernel index) ASSERT(ready) failed with nothing in the log to say why.
+ * Generous, bounded waits remain for reaping and status probes below. */
 #define CLI_SCOPE_HOST_REAP_TIMEOUT_MS 60000U
 #define CLI_SCOPE_HOST_SERVING_TIMEOUT_MS 15000U
 /* Teardown budget for a child the activation ALREADY drained: its service is
@@ -1621,6 +1620,7 @@ typedef struct {
     char *old_home;
     char *old_cache;
     char *old_shell;
+    char failed_step[160]; /* the setup step that failed, "" when ready */
 } cli_scope_fixture_t;
 
 static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, int ready_fd,
@@ -1632,9 +1632,12 @@ static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, i
     cbm_version_cohort_lease_t *lease = NULL;
     cbm_daemon_conflict_t conflict;
     cbm_daemon_runtime_service_t *service = NULL;
-    bool admitted = endpoint && manager &&
-                    cbm_version_cohort_acquire(manager, &fixture->identity, cbm_now_ms() + 45000U,
-                                               &lease, &conflict) == CBM_VERSION_COHORT_OK;
+    int acquire_status = -1;
+    if (endpoint && manager) {
+        acquire_status = (int)cbm_version_cohort_acquire(manager, &fixture->identity,
+                                                         cbm_now_ms() + 45000U, &lease, &conflict);
+    }
+    bool admitted = acquire_status == (int)CBM_VERSION_COHORT_OK;
     if (admitted) {
         cbm_daemon_runtime_service_config_t config = {
             .endpoint = endpoint,
@@ -1654,6 +1657,16 @@ static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, i
     }
     bool ready_ok =
         service && cbm_daemon_runtime_service_state(service) == CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+    if (!ready_ok) {
+        /* The parent sees only 'E'; say here which step it was. */
+        const char *step = !endpoint   ? "creating the endpoint"
+                           : !manager  ? "creating the cohort manager"
+                           : !admitted ? "joining the version cohort"
+                           : !service  ? "starting the runtime service"
+                                       : "reaching the running state";
+        (void)fprintf(stderr, "cli scope host: setup failed at %s (cohort status %d)\n", step,
+                      acquire_status);
+    }
     char ready = ready_ok ? 'R' : 'E';
     (void)write(ready_fd, &ready, 1);
     close(ready_fd);
@@ -1701,30 +1714,11 @@ static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, i
     _exit(!ready_ok ? 1 : drained ? CLI_SCOPE_HOST_DRAINED : 0);
 }
 
-/* Bounded read of the host child's one-byte readiness signal. A child that
- * deadlocks before it can write (a fork-time allocator stall under a sanitizer
- * is the classic cause) must never hang the whole suite on an unbounded read:
- * poll to a generous deadline, then let the caller's ASSERT_TRUE(ready) fail
- * cleanly. Returns the byte, or 0 when the child died, closed the pipe, or
- * never answered in time. */
-static char cli_scope_wait_ready(int fd, uint32_t timeout_ms) {
-    uint64_t deadline = cbm_now_ms() + timeout_ms;
+/* Read the host child's one-byte readiness signal, with no deadline: the
+ * answer is 'R', 'E', or EOF when the child is gone (see
+ * CLI_SCOPE_TIMEOUT_MS). Returns the byte, or 0 on EOF or a read error. */
+static char cli_scope_wait_ready(int fd) {
     for (;;) {
-        int64_t remaining = (int64_t)deadline - (int64_t)cbm_now_ms();
-        if (remaining <= 0) {
-            return 0;
-        }
-        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
-        int r = poll(&pfd, 1, (int)remaining);
-        if (r < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return 0;
-        }
-        if (r == 0) {
-            return 0; /* deadline reached with no signal */
-        }
         char ready = 0;
         ssize_t got = read(fd, &ready, 1);
         if (got == 1) {
@@ -1735,6 +1729,20 @@ static char cli_scope_wait_ready(int fd, uint32_t timeout_ms) {
         }
         return 0; /* EOF (child gone) or error */
     }
+}
+
+/* Records which setup step failed and says so on stderr, so the caller's
+ * ASSERT_TRUE(ready) is never a silent failure. Returns false. */
+static bool cli_scope_setup_failed(cli_scope_fixture_t *fixture, const char *tag, const char *step,
+                                   int os_error) {
+    snprintf(fixture->failed_step, sizeof(fixture->failed_step), "%s", step);
+    if (os_error != 0) {
+        (void)fprintf(stderr, "cli scope fixture %s: setup failed at %s: %s\n", tag, step,
+                      strerror(os_error));
+    } else {
+        (void)fprintf(stderr, "cli scope fixture %s: setup failed at %s\n", tag, step);
+    }
+    return false;
 }
 
 /* Reap the host child within a bound: the release signal makes a healthy child
@@ -1769,7 +1777,7 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     fixture->release_fd = -1;
     snprintf(fixture->tmpdir, sizeof(fixture->tmpdir), "/tmp/cli-guard-scope-%s-XXXXXX", tag);
     if (!cbm_mkdtemp(fixture->tmpdir)) {
-        return false;
+        return cli_scope_setup_failed(fixture, tag, "creating the fixture directory", errno);
     }
     snprintf(fixture->runtime_parent, sizeof(fixture->runtime_parent), "%s/runtime",
              fixture->tmpdir);
@@ -1782,12 +1790,14 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     char canonical_cache[1024];
     if (test_mkdirp(fixture->runtime_parent) != 0 || !cbm_mkdir_p(fixture->host_cache, 0700) ||
         !cbm_canonical_path(fixture->host_cache, canonical_cache, sizeof(canonical_cache))) {
-        return false;
+        return cli_scope_setup_failed(fixture, tag, "creating the host directories", errno);
     }
     cbm_normalize_path_sep(canonical_cache);
     cbm_sha256_hex(canonical_cache, strlen(canonical_cache), fixture->host_cache_fingerprint);
     if (!cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), fixture->self_build)) {
-        return false;
+        /* Fails when the runner's file no longer matches its running image,
+         * e.g. a rebuild replaced it mid-run. */
+        return cli_scope_setup_failed(fixture, tag, "fingerprinting the runner's own image", 0);
     }
     /* The guard claims the supervisor's captured build; the runner stubs that
      * capture while a runtime service must carry the real image hash. Align
@@ -1807,14 +1817,16 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     int ready_pipe[2] = {-1, -1};
     int release_pipe[2] = {-1, -1};
     if (pipe(ready_pipe) != 0) {
-        return false;
+        return cli_scope_setup_failed(fixture, tag, "creating the readiness pipe", errno);
     }
     if (pipe(release_pipe) != 0) {
+        int pipe_error = errno;
         close(ready_pipe[0]);
         close(ready_pipe[1]);
-        return false;
+        return cli_scope_setup_failed(fixture, tag, "creating the release pipe", pipe_error);
     }
     pid_t child = fork();
+    int fork_error = child < 0 ? errno : 0;
     if (child == 0) {
         close(ready_pipe[0]);
         close(release_pipe[1]);
@@ -1822,7 +1834,7 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     }
     close(ready_pipe[1]);
     close(release_pipe[0]);
-    char ready = child > 0 ? cli_scope_wait_ready(ready_pipe[0], CLI_SCOPE_READY_TIMEOUT_MS) : 0;
+    char ready = child > 0 ? cli_scope_wait_ready(ready_pipe[0]) : 0;
     bool host_ready = ready == 'R';
     close(ready_pipe[0]);
     fixture->host = child;
@@ -1831,8 +1843,15 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     const char *shell = getenv("SHELL");
     fixture->old_shell = shell ? strdup(shell) : NULL;
     cbm_setenv("SHELL", "/bin/zsh", 1);
+    if (child < 0) {
+        return cli_scope_setup_failed(fixture, tag, "forking the host", fork_error);
+    }
     if (!host_ready) {
-        return false;
+        return cli_scope_setup_failed(fixture, tag,
+                                      ready == 'E'
+                                          ? "starting the host (its own line names the step)"
+                                          : "starting the host, which exited before answering",
+                                      0);
     }
     fixture->endpoint = cbm_daemon_bootstrap_endpoint_new(fixture->runtime_parent);
     cbm_daemon_runtime_connect_result_t connect_result = {0};
@@ -1840,7 +1859,13 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
                           ? cbm_daemon_runtime_client_connect(fixture->endpoint, &fixture->identity,
                                                               CLI_SCOPE_TIMEOUT_MS, &connect_result)
                           : NULL;
-    return fixture->client != NULL;
+    if (!fixture->client) {
+        return cli_scope_setup_failed(fixture, tag,
+                                      fixture->endpoint ? "connecting the parent's client"
+                                                        : "creating the parent's endpoint",
+                                      0);
+    }
+    return true;
 }
 
 static bool cli_scope_host_serving_within(const cli_scope_fixture_t *fixture, uint32_t timeout_ms) {
@@ -2040,6 +2065,18 @@ TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing) {
     ASSERT_EQ(host_exit, 0);
     ASSERT_TRUE(completed);
     ASSERT_TRUE(nothing_drained);
+    PASS();
+}
+
+/* 2026-10-09: ASSERT(ready) failed with nothing in the log, so which setup
+ * step broke was unknowable. The fixture now names the step it stopped at. A
+ * tag naming a missing directory makes its own mkdtemp fail deterministically;
+ * nothing is created, so there is nothing to finish. */
+TEST(cli_scope_fixture_names_its_failing_setup_step) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "no-such-parent/x");
+    ASSERT_FALSE(ready);
+    ASSERT_STR_EQ(fixture.failed_step, "creating the fixture directory");
     PASS();
 }
 
@@ -17902,6 +17939,7 @@ SUITE(cli) {
     RUN_TEST(cli_install_binary_into_foreign_home_never_drains_host_cohort);
     RUN_TEST(cli_install_into_host_namespace_still_drains_host_cohort);
     RUN_TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing);
+    RUN_TEST(cli_scope_fixture_names_its_failing_setup_step);
     RUN_TEST(cli_install_foreign_home_unreadable_cohort_cache_keeps_host_daemon);
     RUN_TEST(cli_install_foreign_home_busy_cohort_keeps_host_daemon);
 #endif
