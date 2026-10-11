@@ -1738,6 +1738,44 @@ static char *gpf_deploys(const GpfFile *files, int nfiles) {
         free(got_);                                                                                \
     } while (0)
 
+/* Every SPAWNS edge a script or recipe draws (api=shell) as "source ->
+ * program", sorted, one per line; top-level code as "@<file>". */
+static char *gpf_spawns(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT DISTINCT "
+            "CASE WHEN s.label IN ('Module','File') THEN '@' || s.file_path ELSE s.name END "
+            "|| ' -> ' || t.name AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='SPAWNS' AND t.label='Process' "
+            "AND json_extract(e.properties,'$.api')='shell' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+#define GPF_ASSERT_SPAWNS(files, n, want)                                                          \
+    do {                                                                                           \
+        char *got_ = gpf_spawns(files, n);                                                         \
+        if (!got_ || strcmp(got_, want) != 0) {                                                    \
+            fprintf(stderr, "SPAWNS got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want);         \
+            free(got_);                                                                            \
+            FAIL("SPAWNS edge set");                                                               \
+        }                                                                                          \
+        free(got_);                                                                                \
+    } while (0)
+
 #define GPF_CM(name) "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " name "\n"
 #define GPF_KUST "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
 
@@ -1859,6 +1897,80 @@ TEST(probe_shell_paths_follow_the_script) {
                        "@apps/web/deploy.sh -> File:apps/web/sub/cm.yaml (kubectl)\n"
                        "deploy -> File:apps/web/service.yaml (kubectl)\n"
                        "unique -> File:apps/web/deployment.yaml (kubectl)");
+    PASS();
+}
+
+/* A program a script starts by a path SPAWNS the Process of its name: from
+ * a value, or a literal last segment after an unknown prefix; inside $( )
+ * and < <( ) too; past a wrapper. Not a script of the repository, not
+ * `command -v X` (a lookup, not a run). */
+TEST(probe_shell_programs_by_path_spawn) {
+    static const GpfFile files[] = {
+        {"hack/lib.sh", "#!/bin/sh\necho lib\n"},
+        {"hack/run.sh",
+         "#!/usr/bin/env bash\n"
+         "cd \"$(dirname \"$0\")/..\"\n"
+         "./_build/kubermatic-installer deploy kubermatic-master --config x.yaml\n"
+         "\"${INSTALL_DIR}/kubermatic-installer\" deploy seed-mla\n"
+         "./hack/lib.sh\n"
+         "if command -v bin/checker >/dev/null; then echo ok; fi\n"
+         "version=$(bin/werf version)\n"
+         "retry 3 /usr/local/bin/helm version\n"
+         "while read -r l; do echo \"$l\"; done < <(./bin/lister --all)\n"
+         "run() { bin/tool --flag; }\n"}};
+    GPF_ASSERT_SPAWNS(files, 2,
+                      "@hack/run.sh -> helm\n"
+                      "@hack/run.sh -> kubermatic-installer\n"
+                      "@hack/run.sh -> lister\n"
+                      "@hack/run.sh -> werf\n"
+                      "run -> tool");
+    PASS();
+}
+
+/* Make recipes start programs by path as well: through a variable whose
+ * prefix is unknown ($(GOBIN)/controller-gen); in a rule tree-sitter-make
+ * leaves inside an ERROR (an indented, nested ifeq before it), with a
+ * variable assigned after the conditionals; and line by line where the
+ * grammar runs one recipe_line over several lines (a quote opened in
+ * "Don't" and closed lines later) -- there a repository script stays out. */
+TEST(probe_make_programs_by_path_spawn) {
+    static const GpfFile files[] = {
+        {"a/tools/validate.sh", "#!/bin/sh\necho ok\n"},
+        {"a/Makefile", "check:\n"
+                       "\t@docker run --rm img -f $(file)\n"
+                       "\t@./tools/validate.sh\n"
+                       "\t@./_build/tool run\n"
+                       "\t@echo \"Don't forget\"\n"
+                       "\tdocker run --rm img -c \"/app/check.sh 2>/dev/null | sed '/Checking all "
+                       "the pages/ d; /^Maybe wrong/d' | sort -u\"\n"},
+        {"b/Makefile", "LOCALBIN ?= $(shell pwd)/bin\n\n"
+                       "envs:\n"
+                       "  ifeq ($(A),)\n"
+                       " \t\texport A=1\n"
+                       "  endif\n"
+                       "  ifeq ($(B),)\n"
+                       "\t\tifeq ($(C),)\n"
+                       "\t\t\texport B := $(C)\n"
+                       "\t\telse\n"
+                       "\t\t\texport B := x\n"
+                       "\t\tendif\n"
+                       " \tendif\n\n"
+                       "\texport R := $(B)\n\n"
+                       "TOOL ?= $(LOCALBIN)/lint-tool\n\n"
+                       "build: envs\n"
+                       "\tbin/werf build\n"
+                       "\t$(TOOL) run\n"},
+        {"c/Makefile", "GOBIN ?= $(shell go env GOPATH)/bin\n"
+                       "CONTROLLER_GEN = $(GOBIN)/controller-gen\n\n"
+                       "generate:\n"
+                       "\t$(CONTROLLER_GEN) object paths=./...\n\n"
+                       "probe:\n"
+                       "\t@command -v bin/checker >/dev/null || echo missing\n"}};
+    GPF_ASSERT_SPAWNS(files, 4,
+                      "build -> lint-tool\n"
+                      "build -> werf\n"
+                      "check -> tool\n"
+                      "generate -> controller-gen");
     PASS();
 }
 
@@ -3575,6 +3687,8 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_shell_helm_deploys_its_chart);
     RUN_TEST(probe_shell_paths_follow_the_script);
     RUN_TEST(probe_make_recipes_deploy);
+    RUN_TEST(probe_shell_programs_by_path_spawn);
+    RUN_TEST(probe_make_programs_by_path_spawn);
     RUN_TEST(probe_helm_templated_objects_are_resources);
     RUN_TEST(probe_helm_include_resolves_in_the_chart_family);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);

@@ -16,6 +16,11 @@
  *   helm template [NAME] CHART | ... | kubectl apply -f -
  *   find D -name G -exec kubectl apply -f {} \;    D's manifests matching G
  *
+ * A program started by a path (./_build/kubermatic-installer, ${DIR}/x,
+ * $(LOCALBIN)/controller-gen) SPAWNS the Process of its name, as
+ * pass_spawns.c draws a call that starts a program; a path naming a file of
+ * the repository is a script of its own and not linked here.
+ *
  * Words are evaluated by constant propagation over the script, nothing is
  * executed: assignments (local / export / readonly / declare, arrays and
  * "${a[@]}"), ${X:-default}, $0 / BASH_SOURCE, $(dirname ..), $(basename ..),
@@ -362,6 +367,7 @@ typedef struct {
     const char *ext;  /* pass-arena */
     const char *path; /* pass-arena: the deployed path or chart */
     bool chart;
+    bool spawn; /* SPAWNS the Process `ext`, not DEPLOYS */
 } sh_hit_t;
 
 typedef struct {
@@ -764,6 +770,7 @@ static const char *sh_absolute(sh_t *s, const char *v) {
 typedef struct {
     const char **v;
     bool *split;
+    uint32_t *span; /* source bytes of the word: [2i] start, [2i+1] end */
     int n;
     int cap;
 } sh_argv_t;
@@ -773,6 +780,7 @@ static void sh_argv_build(sh_t *s, TSNode cmd, sh_argv_t *out);
 static void sh_argv_free(sh_argv_t *a) {
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)a->v);
     cbm_free(CBM_MEM_CLASS_OTHER, a->split);
+    cbm_free(CBM_MEM_CLASS_OTHER, a->span);
     *a = (sh_argv_t){0};
 }
 
@@ -985,7 +993,7 @@ static bool sh_may_split(TSNode w) {
     return false;
 }
 
-static void sh_argv_push(sh_argv_t *a, const char *v, bool split) {
+static void sh_argv_push(sh_argv_t *a, const char *v, bool split, uint32_t b, uint32_t e) {
     if (a->n >= a->cap) {
         int ncap = a->cap ? a->cap * PAIR_LEN : SH_GROW_MIN;
         const char **nv =
@@ -999,27 +1007,37 @@ static void sh_argv_push(sh_argv_t *a, const char *v, bool split) {
             return;
         }
         a->split = ns;
+        uint32_t *nsp =
+            cbm_realloc(CBM_MEM_CLASS_OTHER, a->span, (size_t)ncap * PAIR_LEN * sizeof(*nsp));
+        if (!nsp) {
+            return;
+        }
+        a->span = nsp;
         a->cap = ncap;
     }
     a->v[a->n] = v;
     a->split[a->n] = split;
+    a->span[PAIR_LEN * a->n] = b;
+    a->span[PAIR_LEN * a->n + SKIP_ONE] = e;
     a->n++;
 }
 
 static void sh_argv_word(sh_t *s, TSNode w, sh_argv_t *out) {
+    uint32_t b = ts_node_start_byte(w);
+    uint32_t e = ts_node_end_byte(w);
     const sh_val_t *arr = sh_array_word(s, w);
     if (arr) {
         if (!arr->items) {
-            sh_argv_push(out, NULL, true);
+            sh_argv_push(out, NULL, true, b, e);
             return;
         }
         for (int i = 0; i < arr->n; i++) {
-            sh_argv_push(out, arr->items[i], false);
+            sh_argv_push(out, arr->items[i], false, b, e);
         }
         return;
     }
     const char *v = sh_eval_word(s, w);
-    sh_argv_push(out, v, v ? false : sh_may_split(w));
+    sh_argv_push(out, v, v ? false : sh_may_split(w), b, e);
 }
 
 /* argv of a command: its name and arguments, evaluated (NULL: unknown). */
@@ -1319,17 +1337,19 @@ static bool sh_numberish(const char *v) {
 }
 
 /* The index of the program argv runs, past wrappers (time, sudo, retry N,
- * timeout D, env A=B, ...); -1 when it is unknown. */
+ * timeout D, env A=B, ...); -1 when argv has none. Its value may be unknown
+ * (NULL). */
 static int sh_program(const sh_argv_t *a) {
     static const char *const wrappers[] = {"time",    "sudo", "exec",    "nice",  "nohup",
                                            "command", "env",  "timeout", "retry", NULL};
     int i = 0;
     while (i < a->n) {
-        if (!a->v[i]) {
-            return -1;
-        }
-        if (!sh_in(sh_basename(a->v[i]), wrappers)) {
+        if (!a->v[i] || !sh_in(sh_basename(a->v[i]), wrappers)) {
             return i;
+        }
+        if (strcmp(a->v[i], "command") == 0 && i + SKIP_ONE < a->n &&
+            (sh_eq(a->v[i + SKIP_ONE], "-v") || sh_eq(a->v[i + SKIP_ONE], "-V"))) {
+            return -1; /* command -v X: is there an X, not a run of it */
         }
         i++;
         while (i < a->n && a->v[i] &&
@@ -1656,10 +1676,11 @@ static void sh_find(sh_t *s, TSNode cmd, const sh_argv_t *a, int prog) {
     /* -exec PROGRAM ... {} ; */
     sh_argv_t e = {0};
     for (i++; i < a->n && !sh_eq(a->v[i], ";") && !sh_eq(a->v[i], "+"); i++) {
-        sh_argv_push(&e, a->v[i], a->split[i]);
+        sh_argv_push(&e, a->v[i], a->split[i], a->span[PAIR_LEN * i],
+                     a->span[PAIR_LEN * i + SKIP_ONE]);
     }
     int p = sh_program(&e);
-    if (p >= 0 && strcmp(sh_basename(e.v[p]), "kubectl") == 0) {
+    if (p >= 0 && e.v[p] && strcmp(sh_basename(e.v[p]), "kubectl") == 0) {
         sh_kubectl_t k = {0};
         sh_kubectl_parse(&e, p + SKIP_ONE, &k);
         const char *verb = k.verb >= 0 ? e.v[k.verb] : NULL;
@@ -1681,7 +1702,7 @@ static void sh_deploy_command(sh_t *s, TSNode cmd, const sh_argv_t *a, const sh_
                               sh_src_t *out) {
     *out = (sh_src_t){SH_SRC_NONE, NULL, NULL};
     int prog = sh_program(a);
-    if (prog < 0) {
+    if (prog < 0 || !a->v[prog]) {
         return;
     }
     const char *base = sh_basename(a->v[prog]);
@@ -1707,6 +1728,75 @@ static void sh_deploy_command(sh_t *s, TSNode cmd, const sh_argv_t *a, const sh_
     }
 }
 
+/* A repository file: the path names a File node. */
+static int sh_t_repo_file(sh_t *s, const char *path, const sh_find_t *f, sh_targets_t *out) {
+    (void)f;
+    int64_t id = (int64_t)(intptr_t)cbm_ht_get(s->ix->file_ids, path);
+    if (id <= 0) {
+        return 0;
+    }
+    sh_targets_push(out, id, path);
+    return SKIP_ONE;
+}
+
+/* A program started by a path (./_build/x, ${DIR}/x, $(LOCALBIN)/x) SPAWNS
+ * the Process of its name -- the value's last segment, or, the value
+ * unknown, the word's literal last segment. A path naming a file of the
+ * repository is a script of its own, not linked here. */
+static void sh_spawn(sh_t *s, TSNode cmd, const sh_argv_t *a) {
+    int p = sh_program(a);
+    if (p < 0) {
+        return;
+    }
+    const char *v = a->v[p];
+    const char *name = NULL;
+    if (v) {
+        if (!strchr(v, '/') || strpbrk(v, "*?[")) {
+            return;
+        }
+        const char *c[PAIR_LEN] = {NULL, NULL};
+        int n = sh_candidates(s, v, c);
+        for (int i = 0; i < n; i++) {
+            sh_targets_t ts = {0};
+            int hit = sh_t_repo_file(s, c[i], NULL, &ts);
+            cbm_free(CBM_MEM_CLASS_OTHER, ts.items);
+            if (hit) {
+                return;
+            }
+        }
+        name = sh_value_basename(s->a, v);
+    } else {
+        uint32_t b = a->span[PAIR_LEN * p];
+        uint32_t e = a->span[PAIR_LEN * p + SKIP_ONE];
+        while (e > b && (s->src[e - SKIP_ONE] == '"' || s->src[e - SKIP_ONE] == '\'')) {
+            e--;
+        }
+        uint32_t k = e;
+        while (k > b && s->src[k - SKIP_ONE] != '/') {
+            k--;
+        }
+        if (k == b) {
+            return;
+        }
+        name = cbm_arena_strndup(s->a, s->src + k, e - k);
+        if (name && strpbrk(name, "$`*?[]{}()\"' \t\\")) {
+            return;
+        }
+    }
+    if (!name || !name[0] || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        return;
+    }
+    sh_hits_t *h = s->hits;
+    if (sh_grow((void **)&h->items, &h->cap, h->count, sizeof(*h->items))) {
+        h->items[h->count++] =
+            (sh_hit_t){.file = s->file,
+                       .line = (int)ts_node_start_point(cmd).row + SKIP_ONE + s->line_base,
+                       .via = "shell",
+                       .ext = cbm_arena_strdup(&h->arena, name),
+                       .spawn = true};
+    }
+}
+
 /* ── Statements ────────────────────────────────────────────────────── */
 
 static void sh_walk(sh_t *s, TSNode n);
@@ -1717,9 +1807,26 @@ static void sh_walk_children(sh_t *s, TSNode n) {
     }
 }
 
+/* The commands inside $( ) and <( ) of a word, a value or a redirect run
+ * too, each in a subshell of its own. */
+static void sh_walk_substs(sh_t *s, TSNode n) {
+    if (sh_type(n, "command_substitution") || sh_type(n, "process_substitution")) {
+        sh_mark_t m = sh_mark(s);
+        sh_walk_children(s, n);
+        sh_rewind(s, m);
+        return;
+    }
+    for (uint32_t i = 0; i < ts_node_named_child_count(n); i++) {
+        sh_walk_substs(s, ts_node_named_child(n, i));
+    }
+}
+
 static void sh_assign(sh_t *s, TSNode n, bool local) {
     TSNode name = ts_node_child_by_field_name(n, TS_FIELD("name"));
     TSNode value = ts_node_child_by_field_name(n, TS_FIELD("value"));
+    if (!ts_node_is_null(value)) {
+        sh_walk_substs(s, value);
+    }
     if (ts_node_is_null(name)) {
         return;
     }
@@ -1811,23 +1918,30 @@ static bool sh_chdir(sh_t *s, const sh_argv_t *a) {
 }
 
 static void sh_command(sh_t *s, TSNode cmd) {
+    sh_walk_substs(s, cmd);
     sh_argv_t a = {0};
     sh_argv_build(s, cmd, &a);
     if (!sh_chdir(s, &a)) {
         sh_src_t out;
         sh_deploy_command(s, cmd, &a, NULL, &out);
+        sh_spawn(s, cmd, &a);
     }
     sh_argv_free(&a);
 }
 
-/* `cat <<EOF | kubectl ...`: the rest of that pipe follows the heredoc start,
- * inside the redirect; it reads the heredoc, not this pipe. */
-static void sh_heredoc_rest(sh_t *s, TSNode el) {
-    for (uint32_t r = 0; sh_type(el, "redirected_statement") && r < ts_node_named_child_count(el);
-         r++) {
-        TSNode red = ts_node_named_child(el, r);
+/* The redirects of a statement: `cat <<EOF | kubectl ...` -- the rest of
+ * that pipe follows the heredoc start, inside the redirect, and reads the
+ * heredoc, not this pipe; `< <(cmd)` runs cmd. */
+static void sh_redirects(sh_t *s, TSNode el) {
+    for (uint32_t r = 0; sh_type(el, "redirected_statement") && r < ts_node_child_count(el); r++) {
+        TSNode red = ts_node_child(el, r);
+        if (!ts_node_is_named(red) || sh_eq(ts_node_field_name_for_child(el, r), "body")) {
+            continue;
+        }
         if (sh_type(red, "heredoc_redirect")) {
             sh_walk_children(s, red);
+        } else {
+            sh_walk_substs(s, red);
         }
     }
 }
@@ -1841,7 +1955,7 @@ static void sh_pipe_run(sh_t *s, TSNode n, sh_src_t *src) {
         TSNode cmd = sh_unwrap(el);
         if (sh_type(cmd, "pipeline")) {
             sh_pipe_run(s, cmd, src);
-            sh_heredoc_rest(s, el);
+            sh_redirects(s, el);
             continue;
         }
         if (!sh_type(cmd, "command")) {
@@ -1849,6 +1963,7 @@ static void sh_pipe_run(sh_t *s, TSNode n, sh_src_t *src) {
             *src = (sh_src_t){SH_SRC_NONE, NULL, NULL};
             continue;
         }
+        sh_walk_substs(s, cmd);
         sh_argv_t a = {0};
         sh_argv_build(s, cmd, &a);
         sh_src_t out;
@@ -1856,8 +1971,9 @@ static void sh_pipe_run(sh_t *s, TSNode n, sh_src_t *src) {
         if (out.kind != SH_SRC_NONE) {
             *src = out;
         }
+        sh_spawn(s, cmd, &a);
         sh_argv_free(&a);
-        sh_heredoc_rest(s, el);
+        sh_redirects(s, el);
     }
 }
 
@@ -1924,6 +2040,10 @@ static void sh_if(sh_t *s, TSNode n) {
 }
 
 static void sh_case(sh_t *s, TSNode n) {
+    TSNode value = ts_node_child_by_field_name(n, TS_FIELD("value"));
+    if (!ts_node_is_null(value)) {
+        sh_walk_substs(s, value); /* case "$(cmd)" in */
+    }
     sh_touch_t t = {0};
     for (uint32_t i = 0; i < ts_node_named_child_count(n); i++) {
         TSNode item = ts_node_named_child(n, i);
@@ -1944,6 +2064,11 @@ static void sh_case(sh_t *s, TSNode n) {
 
 /* A loop's body runs zero or more times, with its variable unknown. */
 static void sh_loop(sh_t *s, TSNode n) {
+    for (uint32_t i = 0; i < ts_node_child_count(n); i++) {
+        if (sh_eq(ts_node_field_name_for_child(n, i), "value")) {
+            sh_walk_substs(s, ts_node_child(n, i)); /* for x in $(cmd) */
+        }
+    }
     sh_touch_t t = {0};
     sh_mark_t m = sh_mark(s);
     TSNode var = ts_node_child_by_field_name(n, TS_FIELD("variable"));
@@ -2024,14 +2149,9 @@ static void sh_walk(sh_t *s, TSNode n) {
         if (!ts_node_is_null(body)) {
             sh_walk(s, body);
         }
-        for (uint32_t i = 0; i < ts_node_named_child_count(n); i++) {
-            TSNode red = ts_node_named_child(n, i);
-            if (sh_type(red, "heredoc_redirect")) {
-                sh_mark_t m = sh_mark(s);
-                sh_walk_children(s, red);
-                sh_rewind(s, m);
-            }
-        }
+        sh_mark_t m = sh_mark(s);
+        sh_redirects(s, n);
+        sh_rewind(s, m);
     } else if (strcmp(t, "pipeline") == 0) {
         sh_pipeline(s, n);
     } else if (strcmp(t, "list") == 0) {
@@ -2049,6 +2169,8 @@ static void sh_walk(sh_t *s, TSNode n) {
         sh_loop(s, n);
     } else if (strcmp(t, "function_definition") == 0) {
         sh_function(s, n);
+    } else {
+        sh_walk_substs(s, n); /* [[ -n "$(cmd)" ]], ((...)), a bare word */
     }
 }
 
@@ -2160,14 +2282,22 @@ typedef struct {
     bool busy;
 } mk_var_t;
 
+/* One recipe line as make runs it: a tab-led line and its \-continuations,
+ * without the @ - + prefixes. */
+typedef struct {
+    uint32_t b; /* source bytes [b, e) */
+    uint32_t e;
+    uint32_t row; /* 0-based row of b */
+} mk_line_t;
+
 typedef struct {
     CBMArena *a;
     const char *src;
     CBMHashTable *vars; /* name -> mk_var_t */
     bool makefile;      /* a Makefile (its recipes run in its dir), not an included .mk */
-    TSNode *recipes;
-    int nrecipes;
-    int cap_recipes;
+    mk_line_t *lines;
+    int nlines;
+    int cap_lines;
 } mk_t;
 
 static const char MK_UNKNOWN[] = "${__cbm_unknown}";
@@ -2345,44 +2475,131 @@ static void mk_assign(mk_t *m, TSNode n, bool cond) {
 }
 
 /* Variables and recipe lines of a makefile; `cond`: under a conditional. */
+/* The recipe lines in the bytes of a recipe_line node, split as make splits
+ * them: tree-sitter-make can let one node run over several lines (a quote in
+ * `"Don't ..."` does it). */
+static void mk_split_lines(mk_t *m, TSNode node) {
+    const char *src = m->src;
+    uint32_t p = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    uint32_t row = ts_node_start_point(node).row;
+    while (p < end) {
+        uint32_t b = p;
+        uint32_t brow = row;
+        uint32_t q = p;
+        for (;;) {
+            while (q < end && src[q] != '\n') {
+                q++;
+            }
+            uint32_t k = (q > p && src[q - SKIP_ONE] == '\r') ? q - SKIP_ONE : q;
+            bool cont = k > p && src[k - SKIP_ONE] == '\\';
+            if (!cont || q >= end) {
+                break;
+            }
+            q++;
+            row++;
+            p = q;
+        }
+        uint32_t e = q;
+        p = q < end ? q + SKIP_ONE : q;
+        row++;
+        while (e > b && src[e - SKIP_ONE] == '\r') {
+            e--;
+        }
+        while (b < e && src[b] && strchr(" \t@-+", src[b])) {
+            b++;
+        }
+        if (b < e && src[b] != '#' &&
+            sh_grow((void **)&m->lines, &m->cap_lines, m->nlines, sizeof(*m->lines))) {
+            m->lines[m->nlines++] = (mk_line_t){b, e, brow};
+        }
+    }
+}
+
+static int mk_cmp_line(const void *a, const void *b) {
+    uint32_t x = ((const mk_line_t *)a)->b;
+    uint32_t y = ((const mk_line_t *)b)->b;
+    return (x > y) - (x < y);
+}
+
+static void mk_collect(mk_t *m, TSNode n, bool cond);
+static void mk_collect_error(mk_t *m, TSNode err, bool cond);
+
+static void mk_collect_one(mk_t *m, TSNode c, bool cond) {
+    const char *t = ts_node_type(c);
+    if (strcmp(t, "variable_assignment") == 0) {
+        mk_assign(m, c, cond);
+    } else if (strcmp(t, "recipe_line") == 0) {
+        mk_split_lines(m, c);
+    } else if (strcmp(t, "rule") == 0 || strcmp(t, "recipe") == 0) {
+        mk_collect(m, c, cond);
+    } else if (strcmp(t, "ERROR") == 0) {
+        mk_collect_error(m, c, cond);
+    } else if (strcmp(t, "define_directive") == 0) {
+        TSNode name = ts_node_child_by_field_name(c, TS_FIELD("name"));
+        if (!ts_node_is_null(name)) {
+            uint32_t nb = ts_node_start_byte(name);
+            const char *nm = mk_trim(m->a, m->src + nb, ts_node_end_byte(name) - nb);
+            mk_var_t *v = cbm_arena_alloc(m->a, sizeof(*v));
+            if (nm && v) {
+                *v = (mk_var_t){"", NULL, false, false};
+                cbm_ht_set(m->vars, nm, v);
+            }
+        }
+    } else if (strstr(t, "conditional") || strstr(t, "if") == t ||
+               strcmp(t, "else_directive") == 0 || strcmp(t, "elsif_directive") == 0) {
+        mk_collect(m, c, true);
+    } else if (strstr(t, "directive")) {
+        mk_collect(m, c, cond);
+    }
+}
+
 static void mk_collect(mk_t *m, TSNode n, bool cond) {
     for (uint32_t i = 0; i < ts_node_named_child_count(n); i++) {
-        TSNode c = ts_node_named_child(n, i);
-        const char *t = ts_node_type(c);
-        if (strcmp(t, "variable_assignment") == 0) {
-            mk_assign(m, c, cond);
-        } else if (strcmp(t, "rule") == 0) {
-            TSNode recipe = {0};
-            for (uint32_t j = 0; j < ts_node_named_child_count(c); j++) {
-                if (sh_type(ts_node_named_child(c, j), "recipe")) {
-                    recipe = ts_node_named_child(c, j);
-                }
-            }
-            for (uint32_t j = 0; !ts_node_is_null(recipe) && j < ts_node_named_child_count(recipe);
-                 j++) {
-                TSNode line = ts_node_named_child(recipe, j);
-                if (sh_type(line, "recipe_line") && sh_grow((void **)&m->recipes, &m->cap_recipes,
-                                                            m->nrecipes, sizeof(*m->recipes))) {
-                    m->recipes[m->nrecipes++] = line;
-                }
-            }
-        } else if (strcmp(t, "define_directive") == 0) {
-            TSNode name = ts_node_child_by_field_name(c, TS_FIELD("name"));
-            if (!ts_node_is_null(name)) {
-                uint32_t nb = ts_node_start_byte(name);
-                const char *nm = mk_trim(m->a, m->src + nb, ts_node_end_byte(name) - nb);
-                mk_var_t *v = cbm_arena_alloc(m->a, sizeof(*v));
-                if (nm && v) {
-                    *v = (mk_var_t){"", NULL, false, false};
-                    cbm_ht_set(m->vars, nm, v);
-                }
-            }
-        } else if (strstr(t, "conditional") || strstr(t, "if") == t ||
-                   strcmp(t, "else_directive") == 0 || strcmp(t, "elsif_directive") == 0) {
-            mk_collect(m, c, true);
-        } else if (strstr(t, "directive")) {
-            mk_collect(m, c, cond);
+        mk_collect_one(m, ts_node_named_child(n, i), cond);
+    }
+}
+
+/* +1 for a line opening a conditional or a define, -1 for its end, else 0. */
+static int mk_directive_delta(const char *p, const char *end) {
+    static const struct {
+        const char *kw;
+        int delta;
+    } kws[] = {{"ifeq", SKIP_ONE},   {"ifneq", SKIP_ONE}, {"ifdef", SKIP_ONE}, {"ifndef", SKIP_ONE},
+               {"define", SKIP_ONE}, {"endif", -1},       {"endef", -1}};
+    while (p < end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+    for (size_t i = 0; i < sizeof(kws) / sizeof(kws[0]); i++) {
+        size_t kl = strlen(kws[i].kw);
+        if ((size_t)(end - p) >= kl && strncmp(p, kws[i].kw, kl) == 0 &&
+            (p + kl == end || strchr(" \t(\r", p[kl]))) {
+            return kws[i].delta;
         }
+    }
+    return 0;
+}
+
+/* A region tree-sitter-make could not parse (an indented, nested ifeq does
+ * it) still holds rules and assignments; an assignment counts as certain
+ * only outside the conditionals its lines open. */
+static void mk_collect_error(mk_t *m, TSNode err, bool cond) {
+    uint32_t scan = ts_node_start_byte(err);
+    uint32_t end = ts_node_end_byte(err);
+    int depth = 0;
+    for (uint32_t i = 0; i < ts_node_named_child_count(err); i++) {
+        TSNode c = ts_node_named_child(err, i);
+        uint32_t cb = ts_node_start_byte(c);
+        while (scan < cb && scan < end) {
+            uint32_t le = scan;
+            while (le < end && m->src[le] != '\n') {
+                le++;
+            }
+            depth += mk_directive_delta(m->src + scan, m->src + le);
+            depth = depth < 0 ? 0 : depth;
+            scan = le + SKIP_ONE;
+        }
+        mk_collect_one(m, c, cond || depth > 0);
     }
 }
 
@@ -2405,18 +2622,19 @@ static void sh_makefile(sh_pass_t *p, const char *rel, const char *src, size_t l
     if (m.vars) {
         mk_collect(&m, ts_tree_root_node(tree), false);
     }
-    for (int r = 0; m.vars && r < m.nrecipes; r++) {
-        TSNode line = m.recipes[r];
-        uint32_t b = ts_node_start_byte(line);
-        uint32_t e = ts_node_end_byte(line);
-        while (b < e && (src[b] == ' ' || src[b] == '\t' || src[b] == '@' || src[b] == '-' ||
-                         src[b] == '+')) {
-            b++;
+    if (m.nlines > SKIP_ONE) {
+        qsort(m.lines, (size_t)m.nlines, sizeof(*m.lines), mk_cmp_line);
+    }
+    for (int r = 0; m.vars && r < m.nlines; r++) {
+        if (r > 0 && m.lines[r].b == m.lines[r - SKIP_ONE].b) {
+            continue; /* nested nodes covered it already */
         }
+        uint32_t b = m.lines[r].b;
+        uint32_t e = m.lines[r].e;
         const char *raw = cbm_arena_strndup(&a, src + b, e - b);
         const char *text = raw ? mk_expand(&m, raw) : NULL;
-        if (!text || !sh_mentions_deploy_tool(text, strlen(text))) {
-            continue;
+        if (!text || (!strchr(text, '/') && !sh_mentions_deploy_tool(text, strlen(text)))) {
+            continue; /* neither a deploy nor a program started by a path */
         }
         size_t tl = strlen(text);
         char *buf = cbm_arena_alloc(&a, tl + CBM_SZ_16);
@@ -2428,7 +2646,7 @@ static void sh_makefile(sh_pass_t *p, const char *rel, const char *src, size_t l
         sh_t s;
         sh_state_init(&s, p, &a, rel);
         if (s.env) {
-            s.line_base = (int)ts_node_start_point(line).row;
+            s.line_base = (int)m.lines[r].row;
             sh_val_t *root = cbm_arena_alloc(&a, sizeof(*root));
             sh_val_t *cur = cbm_arena_alloc(&a, sizeof(*cur));
             if (root && cur) {
@@ -2447,7 +2665,7 @@ static void sh_makefile(sh_pass_t *p, const char *rel, const char *src, size_t l
     if (m.vars) {
         cbm_ht_free(m.vars);
     }
-    cbm_free(CBM_MEM_CLASS_OTHER, m.recipes);
+    cbm_free(CBM_MEM_CLASS_OTHER, m.lines);
     cbm_arena_destroy(&a);
     ts_tree_delete(tree);
 }
@@ -2516,6 +2734,26 @@ static int64_t sh_external_chart(cbm_pipeline_ctx_t *ctx, const char *name, cons
                                 "{\"source\":\"helm\",\"external\":true}");
 }
 
+/* SPAWNS to the Process of `program`, as pass_spawns.c draws it. */
+static int sh_link_spawn(cbm_pipeline_ctx_t *ctx, int64_t src, const sh_hit_t *x) {
+    char program[CBM_SZ_128];
+    cbm_json_escape(program, (int)sizeof(program), x->ext);
+    char qn[CBM_SZ_256];
+    snprintf(qn, sizeof(qn), "__process__%s", x->ext);
+    char node_props[CBM_SZ_256];
+    snprintf(node_props, sizeof(node_props), "{\"program\":\"%s\"}", program);
+    int64_t process = cbm_gbuf_upsert_node(ctx->gbuf, "Process", x->ext, qn, "", 0, 0, node_props);
+    if (process <= 0) {
+        return 0;
+    }
+    char props[CBM_SZ_512];
+    snprintf(props, sizeof(props),
+             "{\"api\":\"%s\",\"program\":\"%s\",\"line\":%d,\"confidence\":1.00}", x->via, program,
+             x->line);
+    cbm_gbuf_insert_edge(ctx->gbuf, src, process, "SPAWNS", props);
+    return SKIP_ONE;
+}
+
 static int sh_link(cbm_pipeline_ctx_t *ctx, const sh_hits_t *h) {
     CBMHashTable *files = cbm_ht_create(0);
     CBMHashTable *modules = cbm_ht_create(0);
@@ -2561,6 +2799,10 @@ static int sh_link(cbm_pipeline_ctx_t *ctx, const sh_hits_t *h) {
     for (int i = 0; i < h->count; i++) {
         const sh_hit_t *x = &h->items[i];
         int64_t src = sh_source(ctx, spans, n, modules, x->file, x->line);
+        if (x->spawn) {
+            edges += src > 0 ? sh_link_spawn(ctx, src, x) : 0;
+            continue;
+        }
         int64_t tgt = x->tgt > 0 ? x->tgt : sh_external_chart(ctx, x->ext, x->file);
         if (src <= 0 || tgt <= 0 || src == tgt) {
             continue;
@@ -2595,18 +2837,16 @@ void cbm_pipeline_pass_shell(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
         if (!src) {
             continue;
         }
-        if (sh_mentions_deploy_tool(src, len)) {
-            if (!p.ix_ready) {
-                p.ix_ready = true;
-                p.ix_ok = sh_index_build(&ix, ctx);
-                p.parser = ts_parser_new();
-            }
-            if (p.ix_ok && p.parser) {
-                if (lang == CBM_LANG_BASH) {
-                    sh_script(&p, files[i].rel_path, src, len);
-                } else {
-                    sh_makefile(&p, files[i].rel_path, src, len);
-                }
+        if (!p.ix_ready) {
+            p.ix_ready = true;
+            p.ix_ok = sh_index_build(&ix, ctx);
+            p.parser = ts_parser_new();
+        }
+        if (p.ix_ok && p.parser) {
+            if (lang == CBM_LANG_BASH) {
+                sh_script(&p, files[i].rel_path, src, len);
+            } else {
+                sh_makefile(&p, files[i].rel_path, src, len);
             }
         }
         cbm_free(CBM_MEM_CLASS_OTHER, src);
