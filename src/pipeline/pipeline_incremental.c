@@ -2351,6 +2351,29 @@ static const char *closure_add_variant_partners(cbm_store_t *store, const char *
     return decline;
 }
 
+/* Whether the directory of `rel` (whose basename is at `base`) holds a
+ * compose file: compose interpolates that directory's .env into it, so the
+ * .env changes what its services build and run (pass_ci.c). */
+static bool closure_dir_has_compose(const char *repo_path, const char *rel, const char *base) {
+    char dir[CBM_SZ_4K];
+    int n = snprintf(dir, sizeof(dir), "%s/%.*s", repo_path, (int)(base - rel), rel);
+    if (n < 0 || (size_t)n >= sizeof(dir)) {
+        return true; /* unknown: decline */
+    }
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return false;
+    }
+    bool found = false;
+    cbm_dirent_t *e;
+    while (!found && (e = cbm_readdir(d)) != NULL) {
+        found = !e->is_dir && cbm_build_path(e->name) &&
+                strncmp(e->name, "skaffold", strlen("skaffold")) != 0;
+    }
+    cbm_closedir(d);
+    return found;
+}
+
 /* Kubernetes inputs reach past their own file (pass_k8s.c): a kustomization
  * decides which manifests deploy together and in which namespace, a
  * Chart.yaml links other charts, and a manifest's Services select workloads
@@ -2370,14 +2393,22 @@ static const char *closure_k8s_decline(cbm_store_t *store, const char *project,
         if (strcmp(base, "Chart.yaml") == 0 || strcmp(base, "Chart.yml") == 0) {
             return "helm_chart_changed";
         }
+        if (strcmp(base, ".env") == 0 && closure_dir_has_compose(repo_path, rel, base)) {
+            return "compose_env_changed";
+        }
         cbm_node_t *nodes = NULL;
         int count = 0;
         if (cbm_store_find_nodes_by_file(store, project, rel, &nodes, &count) != CBM_STORE_OK) {
             return "k8s_lookup_failed";
         }
+        /* A compose service (pass_docker.c) is a Resource too, but it links
+         * only inside its file and to the Images / Dockerfiles every run
+         * recomputes: no bundle reaches past it. */
         bool held = false;
         for (int j = 0; j < count && !held; j++) {
-            held = nodes[j].label && strcmp(nodes[j].label, "Resource") == 0;
+            held = nodes[j].label && strcmp(nodes[j].label, "Resource") == 0 &&
+                   !(nodes[j].properties_json &&
+                     strstr(nodes[j].properties_json, "\"ecosystem\":\"compose\""));
         }
         cbm_store_free_nodes(nodes, count);
         if (held) {

@@ -3665,6 +3665,39 @@ TEST(incremental_compose_edit_replaces_build_edges) {
     PASS();
 }
 
+/* A compose project's .env feeds its compose file (variables in image,
+ * build): changing it is no closure repair -- the unchanged compose file's
+ * services would keep the old image. It rebuilds; no stale image remains. */
+TEST(incremental_compose_dotenv_change_rebuilds) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_composeenv_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "src/web/Dockerfile", "FROM nginx:1.27\n");
+    write_temp_file(tmp, ".env", "REG=ghcr.io/old\n");
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  web:\n    image: ${REG}/web\n    build: ./src/web\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/composeenv.db", tmp);
+    static const char old_img[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Image' AND name='ghcr.io/old/web'";
+    static const char new_use[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' AND "
+        "t.name='ghcr.io/new/web'";
+    int full_old = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, old_img) : -1;
+    write_temp_file(tmp, ".env", "REG=ghcr.io/new\n");
+    int rc = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    int after_old = k8s_inc_count(db_path, old_img);
+    int after_new = k8s_inc_count(db_path, new_use);
+    th_rmtree(tmp);
+    ASSERT_EQ(full_old, 1);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(after_old, 0);
+    ASSERT_EQ(after_new, 1);
+    PASS();
+}
+
 TEST(incremental_deleted_dockerfile_drops_its_image) {
     cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
     int left = incremental_dockerfile_delete(false, &route);
@@ -19307,6 +19340,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);
     RUN_TEST(incremental_compose_edit_replaces_build_edges);
+    RUN_TEST(incremental_compose_dotenv_change_rebuilds);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);

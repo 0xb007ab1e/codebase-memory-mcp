@@ -1083,6 +1083,26 @@ typedef struct {
 } cbm_build_site_t;
 typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
 
+/* A compose service (pass_ci.c): its image (a reference, variables
+ * expanded; NULL: none or unknown), the Dockerfile its build names
+ * (repository path; NULL: no build, or unknown), and the service names its
+ * depends_on and links list. */
+typedef struct {
+    const char *name;
+    const char *image;
+    const char *dockerfile;
+    const char **deps;
+    int ndeps;
+    int line;
+    int end_line;
+} cbm_compose_service_t;
+typedef void (*cbm_compose_service_fn)(const cbm_compose_service_t *svc, void *ud);
+
+/* Hand fn each service of compose file `rel` (YAML text src; `dotenv` the
+ * project's .env text or NULL). Nothing for a file that is no compose file. */
+void cbm_compose_services(CBMArena *a, const char *rel, const char *src, size_t len,
+                          const char *dotenv, cbm_compose_service_fn fn, void *ud);
+
 /* Whether `rel` names a build configuration: skaffold*.yaml|yml,
  * [docker-]compose[.x].yaml|yml. */
 bool cbm_build_path(const char *rel);

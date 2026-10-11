@@ -2114,6 +2114,68 @@ TEST(probe_build_configs_build_images_from_dockerfiles) {
     PASS();
 }
 
+/* Every edge from a compose service as "<service> -> <target> (TYPE
+ * via|ref)", sorted: an Image by repository, a Module by path. */
+static char *gpf_compose(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT s.name || ' -> ' || "
+            "CASE t.label WHEN 'Image' THEN 'Image:' || t.name WHEN 'Module' THEN 'Module:' || "
+            "t.file_path ELSE t.name END || ' (' || e.type || ' ' || "
+            "coalesce(json_extract(e.properties,'$.via'), json_extract(e.properties,'$.ref')) || "
+            "')' AS x FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND s.label='Resource' AND "
+            "json_extract(s.properties,'$.ecosystem')='compose' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A compose service is a Resource {ecosystem:compose}: it DEPENDS_ON the
+ * services its depends_on (a list or a mapping) and links name, USAGE
+ * {ref:image} its image and DEPENDS_ON {via:build} the Dockerfile its build
+ * names (a context, or context + dockerfile). */
+TEST(probe_compose_services_are_resources) {
+    static const GpfFile files[] = {
+        {"web/Dockerfile", "FROM nginx:1.27\n"},
+        {"worker/Dockerfile", "FROM python:3.12\n"},
+        {"compose.yaml",
+         "services:\n  web:\n    image: acme/web:1\n    build: ./web\n"
+         "    depends_on:\n      - db\n      - cache\n    links:\n      - cache:c\n"
+         "  db:\n    image: postgres:16\n"
+         "  cache:\n    image: redis:7\n    depends_on:\n      db:\n"
+         "        condition: service_healthy\n"
+         "  worker:\n    build:\n      context: .\n      dockerfile: worker/Dockerfile\n"}};
+    char *got = gpf_compose(files, 3);
+    static const char want[] =
+        "Service/cache -> Image:docker.io/library/redis (USAGE image)\n"
+        "Service/cache -> Service/db (DEPENDS_ON depends_on)\n"
+        "Service/db -> Image:docker.io/library/postgres (USAGE image)\n"
+        "Service/web -> Image:docker.io/acme/web (USAGE image)\n"
+        "Service/web -> Module:web/Dockerfile (DEPENDS_ON build)\n"
+        "Service/web -> Service/cache (DEPENDS_ON depends_on)\n"
+        "Service/web -> Service/db (DEPENDS_ON depends_on)\n"
+        "Service/worker -> Module:worker/Dockerfile (DEPENDS_ON build)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "compose got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("compose service edge set");
+    }
+    free(got);
+    PASS();
+}
+
 #define GPF_CM(name) "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " name "\n"
 #define GPF_KUST "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
 
@@ -4382,6 +4444,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_dockerfile_entrypoint_runs);
     RUN_TEST(probe_k8s_container_images_are_images);
     RUN_TEST(probe_build_configs_build_images_from_dockerfiles);
+    RUN_TEST(probe_compose_services_are_resources);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
     RUN_TEST(probe_shell_helm_deploys_its_chart);

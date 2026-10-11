@@ -1129,6 +1129,75 @@ static void dk_build_site(const cbm_build_site_t *s, void *ud) {
     b->edges++;
 }
 
+typedef struct {
+    cbm_pipeline_ctx_t *ctx;
+    CBMArena *a;
+    const char *file;
+    const char *base; /* the compose file's module QN */
+    int64_t file_node;
+    int pass; /* 0: make the service nodes, 1: their edges */
+    int edges;
+} dk_compose_t;
+
+static const char *dk_compose_qn(const dk_compose_t *c, const char *name) {
+    return cbm_arena_sprintf(c->a, "%s::compose/Service/-/%s", c->base, name);
+}
+
+static void dk_compose_edge(dk_compose_t *c, int64_t src, int64_t tgt, const char *type,
+                            const char *props) {
+    if (src > 0 && tgt > 0 && src != tgt) {
+        cbm_gbuf_insert_edge(c->ctx->gbuf, src, tgt, type, props);
+        c->edges++;
+    }
+}
+
+/* A compose service: a Resource {ecosystem:compose, kind:Service} the file
+ * DEFINES; it DEPENDS_ON the services it depends on / links, USAGE
+ * {ref:image} its image and DEPENDS_ON {via:build} the Dockerfile it builds. */
+static void dk_compose_service(const cbm_compose_service_t *s, void *ud) {
+    dk_compose_t *c = ud;
+    const char *qn = dk_compose_qn(c, s->name);
+    if (!qn) {
+        return;
+    }
+    if (c->pass == 0) {
+        char esc[CBM_SZ_512];
+        cbm_json_escape(esc, (int)sizeof(esc), s->name);
+        char props[CBM_SZ_1K];
+        snprintf(props, sizeof(props),
+                 "{\"ecosystem\":\"compose\",\"kind\":\"Service\",\"service\":\"%s\"}", esc);
+        int64_t id = cbm_gbuf_upsert_node(c->ctx->gbuf, "Resource",
+                                          cbm_arena_sprintf(c->a, "Service/%s", s->name), qn,
+                                          c->file, s->line + SKIP_ONE, s->end_line, props);
+        dk_compose_edge(c, c->file_node, id, "DEFINES", "{}");
+        return;
+    }
+    const cbm_gbuf_node_t *self = cbm_gbuf_find_by_qn(c->ctx->gbuf, qn);
+    if (!self) {
+        return;
+    }
+    for (int i = 0; i < s->ndeps; i++) {
+        const char *dq = dk_compose_qn(c, s->deps[i]);
+        const cbm_gbuf_node_t *dep = dq ? cbm_gbuf_find_by_qn(c->ctx->gbuf, dq) : NULL;
+        dk_compose_edge(c, self->id, dep ? dep->id : 0, "DEPENDS_ON", "{\"via\":\"depends_on\"}");
+    }
+    if (s->image) {
+        char esc[CBM_SZ_1K];
+        cbm_json_escape(esc, (int)sizeof(esc), s->image);
+        char props[CBM_SZ_2K];
+        snprintf(props, sizeof(props), "{\"ref\":\"image\",\"image\":\"%s\"}", esc);
+        dk_compose_edge(c, self->id, cbm_pipeline_image_node(c->ctx, s->image), "USAGE", props);
+    }
+    if (s->dockerfile) {
+        const char *mqn = cbm_fqn_module(c->a, c->ctx->project_name, s->dockerfile);
+        const cbm_gbuf_node_t *mod = mqn ? cbm_gbuf_find_by_qn(c->ctx->gbuf, mqn) : NULL;
+        if (mod && mod->file_path && strcmp(mod->file_path, s->dockerfile) == 0) {
+            dk_compose_edge(c, self->id, mod->id, "DEPENDS_ON",
+                            "{\"via\":\"build\",\"tool\":\"compose\"}");
+        }
+    }
+}
+
 /* The .env of the directory of `rel` under the repository, NULL when none. */
 static char *dk_read_dotenv(const cbm_pipeline_ctx_t *ctx, const char *rel) {
     if (!ctx->repo_path) {
@@ -1167,6 +1236,15 @@ static int dk_link_builds(cbm_pipeline_ctx_t *ctx, CBMArena *a) {
         char *dotenv = dk_read_dotenv(ctx, rel);
         b.file = rel;
         cbm_build_sites(a, rel, src, len, dotenv, dk_build_site, &b);
+        dk_compose_t cs = {.ctx = ctx,
+                           .a = a,
+                           .file = rel,
+                           .base = cbm_fqn_compute(a, ctx->project_name, rel, NULL),
+                           .file_node = files[i]->id};
+        for (cs.pass = 0; cs.base && cs.pass < PAIR_LEN; cs.pass++) {
+            cbm_compose_services(a, rel, src, len, dotenv, dk_compose_service, &cs);
+        }
+        b.edges += cs.edges;
         if (dotenv) {
             cbm_free(CBM_MEM_CLASS_OTHER, dotenv);
         }

@@ -51,7 +51,8 @@ typedef struct {
     const char *src;
     const char *rel;
     cbm_ci_cmd_fn fn;
-    cbm_build_site_fn site_fn; /* a build-site walk's callback */
+    cbm_build_site_fn site_fn;         /* a build-site walk's callback */
+    cbm_compose_service_fn service_fn; /* a compose walk's callback */
     void *ud;
 } ci_t;
 
@@ -937,32 +938,80 @@ static void ci_skaffold_walk(const ci_t *c, TSNode n, const char *dir, int depth
     }
 }
 
+/* The Dockerfile a compose build names (a context, or context /
+ * dockerfile), as a repository path; NULL: none or unknown. */
+static const char *ci_compose_dockerfile(const ci_t *c, TSNode build, const char *dir,
+                                         const ci_env_t *env) {
+    if (ts_node_is_null(build)) {
+        return NULL;
+    }
+    const char *ctx = ci_scalar(c, build, NULL);
+    const char *df = "Dockerfile";
+    if (!ctx) {
+        ctx = ci_get_str(c, build, "context");
+        const char *d = ci_get_str(c, build, "dockerfile");
+        ctx = ctx ? ctx : ".";
+        df = d ? d : df;
+    }
+    ctx = ci_interp(c->a, ctx, env);
+    df = ci_interp(c->a, df, env);
+    const char *cdir = ctx && df ? ci_repo_path(c->a, dir, ctx) : NULL;
+    return cdir ? ci_repo_path(c->a, cdir, df) : NULL;
+}
+
+/* depends_on (a list, or a mapping's keys) and links ("svc" / "svc:alias"). */
+static int ci_compose_deps(const ci_t *c, TSNode svc, const char ***out) {
+    int nd = 0;
+    int nl = 0;
+    TSNode dep = ci_get(c, svc, "depends_on");
+    TSNode *items = ci_items(c, dep, &nd);
+    ci_pair_t *pairs = items ? NULL : ci_pairs(c, dep, &nd);
+    TSNode *links = ci_items(c, ci_get(c, svc, "links"), &nl);
+    const char **deps = cbm_arena_alloc(c->a, (size_t)(nd + nl + SKIP_ONE) * sizeof(*deps));
+    int n = 0;
+    for (int i = 0; deps && i < nd; i++) {
+        const char *d = items ? ci_scalar(c, items[i], NULL) : pairs[i].key;
+        if (d) {
+            deps[n++] = d;
+        }
+    }
+    for (int i = 0; deps && i < nl; i++) {
+        const char *l = ci_scalar(c, links[i], NULL);
+        const char *colon = l ? strchr(l, ':') : NULL;
+        if (l) {
+            deps[n++] = colon ? cbm_arena_strndup(c->a, l, (size_t)(colon - l)) : l;
+        }
+    }
+    *out = deps;
+    return n;
+}
+
 static void ci_compose(const ci_t *c, TSNode root, const char *dir, const ci_env_t *env) {
     int ns = 0;
     ci_pair_t *svcs = ci_pairs(c, ci_get(c, root, "services"), &ns);
     for (int i = 0; i < ns; i++) {
-        TSNode svc = svcs[i].value;
-        TSNode build = ci_get(c, svc, "build");
+        TSNode svc = ci_content(svcs[i].value);
+        if (!ci_type(svc, "block_mapping") && !ci_type(svc, "flow_mapping")) {
+            continue;
+        }
         int row = 0;
-        const char *image = ci_scalar(c, ci_get(c, svc, "image"), &row);
-        if (ts_node_is_null(build) || !image) {
-            continue;
+        const char *raw = ci_scalar(c, ci_get(c, svc, "image"), &row);
+        const char *image = raw ? ci_interp(c->a, raw, env) : NULL;
+        const char *df = ci_compose_dockerfile(c, ci_get(c, svc, "build"), dir, env);
+        if (c->site_fn && image && df) {
+            cbm_build_site_t site = {
+                .via = "compose", .image = image, .dockerfile = df, .line = row + SKIP_ONE};
+            c->site_fn(&site, c->ud);
         }
-        const char *ctx = ci_scalar(c, build, NULL);
-        const char *df = "Dockerfile";
-        if (!ctx) {
-            ctx = ci_get_str(c, build, "context");
-            const char *d = ci_get_str(c, build, "dockerfile");
-            ctx = ctx ? ctx : ".";
-            df = d ? d : df;
+        if (c->service_fn) {
+            cbm_compose_service_t s = {.name = svcs[i].key,
+                                       .image = image,
+                                       .dockerfile = df,
+                                       .line = (int)ts_node_start_point(svc).row,
+                                       .end_line = (int)ts_node_end_point(svc).row + SKIP_ONE};
+            s.ndeps = ci_compose_deps(c, svc, &s.deps);
+            c->service_fn(&s, c->ud);
         }
-        ctx = ci_interp(c->a, ctx, env);
-        df = ci_interp(c->a, df, env);
-        image = ci_interp(c->a, image, env);
-        if (!ctx || !df || !image) {
-            continue;
-        }
-        ci_build_emit(c, "compose", image, ci_repo_path(c->a, dir, ctx), df, row);
     }
 }
 
@@ -981,8 +1030,26 @@ bool cbm_build_path(const char *rel) {
     return strncmp(b, "compose", cl) == 0 && (b[cl] == '.' || b[cl] == '-' || b[cl] == '_');
 }
 
+static void ci_build_walk(CBMArena *a, const char *rel, const char *src, size_t len,
+                          const char *dotenv, ci_t proto);
+
 void cbm_build_sites(CBMArena *a, const char *rel, const char *src, size_t len, const char *dotenv,
                      cbm_build_site_fn fn, void *ud) {
+    ci_build_walk(a, rel, src, len, dotenv, (ci_t){.site_fn = fn, .ud = ud});
+}
+
+void cbm_compose_services(CBMArena *a, const char *rel, const char *src, size_t len,
+                          const char *dotenv, cbm_compose_service_fn fn, void *ud) {
+    const char *slash = strrchr(rel, '/');
+    const char *base = slash ? slash + SKIP_ONE : rel;
+    if (strncmp(base, "skaffold", strlen("skaffold")) == 0) {
+        return;
+    }
+    ci_build_walk(a, rel, src, len, dotenv, (ci_t){.service_fn = fn, .ud = ud});
+}
+
+static void ci_build_walk(CBMArena *a, const char *rel, const char *src, size_t len,
+                          const char *dotenv, ci_t proto) {
     if (!cbm_build_path(rel)) {
         return;
     }
@@ -1003,7 +1070,10 @@ void cbm_build_sites(CBMArena *a, const char *rel, const char *src, size_t len, 
         env = ci_dotenv(a, dotenv);
     }
     if (tree && dir) {
-        ci_t c = {.a = a, .src = src, .rel = rel, .site_fn = fn, .ud = ud};
+        ci_t c = proto;
+        c.a = a;
+        c.src = src;
+        c.rel = rel;
         TSNode stream = ts_tree_root_node(tree);
         for (uint32_t i = 0; i < ts_node_named_child_count(stream); i++) {
             TSNode doc = ts_node_named_child(stream, i);
@@ -1018,12 +1088,12 @@ void cbm_build_sites(CBMArena *a, const char *rel, const char *src, size_t len, 
                     break;
                 }
             }
-            if (skaffold) {
+            if (skaffold && c.site_fn) {
                 const char *api = ci_get_str(&c, root, "apiVersion");
                 if (api && strncmp(api, "skaffold/", strlen("skaffold/")) == 0) {
                     ci_skaffold_walk(&c, root, dir, 0);
                 }
-            } else {
+            } else if (!skaffold) {
                 ci_compose(&c, root, dir, &env);
             }
         }
