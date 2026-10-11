@@ -1079,6 +1079,11 @@ void cbm_ci_commands(CBMArena *a, const char *rel, const char *src, size_t len, 
 void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                  int file_count);
 
+/* The Image node of image reference `ref` (its normalised repository:
+ * docker.io for no registry host, library/ for an official image; tag and
+ * digest dropped), made when new; 0 for scratch or no image. */
+int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref);
+
 /* Container builds (pass_docker.c): a Dockerfile DEPENDS_ON the Images it
  * builds on (FROM, COPY --from). Run at the end of the K8s pass. */
 void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,

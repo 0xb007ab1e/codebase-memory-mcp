@@ -773,8 +773,35 @@ static void k8s_emit_ref(k8s_walk_t *w, const char *kind, const char *ns, const 
     cbm_k8sfact_push(&w->ctx->result->k8s_facts, a, f);
 }
 
+// A container's literal image: `path` ends in containers[].image,
+// initContainers[].image or ephemeralContainers[].image at any depth (pod
+// templates, CronJobs, the pod templates of custom resources).
+static bool k8s_image_leaf(const char *path, const char *value) {
+    static const char *const LEAVES[] = {"containers[].image", "initContainers[].image",
+                                         "ephemeralContainers[].image"};
+    if (!value[0] || strchr(value, '$') || strchr(value, ' ') || strstr(value, "{{")) {
+        return false;
+    }
+    size_t pl = strlen(path);
+    for (size_t i = 0; i < sizeof(LEAVES) / sizeof(LEAVES[0]); i++) {
+        size_t ll = strlen(LEAVES[i]);
+        if (pl >= ll && strcmp(path + pl - ll, LEAVES[i]) == 0 &&
+            (pl == ll || path[pl - ll - SKIP_ONE] == '.')) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // A scalar at `path`: a leaf reference, or a CRD's group / kind.
 static void k8s_leaf(k8s_walk_t *w, const char *path, const char *value) {
+    if (k8s_image_leaf(path, value)) {
+        CBMK8sFact f = {.fact = CBM_K8S_FACT_IMAGE,
+                        .def_index = w->def_index,
+                        .name = cbm_arena_strdup(w->ctx->arena, value),
+                        .via = "container"};
+        cbm_k8sfact_push(&w->ctx->result->k8s_facts, w->ctx->arena, f);
+    }
     const char *pod = k8s_pod_prefix(w->kind);
     size_t pl = strlen(pod);
     if (pl && strncmp(path, pod, pl) == 0 && path[pl] == '.') {

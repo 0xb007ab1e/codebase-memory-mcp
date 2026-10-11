@@ -1159,6 +1159,9 @@ typedef struct {
     k8s_hr_t *srcs; /* an OCIRepository (node) and the URL it fetches (chart) */
     int src_n;
     int src_cap;
+    k8s_hr_t *imgs; /* an object (node) and a container image it runs (chart) */
+    int img_n;
+    int img_cap;
 } k8s_facts_t;
 
 static void k8s_facts_free(k8s_facts_t *f) {
@@ -1183,8 +1186,12 @@ static void k8s_facts_free(k8s_facts_t *f) {
     for (int i = 0; i < f->src_n; i++) {
         cbm_free(CBM_MEM_CLASS_OTHER, f->srcs[i].chart);
     }
+    for (int i = 0; i < f->img_n; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, f->imgs[i].chart);
+    }
     cbm_free(CBM_MEM_CLASS_OTHER, f->hrs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->srcs);
+    cbm_free(CBM_MEM_CLASS_OTHER, f->imgs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->refs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->crds);
     cbm_free(CBM_MEM_CLASS_OTHER, f->deploys);
@@ -1260,6 +1267,11 @@ static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64
         } else if (x->fact == CBM_K8S_FACT_SOURCE) {
             if (x->name && k8s_grow((void **)&f->srcs, &f->src_cap, f->src_n, sizeof(*f->srcs))) {
                 f->srcs[f->src_n++] =
+                    (k8s_hr_t){node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name), NULL};
+            }
+        } else if (x->fact == CBM_K8S_FACT_IMAGE) {
+            if (x->name && k8s_grow((void **)&f->imgs, &f->img_cap, f->img_n, sizeof(*f->imgs))) {
+                f->imgs[f->img_n++] =
                     (k8s_hr_t){node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name), NULL};
             }
         } else if (x->fact == CBM_K8S_FACT_CRD) {
@@ -3272,6 +3284,22 @@ static void k8s_link_chart_refs(k8s_dep_link_t *l, const k8s_hr_t *oci) {
     }
 }
 
+/* A container image an object runs: USAGE {ref:image} to its Image node --
+ * the node a Dockerfile building or building on that image joins. */
+static void k8s_link_images(cbm_pipeline_ctx_t *ctx, const k8s_facts_t *f) {
+    for (int i = 0; i < f->img_n; i++) {
+        int64_t img = cbm_pipeline_image_node(ctx, f->imgs[i].chart);
+        if (img <= 0) {
+            continue;
+        }
+        char esc[CBM_SZ_1K];
+        cbm_json_escape(esc, (int)sizeof(esc), f->imgs[i].chart);
+        char props[CBM_SZ_2K];
+        snprintf(props, sizeof(props), "{\"ref\":\"image\",\"image\":\"%s\"}", esc);
+        cbm_gbuf_insert_edge(ctx->gbuf, f->imgs[i].node, img, "USAGE", props);
+    }
+}
+
 static void k8s_link_deploys(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundles_t *b,
                              const k8s_facts_t *f) {
     if (f->dep_n == 0 && f->hr_n == 0 && f->src_n == 0) {
@@ -3460,6 +3488,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_resolve_refs(ctx, &bundles, &facts);
     k8s_link_crds(ctx, &bundles, &facts);
     k8s_link_deploys(ctx, &kusts, &bundles, &facts);
+    k8s_link_images(ctx, &facts);
     k8s_facts_free(&facts);
     k8s_records_free(&recs);
     /* Link `file://` chart dependencies now that every Chart.yaml is read,

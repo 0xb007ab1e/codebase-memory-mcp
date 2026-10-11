@@ -614,13 +614,16 @@ typedef struct {
  *     (name NULL: none); via "ingress" / "httproute".
  *   CBM_K8S_FACT_SOURCE: object def_index (a Flux OCIRepository) fetches
  *     from the URL `name`; a HelmRelease whose chartRef names it deploys the
- *     chart there. */
+ *     chart there.
+ *   CBM_K8S_FACT_IMAGE: object def_index runs a container of image `name`
+ *     (a literal reference); via "container". */
 typedef enum {
     CBM_K8S_FACT_REF = 0,
     CBM_K8S_FACT_CRD,
     CBM_K8S_FACT_DEPLOY,
     CBM_K8S_FACT_ROUTE,
-    CBM_K8S_FACT_SOURCE
+    CBM_K8S_FACT_SOURCE,
+    CBM_K8S_FACT_IMAGE
 } CBMK8sFactKind;
 typedef struct {
     CBMK8sFactKind fact;

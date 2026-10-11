@@ -249,7 +249,22 @@ static const char *dk_expand(dk_t *d, const dk_var_t *vars, const char *text) {
 }
 
 /* The repository identity of image reference `ref` into out. */
+/* Only characters an image reference can hold (name, :tag, @digest) -- a
+ * template's placeholder (`<.Values.image>`, `<tpl>`) or an expression is
+ * no image. */
+static bool dk_ref_chars(const char *ref) {
+    for (const char *p = ref; *p; p++) {
+        if (!isalnum((unsigned char)*p) && !strchr("._-/:@+", *p)) {
+            return false;
+        }
+    }
+    return ref[0] != '\0';
+}
+
 static bool dk_normalize(const char *ref, char *out, size_t sz) {
+    if (!dk_ref_chars(ref)) {
+        return false;
+    }
     char r[CBM_SZ_512];
     snprintf(r, sizeof(r), "%s", ref);
     char *at = strchr(r, '@');
@@ -306,11 +321,10 @@ static bool dk_is_stage(const dk_t *d, const char *ref) {
     return false;
 }
 
-/* DEPENDS_ON from the Dockerfile to the Image of resolved reference `ref`. */
-static void dk_link(dk_t *d, const char *ref, const char *via, int line) {
+int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref) {
     char repo[CBM_SZ_512];
-    if (dk_ieq(ref, "scratch") || !dk_normalize(ref, repo, sizeof(repo))) {
-        return;
+    if (!ref || dk_ieq(ref, "scratch") || !dk_normalize(ref, repo, sizeof(repo))) {
+        return 0;
     }
     char qn[CBM_SZ_1K];
     snprintf(qn, sizeof(qn), "__image__%s", repo);
@@ -318,7 +332,12 @@ static void dk_link(dk_t *d, const char *ref, const char *via, int line) {
     cbm_json_escape(esc_repo, (int)sizeof(esc_repo), repo);
     char node_props[CBM_SZ_2K];
     snprintf(node_props, sizeof(node_props), "{\"repository\":\"%s\"}", esc_repo);
-    int64_t img = cbm_gbuf_upsert_node(d->ctx->gbuf, "Image", repo, qn, "", 0, 0, node_props);
+    return cbm_gbuf_upsert_node(ctx->gbuf, "Image", repo, qn, "", 0, 0, node_props);
+}
+
+/* DEPENDS_ON from the Dockerfile to the Image of resolved reference `ref`. */
+static void dk_link(dk_t *d, const char *ref, const char *via, int line) {
+    int64_t img = cbm_pipeline_image_node(d->ctx, ref);
     if (img <= 0) {
         return;
     }

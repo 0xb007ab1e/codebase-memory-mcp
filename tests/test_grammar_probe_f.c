@@ -1995,6 +1995,62 @@ TEST(probe_dockerfile_entrypoint_runs) {
     PASS();
 }
 
+/* Every USAGE {ref:image} edge as "<object> -> <repository>", sorted. */
+static char *gpf_image_users(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT s.name || ' -> ' || "
+            "t.name AS x FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND e.type='USAGE' AND t.label='Image' AND "
+            "json_extract(e.properties,'$.ref')='image' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* An object running a container USAGE {ref:image} the Image of its literal
+ * image reference -- containers, initContainers, any pod template (CronJob,
+ * a custom resource). A shell substitution or a template placeholder is no
+ * image. */
+TEST(probe_k8s_container_images_are_images) {
+    static const GpfFile files[] = {
+        {"app.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n"
+         "    spec:\n      initContainers:\n        - name: init\n"
+         "          image: busybox@sha256:0123\n      containers:\n        - name: web\n"
+         "          image: nginx:1.27\n        - name: side\n          image: $(SIDE_IMAGE)\n"
+         "---\napiVersion: batch/v1\nkind: CronJob\nmetadata:\n  name: nightly\nspec:\n"
+         "  jobTemplate:\n    spec:\n      template:\n        spec:\n          containers:\n"
+         "            - name: job\n              image: ghcr.io/acme/job:2\n"
+         "---\napiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: w\nspec:\n"
+         "  template:\n    spec:\n      containers:\n        - name: w\n"
+         "          image: quay.io/acme/widget:3\n        - name: placeholder\n"
+         "          image: <image-built-from-dockerfile>\n"}};
+    char *got = gpf_image_users(files, 1);
+    static const char want[] = "CronJob/nightly -> ghcr.io/acme/job\n"
+                               "Deployment/web -> docker.io/library/busybox\n"
+                               "Deployment/web -> docker.io/library/nginx\n"
+                               "Widget/w -> quay.io/acme/widget";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "image users got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("USAGE {ref:image} edge set");
+    }
+    free(got);
+    PASS();
+}
+
 #define GPF_CM(name) "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " name "\n"
 #define GPF_KUST "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
 
@@ -4261,6 +4317,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_dockerfile_bases_are_images);
     RUN_TEST(probe_dockerfile_variants_are_dockerfiles);
     RUN_TEST(probe_dockerfile_entrypoint_runs);
+    RUN_TEST(probe_k8s_container_images_are_images);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
     RUN_TEST(probe_shell_helm_deploys_its_chart);
