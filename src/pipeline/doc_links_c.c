@@ -471,6 +471,27 @@ static void cr_resolve_name(const cr_index_t *ix, int src, const CBMDocLink *lin
     }
 }
 
+/* A function, variable, enum constant, field or macro (D kind link name qn
+ * parent, kind f v e r m M) and a Doxygen anchor (A name) each declare one
+ * name. A type (t) is what members and Type::member are found through:
+ * GLOBAL, as is every new or changed record. */
+static bool cr_removable(const char *line, size_t len, const char **name, size_t *nlen) {
+    if (len <= PAIR_LEN || line[1] != '\t') {
+        return false;
+    }
+    if (line[0] == 'A') {
+        return cbm_doclinks_scope_field(line, len, 1, name, nlen);
+    }
+    return line[0] == 'D' && strchr("fverMm", line[PAIR_LEN]) && line[PAIR_LEN] &&
+           line[PAIR_LEN + SKIP_ONE] == '\t' &&
+           cbm_doclinks_scope_field(line, len, CBM_SZ_3, name, nlen);
+}
+
+static int cr_scope_delta(const char *stored, const char *fresh, cbm_doclink_name_fn removed,
+                          void *ud) {
+    return cbm_doclinks_scope_delta_lines(stored, fresh, cr_removable, removed, ud);
+}
+
 const cbm_doclink_resolver_t cbm_doclink_c_resolver = {
     .langs = {CBM_LANG_C, CBM_LANG_CPP},
     .lang_count = PAIR_LEN,
@@ -478,4 +499,5 @@ const cbm_doclink_resolver_t cbm_doclink_c_resolver = {
     .build = cr_build,
     .destroy = cr_destroy,
     .resolve = cr_resolve,
+    .scope_delta = cr_scope_delta,
 };

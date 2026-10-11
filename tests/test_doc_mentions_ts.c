@@ -307,7 +307,7 @@ TEST(doc_mentions_ts_incremental_equals_full) {
     ASSERT_EQ(dm_step(repo, inc_db, full_db, "body edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
     ASSERT_TRUE(ts_edge(inc_db, "src.use.use", "src.lib.a"));
 
-    /* an export goes: without a scope_delta hook that is a full run */
+    /* an export goes: the declaration's record changes, a full run */
     th_write_file(TH_PATH(repo, "src/lib.ts"), "function a() {}\nexport function b() {}\n");
     ASSERT_EQ(dm_step(repo, inc_db, full_db, "export removed", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
               0);

@@ -287,7 +287,12 @@ TEST(doc_mentions_c_incremental_equals_full) {
     ASSERT_EQ(dm_step(repo, inc_db, full_db, "body edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
     ASSERT_TRUE(c_edge(inc_db, "src.use.user", "src.lib.a"));
 
-    /* a becomes static: without a scope_delta hook that is a full run */
+    /* b goes: the files that name it are repaired, nothing else */
+    th_write_file(TH_PATH(repo, "src/lib.c"), "int a(void) { return 2; }\n");
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "b removed", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_TRUE(c_edge(inc_db, "src.use.user", "src.lib.a"));
+
+    /* a becomes static (and b is back): changed records, a full run */
     th_write_file(TH_PATH(repo, "src/lib.c"),
                   "static int a(void) { return 0; }\nint b(void) { return 1; }\n");
     ASSERT_EQ(dm_step(repo, inc_db, full_db, "made static", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);

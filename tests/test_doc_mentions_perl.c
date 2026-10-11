@@ -229,8 +229,7 @@ TEST(doc_mentions_perl_incremental_equals_full) {
         dm_step(repo, inc_db, full_db, "module doc link", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
     ASSERT_TRUE(pl_edge(inc_db, "lib.Knob.pm.__file__", "lib.Knob.Dial.pm.__file__"));
 
-    /* a new heading changes the file's scope blob: without a scope_delta hook
-     * that is a full run */
+    /* a new heading changes how a section is found: a full run */
     th_write_file(TH_PATH(repo, "lib/Knob.pm"),
                   "package Knob;\n\n=head1 NAME\n\nKnob, a knob - see L<Knob::Dial/spin> and\n"
                   "L<Knob::Dial>.\n\n=head1 SEE ALSO\n\nL<Knob::Dial/OVERVIEW>\n\n=cut\n\n"
@@ -249,6 +248,12 @@ TEST(doc_mentions_perl_incremental_equals_full) {
     int n = 0;
     dm_edge(inc_db, "lib.Knob.pm.__file__", "lib.Knob.Dial.spin", props, sizeof(props), &n);
     ASSERT_EQ(n, 0);
+
+    /* the sub goes: the files that name it are repaired, nothing else */
+    th_write_file(TH_PATH(repo, "lib/Knob/Dial.pm"),
+                  "package Knob::Dial;\n\n=head1 OVERVIEW\n\nThe dial.\n\n=cut\n\n1;\n");
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "sub removed", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
+              0);
     th_cleanup(tmp);
     PASS();
 }

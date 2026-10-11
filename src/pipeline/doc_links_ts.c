@@ -1083,6 +1083,20 @@ static void tr_resolve(const void *index, void *state, int run_file, const CBMDo
     tr_out(&c, r);
 }
 
+/* A top-level declaration (D name flags) declares one name: other files reach
+ * it through an import of it, so a reference that did either bound it (an
+ * edge into this file) or names it in its unresolved row. Imports, exports
+ * and namespaces change how others resolve: GLOBAL. */
+static bool tr_removable(const char *line, size_t len, const char **name, size_t *nlen) {
+    return len > PAIR_LEN && line[0] == 'D' && line[1] == '\t' &&
+           cbm_doclinks_scope_field(line, len, 1, name, nlen);
+}
+
+static int tr_scope_delta(const char *stored, const char *fresh, cbm_doclink_name_fn removed,
+                          void *ud) {
+    return cbm_doclinks_scope_delta_lines(stored, fresh, tr_removable, removed, ud);
+}
+
 const cbm_doclink_resolver_t cbm_doclink_ts_resolver = {
     .langs = {CBM_LANG_TYPESCRIPT, CBM_LANG_TSX, CBM_LANG_JAVASCRIPT},
     .lang_count = CBM_SZ_3,
@@ -1090,4 +1104,5 @@ const cbm_doclink_resolver_t cbm_doclink_ts_resolver = {
     .build = tr_build,
     .destroy = tr_destroy,
     .resolve = tr_resolve,
+    .scope_delta = tr_scope_delta,
 };

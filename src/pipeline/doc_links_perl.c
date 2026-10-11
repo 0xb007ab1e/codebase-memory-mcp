@@ -26,9 +26,10 @@
  * Test code (t/, xt/, *.t, and cbm_is_test_file) is bound only from test code.
  * Every edge is exact: a module name and a heading are spelled out in full.
  *
- * The scope blob carries no lines (doclink_perl.c), and without a scope_delta
- * hook every change of a blob is a full re-resolution: a change that adds or
- * drops a package, a sub or a heading; an edit inside a sub changes no blob.
+ * The scope blob carries no lines (doclink_perl.c). A dropped sub is repaired
+ * file by file (pl_scope_delta); a change that adds a sub, or adds or drops a
+ * package or a heading, is a full re-resolution; an edit inside a sub changes
+ * no blob.
  */
 #include "pipeline/doc_links.h"
 #include "pipeline/pipeline_internal.h" /* cbm_pipeline_file_node */
@@ -479,6 +480,19 @@ static void pr_resolve(const void *index, void *state, int run_file, const CBMDo
     pr_edge(&c, f, pr_module_node(&c, f));
 }
 
+/* A sub (S pkg name) declares one name. A package (its index places every
+ * sub after it), a heading (a section is found by its text) and the
+ * parse-error mark change how others resolve: GLOBAL. */
+static bool pl_removable(const char *line, size_t len, const char **name, size_t *nlen) {
+    return len > PAIR_LEN && line[0] == 'S' && line[1] == '\t' &&
+           cbm_doclinks_scope_field(line, len, PAIR_LEN, name, nlen);
+}
+
+static int pl_scope_delta(const char *stored, const char *fresh, cbm_doclink_name_fn removed,
+                          void *ud) {
+    return cbm_doclinks_scope_delta_lines(stored, fresh, pl_removable, removed, ud);
+}
+
 const cbm_doclink_resolver_t cbm_doclink_perl_resolver = {
     .langs = {CBM_LANG_PERL},
     .lang_count = 1,
@@ -486,4 +500,5 @@ const cbm_doclink_resolver_t cbm_doclink_perl_resolver = {
     .build = pr_build,
     .destroy = pr_destroy,
     .resolve = pr_resolve,
+    .scope_delta = pl_scope_delta,
 };

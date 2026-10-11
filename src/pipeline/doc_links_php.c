@@ -954,6 +954,35 @@ static void pr_resolve(const void *index, void *state, int run_file, const CBMDo
     pr_out(&c, res, out);
 }
 
+/* A top-level function (F fqn flags) or a member of the type above it (K kind
+ * name) declares one name; reported as a reference spells it, the last
+ * segment of a qualified name. A type, a supertype, a namespace block or a
+ * use import changes how others resolve: GLOBAL. */
+static bool pr_removable(const char *line, size_t len, const char **name, size_t *nlen) {
+    if (len <= PAIR_LEN || line[1] != '\t') {
+        return false;
+    }
+    if (line[0] == 'K') {
+        return cbm_doclinks_scope_field(line, len, PAIR_LEN, name, nlen);
+    }
+    if (line[0] != 'F' || !cbm_doclinks_scope_field(line, len, 1, name, nlen)) {
+        return false;
+    }
+    for (size_t i = *nlen; i > 0; i--) {
+        if ((*name)[i - SKIP_ONE] == '\\') {
+            *nlen -= i;
+            *name += i;
+            break;
+        }
+    }
+    return true;
+}
+
+static int pr_scope_delta(const char *stored, const char *fresh, cbm_doclink_name_fn removed,
+                          void *ud) {
+    return cbm_doclinks_scope_delta_lines(stored, fresh, pr_removable, removed, ud);
+}
+
 const cbm_doclink_resolver_t cbm_doclink_php_resolver = {
     .langs = {CBM_LANG_PHP},
     .lang_count = SKIP_ONE,
@@ -961,4 +990,5 @@ const cbm_doclink_resolver_t cbm_doclink_php_resolver = {
     .build = pr_build,
     .destroy = pr_destroy,
     .resolve = pr_resolve,
+    .scope_delta = pr_scope_delta,
 };

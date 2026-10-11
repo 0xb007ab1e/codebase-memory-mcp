@@ -120,6 +120,64 @@ int cbm_doclinks_scope_delta(const char *stored, const char *fresh, cbm_doclink_
     return R->scope_delta(stored, fresh, removed, ud);
 }
 
+/* One line of a scope blob at *p, without its newline; false at the end. */
+static bool scope_next_line(const char **p, const char **line, size_t *len) {
+    if (!*p || !**p) {
+        return false;
+    }
+    const char *nl = strchr(*p, '\n');
+    *line = *p;
+    *len = nl ? (size_t)(nl - *p) : strlen(*p);
+    *p = nl ? nl + SKIP_ONE : *p + *len;
+    return true;
+}
+
+int cbm_doclinks_scope_delta_lines(const char *stored, const char *fresh,
+                                   cbm_doclink_removable_fn removable, cbm_doclink_name_fn removed,
+                                   void *ud) {
+    const char *sp = stored;
+    const char *fp = fresh;
+    const char *sl = NULL;
+    const char *fl = NULL;
+    size_t slen = 0;
+    size_t flen = 0;
+    bool hs = scope_next_line(&sp, &sl, &slen);
+    bool hf = scope_next_line(&fp, &fl, &flen);
+    while (hs || hf) {
+        if (hs && hf && slen == flen && memcmp(sl, fl, slen) == 0) {
+            hs = scope_next_line(&sp, &sl, &slen);
+            hf = scope_next_line(&fp, &fl, &flen);
+            continue;
+        }
+        const char *name = NULL;
+        size_t nlen = 0;
+        if (!hs || !removable(sl, slen, &name, &nlen) || nlen == 0) {
+            return CBM_DOCLINK_DELTA_GLOBAL; /* new, changed, or resolved through */
+        }
+        if (!removed || !removed(ud, name, nlen)) {
+            return CBM_NOT_FOUND;
+        }
+        hs = scope_next_line(&sp, &sl, &slen);
+    }
+    return CBM_DOCLINK_DELTA_LOCAL;
+}
+
+bool cbm_doclinks_scope_field(const char *line, size_t len, int k, const char **field,
+                              size_t *field_len) {
+    size_t s = 0;
+    for (int f = 0; f < k; f++) {
+        const char *tab = memchr(line + s, '\t', len - s);
+        if (!tab) {
+            return false;
+        }
+        s = (size_t)(tab - line) + SKIP_ONE;
+    }
+    const char *tab = memchr(line + s, '\t', len - s);
+    *field = line + s;
+    *field_len = tab ? (size_t)(tab - line) - s : len - s;
+    return true;
+}
+
 const char *cbm_doclinks_storable_scope(const char *scope, char **owned) {
     *owned = NULL;
     const cbm_doclink_resolver_t *R = resolver_of_scope(scope);
