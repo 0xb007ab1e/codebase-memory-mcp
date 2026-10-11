@@ -1622,14 +1622,14 @@ static void dk_hub_collect(cbm_pipeline_ctx_t *ctx, CBMArena *a, int64_t img,
         }
         atomic_fetch_add_explicit(&g_dk_hub_edges, (uint64_t)n, memory_order_relaxed);
     }
-    static const char *const IN[] = {"USAGE", "DEPENDS_ON"};
-    for (size_t t = 0; t < sizeof(IN) / sizeof(IN[0]); t++) {
-        if (cbm_gbuf_find_edges_by_target_type(ctx->gbuf, img, IN[t], &es, &n) != 0) {
+    static const char *const REF_TYPES[] = {"USAGE", "DEPENDS_ON"};
+    for (size_t t = 0; t < sizeof(REF_TYPES) / sizeof(REF_TYPES[0]); t++) {
+        if (cbm_gbuf_find_edges_by_target_type(ctx->gbuf, img, REF_TYPES[t], &es, &n) != 0) {
             continue;
         }
         atomic_fetch_add_explicit(&g_dk_hub_edges, (uint64_t)n, memory_order_relaxed);
         for (int i = 0; i < n; i++) {
-            if (dk_hub_ref(IN[t], es[i]->properties_json) &&
+            if (dk_hub_ref(REF_TYPES[t], es[i]->properties_json) &&
                 dk_prop(es[i]->properties_json, "image", ref, sizeof(ref))) {
                 dk_tag(ref, tag, sizeof(tag));
                 dk_hub_push(a, refs, es[i], tag);

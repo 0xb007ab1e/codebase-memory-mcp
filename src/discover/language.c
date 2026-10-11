@@ -980,7 +980,7 @@ CBMLanguage cbm_language_for_extension(const char *ext) {
  * ignore file (Dockerfile.dockerignore). */
 static bool lang_dockerfile_variant(const cbm_userconfig_t *ucfg, const char *filename) {
     static const char *const BASES[] = {"Dockerfile", "Containerfile"};
-    static const char IGNORE[] = ".dockerignore";
+    static const char DOCKERIGNORE[] = ".dockerignore";
     for (size_t i = 0; i < sizeof(BASES) / sizeof(BASES[0]); i++) {
         size_t bl = strlen(BASES[i]);
         char sep = filename[bl];
@@ -989,8 +989,8 @@ static bool lang_dockerfile_variant(const cbm_userconfig_t *ucfg, const char *fi
             continue;
         }
         size_t fl = strlen(filename);
-        if (fl >= sizeof(IGNORE) - SKIP_ONE &&
-            strcmp(filename + fl - (sizeof(IGNORE) - SKIP_ONE), IGNORE) == 0) {
+        if (fl >= sizeof(DOCKERIGNORE) - SKIP_ONE &&
+            strcmp(filename + fl - (sizeof(DOCKERIGNORE) - SKIP_ONE), DOCKERIGNORE) == 0) {
             return false;
         }
         const char *last_dot = strrchr(filename, '.');
