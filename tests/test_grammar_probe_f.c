@@ -1963,6 +1963,38 @@ TEST(probe_dockerfile_variants_are_dockerfiles) {
     PASS();
 }
 
+/* A Dockerfile SPAWNS what its last stage runs: the Go main of a binary a
+ * stage built and the image copied in, an interpreter script or a file
+ * copied in (also a CMD file under an inherited ENTRYPOINT), else the
+ * program's Process. sh -c and arguments-only CMDs are no edge. */
+TEST(probe_dockerfile_entrypoint_runs) {
+    static const GpfFile files[] = {
+        {"go.mod", "module example.com/app\n\ngo 1.22\n"},
+        {"cmd/server/main.go", "package main\n\nfunc main() {}\n"},
+        {"svc/Dockerfile", "FROM golang:1.22 AS build\nWORKDIR /src\nCOPY . .\n"
+                           "RUN CGO_ENABLED=0 go build -o /out/server ./cmd/server\n"
+                           "FROM gcr.io/distroless/static\nCOPY --from=build /out/server /server\n"
+                           "ENTRYPOINT [\"/server\", \"--port\", \"8080\"]\n"},
+        {"py/app.py", "print('x')\n"},
+        {"py/Dockerfile", "FROM python:3.12\nWORKDIR /app\nCOPY . .\nCMD [\"python\", \"app.py\"]\n"},
+        {"node/index.js", "console.log(1);\n"},
+        {"node/Dockerfile",
+         "FROM gcr.io/distroless/nodejs22\nWORKDIR /app\nCOPY index.js .\nCMD [\"index.js\"]\n"},
+        {"tool/run.sh", "#!/bin/sh\necho run\n"},
+        {"tool/Dockerfile", "FROM alpine:3.20\nCOPY run.sh /usr/local/bin/run.sh\n"
+                            "ENTRYPOINT [\"/usr/local/bin/run.sh\"]\n"},
+        {"web/Dockerfile", "FROM nginx:1.27\nCMD [\"nginx\", \"-g\", \"daemon off;\"]\n"},
+        {"sh/Dockerfile", "FROM alpine:3.20\nCMD sh -c \"echo hi\"\n"},
+        {"args/Dockerfile", "FROM gcr.io/distroless/python3\nCMD [\"--flag\"]\n"}};
+    GPF_ASSERT_RUNS(files, 12,
+                    "@node/Dockerfile -> script:node/index.js (SPAWNS dockerfile)\n"
+                    "@py/Dockerfile -> script:py/app.py (SPAWNS dockerfile)\n"
+                    "@svc/Dockerfile -> rule:cmd/server/main.go:main (SPAWNS dockerfile)\n"
+                    "@tool/Dockerfile -> script:tool/run.sh (SPAWNS dockerfile)\n"
+                    "@web/Dockerfile -> proc:nginx (SPAWNS dockerfile)");
+    PASS();
+}
+
 #define GPF_CM(name) "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " name "\n"
 #define GPF_KUST "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
 
@@ -4228,6 +4260,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_mcp_trace_deploy);
     RUN_TEST(probe_dockerfile_bases_are_images);
     RUN_TEST(probe_dockerfile_variants_are_dockerfiles);
+    RUN_TEST(probe_dockerfile_entrypoint_runs);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
     RUN_TEST(probe_shell_helm_deploys_its_chart);

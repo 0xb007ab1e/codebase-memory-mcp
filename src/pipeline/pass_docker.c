@@ -13,7 +13,22 @@
  *
  * Image identity is the normalised repository: docker.io for an image
  * without a registry host, library/ for an official one-segment image;
- * tag and digest stay on the edge. Run at the end of the K8s pass.
+ * tag and digest stay on the edge.
+ *
+ * PHASE 4 P4.1b: what the container runs. The last stage's ENTRYPOINT (else
+ * CMD) SPAWNS -- from the Dockerfile's Module {api:dockerfile}:
+ *   the repository file it runs     a script / source copied into the image
+ *                                   (an interpreter's script, a path, a CMD
+ *                                   file under an inherited ENTRYPOINT)
+ *   the Go `main` of the package    a binary `go build -o` made in a stage
+ *                                   and the image copied in
+ *   a Process                       any other program
+ * Container paths map back through COPY: a context source is looked up under
+ * the Dockerfile's directory and the repository root -- the one where it is
+ * the file (or Go main package) wanted, else nothing; COPY --from=<stage>
+ * continues in that stage. WORKDIR makes paths absolute. `sh -c`, a variable
+ * program and arguments to an inherited ENTRYPOINT are no edge.
+ * Run at the end of the K8s pass.
  */
 #include "foundation/constants.h"
 #include "foundation/compat.h"
@@ -35,7 +50,42 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { DK_MAX_STAGES = 64 };
+enum { DK_MAX_STAGES = 64, DK_MAX_WORDS = 256, DK_MAX_DEPTH = 8 };
+
+typedef struct dk_copy {
+    const char *from;  /* --from= value; NULL: none, or unknown */
+    bool has_from;     /* --from given */
+    const char **srcs; /* NULL entries: unknown */
+    int nsrc;
+    const char *dst; /* as written; NULL: unknown */
+    const char *workdir;
+    struct dk_copy *next; /* the stage's previous COPY */
+} dk_copy_t;
+
+typedef struct dk_build {
+    const char *out; /* go build -o; NULL: none or unknown */
+    const char *pkg; /* NULL: unknown */
+    const char *workdir;
+    struct dk_build *next; /* the stage's previous build */
+} dk_build_t;
+
+typedef struct {
+    const char **argv;
+    int argc;
+    int line;
+    const char *workdir;
+    bool set;
+} dk_entry_t;
+
+typedef struct {
+    dk_copy_t *copies;  /* newest first */
+    dk_build_t *builds; /* newest first */
+} dk_stage_t;
+
+typedef struct {
+    CBMHashTable *files;  /* repo path -> File node */
+    CBMHashTable *gomain; /* repo dir -> the `main` Function of its package */
+} dk_index_t;
 
 typedef struct dk_var {
     const char *name;
@@ -54,6 +104,12 @@ typedef struct {
     const char *stages[DK_MAX_STAGES]; /* stage names; NULL: unnamed */
     int stage;                         /* index of the current stage; -1 before FROM */
     int edges;
+    const char *dir;              /* the Dockerfile's directory ("" at the root) */
+    const char *workdir;          /* the current stage's WORKDIR */
+    dk_stage_t st[DK_MAX_STAGES]; /* COPY / go build records */
+    dk_entry_t entry;             /* the current stage's ENTRYPOINT */
+    dk_entry_t cmd;               /* the current stage's CMD */
+    const dk_index_t *ix;
 } dk_t;
 
 static bool dk_type(TSNode n, const char *t) {
@@ -334,6 +390,9 @@ static void dk_from(dk_t *d, TSNode ins) {
     const char *ref = ts_node_is_null(spec) ? NULL : dk_expand(d, d->global, dk_text(d, spec));
     d->stage++;
     d->local = NULL;
+    d->workdir = "/";
+    d->entry.set = false;
+    d->cmd.set = false;
     if (ref && !dk_is_stage(d, ref)) {
         dk_link(d, ref, "from", dk_line(ins));
     }
@@ -342,10 +401,61 @@ static void dk_from(dk_t *d, TSNode ins) {
     }
 }
 
+/* JSON string `s` (quoted) unquoted; \\ and \" unescaped. */
+static const char *dk_json_string(dk_t *d, const char *s) {
+    size_t l = s ? strlen(s) : 0;
+    if (l < PAIR_LEN || s[0] != '"') {
+        return s;
+    }
+    char *out = cbm_arena_alloc(d->a, l);
+    size_t n = 0;
+    for (size_t i = SKIP_ONE; out && i + SKIP_ONE < l; i++) {
+        if (s[i] == '\\' && i + PAIR_LEN < l) {
+            i++;
+        }
+        out[n++] = s[i];
+    }
+    if (out) {
+        out[n] = '\0';
+    }
+    return out;
+}
+
+/* The strings of a json_string_array node. */
+static int dk_json_array(dk_t *d, TSNode arr, const char **out, int max) {
+    int n = 0;
+    for (uint32_t i = 0; i < ts_node_named_child_count(arr) && n < max; i++) {
+        TSNode js = ts_node_named_child(arr, i);
+        if (dk_type(js, "json_string")) {
+            out[n++] = dk_json_string(d, dk_text(d, js));
+        }
+    }
+    return n;
+}
+
 static void dk_copy(dk_t *d, TSNode ins) {
     static const char FROM[] = "--from=";
+    const char *words[DK_MAX_WORDS];
+    int nw = 0;
+    dk_copy_t *c = cbm_arena_alloc(d->a, sizeof(*c));
+    if (c) {
+        *c = (dk_copy_t){.workdir = d->workdir};
+    }
     for (uint32_t i = 0; i < ts_node_named_child_count(ins); i++) {
         TSNode p = ts_node_named_child(ins, i);
+        if (dk_type(p, "path") && nw < DK_MAX_WORDS) {
+            const char *t = dk_text(d, p);
+            words[nw++] = t ? dk_expand(d, d->local, t) : NULL;
+            continue;
+        }
+        if (dk_type(p, "json_string_array")) {
+            const char *raw[DK_MAX_WORDS];
+            int n = dk_json_array(d, p, raw, DK_MAX_WORDS - nw);
+            for (int k = 0; k < n; k++) {
+                words[nw++] = raw[k] ? dk_expand(d, d->local, raw[k]) : NULL;
+            }
+            continue;
+        }
         if (!dk_type(p, "param")) {
             continue;
         }
@@ -354,10 +464,568 @@ static void dk_copy(dk_t *d, TSNode ins) {
             continue;
         }
         const char *ref = dk_expand(d, d->local, t + sizeof(FROM) - SKIP_ONE);
+        if (c) {
+            c->has_from = true;
+            c->from = ref;
+        }
         if (ref && ref[0] && !dk_is_stage(d, ref)) {
             dk_link(d, ref, "copy-from", dk_line(ins));
         }
     }
+    if (!c || nw < PAIR_LEN || d->stage >= DK_MAX_STAGES) {
+        return;
+    }
+    c->srcs = cbm_arena_alloc(d->a, (size_t)(nw - SKIP_ONE) * sizeof(*c->srcs));
+    if (!c->srcs) {
+        return;
+    }
+    memcpy((void *)c->srcs, words, (size_t)(nw - SKIP_ONE) * sizeof(*c->srcs));
+    c->nsrc = nw - SKIP_ONE;
+    c->dst = words[nw - SKIP_ONE];
+    c->next = d->st[d->stage].copies;
+    d->st[d->stage].copies = c;
+}
+
+/* ── Paths in the image and in the repository ────────────────────────── */
+
+static const char *dk_join(dk_t *d, const char *a, const char *b) {
+    if (!a || !a[0]) {
+        return b;
+    }
+    if (!b || !b[0]) {
+        return a;
+    }
+    size_t al = strlen(a);
+    size_t bl = strlen(b);
+    char *s = cbm_arena_alloc(d->a, al + bl + PAIR_LEN);
+    if (s) {
+        memcpy(s, a, al);
+        size_t n = al;
+        if (a[al - SKIP_ONE] != '/') {
+            s[n++] = '/';
+        }
+        memcpy(s + n, b, bl);
+        s[n + bl] = '\0';
+    }
+    return s;
+}
+
+/* `p` with "." and empty segments dropped and ".." applied; an absolute path
+ * stays absolute ("/" at most), a relative one climbing out keeps "..". */
+static const char *dk_norm(dk_t *d, const char *p) {
+    if (!p) {
+        return NULL;
+    }
+    size_t cap = strlen(p) + PAIR_LEN;
+    char *out = cbm_arena_alloc(d->a, cap);
+    if (!out) {
+        return NULL;
+    }
+    bool abs = p[0] == '/';
+    size_t len = 0;
+    if (abs) {
+        out[len++] = '/';
+    }
+    size_t base = len;
+    for (const char *s = p; *s;) {
+        while (*s == '/') {
+            s++;
+        }
+        const char *e = s;
+        while (*e && *e != '/') {
+            e++;
+        }
+        size_t sl = (size_t)(e - s);
+        if (sl == 0) {
+            break;
+        }
+        bool dot = sl == SKIP_ONE && s[0] == '.';
+        bool up = sl == PAIR_LEN && s[0] == '.' && s[SKIP_ONE] == '.';
+        if (up) {
+            size_t k = len;
+            while (k > base && out[k - SKIP_ONE] != '/') {
+                k--;
+            }
+            bool last_up = len - k == PAIR_LEN && out[k] == '.' && out[k + SKIP_ONE] == '.';
+            if (len > base && !last_up) {
+                len = k > base ? k - SKIP_ONE : base;
+            } else if (!abs) {
+                if (len > base) {
+                    out[len++] = '/';
+                }
+                out[len++] = '.';
+                out[len++] = '.';
+            }
+        } else if (!dot) {
+            if (len > base) {
+                out[len++] = '/';
+            }
+            memcpy(out + len, s, sl);
+            len += sl;
+        }
+        s = e;
+    }
+    out[len] = '\0';
+    return out;
+}
+
+/* Container path `p` made absolute against `workdir`, normalised. */
+static const char *dk_absolute(dk_t *d, const char *p, const char *workdir) {
+    if (!p) {
+        return NULL;
+    }
+    return dk_norm(d, p[0] == '/' ? p : dk_join(d, workdir && workdir[0] ? workdir : "/", p));
+}
+
+static const char *dk_base(const char *p) {
+    const char *s = strrchr(p, '/');
+    return s ? s + SKIP_ONE : p;
+}
+
+/* The directory of normalised path `p` ("/" for "/x", "" for "x"). */
+static const char *dk_dir(dk_t *d, const char *p) {
+    const char *s = strrchr(p, '/');
+    if (!s) {
+        return "";
+    }
+    if (s == p) {
+        return "/";
+    }
+    char *out = cbm_arena_alloc(d->a, (size_t)(s - p) + SKIP_ONE);
+    if (out) {
+        memcpy(out, p, (size_t)(s - p));
+        out[s - p] = '\0';
+    }
+    return out;
+}
+
+static bool dk_ends(const char *s, const char *suffix) {
+    size_t l = strlen(s);
+    size_t k = strlen(suffix);
+    return l >= k && strcmp(s + l - k, suffix) == 0;
+}
+
+enum { DK_WANT_FILE, DK_WANT_GOMAIN };
+
+/* The repository path of context source `src` (+ `rel`) that is what `want`
+ * asks for, the one such path over the context candidates (the Dockerfile's
+ * directory, the repository root); NULL when none or two. */
+static const char *dk_repo(dk_t *d, const char *src, const char *rel, int want) {
+    const char *ctxs[PAIR_LEN] = {d->dir, ""};
+    int nctx = d->dir[0] ? PAIR_LEN : SKIP_ONE;
+    CBMHashTable *t = want == DK_WANT_FILE ? d->ix->files : d->ix->gomain;
+    const char *hit = NULL;
+    int hits = 0;
+    while (*src == '/') {
+        src++;
+    }
+    for (int i = 0; t && i < nctx; i++) {
+        const char *base = dk_join(d, ctxs[i], src);
+        const char *p = dk_norm(d, rel && rel[0] ? dk_join(d, base, rel) : base);
+        if (!p || strncmp(p, "..", PAIR_LEN) == 0 || !cbm_ht_get(t, p)) {
+            continue;
+        }
+        if (!hit || strcmp(hit, p) != 0) {
+            hits++;
+            hit = p;
+        }
+    }
+    return hits == SKIP_ONE ? hit : NULL;
+}
+
+/* The stage a --from names: an index, else the last stage of that name. */
+static int dk_stage_of(const dk_t *d, const char *ref) {
+    if (!ref || !ref[0]) {
+        return -1;
+    }
+    bool digits = true;
+    for (const char *p = ref; *p; p++) {
+        digits = digits && isdigit((unsigned char)*p);
+    }
+    if (digits) {
+        int k = atoi(ref);
+        return k < DK_MAX_STAGES ? k : -1;
+    }
+    int found = -1;
+    for (int i = 0; i <= d->stage && i < DK_MAX_STAGES; i++) {
+        if (d->stages[i] && dk_ieq(d->stages[i], ref)) {
+            found = i;
+        }
+    }
+    return found;
+}
+
+typedef struct {
+    const char *repo;        /* a repository path, or */
+    const dk_build_t *build; /* the go build that made the path */
+    int build_stage;
+} dk_found_t;
+
+/* Where container path `path` of `stage` came from: a repository path that is
+ * what `want` asks for, or a go build of the stage; false: nothing known. */
+static bool dk_origin(dk_t *d, int stage, const char *path, int want, int depth, dk_found_t *out) {
+    if (depth > DK_MAX_DEPTH || stage < 0 || stage >= DK_MAX_STAGES || !path) {
+        return false;
+    }
+    for (const dk_build_t *b = d->st[stage].builds; b; b = b->next) {
+        const char *o = b->out ? dk_absolute(d, b->out, b->workdir) : NULL;
+        if (o && strcmp(o, path) == 0) {
+            out->build = b;
+            out->build_stage = stage;
+            return true;
+        }
+    }
+    for (const dk_copy_t *c = d->st[stage].copies; c; c = c->next) {
+        bool known = c->dst != NULL;
+        for (int s = 0; known && s < c->nsrc; s++) {
+            known = c->srcs[s] != NULL;
+        }
+        if (!known) {
+            continue;
+        }
+        const char *dst = dk_absolute(d, c->dst, c->workdir);
+        int src_stage = c->has_from ? dk_stage_of(d, c->from) : -1;
+        if (!dst || (c->has_from && src_stage < 0)) {
+            continue; /* out of an image, or an unknown --from */
+        }
+        size_t dl = strlen(dst);
+        bool into_dir = c->nsrc > SKIP_ONE || dk_ends(c->dst, "/");
+        const char *tail = NULL;
+        if (strcmp(dst, "/") == 0) {
+            tail = strcmp(path, "/") != 0 ? path + SKIP_ONE : NULL;
+        } else if (strncmp(path, dst, dl) == 0 && path[dl] == '/') {
+            tail = path + dl + SKIP_ONE;
+        }
+        for (int s = 0; s < c->nsrc; s++) {
+            /* the source itself, a path inside a directory source, or a file
+             * source copied into the directory dst */
+            const char *rels[PAIR_LEN + SKIP_ONE];
+            int nc = 0;
+            if (strcmp(path, dst) == 0 && !into_dir) {
+                rels[nc++] = "";
+            }
+            if (tail) {
+                rels[nc++] = tail;
+                const char *sn = dk_norm(d, c->srcs[s]);
+                if (sn && strcmp(dk_base(sn), tail) == 0) {
+                    rels[nc++] = "";
+                }
+            }
+            for (int k = 0; k < nc; k++) {
+                if (src_stage >= 0) {
+                    const char *from = rels[k][0] ? dk_join(d, c->srcs[s], rels[k]) : c->srcs[s];
+                    if (dk_origin(d, src_stage, dk_absolute(d, from, "/"), want, depth + SKIP_ONE,
+                                  out)) {
+                        return true;
+                    }
+                    continue;
+                }
+                const char *hit = dk_repo(d, c->srcs[s], rels[k], want);
+                if (hit) {
+                    out->repo = hit;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static const cbm_gbuf_node_t *dk_gomain_node(const dk_t *d, const char *dir) {
+    return dir && d->ix->gomain ? cbm_ht_get(d->ix->gomain, dir) : NULL;
+}
+
+/* The `main` of the Go package build `b` (of `stage`) compiled: a file
+ * package through that file; a directory through the directory, else through
+ * the .go files copied straight into it (all from one repository dir). */
+static const cbm_gbuf_node_t *dk_gomain(dk_t *d, const dk_build_t *b, int stage) {
+    const char *pkg = b->pkg;
+    if (!pkg || strstr(pkg, "...") || strchr(pkg, '$')) {
+        return NULL;
+    }
+    dk_found_t f = {0};
+    if (dk_ends(pkg, ".go")) {
+        if (!dk_origin(d, stage, dk_absolute(d, pkg, b->workdir), DK_WANT_FILE, 0, &f) || !f.repo) {
+            return NULL;
+        }
+        return dk_gomain_node(d, dk_dir(d, f.repo));
+    }
+    const char *cdir = dk_absolute(d, pkg, b->workdir);
+    if (dk_origin(d, stage, cdir, DK_WANT_GOMAIN, 0, &f) && f.repo) {
+        return dk_gomain_node(d, f.repo);
+    }
+    const char *found = NULL;
+    bool many = false;
+    for (const dk_copy_t *c = d->st[stage].copies; c && cdir; c = c->next) {
+        if (c->has_from || !c->dst || c->nsrc != SKIP_ONE || !c->srcs[0] ||
+            !dk_ends(c->srcs[0], ".go") || dk_ends(c->dst, "/")) {
+            continue;
+        }
+        const char *into = dk_absolute(d, c->dst, c->workdir);
+        if (!into || strcmp(dk_dir(d, into), cdir) != 0) {
+            continue;
+        }
+        const char *hit = dk_repo(d, c->srcs[0], "", DK_WANT_FILE);
+        const char *hd = hit ? dk_dir(d, hit) : NULL;
+        if (hd) {
+            many = many || (found && strcmp(found, hd) != 0);
+            found = hd;
+        }
+    }
+    return found && !many ? dk_gomain_node(d, found) : NULL;
+}
+
+/* The words of shell text [p, e): split at blanks outside quotes, quotes
+ * and backslash escapes removed (a backslash-newline is a blank). */
+static int dk_words(dk_t *d, const char *p, const char *e, const char **out, int max) {
+    int n = 0;
+    while (p < e && n < max) {
+        while (p < e && (isspace((unsigned char)*p) ||
+                         (*p == '\\' && p + SKIP_ONE < e && p[SKIP_ONE] == '\n'))) {
+            p += *p == '\\' ? PAIR_LEN : SKIP_ONE;
+        }
+        if (p >= e) {
+            break;
+        }
+        char *w = cbm_arena_alloc(d->a, (size_t)(e - p) + SKIP_ONE);
+        if (!w) {
+            return n;
+        }
+        size_t len = 0;
+        char quote = 0;
+        while (p < e && (quote || !isspace((unsigned char)*p))) {
+            char c = *p++;
+            if (quote) {
+                if (c == quote) {
+                    quote = 0;
+                } else if (c == '\\' && quote == '"' && p < e &&
+                           (*p == '"' || *p == '\\' || *p == '$' || *p == '`')) {
+                    w[len++] = *p++;
+                } else {
+                    w[len++] = c;
+                }
+            } else if (c == '\'' || c == '"') {
+                quote = c;
+            } else if (c == '\\' && p < e) {
+                if (*p == '\n') {
+                    p++;
+                    break;
+                }
+                w[len++] = *p++;
+            } else {
+                w[len++] = c;
+            }
+        }
+        w[len] = '\0';
+        out[n++] = w;
+    }
+    return n;
+}
+
+/* `go build` flags that take the next word as their value (go help build). */
+static bool dk_go_value_flag(const char *f) {
+    static const char *const FLAGS[] = {
+        "-o",       "-ldflags", "-gcflags", "-asmflags", "-gccgoflags", "-tags",
+        "-mod",     "-modfile", "-p",       "-pkgdir",   "-buildmode",  "-installsuffix",
+        "-overlay", "-pgo",     "-C",       "-toolexec", "-compiler",   NULL};
+    for (int i = 0; FLAGS[i]; i++) {
+        if (strcmp(f, FLAGS[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Each `go build [-o OUT] [PKG]` of one command list; OUT and PKG see the
+ * stage's ARG / ENV. */
+static void dk_go_builds(dk_t *d, const char **w, int n) {
+    for (int j = 0; j + SKIP_ONE < n; j++) {
+        if (strcmp(w[j], "go") != 0 || strcmp(w[j + SKIP_ONE], "build") != 0) {
+            continue;
+        }
+        const char *out = NULL;
+        const char *pkg = NULL;
+        for (int k = j + PAIR_LEN; k < n; k++) {
+            const char *a = w[k];
+            if (strcmp(a, "-o") == 0 && k + SKIP_ONE < n) {
+                out = w[++k];
+            } else if (strncmp(a, "-o=", strlen("-o=")) == 0) {
+                out = a + strlen("-o=");
+            } else if (a[0] == '-') {
+                k += dk_go_value_flag(a) ? SKIP_ONE : 0;
+            } else if (!pkg) {
+                pkg = a;
+            }
+        }
+        dk_build_t *b = cbm_arena_alloc(d->a, sizeof(*b));
+        if (!b) {
+            return;
+        }
+        *b = (dk_build_t){.out = out ? dk_expand(d, d->local, out) : NULL,
+                          .pkg = dk_expand(d, d->local, pkg ? pkg : "."),
+                          .workdir = d->workdir,
+                          .next = d->st[d->stage].builds};
+        d->st[d->stage].builds = b;
+    }
+}
+
+static void dk_run(dk_t *d, TSNode ins) {
+    if (d->stage >= DK_MAX_STAGES) {
+        return;
+    }
+    for (uint32_t i = 0; i < ts_node_named_child_count(ins); i++) {
+        TSNode sc = ts_node_named_child(ins, i);
+        if (!dk_type(sc, "shell_command")) {
+            continue;
+        }
+        /* command lists split at && || ; (as written, quotes or not) */
+        const char *p = d->src + ts_node_start_byte(sc);
+        const char *end = d->src + ts_node_end_byte(sc);
+        while (p < end) {
+            const char *q = p;
+            while (q < end &&
+                   !(q + SKIP_ONE < end && ((q[0] == '&' && q[SKIP_ONE] == '&') ||
+                                            (q[0] == '|' && q[SKIP_ONE] == '|'))) &&
+                   *q != ';') {
+                q++;
+            }
+            const char *w[DK_MAX_WORDS];
+            int n = dk_words(d, p, q, w, DK_MAX_WORDS);
+            dk_go_builds(d, w, n);
+            p = q < end ? q + (*q == ';' ? SKIP_ONE : PAIR_LEN) : end;
+        }
+    }
+}
+
+static void dk_workdir(dk_t *d, TSNode ins) {
+    for (uint32_t i = 0; i < ts_node_named_child_count(ins); i++) {
+        TSNode pn = ts_node_named_child(ins, i);
+        if (!dk_type(pn, "path")) {
+            continue;
+        }
+        const char *raw = dk_text(d, pn);
+        const char *v = raw ? dk_expand(d, d->local, raw) : NULL;
+        const char *w = v ? v : raw;
+        if (w) {
+            d->workdir = dk_absolute(d, w, d->workdir);
+        }
+        return;
+    }
+}
+
+/* ENTRYPOINT / CMD of the current stage: its argv, as written. */
+static void dk_entry(dk_t *d, TSNode ins, dk_entry_t *e) {
+    const char *w[DK_MAX_WORDS];
+    int n = 0;
+    for (uint32_t i = 0; i < ts_node_named_child_count(ins); i++) {
+        TSNode c = ts_node_named_child(ins, i);
+        if (dk_type(c, "json_string_array")) {
+            n = dk_json_array(d, c, w, DK_MAX_WORDS);
+        } else if (dk_type(c, "shell_command")) {
+            n = dk_words(d, d->src + ts_node_start_byte(c), d->src + ts_node_end_byte(c), w,
+                         DK_MAX_WORDS);
+        }
+    }
+    const char **argv = cbm_arena_alloc(d->a, (size_t)(n ? n : SKIP_ONE) * sizeof(*argv));
+    if (!argv) {
+        return;
+    }
+    memcpy((void *)argv, w, (size_t)n * sizeof(*argv));
+    *e = (dk_entry_t){
+        .argv = argv, .argc = n, .line = dk_line(ins), .workdir = d->workdir, .set = true};
+}
+
+static bool dk_interpreter(const char *base) {
+    static const char *const NAMES[] = {"node", "php",  "ruby", "perl", "bun",
+                                        "deno", "bash", "sh",   NULL};
+    for (int i = 0; NAMES[i]; i++) {
+        if (strcmp(base, NAMES[i]) == 0) {
+            return true;
+        }
+    }
+    if (strncmp(base, "python", strlen("python")) != 0) {
+        return false;
+    }
+    for (const char *p = base + strlen("python"); *p; p++) {
+        if (!isdigit((unsigned char)*p) && *p != '.') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* SPAWNS from the Dockerfile to what its last stage runs. */
+static void dk_spawn(dk_t *d) {
+    if (d->stage < 0 || d->stage >= DK_MAX_STAGES || (!d->entry.set && !d->cmd.set)) {
+        return;
+    }
+    const dk_entry_t *e = d->entry.set ? &d->entry : &d->cmd;
+    const char *argv[DK_MAX_WORDS];
+    int argc = 0;
+    for (int i = 0; i < e->argc; i++) {
+        if (e->argv[i] && e->argv[i][0]) {
+            argv[argc++] = e->argv[i];
+        }
+    }
+    if (argc == 0 || strchr(argv[0], '$') || argv[0][0] == '-') {
+        return; /* unknown, or arguments to an inherited ENTRYPOINT */
+    }
+    const char *prog = argv[0];
+    const char *base = dk_base(prog);
+    if ((strcmp(base, "sh") == 0 || strcmp(base, "bash") == 0) && argc > SKIP_ONE &&
+        strcmp(argv[SKIP_ONE], "-c") == 0) {
+        return;
+    }
+    dk_found_t f = {0};
+    const char *path = NULL;
+    const cbm_gbuf_node_t *main_fn = NULL;
+    if (dk_interpreter(base)) {
+        const char *script = NULL;
+        for (int i = SKIP_ONE; i < argc && !script; i++) {
+            script = argv[i][0] != '-' ? argv[i] : NULL;
+        }
+        if (script && !strchr(script, '$') &&
+            dk_origin(d, d->stage, dk_absolute(d, script, e->workdir), DK_WANT_FILE, 0, &f)) {
+            path = f.repo;
+        }
+    } else if (strchr(prog, '/')) {
+        if (dk_origin(d, d->stage, dk_absolute(d, prog, e->workdir), DK_WANT_FILE, 0, &f)) {
+            path = f.repo;
+            main_fn = f.build ? dk_gomain(d, f.build, f.build_stage) : NULL;
+        }
+    } else if (!d->entry.set &&
+               dk_origin(d, d->stage, dk_absolute(d, prog, e->workdir), DK_WANT_FILE, 0, &f)) {
+        path = f.repo; /* a CMD file under an inherited ENTRYPOINT (distroless) */
+    }
+    int64_t tgt = 0;
+    if (path) {
+        const char *mqn = cbm_fqn_module(d->a, d->ctx->project_name, path);
+        const cbm_gbuf_node_t *m = mqn ? cbm_gbuf_find_by_qn(d->ctx->gbuf, mqn) : NULL;
+        const cbm_gbuf_node_t *file = m ? NULL : cbm_ht_get(d->ix->files, path);
+        tgt = m ? m->id : file ? file->id : 0;
+    } else if (main_fn) {
+        tgt = main_fn->id;
+    } else {
+        char esc_base[CBM_SZ_512];
+        cbm_json_escape(esc_base, (int)sizeof(esc_base), base);
+        char qn[CBM_SZ_512];
+        snprintf(qn, sizeof(qn), "__process__%s", base);
+        char node_props[CBM_SZ_1K];
+        snprintf(node_props, sizeof(node_props), "{\"program\":\"%s\"}", esc_base);
+        tgt = cbm_gbuf_upsert_node(d->ctx->gbuf, "Process", base, qn, "", 0, 0, node_props);
+    }
+    if (tgt <= 0 || tgt == d->module) {
+        return;
+    }
+    char esc_prog[CBM_SZ_1K];
+    cbm_json_escape(esc_prog, (int)sizeof(esc_prog), prog);
+    char props[CBM_SZ_2K];
+    snprintf(props, sizeof(props),
+             "{\"api\":\"dockerfile\",\"instruction\":\"%s\",\"program\":\"%s\",\"line\":%d,"
+             "\"confidence\":1.00}",
+             d->entry.set ? "ENTRYPOINT" : "CMD", esc_prog, e->line);
+    cbm_gbuf_insert_edge(d->ctx->gbuf, d->module, tgt, "SPAWNS", props);
+    d->edges++;
 }
 
 static void dk_file(dk_t *d, TSNode root) {
@@ -369,10 +1037,20 @@ static void dk_file(dk_t *d, TSNode root) {
             dk_env(d, ins);
         } else if (dk_type(ins, "from_instruction")) {
             dk_from(d, ins);
-        } else if (dk_type(ins, "copy_instruction") && d->stage >= 0) {
+        } else if ((dk_type(ins, "copy_instruction") || dk_type(ins, "add_instruction")) &&
+                   d->stage >= 0) {
             dk_copy(d, ins);
+        } else if (dk_type(ins, "workdir_instruction") && d->stage >= 0) {
+            dk_workdir(d, ins);
+        } else if (dk_type(ins, "run_instruction") && d->stage >= 0) {
+            dk_run(d, ins);
+        } else if (dk_type(ins, "entrypoint_instruction") && d->stage >= 0) {
+            dk_entry(d, ins, &d->entry);
+        } else if (dk_type(ins, "cmd_instruction") && d->stage >= 0) {
+            dk_entry(d, ins, &d->cmd);
         }
     }
+    dk_spawn(d);
 }
 
 static char *dk_read(const char *path, size_t *len) {
@@ -400,15 +1078,63 @@ static char *dk_read(const char *path, size_t *len) {
     return buf;
 }
 
+static bool dk_node_before(const cbm_gbuf_node_t *a, const cbm_gbuf_node_t *b) {
+    int c = strcmp(a->file_path, b->file_path);
+    return c < 0 || (c == 0 && a->start_line < b->start_line);
+}
+
+/* The repository's File nodes by path, and the `main` of each Go main
+ * package by directory (the first by file and line). */
+static void dk_index_build(cbm_pipeline_ctx_t *ctx, CBMArena *a, dk_index_t *ix) {
+    ix->files = cbm_ht_create(0);
+    ix->gomain = cbm_ht_create(0);
+    const cbm_gbuf_node_t **nodes = NULL;
+    int n = 0;
+    if (ix->files && cbm_gbuf_find_by_label(ctx->gbuf, "File", &nodes, &n) == 0) {
+        for (int i = 0; i < n; i++) {
+            if (nodes[i]->file_path) {
+                cbm_ht_set(ix->files, nodes[i]->file_path, (void *)nodes[i]);
+            }
+        }
+    }
+    if (!ix->gomain || cbm_gbuf_find_by_name(ctx->gbuf, "main", &nodes, &n) != 0) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        const cbm_gbuf_node_t *fn = nodes[i];
+        const char *fp = fn->file_path;
+        if (!fp || strcmp(fn->label, "Function") != 0 || !dk_ends(fp, ".go") ||
+            dk_ends(fp, "_test.go")) {
+            continue;
+        }
+        const char *slash = strrchr(fp, '/');
+        char *dir = cbm_arena_alloc(a, slash ? (size_t)(slash - fp) + SKIP_ONE : SKIP_ONE);
+        if (!dir) {
+            continue;
+        }
+        size_t dl = slash ? (size_t)(slash - fp) : 0;
+        memcpy(dir, fp, dl);
+        dir[dl] = '\0';
+        const cbm_gbuf_node_t *have = cbm_ht_get(ix->gomain, dir);
+        if (!have || dk_node_before(fn, have)) {
+            cbm_ht_set(ix->gomain, dir, (void *)fn);
+        }
+    }
+}
+
 void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                               int file_count) {
     TSParser *parser = NULL;
     CBMArena arena;
     cbm_arena_init_lazy(&arena, CBM_SZ_4K);
+    dk_index_t ix = {0};
     int edges = 0;
     for (int i = 0; i < file_count; i++) {
         if (files[i].language != CBM_LANG_DOCKERFILE) {
             continue;
+        }
+        if (!ix.files) {
+            dk_index_build(ctx, &arena, &ix);
         }
         const char *mqn = cbm_fqn_module(&arena, ctx->project_name, files[i].rel_path);
         const cbm_gbuf_node_t *mod = mqn ? cbm_gbuf_find_by_qn(ctx->gbuf, mqn) : NULL;
@@ -428,12 +1154,23 @@ void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fi
             tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)len);
         }
         if (tree) {
+            const char *slash = strrchr(files[i].rel_path, '/');
+            char *dir = cbm_arena_alloc(
+                &arena, slash ? (size_t)(slash - files[i].rel_path) + SKIP_ONE : SKIP_ONE);
+            if (dir) {
+                size_t dl = slash ? (size_t)(slash - files[i].rel_path) : 0;
+                memcpy(dir, files[i].rel_path, dl);
+                dir[dl] = '\0';
+            }
             dk_t d = {.ctx = ctx,
                       .a = &arena,
                       .src = src,
                       .file = files[i].rel_path,
                       .module = mod->id,
-                      .stage = -1};
+                      .stage = -1,
+                      .dir = dir ? dir : "",
+                      .workdir = "/",
+                      .ix = &ix};
             dk_file(&d, ts_tree_root_node(tree));
             edges += d.edges;
             ts_tree_delete(tree);
@@ -443,10 +1180,16 @@ void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fi
     if (parser) {
         ts_parser_delete(parser);
     }
+    if (ix.files) {
+        cbm_ht_free(ix.files);
+    }
+    if (ix.gomain) {
+        cbm_ht_free(ix.gomain);
+    }
     cbm_arena_destroy(&arena);
     if (edges > 0) {
         char buf[CBM_SZ_32];
         snprintf(buf, sizeof(buf), "%d", edges);
-        cbm_log_info("pass.docker.images", "edges", buf);
+        cbm_log_info("pass.docker.edges", "edges", buf);
     }
 }
