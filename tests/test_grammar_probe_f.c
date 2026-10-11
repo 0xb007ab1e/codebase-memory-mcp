@@ -1675,6 +1675,50 @@ TEST(probe_mcp_trace_topology_follows_deploys) {
     PASS();
 }
 
+/* trace_path mode=run walks what a Service runs: out to its workload, the
+ * Image the workload runs, the Dockerfile that builds the image, the Go main
+ * its ENTRYPOINT starts -- and the environment the container is given.
+ * mode=topology stops before the program. */
+TEST(probe_mcp_trace_run) {
+    static const GpfFile files[] = {
+        {"go.mod", "module example.com/app\n\ngo 1.22\n"},
+        {"cmd/server/main.go", "package main\n\nfunc main() {}\n"},
+        {"svc/Dockerfile", "FROM golang:1.22 AS build\nWORKDIR /src\nCOPY . .\n"
+                           "RUN CGO_ENABLED=0 go build -o /out/server ./cmd/server\n"
+                           "FROM gcr.io/distroless/static\nCOPY --from=build /out/server /server\n"
+                           "ENTRYPOINT [\"/server\"]\n"},
+        {"skaffold.yaml", "apiVersion: skaffold/v4beta6\nkind: Config\nbuild:\n  artifacts:\n"
+                          "    - image: acme/server\n      context: .\n      docker:\n"
+                          "        dockerfile: svc/Dockerfile\n"},
+        {"k8s/app.yaml",
+         "apiVersion: v1\nkind: Service\nmetadata:\n  name: server\nspec:\n  selector:\n"
+         "    app: server\n---\n"
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: server\nspec:\n"
+         "  template:\n    metadata:\n      labels:\n        app: server\n    spec:\n"
+         "      containers:\n        - name: server\n          image: acme/server:1.0\n"
+         "          env:\n            - name: LISTEN_PORT\n              value: \"8080\"\n"}};
+    char *r = gpf_tool_on(files, 5, "trace_path",
+                          "{\"function_name\":\"Service/server\",\"project\":\"%s\","
+                          "\"direction\":\"outbound\",\"mode\":\"run\",\"depth\":5,"
+                          "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    /* qualified names are grouped by prefix, split at a dot */
+    ASSERT_NOT_NULL(strstr(r, "Deployment/-/server"));
+    ASSERT_NOT_NULL(strstr(r, "\"__image__docker\",\"rows\":[[\"io/acme/server\""));
+    ASSERT_NOT_NULL(strstr(r, ".svc\",\"rows\":[[\"Dockerfile\""));   /* its Module */
+    ASSERT_NOT_NULL(strstr(r, ".cmd.server\",\"rows\":[[\"main\"")); /* what it starts */
+    ASSERT_NOT_NULL(strstr(r, "Deployment/-/server#env/server/LISTEN_PORT"));
+    free(r);
+    r = gpf_tool_on(files, 5, "trace_path",
+                    "{\"function_name\":\"Service/server\",\"project\":\"%s\","
+                    "\"direction\":\"outbound\",\"mode\":\"topology\",\"depth\":5,"
+                    "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(strstr(r, ".cmd.server\",\"rows\":[[\"main\""));
+    free(r);
+    PASS();
+}
+
 /* trace_path mode=deploy walks deploy chains: in from a chart to the shell
  * function that installs it (DEPLOYS), the script calling the function
  * (CALLS) and the CI job running the script (SPAWNS). The call graph mode
@@ -4679,6 +4723,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_mcp_search_filters_kind_and_namespace);
     RUN_TEST(probe_mcp_trace_topology);
     RUN_TEST(probe_mcp_trace_topology_follows_deploys);
+    RUN_TEST(probe_mcp_trace_run);
     RUN_TEST(probe_mcp_trace_deploy);
     RUN_TEST(probe_dockerfile_bases_are_images);
     RUN_TEST(probe_dockerfile_variants_are_dockerfiles);

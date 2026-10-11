@@ -623,10 +623,12 @@ static const tool_def_t TOOLS[] = {
      "args unchanged; budget may increase.\"},"
      "\"mode\":{"
      "\"type\":\"string\",\"enum\":[\"calls\",\"data_flow\",\"cross_service\",\"topology\","
-     "\"deploy\"],"
+     "\"deploy\",\"run\"],"
      "\"default\":\"calls\",\"description\":\"calls, argument-aware data_flow, service edges, "
-     "topology: infra objects, routes and controllers (start at a Resource or Route), or "
-     "deploy: scripts, make targets and charts a CI job, script or rule runs and deploys.\"},"
+     "topology: infra objects, routes and controllers (start at a Resource or Route), "
+     "deploy: scripts, make targets and charts a CI job, script or rule runs and deploys, or "
+     "run: what a Service or workload runs (image, Dockerfile, the program and its "
+     "environment).\"},"
      "\"parameter_name\":{\"type\":\"string\",\"description\":\"data_flow parameter filter.\"},"
      "\"edge_types\":{\"type\":\"array\",\"items\":{"
      "\"type\":\"string\"}},\"risk_labels\":{\"type\":\"boolean\",\"default\":false,"
@@ -8671,6 +8673,12 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
      * make targets, programs), calls (CALLS: shell functions) and puts on a
      * cluster (DEPLOYS) -- outbound from the job, inbound from a chart */
     static const char *mode_deploy[] = {"DEPLOYS", "SPAWNS", "CALLS"};
+    /* run: what a Service or workload runs -- traffic to the workload
+     * (INFRA_MAPS), the Image its container runs (USAGE), the Dockerfile
+     * that builds it and what that builds on (DEPENDS_ON), the program the
+     * ENTRYPOINT starts (SPAWNS) and the environment each container is
+     * given (CONFIGURES) */
+    static const char *mode_run[] = {"INFRA_MAPS", "USAGE", "DEPENDS_ON", "SPAWNS", "CONFIGURES"};
 
     *out_count = 0;
 
@@ -8709,6 +8717,9 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
     } else if (mode && strcmp(mode, "deploy") == 0) {
         defaults = mode_deploy;
         n_defaults = (int)(sizeof(mode_deploy) / sizeof(mode_deploy[0]));
+    } else if (mode && strcmp(mode, "run") == 0) {
+        defaults = mode_run;
+        n_defaults = (int)(sizeof(mode_run) / sizeof(mode_run[0]));
     }
     for (int i = 0; i < n_defaults; i++) {
         out_types[i] = defaults[i];

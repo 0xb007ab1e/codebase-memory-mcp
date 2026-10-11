@@ -73,6 +73,7 @@ extern _Atomic uint64_t g_k8s_candidates;
 extern _Atomic uint64_t g_op_candidates;
 extern _Atomic uint64_t g_sh_candidates;
 extern _Atomic uint64_t g_tf_candidates;
+extern _Atomic uint64_t g_dk_hub_edges;
 
 /* ── Corpus scale ──────────────────────────────────────────────────────
  * Small on purpose: the gate reads exponents from ratios, not magnitudes.
@@ -382,8 +383,13 @@ static void cx_pass_sink(const char *line) {
  * group/kind is one identity across a repository: copies declaring the same
  * one ARE joined (a CRD links to every package marking its group), so the
  * fixtures' CRDs use groups no copy's Go code declares -- the guard measures
- * accidental growth, not that by-design join. */
-static const char *const CX_INFRA_DIRS[] = {"fx_Kubernetes", "fx_Go", "fx_Bash", "fx_HCL"};
+ * accidental growth, not that by-design join. The container layer (Docker)
+ * has Dockerfiles with stage ENV, an ENTRYPOINT script and a compose project
+ * building two components of one repository; an image repository is one
+ * identity too, so every copy's builds of it join one Image -- that join
+ * must stay linear (the component split examines its edges). */
+static const char *const CX_INFRA_DIRS[] = {"fx_Kubernetes", "fx_Go", "fx_Bash", "fx_HCL",
+                                            "fx_Dockerfile"};
 enum { CX_INFRA_COUNT = sizeof(CX_INFRA_DIRS) / sizeof(CX_INFRA_DIRS[0]) };
 
 typedef struct {
@@ -405,6 +411,7 @@ typedef struct {
     uint64_t op_candidates;   /* Go types / dirs the operator pass examined */
     uint64_t sh_candidates;   /* paths / make rules the shell layer examined */
     uint64_t tf_candidates;   /* blocks the Terraform layer examined */
+    uint64_t dk_hub_edges;    /* Image edges the component split examined */
     int infra_nodes[CX_INFRA_COUNT];
     int infra_edges[CX_INFRA_COUNT];
     double wall_s;
@@ -433,6 +440,7 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     uint64_t oc0 = atomic_load_explicit(&g_op_candidates, memory_order_relaxed);
     uint64_t sc0 = atomic_load_explicit(&g_sh_candidates, memory_order_relaxed);
     uint64_t fc0 = atomic_load_explicit(&g_tf_candidates, memory_order_relaxed);
+    uint64_t dh0 = atomic_load_explicit(&g_dk_hub_edges, memory_order_relaxed);
 
     atomic_store_explicit(&g_cx_pass_count, 0, memory_order_relaxed);
     cbm_log_set_sink_ex(cx_pass_sink, CBM_LOG_SINK_TEE);
@@ -474,6 +482,7 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     out->op_candidates = atomic_load_explicit(&g_op_candidates, memory_order_relaxed) - oc0;
     out->sh_candidates = atomic_load_explicit(&g_sh_candidates, memory_order_relaxed) - sc0;
     out->tf_candidates = atomic_load_explicit(&g_tf_candidates, memory_order_relaxed) - fc0;
+    out->dk_hub_edges = atomic_load_explicit(&g_dk_hub_edges, memory_order_relaxed) - dh0;
 
     cbm_store_t *s = cbm_store_open_path(db_path);
     if (!s) {
@@ -625,6 +634,12 @@ TEST(complexity_infra_resolution_is_linear) {
     printf("    sh_candidates ratio %.2f  tf_candidates ratio %.2f\n", sr, fr);
     ASSERT_TRUE(sr >= CX_RATIO_LO && sr <= CX_RATIO_HI);
     ASSERT_TRUE(fr >= CX_RATIO_LO && fr <= CX_RATIO_HI);
+    printf("    dk_hub_edges %llu -> %llu\n", (unsigned long long)a->dk_hub_edges,
+           (unsigned long long)b->dk_hub_edges);
+    ASSERT_GT((long long)a->dk_hub_edges, 0);
+    double dr = cx_ratio((double)b->dk_hub_edges, (double)a->dk_hub_edges);
+    printf("    dk_hub_edges ratio %.2f\n", dr);
+    ASSERT_TRUE(dr >= CX_RATIO_LO && dr <= CX_RATIO_HI);
     for (int i = 0; i < CX_INFRA_COUNT; i++) {
         ASSERT_GT(a->infra_nodes[i], 0);
         ASSERT_GT(a->infra_edges[i], 0);
