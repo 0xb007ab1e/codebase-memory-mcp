@@ -93,8 +93,8 @@ describe('commandPlaceholderFor', () => {
     });
 
     it('faellt auf die Gattung zurueck, statt einen Namen zu erfinden', () => {
-        expect(commandPlaceholderFor(undefined, 'type a command or ask the atlas...'))
-            .toBe('type a command or ask the atlas...');
+        expect(commandPlaceholderFor(undefined, 'type a command or ask CBM Lens...'))
+            .toBe('type a command or ask CBM Lens...');
     });
 
     it('sagt ueber der Liste, worum es geht', () => {

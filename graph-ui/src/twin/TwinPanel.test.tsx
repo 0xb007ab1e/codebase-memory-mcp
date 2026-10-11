@@ -433,7 +433,7 @@ describe('wenn es nichts zu zeigen gibt', () => {
             ir: undefined,
             symbolName: 'nothing',
             message: 'This file is not indexed yet.',
-            hint: 'CodeAtlas is still reading this workspace.',
+            hint: 'CBM Lens is still reading this workspace.',
         });
         const empty = q('[data-testid="atlas-twin-empty"]');
         expect(empty?.textContent).toContain('not indexed yet');
@@ -627,7 +627,7 @@ describe('die Pseudocode-Ansicht', () => {
         expect(q('[data-testid="atlas-pseudocode-group"]')?.textContent)
             .toContain('not used anywhere in this file as far as the index shows');
         expect(q('[data-testid="atlas-pseudocode-tally"]')?.textContent)
-            .toContain('that CodeAtlas cannot check');
+            .toContain('that CBM Lens cannot check');
     });
 
     it('nennt an jeder Schrittzeile Datei und Zeile des aufgerufenen Symbols', async () => {

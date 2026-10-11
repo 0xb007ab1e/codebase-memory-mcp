@@ -252,7 +252,7 @@ describe('where a reader is sent, and what the group says about itself', () => {
         expect(built.used).toBe(5);
         expect(built.unused).toBe(2);
         expect(built.unknown).toBe(0);
-        expect(built.tally).toBe('5 used in this file, 2 not used in it, 0 that CodeAtlas cannot check.');
+        expect(built.tally).toBe('5 used in this file, 2 not used in it, 0 that CBM Lens cannot check.');
     });
 
     it('says how many entries the cap left out rather than trailing off', () => {

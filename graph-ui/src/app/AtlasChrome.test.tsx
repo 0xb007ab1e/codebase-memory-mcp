@@ -162,8 +162,9 @@ describe('AtlasChrome', () => {
 
     it('zeigt Marke und Versions-Chip in der Kopfzeile', async () => {
         await render(props());
-        expect(container.querySelector('.atlas-brand')?.textContent).toBe('CODEATLAS');
-        expect(testId('atlas-version')?.textContent).toBe('v0.0.0-dirty');
+        expect(container.querySelector('.atlas-brand')?.textContent).toBe('CBM LENS Beta');
+        expect(container.querySelector('.atlas-brand-beta')?.textContent).toBe('Beta');
+        expect(testId('atlas-version')?.textContent).toBe('v0.0.0');
     });
 
     it('keeps project switching at the end of the header without a duplicate project chip', async () => {
@@ -177,18 +178,10 @@ describe('AtlasChrome', () => {
         expect(header?.querySelector('[data-chip="sym"]')?.textContent).toContain('76');
     });
 
-    /*
-     * Der Zustand des Arbeitsbaums steht neben der Fassung, nicht in ihr.
-     *
-     * Der Chip beantwortet "welche Fassung ist das" und `v1.0.0-dirty` waere
-     * darauf eine Antwort, die es als Release nicht gibt. Ohne Zusatz steht
-     * daneben nichts: ein leeres Element waere ein Platz, an dem jemand eine
-     * Angabe vermutet.
-     */
-    it('haelt den Bau-Zusatz getrennt vom Versions-Chip', async () => {
+    it('omits build diagnostics from the header', async () => {
         await render(props({ version: 'v1.0.0', buildSuffix: 'dirty' }));
         expect(testId('atlas-version')?.textContent).toBe('v1.0.0');
-        expect(testId('atlas-version-suffix')?.textContent).toBe('dirty');
+        expect(testId('atlas-version-suffix')).toBeNull();
     });
 
     it('zeigt gar kein Zusatz-Element, wenn der Baum sauber war', async () => {

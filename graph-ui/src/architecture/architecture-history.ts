@@ -2,12 +2,13 @@
  * The Architecture entry for Back and Forward (hand test K27): which place the
  * workspace shows, without what it loaded for it.
  *
- * One entry is the subtab and what that subtab has opened: in Overview the area
- * or file, in Routes the perspective and the route filter (an opened route
- * group is that filter), in System structure the focus and the expanded groups,
+ * One stop is a meaningful exploration: in Overview the area or file, in
+ * Routes an explicitly opened route group, in System structure the focus,
  * in Behavior the start, the destination, where a followed call began and where
- * the journey stands; and in every view that draws a scene, Plan or 3D. It holds
- * identities, names and small numbers only, never projections, scenes or
+ * the journey stands. Each entry also keeps its subtab, perspective, filter,
+ * expanded groups and Plan or 3D setting so returning restores that context.
+ * Context changes update the current stop. It holds identities, names and small
+ * numbers only, never projections, scenes or
  * cameras, so nothing grows with the session. The model behind it is the one
  * Galaxy uses (src/graph/navigation-history.ts); the concept is in
  * docs/development/pr-2068-galaxy-history.md.
@@ -61,7 +62,7 @@ export interface ArchitectureHistoryEntry {
     view: ArchitectureView;
     spatial: SpatialPlace;
     routes: RoutesPerspective;
-    /** The Routes filter, as far as it is a step: a route group or typing that paused. */
+    /** The Routes filter: typing updates context; explicitly opening a route group creates a stop. */
     filter: string;
     system: SystemPlace;
 }
@@ -106,8 +107,8 @@ const behaviorPath = (entry: ArchitectureHistoryEntry): number => (entry.view ==
 const viewOf = (entry: ArchitectureHistoryEntry): ArchitectureView => (entry.view === 'dependencies' ? 'overview' : entry.view);
 
 export const architectureHistoryOptions: NavigationHistoryOptions<ArchitectureHistoryEntry> = {
-    key: (entry) => JSON.stringify([viewOf(entry), ...location(entry), planar(entry),
-        entry.view === 'structure' ? [...entry.system.expanded].sort() : null, behaviorPath(entry)]),
+    // View, perspective and filter identify restored locations, but their controls replace the current entry.
+    key: (entry) => JSON.stringify([viewOf(entry), ...location(entry), behaviorPath(entry)]),
     recentKey: (entry) => JSON.stringify([viewOf(entry), ...location(entry)]),
 };
 

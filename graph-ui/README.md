@@ -1,4 +1,4 @@
-# CodeAtlasWeb
+# CBM Lens Beta
 
 ## In this repository
 

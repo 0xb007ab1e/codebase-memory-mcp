@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import type { JSX, ReactNode } from 'react';
 import type { ArchitectureHotspot, ArchitectureOverviewDto } from '../core/intelligence-provider';
 import {
@@ -8,7 +8,6 @@ import type { ArchitectureView, ConfigStorage } from './architecture-model';
 import { architectureHistoryText as historyText, architectureText as text } from './strings';
 import { peekNavigation, type NavigationHistory } from '../graph/navigation-history';
 import { useDismissibleMenu } from '../graph/use-dismissible-menu';
-import { FitLabel, useToolbarFit } from '../galaxy/toolbar-fit';
 import {
     architectureEntryDetail, architectureEntryLabel, architectureEntryName, architectureHistoryOptions, initialArchitecturePlace,
     type ArchitectureHistoryEntry, type PlaceChange, type RoutesPerspective, type SpatialPlace, type SystemPlace,
@@ -123,14 +122,7 @@ function Findings({ view, data, empty, onNavigate }: {
 
 const paletteStyle = scenePaletteStyle();
 
-/**
- * Back, Forward and the Recent list for the whole workspace (K27). The
- * tooltips name the target ("Back to Overview · django"); the list holds the
- * last distinct places, newest first, and the current one is not a target.
- * They stand at the start of the subtab row and read as in Galaxy, "← Back",
- * "Forward →" and "▾", with the glyphs alone once the tabs would scroll
- * (hand test 2026-10-04, A1). The menu closes as Galaxy's does (A2).
- */
+/** Compact exploration history beside the current scope. Tooltips name each destination. */
 function HistoryControls({ history, place, onGo, onJump }: {
     history: NavigationHistory<ArchitectureHistoryEntry>; place: ArchitectureHistoryEntry;
     onGo: (step: -1 | 1) => void; onJump: (entry: ArchitectureHistoryEntry) => void;
@@ -141,12 +133,12 @@ function HistoryControls({ history, place, onGo, onJump }: {
     return <div className="atlas-arch-history" role="group" aria-label={historyText.group} data-position={`${history.index + 1}/${history.entries.length}`}>
         <button type="button" aria-label={historyText.back} disabled={!back} onClick={() => onGo(-1)}
             title={back ? historyText.backTo(architectureEntryLabel(back)) : historyText.noBack}>
-            <FitLabel wide={historyText.backWide} narrow={historyText.backGlyph} /></button>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12 5-5 5 5 5" /></svg></button>
         <button type="button" aria-label={historyText.forward} disabled={!forward} onClick={() => onGo(1)}
             title={forward ? historyText.forwardTo(architectureEntryLabel(forward)) : historyText.noForward}>
-            <FitLabel wide={historyText.forwardWide} narrow={historyText.forwardGlyph} /></button>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m8 5 5 5-5 5" /></svg></button>
         {history.recent.length > 1 && <details className="atlas-arch-recent" ref={menu.ref}>
-            <summary title={historyText.recentTitle} aria-label={historyText.recent}>{historyText.recentGlyph}</summary>
+            <summary title={historyText.recentTitle} aria-label={historyText.recent}><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6a7 7 0 1 1-1 7M4 2v4H0m10 0v4l3 2" /></svg></summary>
             <ul className="atlas-arch-recent-menu" aria-label={historyText.recentList}>{history.recent.map(entry => {
                 const id = architectureHistoryOptions.recentKey?.(entry);
                 const current = id === here;
@@ -169,25 +161,22 @@ function ArchitectureWorkspace({ projectName, overview, loading = false, error, 
      * route perspective and filter, System structure focus and groups, Behavior
      * start, destination and position, and Plan or 3D of each scene. The views
      * below read their part of it and report changes back, so Back and Forward
-     * restore every part at once; the one Back for all of them sits before the
-     * subtabs. A filter is a search for this visit: one saved by an earlier
+      * restore every part at once. Only deliberate exploration adds a stop;
+      * tabs and display controls update the current visit. A filter saved by an earlier
      * session would silently hide routes, so only the subtab is read back.
      */
     const navigation = useArchitectureHistory(() => initialArchitecturePlace(readArchitectureConfig(storage, projectName).view), {
         active, escapeTaken, onRestore: (from, to) => { if (from.view !== to.view) onSelectionEvidence?.(undefined); },
     });
     const { place, navigate } = navigation;
-    // The row measures itself as Galaxy's toolbar does (toolbar-fit.tsx): it counts as narrow once the tabs would scroll.
-    const tabRow = useRef<HTMLDivElement>(null);
-    useToolbarFit(tabRow, true);
     useEffect(() => { saveArchitectureConfig(storage, projectName, { view: place.view, filter: place.filter }); }, [place.view, place.filter, projectName, storage]);
-    const setView = useCallback((view: ArchitectureView) => navigate(current => ({ ...current, view: view === 'dependencies' ? 'overview' : view })), [navigate]);
+    const setView = useCallback((view: ArchitectureView) => navigate(current => ({ ...current, view: view === 'dependencies' ? 'overview' : view }), true), [navigate]);
     const changeSpatial = useCallback<PlaceChange<SpatialPlace>>((change, automatic) =>
         navigate(current => ({ ...current, spatial: { ...current.spatial, ...change } }), automatic), [navigate]);
     const changeSystem = useCallback<PlaceChange<SystemPlace>>((change, automatic) =>
         navigate(current => ({ ...current, system: { ...current.system, ...change } }), automatic), [navigate]);
-    const changePerspective = useCallback((routes: RoutesPerspective) => navigate(current => ({ ...current, routes })), [navigate]);
-    // An opened route group ("Show these N routes") is a step at once; typing waits for a pause.
+    const changePerspective = useCallback((routes: RoutesPerspective) => navigate(current => ({ ...current, routes }), true), [navigate]);
+    // Opening a route group is navigation; typing only refines the current visit.
     const openRouteGroup = useCallback((filter: string) => navigate(current => ({ ...current, filter })), [navigate]);
     // A cached summary from another project must never appear here.
     const data = overview?.projectName && overview.projectName !== projectName ? undefined : overview;
@@ -198,24 +187,25 @@ function ArchitectureWorkspace({ projectName, overview, loading = false, error, 
     }, [active, projectName, systemView, ready, graph, onSelectionEvidence]);
     // Only the Routes view offers the filter, so no other view may receive a stale one.
     const filter = place.view === 'routes' ? navigation.filter : '';
+    const historyControls = <HistoryControls history={navigation.history} place={place} onGo={navigation.go} onJump={navigation.jump} />;
     const spatialProps = !systemView && ready && data && graph ? {
         project: projectName, generation: graphGeneration, graph, overview: data,
         view: place.view === 'dependencies' || place.view === 'structure' || place.view === 'behavior' ? 'overview' as const : place.view,
-        filter, onFilter: openRouteGroup, active, graphNote, coverage, onSelect, onClearSelection, onSelectionEvidence, selectionPanel, onNavigate,
+        filter, onFilter: openRouteGroup, active, graphNote, coverage, onSelect, onClearSelection, onSelectionEvidence, selectionPanel, onNavigate, navigation: historyControls,
         onView: (view: ArchitectureView) => { onSelectionEvidence?.(undefined); setView(view); }, place: place.spatial, onPlace: changeSpatial,
     } : undefined;
     // Every scene below draws with the same palette; the DOM reads it as CSS variables.
     return <section className="atlas-architecture" data-testid="atlas-architecture" data-system-view={systemView} aria-label={text.title} aria-busy={!systemView && loading} style={paletteStyle}>
-        <div className="atlas-arch-tabrow" ref={tabRow}>
-            <HistoryControls history={navigation.history} place={place} onGo={navigation.go} onJump={navigation.jump} />
-            <nav className="atlas-arch-tabs" aria-label={text.navigation} data-fit-whole="">{ARCHITECTURE_VIEWS.map(view =>
+        <div className="atlas-arch-tabrow">
+            <nav className="atlas-arch-tabs" aria-label={text.navigation}>{ARCHITECTURE_VIEWS.map(view =>
                 <button className="atlas-arch-tab" key={view} aria-pressed={place.view === view || (view === 'overview' && ['dependencies', 'entryPoints'].includes(place.view))} data-view={view}
                     onClick={() => { if (view !== place.view) onSelectionEvidence?.(undefined); setView(view); }}>{text.views[view]}</button>)}</nav>
         </div>
         {systemView && projectName ? <Suspense fallback={<div role="status"><Empty>Preparing system analysis…</Empty></div>}><SystemArchitecture
             project={projectName} generation={graphGeneration} view={systemView} filter={filter} active={active}
             graph={graph} onSelect={onSelect} onClearSelection={onClearSelection} onSelectionEvidence={onSelectionEvidence} onNavigate={onNavigate} loader={systemArchitectureLoader}
-            place={place.system} onPlace={changeSystem} /></Suspense> : null}
+            place={place.system} onPlace={changeSystem} navigation={historyControls} /></Suspense> : null}
+        {!systemView && !spatialProps && <div className="atlas-arch-context">{historyControls}<span>{projectName}</span></div>}
         {!systemView && (!projectName ? <Empty>{text.chooseProject}</Empty> : loading ? <div role="status"><Empty>{text.loading}</Empty></div>
             : error ? <div role="alert" className="atlas-arch-empty" data-error="true"><p>{text.loadFailed}</p><p className="atlas-arch-error-detail">{error}</p>
                 {onRefresh && <button className="atlas-arch-action" onClick={onRefresh}>{text.retry}</button>}</div>

@@ -543,7 +543,7 @@ async function main() {
             && short.imports.top < short.firstLineTop;
         report.importHonestyWordsKept = short.imports.entries
             .some((entry) => entry.text.includes('not used by this symbol as far as the index shows'))
-            && short.imports.tally.includes('that CodeAtlas cannot check')
+            && short.imports.tally.includes('that CBM Lens cannot check')
             && short.imports.heading.includes('as far as the index shows');
         log(`Importgruppe: "${short.imports.heading}" / "${short.imports.tally}"`);
 
@@ -681,7 +681,7 @@ async function main() {
                 .filter((line) => !line.targetKnown)
                 .every((line) => line.target.includes('the index records no place'));
         report.importHonestyWordsKept = report.importHonestyWordsKept
-            && long.imports.tally.includes('that CodeAtlas cannot check');
+            && long.imports.tally.includes('that CBM Lens cannot check');
         report.headSaysWhatTheFindingIs = report.headSaysWhatTheFindingIs
             && long.lead.text.length > 0
             && long.lead.kind.length > 0;

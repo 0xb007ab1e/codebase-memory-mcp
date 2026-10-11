@@ -28,24 +28,26 @@ describe('the Architecture history entry (K27)', () => {
         expect(initialArchitecturePlace('dependencies').view).toBe('overview');
     });
 
-    it('is a new step for every subtab and for what each subtab opens', () => {
+    it('identifies what each subtab opens without treating display settings as exploration', () => {
         const views = ['overview', 'entryPoints', 'routes', 'hotspots', 'structure', 'behavior'] as const;
         expect(new Set(views.map(view => key(at({ view }))))).toHaveProperty('size', views.length);
-        // Overview: the opened area and file, and Plan or 3D.
+        // Overview: the opened area and file. Plan or 3D stays with that location.
         const django = at({ spatial: { planar: false, areaPath: 'django' } });
         expect(key(django)).not.toBe(key(start));
         expect(key(at({ spatial: { planar: false, areaPath: 'django', filePath: 'django/shortcuts.py' } }))).not.toBe(key(django));
-        expect(key(at({ spatial: { planar: true, areaPath: 'django' } }))).not.toBe(key(django));
-        // Routes: the perspective and the filter an opened route group sets.
+        expect(key(at({ spatial: { planar: true, areaPath: 'django' } }))).toBe(key(django));
+        // Routes: explicit route-group navigation uses the perspective and filter.
+        // The hook replaces the current entry when these are changed by context controls.
         const routes = at({ view: 'routes' });
         expect(key({ ...routes, routes: 'endpoints' })).not.toBe(key(routes));
         expect(key({ ...routes, routes: 'endpoints', filter: '/edit' })).not.toBe(key({ ...routes, routes: 'endpoints' }));
-        // System structure: the focus and the expanded groups, in any order.
+        // System structure: the focus is exploration; expanded groups stay with it.
         const structure = at({ view: 'structure' });
         const focused = { ...structure, system: { expanded: [], focus: { id: 'g:django', label: 'django' } } };
         expect(key(focused)).not.toBe(key(structure));
         expect(key({ ...structure, system: { expanded: ['g:a', 'g:b'] } })).toBe(key({ ...structure, system: { expanded: ['g:b', 'g:a'] } }));
-        expect(key({ ...structure, system: { expanded: ['g:a'] } })).not.toBe(key(structure));
+        expect(key({ ...structure, system: { expanded: ['g:a'] } })).toBe(key(structure));
+        expect(key(at({ view: 'hotspots', spatial: { planar: false, hotspotArea: 'django/db' } }))).not.toBe(key(at({ view: 'hotspots' })));
         // Behavior: the start and the destination ("Reach").
         expect(key(behavior(7, 'handle'))).not.toBe(key(behavior(8, 'get_autocommit')));
         expect(key(behavior(7, 'handle', { targetId: 9, targetName: 'save' }))).not.toBe(key(behavior(7, 'handle')));
@@ -61,7 +63,7 @@ describe('the Architecture history entry (K27)', () => {
         expect(key(behavior(7, 'handle'))).toBe(key(behavior(7, 'renamed', { from: symbol(3, 'main'), generation: 'g2' })));
         // A Service map does not draw Plan or 3D.
         expect(key(at({ view: 'routes', spatial: { planar: true } }))).toBe(key(at({ view: 'routes' })));
-        expect(key(at({ view: 'routes', routes: 'endpoints', spatial: { planar: true } }))).not.toBe(key(at({ view: 'routes', routes: 'endpoints' })));
+        expect(key(at({ view: 'routes', routes: 'endpoints', spatial: { planar: true } }))).toBe(key(at({ view: 'routes', routes: 'endpoints' })));
     });
 
     it('names the target of Back and Forward', () => {
@@ -89,11 +91,11 @@ describe('the Architecture history entry (K27)', () => {
 
     it('holds Plan or 3D in System structure and Behavior, and where a call chain stands (K27)', () => {
         const structure = at({ view: 'structure' });
-        // Plan or 3D is a step in every view that draws a scene, each with its own camera as before.
-        expect(key({ ...structure, system: { expanded: [], structurePlanar: true } })).not.toBe(key(structure));
+        // Plan or 3D is saved context in every view that draws a scene, each with its own camera as before.
+        expect(key({ ...structure, system: { expanded: [], structurePlanar: true } })).toBe(key(structure));
         expect(key({ ...structure, system: { expanded: [], behaviorPlanar: true } })).toBe(key(structure));
         const reach = behavior(1, 'main', { targetId: 3, targetName: 'save' });
-        expect(key({ ...reach, system: { ...reach.system, behaviorPlanar: true } })).not.toBe(key(reach));
+        expect(key({ ...reach, system: { ...reach.system, behaviorPlanar: true } })).toBe(key(reach));
         expect(key({ ...reach, system: { ...reach.system, structurePlanar: true } })).toBe(key(reach));
         // Another indexed path to the destination is a step; the operation on it and the page of direct calls are not.
         const second = { ...reach, system: { ...reach.system, behavior: { ...reach.system.behavior!, position: { path: 1 } } } };

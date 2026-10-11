@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { behaviorJourney } from './behavior-journey-model';
 import { projectionLimits, type SystemSceneModel } from './system-architecture-model';
 import { architectureText as text } from './strings';
@@ -27,6 +27,7 @@ export interface BehaviorJourneyProps {
      */
     place?: JourneyPlace;
     onPlace?: PlaceChange<JourneyPlace>;
+    navigation?: ReactNode;
     /** Reports the start shown when none was requested, so a Back or Forward tooltip can name it (K27). */
     onShownStart?: (name: string) => void;
     onClearSelection?: () => void;
@@ -61,7 +62,7 @@ export function journeyPage(scene: SystemSceneModel, step: number, choices = fal
 }
 
 export default function BehaviorJourney({ project, generation, data, entries, targets, entryId, targetId, active, pending, error, filter,
-    onRequest, onRefresh, refresh, suggestedEntries, onSelectSymbol, onNavigate, onClearSelection, onSelectionEvidence, from, place: liftedPlace, onPlace, onShownStart }: BehaviorJourneyProps) {
+    onRequest, onRefresh, refresh, suggestedEntries, onSelectSymbol, onNavigate, onClearSelection, onSelectionEvidence, from, place: liftedPlace, onPlace, onShownStart, navigation }: BehaviorJourneyProps) {
     const [place, changePlace] = useLiftedPlace<JourneyPlace>(liftedPlace, onPlace, () => ({}));
     const { path: pathIndex = 0, step = 0, page: branchPage = 0, planar = false } = place;
     const [overview, setOverview] = useState(false);
@@ -173,6 +174,7 @@ export default function BehaviorJourney({ project, generation, data, entries, ta
             <p>{path ? 'Follow one recorded call chain across the parts it touches.' : 'Choose a starting operation. Explore its calls, or follow a path to a destination.'}</p></div>
             <RefreshControl labels={text.refreshFeedback.behavior} feedback={refresh} onRefresh={onRefresh} /></header>
         <div className="behavior-requests">
+            {navigation}
             {/*
               * The field names the operation the journey shows, also when the projection chose it. Suggestions come
               * first, then every operation alphabetically; the filter before it narrows both (hand test 2026-10-04, A4).

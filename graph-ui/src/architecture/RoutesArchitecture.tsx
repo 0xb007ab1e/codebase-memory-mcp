@@ -26,6 +26,6 @@ export default function RoutesArchitecture({ perspective, onPerspective, ...prop
         <button aria-pressed={mode === 'endpoints'} onClick={() => show('endpoints')}>{text.endpoints}</button>
     </nav>{mode === 'services' ? <Suspense fallback={<p role="status">{text.preparing}</p>}><ContainerMap
         project={props.project} generation={props.generation} active={props.active} filter={props.filter} onNavigate={props.onNavigate} onClearSelection={props.onClearSelection} onSelectionEvidence={props.onSelectionEvidence}
-        onShowEndpoints={() => show('endpoints')} /></Suspense>
+        onShowEndpoints={() => show('endpoints')} navigation={props.navigation} /></Suspense>
         : <SpatialArchitecture {...props} />}</>;
 }

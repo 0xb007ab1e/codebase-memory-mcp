@@ -45,27 +45,22 @@
 }
 .atlas-arch-tab[aria-pressed="true"] { color: var(--atlas-fg); border-bottom-color: var(--atlas-phosphor); }
 .atlas-arch-tab:hover { color: var(--atlas-fg); background: var(--atlas-panel); }
-/*
- * K27: one Back, Forward and Recent for the whole workspace and the tabs share a row. The menu sits outside the
- * scrolling tab strip. Hand test 2026-10-04 (A1): the controls come first and read as in Galaxy, "← Back" and
- * "Forward →" while the tabs fit, the glyphs alone once they would scroll (`data-fit`, galaxy/toolbar-fit.tsx).
- */
-.atlas-arch-tabrow { display: flex; align-items: center; gap: 14px; border-bottom: 1px solid var(--atlas-line); margin-bottom: 16px; }
+/* Exploration history belongs to the current scope; tabs only choose a lens. */
+.atlas-arch-tabrow { display: flex; border-bottom: 1px solid var(--atlas-line); margin-bottom: 16px; }
 .atlas-arch-tabrow > .atlas-arch-tabs { flex: 1 1 auto; min-width: 0; border-bottom: 0; margin-bottom: 0; }
-.atlas-arch-history { display: flex; align-items: center; gap: 4px; flex: none; position: relative; }
-.atlas-arch-history > button, .atlas-arch-recent > summary {
-    border: 1px solid var(--atlas-line); border-radius: 6px; background: var(--atlas-panel); color: var(--atlas-fg);
-    min-width: 30px; min-height: 30px; padding: 3px 10px; line-height: 1.4; white-space: nowrap;
+.atlas-arch-context { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }
+.atlas-arch-context > span { max-width: min(32rem, 70vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--atlas-dim); }
+.atlas-arch-history { display: flex; align-items: center; gap: 2px; flex: none; position: relative; }
+.atlas-architecture .atlas-arch-history > button, .atlas-arch-recent > summary {
+    display: grid; place-items: center; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--atlas-dim);
+    width: 32px; height: 32px; min-width: 32px; min-height: 32px; padding: 6px; line-height: 1;
 }
-.atlas-arch-history > button:hover:not(:disabled), .atlas-arch-recent > summary:hover { background: var(--atlas-panel-raised); border-color: var(--atlas-dim); }
-.atlas-arch-history > button:disabled { opacity: 0.4; }
-.atlas-arch-history .atlas-fit-narrow { display: none; }
-.atlas-arch-history .atlas-fit-narrow::before { content: attr(data-label); }
-.atlas-arch-tabrow:is([data-fit=compact], [data-fit=tight], [data-fit=wrap]) .atlas-arch-history .atlas-fit-wide { display: none; }
-.atlas-arch-tabrow:is([data-fit=compact], [data-fit=tight], [data-fit=wrap]) .atlas-arch-history .atlas-fit-narrow { display: inline; }
-.atlas-arch-tabrow:is([data-fit=compact], [data-fit=tight], [data-fit=wrap]) .atlas-arch-history > button { padding-inline: 8px; }
-.atlas-arch-recent { position: relative; }
-.atlas-arch-recent > summary { display: block; cursor: pointer; list-style: none; text-align: center; color: var(--atlas-dim); padding-inline: 8px; }
+.atlas-architecture .atlas-arch-history > button:hover:not(:disabled), .atlas-arch-recent > summary:hover { background: var(--atlas-panel-raised); color: var(--atlas-fg); border-color: var(--atlas-line); }
+.atlas-architecture .atlas-arch-history > button:disabled { opacity: 0.28; cursor: default; }
+.atlas-arch-history svg { display: block; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.atlas-arch-history :is(button, summary):focus-visible { outline: 2px solid var(--atlas-phosphor); outline-offset: 2px; }
+.atlas-arch-recent { position: static; }
+.atlas-arch-recent > summary { cursor: pointer; list-style: none; }
 .atlas-arch-recent > summary::-webkit-details-marker { display: none; }
 .atlas-arch-recent-menu {
     position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; width: min(24rem, calc(100vw - 3rem)); max-height: 20rem; overflow: auto;

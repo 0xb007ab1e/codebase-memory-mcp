@@ -127,7 +127,7 @@ export function commandExamplesFor(symbol: string): CommandExample[] {
         {
             id: 'question',
             text: `Who calls ${symbol}?`,
-            note: 'ask the atlas',
+            note: 'ask CBM Lens',
             symbol,
         },
     ];

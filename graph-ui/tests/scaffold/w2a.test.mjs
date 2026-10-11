@@ -24,7 +24,8 @@ test('AC1: design tokens and chrome are in place', () => {
     'atlas-statusbar', 'atlas-tree', 'atlas-breadcrumb']) {
     assert.ok(smoke.testids.includes(id), `data-testid ${id} wurde im Smoke nicht gesehen`);
   }
-  assert.ok(/CODEATLAS/.test(smoke.brandText), 'Marke CODEATLAS fehlt in der Kopfzeile');
+  // Archived W2 evidence predates the CBM Lens name; new smoke runs require the current brand.
+  assert.ok(/CBM LENS|CODEATLAS/.test(smoke.brandText), 'Frontend-Marke fehlt in der Kopfzeile');
   assert.match(smoke.versionChip, /^v\d+\.\d+\.\d+/, 'Versions-Chip fehlt oder falsch');
   // Spezifikations-Korrektur 2026-08-29 (Orchestrator, Nutzerauftrag):
   // Der Test nagelte [f]ile fest, also ausgerechnet einen der vier
@@ -32,7 +33,7 @@ test('AC1: design tokens and chrome are in place', () => {
   // sein. Verlangt bleibt das Buchstaben-Menue als Form, belegt am
   // verdrahteten [a]tlas.
   assert.ok(/\[a\]tlas/.test(smoke.menuText), 'Buchstaben-Menue fehlt');
-  assert.ok(/type a command or ask the atlas/.test(smoke.commandPlaceholder),
+  assert.ok(/type a command or ask (?:CBM Lens|the atlas)/.test(smoke.commandPlaceholder),
     'Kommandozeilen-Platzhalter fehlt');
 });
 

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from 'react';
 import type { GraphData, GraphNode } from '../galaxy/types';
 import { useSelectionEvidence, type SelectionEvidenceListener } from '../galaxy/selection-evidence';
 import { loadSystemArchitecture, type SystemArchitectureLoader, type SystemArchitectureResponse, type SystemProjection, type SystemSymbol, type SystemWitness, type SystemCallEvidence } from './system-architecture-source';
@@ -29,6 +29,7 @@ export interface SystemArchitectureProps {
     /** Focus, expanded groups, the Behavior start and position, and both cameras, lifted to the workspace for Back and Forward (K27). */
     place?: SystemPlace;
     onPlace?: PlaceChange<SystemPlace>;
+    navigation?: ReactNode;
 }
 /** Ranked call-graph flows (route handlers, call-graph roots) from /api/flows. */
 export type FlowsLoader = (project: string) => Promise<FlowSummary[]>;
@@ -80,7 +81,7 @@ const connectionAllowed = (type: string, view: ConnectionView) => view === 'all'
     || (view === 'calls' ? ['CALLS', 'IMPORTS', 'HTTP_CALLS', 'ASYNC_CALLS'] : ['INHERITS', 'IMPLEMENTS']).includes(type);
 
 /** Poll only while this view is active. A new request key hides stale results before its effect runs. */
-export default function SystemArchitecture({ project, generation, view, filter, active, graph, onSelect, onClearSelection, onSelectionEvidence, onNavigate, loader = loadSystemArchitecture, flowsLoader = loadFlows, operationNames = nameFlowStarts, place: liftedPlace, onPlace }: SystemArchitectureProps) {
+export default function SystemArchitecture({ project, generation, view, filter, active, graph, onSelect, onClearSelection, onSelectionEvidence, onNavigate, loader = loadSystemArchitecture, flowsLoader = loadFlows, operationNames = nameFlowStarts, place: liftedPlace, onPlace, navigation }: SystemArchitectureProps) {
     const [place, changePlace] = useLiftedPlace<SystemPlace>(liftedPlace, onPlace, () => ({ expanded: [] }));
     const entryChoice = place.behavior;
     /** A start the page picks itself (the suggestion, a reset) completes the current step instead of adding one. */
@@ -347,7 +348,7 @@ export default function SystemArchitecture({ project, generation, view, filter, 
     const behaviorPage = view === 'behavior' ? <BehaviorJourney project={project} generation={projectionGeneration} data={queryData}
         entries={entries} targets={targets} entryId={requestedEntry} targetId={requestedTarget} active={active} pending={queryPending}
         error={error} filter={filter} onRefresh={refreshAnalysis} refresh={refresh.feedback} suggestedEntries={suggestedStarts} onNavigate={onNavigate} onSelectSymbol={selectSymbol} onClearSelection={onClearSelection} onSelectionEvidence={onSelectionEvidence}
-        from={requestedEntry !== undefined ? entryChoice?.from : undefined} place={journeyPlace} onPlace={changeJourney}
+        from={requestedEntry !== undefined ? entryChoice?.from : undefined} place={journeyPlace} onPlace={changeJourney} navigation={navigation}
         onShownStart={name => { if (name !== place.shown) changePlace({ shown: name }, true); }}
         onRequest={(entry, targetId, detail) => {
             const analysisGeneration = projectionGeneration ?? sourceGeneration;
@@ -363,7 +364,7 @@ export default function SystemArchitecture({ project, generation, view, filter, 
             <RefreshControl className="atlas-arch-action system-refresh" labels={text.refreshFeedback.structure} feedback={refresh.feedback}
                 onRefresh={() => { refreshAnalysis(); setResetKey(value => value + 1); }} />
         </div><div className="system-controls">
-            <div className="system-scope-actions"><button disabled={!focusId} onClick={clearSelection}>Whole system</button></div>
+            <div className="system-scope-actions atlas-arch-context">{navigation}<button disabled={!focusId} onClick={clearSelection}>Whole system</button>{place.focus && <span title={place.focus.label}>/ {place.focus.label}</span>}</div>
             {view === 'structure' && <label>Connections <select aria-label="Connection view" value={connectionView} onChange={event => { setConnectionView(event.target.value as ConnectionView); setCyclesOnly(false); }}>
                 <option value="calls">Calls &amp; imports</option><option value="types">Type relationships</option><option value="all">All relationships</option>
             </select></label>}

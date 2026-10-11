@@ -68,7 +68,8 @@ export const messages = {
     },
     /** Die Kopfzeile und die Flaechen, die zu keinem Panel gehoeren. */
     app: {
-        brand: 'CODEATLAS',
+        brand: 'CBM LENS',
+        releaseLabel: 'Beta',
         /** Steht in der Tab-Leiste und im Breadcrumb, wenn nichts offen ist. */
         noFileOpen: 'no file open',
         /** Der Name, den eine Oberflaeche ohne Projekt traegt. */
@@ -147,14 +148,14 @@ export const messages = {
      *    Repository.
      */
     help: {
-        title: 'CODEATLAS HELP',
+        title: 'CBM LENS HELP',
         subtitle: 'a reading surface over an indexed repository',
         close: '[esc] close',
         closeLabel: CLOSE,
 
         whatTitle: 'What this is',
         what: [
-            'CodeAtlasWeb reads a repository that the analysis server has indexed and explains it: '
+            'CBM Lens reads a repository that the analysis server has indexed and explains it: '
             + 'the tree and the source, a twin of the symbol under the caret, a walk along the calls, '
             + 'the scope of a change, and the answers of a local model.',
             'Everything on this screen comes from that index or from a file the server handed over, '
@@ -400,7 +401,7 @@ export const messages = {
          * Beispiele, wie man den Chat nutzt, sonst weiss niemand, wie man es
          * nutzt."
          */
-        placeholder: 'type a command or ask the atlas...',
+        placeholder: 'type a command or ask CBM Lens...',
         examplesLabel: 'what you can type here',
         hintIdle: 'type 2 letters to search by meaning',
         hintOpen: 'up/down picks, enter opens, esc closes',
@@ -422,7 +423,7 @@ export const messages = {
          * Schweigen. Jetzt steht der Satz an der Stelle, an der die Antwort
          * erwartet wird.
          */
-        oneMoreLetter: 'one more letter, then the atlas searches by meaning',
+        oneMoreLetter: 'one more letter, then CBM Lens searches by meaning',
         /*
          * Die Sofort-Vorschlaege, und dass sie vorlaeufig sind.
          *
@@ -648,7 +649,7 @@ export const messages = {
 
     /** Der Rahmen des Antwort-Panels. Seine Saetze stehen in chat-strings.ts. */
     chat: {
-        panelLabel: 'atlas chat',
+        panelLabel: 'CBM Lens chat',
         depthGroupLabel: 'neighbourhood depth',
         /*
          * `clear` bleibt der einzige Knopf, der loescht, und sagt es.
@@ -706,7 +707,7 @@ export const messages = {
      *    das wurde am 2026-08-29 gemessen, und der Satz sagt es so.
      */
     settings: {
-        title: 'CODEATLAS SETTINGS',
+        title: 'CBM LENS SETTINGS',
         subtitle: 'which model answers, and everything that costs computing time',
         panelLabel: 'settings',
         close: '[esc] close',
@@ -974,7 +975,7 @@ export const messages = {
      * not about one subject area.
      */
     projects: {
-        title: 'CODEATLAS PROJECTS',
+        title: 'CBM LENS PROJECTS',
         subtitle: 'what this server has indexed, and how to give it more',
         panelLabel: 'projects',
         close: '[esc] close',
@@ -1100,7 +1101,7 @@ export const messages = {
     /** Der Rahmen des Twins. Seine Fakten-Saetze stehen in twin/strings.ts. */
     twin: {
         /** Das Etikett des Leseprofils, mit dem dieses Produkt startet. */
-        profileLabel: 'CodeAtlasWeb Twin',
+        profileLabel: 'CBM Lens Twin',
         /** Der Kopf des Panels, solange kein Symbol vor dem Leser steht. */
         noSymbol: 'no symbol',
     },

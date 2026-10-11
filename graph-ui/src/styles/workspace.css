@@ -2,7 +2,7 @@
 .atlas-shell[data-has-status=true] { grid-template-rows: auto auto minmax(0, 1fr) auto; }
 .atlas-header { gap: 12px; padding: 12px 18px; overflow: visible; position: relative; z-index: 20; border-bottom-color: var(--atlas-phosphor-mute); box-shadow: 0 2px 18px var(--atlas-glow); }
 .atlas-brand { font-size: 15px; font-weight: 700; letter-spacing: .22em; color: var(--atlas-phosphor); text-shadow: 0 0 16px var(--atlas-glow); }
-.atlas-version, .atlas-version-suffix { font-size: 10px; color: var(--atlas-dim); }
+.atlas-version { font-size: 9px; color: var(--atlas-dim); }
 .atlas-workspace-tabs { display: flex; gap: 4px; margin-left: 16px; }
 .atlas-workspace-tabs button, .atlas-guidance, .atlas-tools-menu > summary { border: 1px solid transparent; border-radius: 2px; background: transparent; color: var(--atlas-dim); padding: 7px 12px; font: inherit; cursor: pointer; }
 .atlas-workspace-tabs button[aria-selected=true] { background: var(--atlas-select); color: var(--atlas-phosphor); border-color: var(--atlas-phosphor-mute); box-shadow: inset 0 1px 0 var(--atlas-phosphor); }

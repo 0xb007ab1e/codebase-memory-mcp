@@ -131,9 +131,9 @@ Package-manager setup (npm, PyPI, or Go) verifies and publishes a coherent priva
 
 The ordinary `cli` mode is intentionally separate: it runs one command locally and never starts or connects to the coordination daemon, registers a daemon session, or starts watchers/UI. Its only shared state is the OS admission barrier plus per-project locks for graph mutations. While the command is running, a temporary monitor lets activation cancel that operation and its supervised worker safely; the monitor exits with the command and never becomes a standing daemon. See [CLI Mode](#cli-mode) for details.
 
-### CBM Atlas — the human interface
+### CBM Lens Beta — the human interface
 
-The MCP tools are the agent's interface to the code graph; **CBM Atlas** is the human's. It is built into the binary — every install on every channel has it:
+The MCP tools are the agent's interface to the code graph; **CBM Lens Beta** is the human's. It is built into the binary — every install on every channel has it:
 
 ```bash
 codebase-memory-mcp --ui=true --port=9749
@@ -141,9 +141,9 @@ codebase-memory-mcp --ui=true --port=9749
 
 Open `http://localhost:9749` in your browser. The UI is owned by the shared coordination daemon, so concurrent agent sessions do not start duplicate HTTP servers.
 
-Atlas is **CodeAtlasWeb**, a reading IDE built by [Bernhard Jackiewicz](https://github.com/BernhardJackiewicz) on the CBM read surface (design and tracking in #1964). It runs air-gapped on loopback, reaches no cloud, and every panel names where its facts come from; what the index did not record is shown as a gap, never filled in with a guess.
+CBM Lens builds on **CodeAtlasWeb**, a reading IDE built by [Bernhard Jackiewicz](https://github.com/BernhardJackiewicz) on the CBM read surface (design and tracking in #1964). It runs air-gapped on loopback, reaches no cloud, and every panel names where its facts come from; what the index did not record is shown as a gap, never filled in with a guess.
 
-When something in Atlas does not load, the page has already written it down: its console output, uncaught errors and failed requests go to `${CBM_CACHE_DIR}/logs/ui.log` (default `~/.cache/codebase-memory-mcp/logs/ui.log`, one JSON line per entry, rotated once at 5 MiB). The projects panel (alt+p) shows the tail under "This server", `GET http://localhost:9749/api/ui-log?lines=200` returns it, and a bug report can attach the file.
+When something in CBM Lens does not load, the page has already written it down: its console output, uncaught errors and failed requests go to `${CBM_CACHE_DIR}/logs/ui.log` (default `~/.cache/codebase-memory-mcp/logs/ui.log`, one JSON line per entry, rotated once at 5 MiB). The projects panel (alt+p) shows the tail under "This server", `GET http://localhost:9749/api/ui-log?lines=200` returns it, and a bug report can attach the file.
 
 - **Explorer and reader** — the indexed file tree and a read-only Monaco reader whose source comes from the index.
 - **Semantic twin** — follows the caret: what the symbol under it holds, calls, raises and touches, as facts or as pseudocode, pitched at who is reading.

@@ -69,7 +69,7 @@ export function impactRiskTooltip(level: 'low' | 'medium' | 'high', reasons: str
 /** How a route was tied to the change. Two different strengths of claim. */
 export const IMPACT_ENDPOINT_VIA_HANDLER = 'The registration names a handler this change reaches.';
 export const IMPACT_ENDPOINT_VIA_FILE =
-    'The registration is written in a file this change reaches. CodeAtlas cannot name the handler here, so this is the file and not the function.';
+    'The registration is written in a file this change reaches. CBM Lens cannot name the handler here, so this is the file and not the function.';
 
 // Die Erzaehlung, ein Satz je Lesung -----------------------------------------
 
@@ -110,7 +110,7 @@ export function impactDownstreamSentence(count: number, distance: number): strin
 
 export function impactEndpointSentence(paths: string[]): string {
     if (paths.length === 0) {
-        return 'No HTTP endpoint CodeAtlas recovered is registered in a file this change reaches.';
+        return 'No HTTP endpoint CBM Lens recovered is registered in a file this change reaches.';
     }
     return `${countOf(paths.length, 'endpoint is', 'endpoints are')} registered in a file `
         + `this change reaches: ${paths.join(', ')}.`;
@@ -152,7 +152,7 @@ export const IMPACT_EVIDENCE_TITLE = 'What this rests on';
 
 export const IMPACT_EVIDENCE_SOURCES: Readonly<Record<'detect_changes' | 'architecture' | 'facts', string>> = {
     detect_changes: 'the change set the analysis reported, plus the calls into it',
-    architecture: 'the whole-project summary, including the routes CodeAtlas recovered',
+    architecture: 'the whole-project summary, including the routes CBM Lens recovered',
     facts: 'the per-symbol readings: complexity, and callers flagged as test code',
 };
 
@@ -192,7 +192,7 @@ export const IMPACT_MENU_LABEL = '[c]hange scope';
 
 /** Der Satz darunter: was gelesen wird und was das Wort am Ende bedeutet. */
 export const IMPACT_SUBLINE =
-    'Read from the change set the analysis reports, the calls into it, and the routes CodeAtlas recovered. '
+    'Read from the change set the analysis reports, the calls into it, and the routes CBM Lens recovered. '
     + 'The word on the right is a rule applied to those readings, never a prediction.';
 
 export const IMPACT_MODE_LABEL = 'Compare against';
@@ -244,7 +244,7 @@ export const IMPACT_DIRECT_EMPTY =
 export const IMPACT_DOWNSTREAM_EMPTY =
     'Nothing in the indexed workspace calls the changed symbols.';
 export const IMPACT_ENDPOINTS_EMPTY =
-    'No route CodeAtlas recovered is registered in a file this change reaches.';
+    'No route CBM Lens recovered is registered in a file this change reaches.';
 export const IMPACT_TESTS_EMPTY = 'No affected symbol could be checked for test callers.';
 
 /**

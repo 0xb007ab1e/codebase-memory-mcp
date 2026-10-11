@@ -273,7 +273,7 @@ describe('importsSection', () => {
     });
 
     it('schreibt die Bilanz ueber die Zeilen und die Herkunft darunter', () => {
-        expect(built.text).toBe('1 used in this file, 1 not used in it, 0 that CodeAtlas cannot check.');
+        expect(built.text).toBe('1 used in this file, 1 not used in it, 0 that CBM Lens cannot check.');
         expect(built.note).toContain('The dependency comes from the index');
         expect(built.populated).toBe(true);
     });

@@ -31,6 +31,7 @@ interface Props {
     /** The opened area or file, the hotspot area and Plan or 3D, lifted to the workspace for Back and Forward (K27). */
     place?: SpatialPlace;
     onPlace?: PlaceChange<SpatialPlace>;
+    navigation?: ReactNode;
 }
 
 class SceneBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
@@ -50,7 +51,7 @@ const viewNotes: Record<SemanticView, string> = {
 };
 const relationKinds = ['CALLS', 'IMPORTS', 'USAGE', 'INHERITS', 'IMPLEMENTS', 'DATA_FLOWS'];
 
-export default function SpatialArchitecture({ project, generation, graph, overview, view, filter, active, graphNote, onSelect, onClearSelection, onSelectionEvidence, selectionPanel, onNavigate, onView, onFilter, coverage, place: liftedPlace, onPlace }: Props) {
+export default function SpatialArchitecture({ project, generation, graph, overview, view, filter, active, graphNote, onSelect, onClearSelection, onSelectionEvidence, selectionPanel, onNavigate, onView, onFilter, coverage, place: liftedPlace, onPlace, navigation }: Props) {
     const [place, changePlace] = useLiftedPlace<SpatialPlace>(liftedPlace, onPlace, () => ({ planar: false }));
     const { planar } = place;
     // The place keeps the opened area or file and the hotspot area for Back and Forward (K27), but only the view
@@ -188,14 +189,17 @@ export default function SpatialArchitecture({ project, generation, graph, overvi
             </div>
         </div>
         <div className="spatial-controls">
-            {['overview', 'dependencies', 'entryPoints'].includes(view) && <div className="spatial-projection-modes" role="group" aria-label="Overview mode"><button aria-pressed={view !== 'entryPoints'} onClick={() => onView('overview')}>Structure</button><button aria-pressed={view === 'entryPoints'} onClick={() => onView('entryPoints')}>Entry points</button></div>}
+            <div className="atlas-arch-context">{navigation}
             {(view === 'overview' || view === 'dependencies') && <nav aria-label="Architecture location"><button onClick={clearScope}>{project}</button>
                 {areaPath && areaLevels(areaPath).map((level, index, levels) => <Fragment key={level}><span>/</span><button onClick={() => { changePlace({ areaPath: level, filePath: undefined }); setSelection(undefined); }}>{index ? level.slice(levels[index - 1].length + 1) : level}</button></Fragment>)}{filePath && <><span>/</span><span>{filePath.split('/').at(-1)}</span></>}
             </nav>}
+            {view === 'hotspots' && (hotspotArea ? <nav aria-label="Hotspot area"><button onClick={clearScope}>All hotspots</button><span>/ {hotspotArea}</span></nav> : <span>All hotspots</span>)}
+            {view === 'routes' && <span title={filter || undefined}>{filter || 'All endpoints'}</span>}
+            </div>
+            {['overview', 'dependencies', 'entryPoints'].includes(view) && <div className="spatial-projection-modes" role="group" aria-label="Overview mode"><button aria-pressed={view !== 'entryPoints'} onClick={() => onView('overview')}>Structure</button><button aria-pressed={view === 'entryPoints'} onClick={() => onView('entryPoints')}>Entry points</button></div>}
             {view === 'entryPoints' && <><label>Start <select aria-label="Entry point" value={currentEntry?.id ?? ''} onChange={event => { const node = entries.find(node => node.id === Number(event.target.value)); setEntryChoice(node ? { node, generation } : undefined); setSelection(undefined); }}>
                 {!entries.length && <option value="">No indexed entry points</option>}{entries.map(node => <option key={node.id} value={node.id}>{node.name} · {node.file_path}</option>)}
             </select></label><label>Call depth <select aria-label="Call depth" value={depth} onChange={event => setDepth(Number(event.target.value))}>{[1, 2, 3, 4].map(value => <option key={value}>{value}</option>)}</select></label></>}
-            {view === 'hotspots' && hotspotArea && <nav aria-label="Hotspot area"><button onClick={clearScope}>All hotspots</button><span>/ {hotspotArea}</span></nav>}
             {view === 'routes' && <RefreshControl labels={text.refreshFeedback.routes} feedback={routeRefresh.feedback}
                 onRefresh={() => { routeRefresh.begin(); setRouteRevision(value => value + 1); }} />}
             {view === 'routes' && <label className="spatial-gravity-toggle"><input type="checkbox" checked={includeTestRoutes} onChange={event => { setIncludeTestRoutes(event.target.checked); setSelection(undefined); }} />{routesChecking ? text.includeTestRoutesChecking : text.includeTestRoutes(model.hiddenRoutes ?? 0)}</label>}

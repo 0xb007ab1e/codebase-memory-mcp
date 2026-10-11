@@ -15,6 +15,7 @@ interface Props {
     project: string; generation?: string; active: boolean; filter: string; onNavigate: (path: string, line?: number) => void; onClearSelection?: () => void; onSelectionEvidence?: SelectionEvidenceListener;
     /** Leads from a project without deployment files to the routes it does have. */
     onShowEndpoints?: () => void;
+    navigation?: ReactNode;
 }
 /** Reading the deployment inventory: a project without Compose files is an answer, not a failure. */
 type Discovery = keyof typeof text.serviceMap | undefined;
@@ -29,7 +30,7 @@ const relativeSource = (absolute: string, selection: ContainerSelection) => {
     return absolute.startsWith(prefix) ? absolute.slice(prefix.length) : undefined;
 };
 
-export default function ContainerMap({ project, generation, active, filter, onNavigate, onClearSelection, onSelectionEvidence, onShowEndpoints }: Props) {
+export default function ContainerMap({ project, generation, active, filter, onNavigate, onClearSelection, onSelectionEvidence, onShowEndpoints, navigation }: Props) {
     const [available, setAvailable] = useState<ProjectEntry[]>([]);
     const [selections, setSelections] = useState<ContainerSelection[]>([]);
     const [discovery, setDiscovery] = useState<Discovery>('reading');
@@ -160,7 +161,7 @@ export default function ContainerMap({ project, generation, active, filter, onNa
             {index > 0 && <button aria-label={`Remove ${selection.inventory.project}`} onClick={() => setSelections(current => current.filter((_, i) => i !== index))}>×</button>}</label>)}
             {selections.length < 4 && <select aria-label="Compare indexed project" value="" disabled={adding} onChange={event => { void addProject(event.target.value); }}><option value="">{adding ? 'Reading project…' : '+ Compare project'}</option>
                 {available.filter(entry => !selections.some(selection => selection.inventory.project === entry.name)).map(entry => <option key={entry.name} value={entry.name}>{entry.name}</option>)}</select>}</div>
-        <div className="spatial-controls"><nav aria-label="Service navigation"><button onClick={clearSelection}>All services</button>{focus && <span> / {servicesById.get(focus)?.name} and neighbors</span>}</nav>
+        <div className="spatial-controls"><div className="atlas-arch-context">{navigation}<nav aria-label="Service navigation"><button onClick={clearSelection}>All services</button>{focus && <span> / {servicesById.get(focus)?.name} and neighbors</span>}</nav></div>
             <div className="container-edge-key"><span><i className="container-call-key" />Calls</span><label><input type="checkbox" checked={configured} onChange={event => setConfigured(event.target.checked)} />Configured destinations</label>
                 <label><input type="checkbox" checked={startup} onChange={event => setStartup(event.target.checked)} />Startup dependencies</label></div></div>
         {discovery && <div role="status" className="spatial-notice container-discovery" data-discovery={discovery}><p>{text.serviceMap[discovery]}</p>
