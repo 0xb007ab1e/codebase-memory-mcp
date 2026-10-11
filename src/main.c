@@ -2815,8 +2815,8 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    bool configure_stateless = role == CBM_DAEMON_PROCESS_STATELESS && argc > 1 &&
-                               strcmp(argv[1], "config") == 0;
+    bool configure_stateless =
+        role == CBM_DAEMON_PROCESS_STATELESS && argc > 1 && strcmp(argv[1], "config") == 0;
     if ((role != CBM_DAEMON_PROCESS_STATELESS && role != CBM_DAEMON_PROCESS_HOOK_CLIENT) ||
         configure_stateless) {
         const char *settings_cache = cbm_resolve_cache_dir();

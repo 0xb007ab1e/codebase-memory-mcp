@@ -406,9 +406,12 @@ static bool resolve_environment(const char *key, const char **value) {
             continue;
         if (strcmp(settings[i].type, "boolean") == 0) {
             bool enabled = strcmp(environment_values[i], "true") == 0;
-            *value = !enabled && strcmp(key, "CBM_DISABLE_LSP_CROSS") == 0 ? NULL
-                     : enabled                                             ? "1"
-                                                                           : "0";
+            if (enabled)
+                *value = "1";
+            else if (strcmp(key, "CBM_DISABLE_LSP_CROSS") == 0)
+                *value = NULL;
+            else
+                *value = "0";
         } else
             *value = environment_values[i];
         return true;

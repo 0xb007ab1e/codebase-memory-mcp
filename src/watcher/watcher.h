@@ -115,8 +115,7 @@ typedef struct {
 /* Thread-safe snapshot with a constant-time registry lookup. A NULL watcher
  * reports both fields false; a NULL project reports only the run-loop state.
  * Registrations can remain present after the watcher has stopped. */
-cbm_watcher_project_status_t cbm_watcher_project_status(cbm_watcher_t *w,
-                                                       const char *project_name);
+cbm_watcher_project_status_t cbm_watcher_project_status(cbm_watcher_t *w, const char *project_name);
 
 /* Return the number of projects in the watch list. */
 int cbm_watcher_watch_count(cbm_watcher_t *w);
