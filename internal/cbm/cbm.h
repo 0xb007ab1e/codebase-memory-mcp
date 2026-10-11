@@ -211,6 +211,10 @@ typedef enum {
     CBM_LANG_CHIALISP, // Chialisp (.clsp/.clib/.clinc — Chia smart-coin s-expression language)
     CBM_LANG_PDF,      // PDF documents: the text layer, read without a grammar (doc_pdf.c)
     CBM_LANG_ASCIIDOC, // AsciiDoc documents, read without a grammar (doc_adoc.c)
+    CBM_LANG_OPENAPI,  // openapi.json / swagger.json: the JSON grammar, no node per key; their
+                       // operations are Routes (openapi.c)
+    CBM_LANG_DIAGRAM,  // diagram files (PlantUML, DOT, D2, draw.io, Excalidraw), read
+                       // without a grammar (diagram.c)
     CBM_LANG_COUNT
 } CBMLanguage;
 
@@ -612,6 +616,23 @@ typedef struct {
     int cap;
 } CBMChannelArray;
 
+/* One arrow of a diagram (diagram.c): from one DiagramElement definition of
+ * the file to another, written as a DIAGRAM_ARROW edge. */
+typedef struct {
+    const char *from_qn;
+    const char *to_qn;
+    const char *label; /* the arrow's text, NULL for none */
+    const char *style; /* what the arrow means as its format writes it: "flow",
+                        * "message", "inherits", "composition", ... */
+    uint32_t line;
+} CBMDiagramArrow;
+
+typedef struct {
+    CBMDiagramArrow *items;
+    int count;
+    int cap;
+} CBMDiagramArrowArray;
+
 typedef struct {
     CBMFieldType *items;
     int count;
@@ -661,6 +682,7 @@ typedef struct CBMFileResult {
     CBMStringRefArray string_refs;       // URL/config string literals from AST
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
     CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
+    CBMDiagramArrowArray diagram_arrows; // arrows between the file's DiagramElement defs
     CBMFieldTypeArray field_types;       // Python: annotated instance fields (#1277)
 
     const char *module_qn;      // module qualified name
@@ -1122,6 +1144,7 @@ void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBindi
 void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
 void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
 void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
+void cbm_diagram_arrows_push(CBMDiagramArrowArray *arr, CBMArena *a, CBMDiagramArrow da);
 
 // --- Sub-extractor entry points ---
 
@@ -1140,6 +1163,31 @@ void cbm_extract_type_refs(CBMExtractCtx *ctx);
 void cbm_extract_env_accesses(CBMExtractCtx *ctx);
 void cbm_extract_type_assigns(CBMExtractCtx *ctx);
 void cbm_extract_channels(CBMExtractCtx *ctx);
+/* Diagrams (diagram.c): a Diagram definition per diagram -- a Markdown, reST
+ * or AsciiDoc block, or a diagram file -- with a DiagramElement definition per
+ * element and the arrows between them. */
+void cbm_extract_diagrams(CBMExtractCtx *ctx);
+/* Is a Markdown block a diagram fence, and the labels its parser reads from
+ * it (space-joined; NULL for none): a Section's text keeps those labels in
+ * place of the fence (extract_markdown_section_body). */
+bool cbm_diagram_fence_is_diagram(const char *source, TSNode block);
+const char *cbm_diagram_fence_labels(CBMExtractCtx *ctx, TSNode block);
+/* A diagram file (CBM_LANG_DIAGRAM): its format comes from its extension. */
+void cbm_extract_diagram_file(CBMExtractCtx *ctx);
+
+/* OpenAPI / Swagger documents (openapi.c): a Route definition per operation and
+ * a doc link per operationId. Self-gated: openapi.json / swagger.json, and YAML
+ * or JSON files whose root says `openapi` or `swagger`. */
+void cbm_extract_openapi(CBMExtractCtx *ctx);
+
+/* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
+ * "${...}") to a single "{}" token so that client call sites, server handlers
+ * and OpenAPI operations rendezvous on the same Route QN regardless of
+ * framework syntax. Parameter names are intentionally discarded ("/u/{id}" and
+ * "/u/{slug}" both canonicalize to "/u/{}"). The result never exceeds the
+ * input length, so out_sz >= strlen(in) + 1 always suffices. Returns out.
+ * (route_path.c) */
+const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz);
 
 // Single-pass unified extraction (replaces the 7 calls above except defs+imports).
 void cbm_extract_unified(CBMExtractCtx *ctx);

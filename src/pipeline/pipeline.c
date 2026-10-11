@@ -2292,6 +2292,7 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
                      (size_t)r->impl_traits.count * sizeof(CBMImplTrait) +
                      (size_t)r->infra_bindings.count * sizeof(CBMInfraBinding) +
                      (size_t)r->channels.count * sizeof(CBMChannel) +
+                     (size_t)r->diagram_arrows.count * sizeof(CBMDiagramArrow) +
                      (size_t)r->field_types.count * sizeof(CBMFieldType);
         cap_other += (size_t)r->imports.cap * sizeof(CBMImport) +
                      (size_t)r->resolved_calls.cap * sizeof(CBMResolvedCall) +
@@ -2302,6 +2303,7 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
                      (size_t)r->impl_traits.cap * sizeof(CBMImplTrait) +
                      (size_t)r->infra_bindings.cap * sizeof(CBMInfraBinding) +
                      (size_t)r->channels.cap * sizeof(CBMChannel) +
+                     (size_t)r->diagram_arrows.cap * sizeof(CBMDiagramArrow) +
                      (size_t)r->field_types.cap * sizeof(CBMFieldType);
         n_defs += (size_t)r->defs.count;
         n_calls += (size_t)r->calls.count;

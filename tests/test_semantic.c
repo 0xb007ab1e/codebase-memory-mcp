@@ -611,6 +611,86 @@ TEST(sem_doc_calibrated_p_bands) {
     PASS();
 }
 
+/* A section's diagram family (DIAG-C): Mermaid and PlantUML structural kinds,
+ * any other Mermaid or PlantUML kind is prose, any other format a graph. */
+TEST(sem_diag_family_by_format_and_kind) {
+    ASSERT_EQ(cbm_sem_diag_family("mermaid", "sequence"), CBM_SEM_DIAG_STRUCTURAL);
+    ASSERT_EQ(cbm_sem_diag_family("mermaid", "class"), CBM_SEM_DIAG_STRUCTURAL);
+    ASSERT_EQ(cbm_sem_diag_family("mermaid", "er"), CBM_SEM_DIAG_STRUCTURAL);
+    ASSERT_EQ(cbm_sem_diag_family("mermaid", "c4_deployment"), CBM_SEM_DIAG_STRUCTURAL);
+    ASSERT_EQ(cbm_sem_diag_family("mermaid", "architecture"), CBM_SEM_DIAG_STRUCTURAL);
+    ASSERT_EQ(cbm_sem_diag_family("mermaid", "flowchart"), CBM_SEM_DIAG_PROSE);
+    ASSERT_EQ(cbm_sem_diag_family("mermaid", "state"), CBM_SEM_DIAG_PROSE);
+    ASSERT_EQ(cbm_sem_diag_family("mermaid", "usecase"), CBM_SEM_DIAG_PROSE);
+    ASSERT_EQ(cbm_sem_diag_family("mermaid", NULL), CBM_SEM_DIAG_PROSE);
+    ASSERT_EQ(cbm_sem_diag_family("plantuml", "usecase"), CBM_SEM_DIAG_STRUCTURAL);
+    ASSERT_EQ(cbm_sem_diag_family("plantuml", "component"), CBM_SEM_DIAG_STRUCTURAL);
+    ASSERT_EQ(cbm_sem_diag_family("plantuml", "c4"), CBM_SEM_DIAG_STRUCTURAL);
+    ASSERT_EQ(cbm_sem_diag_family("plantuml", "activity"), CBM_SEM_DIAG_PROSE);
+    ASSERT_EQ(cbm_sem_diag_family("plantuml", "er"), CBM_SEM_DIAG_PROSE);
+    ASSERT_EQ(cbm_sem_diag_family("dot", "digraph"), CBM_SEM_DIAG_GRAPH);
+    ASSERT_EQ(cbm_sem_diag_family("d2", "d2"), CBM_SEM_DIAG_GRAPH);
+    ASSERT_EQ(cbm_sem_diag_family("", "sequence"), CBM_SEM_DIAG_NONE);
+    ASSERT_EQ(cbm_sem_diag_family(NULL, NULL), CBM_SEM_DIAG_NONE);
+    PASS();
+}
+
+/* A Markdown section that embeds a diagram (DIAG-C): function candidates at
+ * or inside the home and local extras carry the family's judged curve, from
+ * the first band; outside functions, files, other formats, graph diagrams
+ * and sections without a diagram keep cbm_sem_doc_calibrated_p. */
+TEST(sem_doc_section_p_diagram_families) {
+    const cbm_sem_doc_format_t md = CBM_SEM_DOC_FMT_MARKDOWN;
+    const cbm_sem_doc_kind_t fn = CBM_SEM_DOC_KIND_FUNCTION;
+    const cbm_sem_doc_kind_t lx = CBM_SEM_DOC_KIND_LOCAL;
+    const cbm_sem_doc_pos_t global = CBM_SEM_DOC_POS_GLOBAL;
+    const cbm_sem_doc_pos_t local = CBM_SEM_DOC_POS_LOCAL;
+    const cbm_sem_doc_pos_t outside = CBM_SEM_DOC_POS_OUTSIDE;
+    const cbm_sem_diag_family_t prose = CBM_SEM_DIAG_PROSE;
+    const cbm_sem_diag_family_t st = CBM_SEM_DIAG_STRUCTURAL;
+    ASSERT_FLOAT_EQ(cbm_sem_doc_section_p(md, prose, fn, global, 0.199F), 0.0F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_section_p(md, prose, fn, global, 0.20F), 0.24F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_section_p(md, prose, fn, local, 0.30F), 0.28F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_section_p(md, prose, fn, global, 0.40F), 0.45F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_section_p(md, prose, lx, local, 0.20F), 0.275F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_section_p(md, st, fn, local, 0.25F), 0.32F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_section_p(md, st, fn, global, 0.35F), 0.464F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_section_p(md, st, fn, local, 0.90F), 0.567F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_section_p(md, st, lx, local, 0.50F), 0.778F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_section_p(md, st, lx, local, 0.199F), 0.0F, 0.0);
+    /* stored as two decimals: 0.275 -> 0.28, 0.464 -> 0.46, 0.567 -> 0.57 */
+    ASSERT_FLOAT_EQ(cbm_sem_p_2dp(cbm_sem_doc_section_p(md, prose, lx, local, 0.5F)), 0.28, 1e-12);
+    ASSERT_FLOAT_EQ(cbm_sem_p_2dp(cbm_sem_doc_section_p(md, st, fn, local, 0.35F)), 0.46, 1e-12);
+    static const cbm_sem_doc_kind_t KINDS[] = {CBM_SEM_DOC_KIND_FUNCTION, CBM_SEM_DOC_KIND_LOCAL,
+                                               CBM_SEM_DOC_KIND_FILE};
+    for (int fam = 0; fam < CBM_SEM_DIAG_COUNT; fam++) {
+        for (size_t k = 0; k < sizeof(KINDS) / sizeof(KINDS[0]); k++) {
+            for (int pos = 0; pos < CBM_SEM_DOC_POS_COUNT; pos++) {
+                float last = 0.0F;
+                for (int milli = 0; milli <= 1000; milli++) {
+                    float s = (float)milli / 1000.0F;
+                    cbm_sem_doc_pos_t ps = (cbm_sem_doc_pos_t)pos;
+                    float p =
+                        cbm_sem_doc_section_p(md, (cbm_sem_diag_family_t)fam, KINDS[k], ps, s);
+                    ASSERT_TRUE(p >= last);
+                    last = p;
+                    bool own = (fam == prose || fam == st) && ((KINDS[k] == fn && pos != outside) ||
+                                                               (KINDS[k] == lx && pos == local));
+                    if (!own) {
+                        ASSERT_FLOAT_EQ(p, cbm_sem_doc_calibrated_p(md, KINDS[k], ps, s), 0.0);
+                    }
+                    ASSERT_FLOAT_EQ(
+                        cbm_sem_doc_section_p(CBM_SEM_DOC_FMT_RST, (cbm_sem_diag_family_t)fam,
+                                              KINDS[k], ps, s),
+                        cbm_sem_doc_calibrated_p(CBM_SEM_DOC_FMT_RST, KINDS[k], ps, s), 0.0);
+                }
+            }
+        }
+    }
+    ASSERT_FLOAT_EQ(cbm_sem_doc_section_p(md, CBM_SEM_DIAG_COUNT, fn, global, 0.25F), 0.0F, 0.0);
+    PASS();
+}
+
 /* p is stored and shown at two decimals, half up, whatever the float
  * representation of the judged value (0.225F is 0.22499999...). */
 TEST(sem_p_two_decimals_half_up) {
@@ -841,6 +921,8 @@ SUITE(semantic) {
     RUN_TEST(sem_admit_best_first_keeps_the_best);
     RUN_TEST(sem_calibrated_p_bands);
     RUN_TEST(sem_doc_calibrated_p_bands);
+    RUN_TEST(sem_diag_family_by_format_and_kind);
+    RUN_TEST(sem_doc_section_p_diagram_families);
     RUN_TEST(sem_doc_format_by_extension);
     RUN_TEST(sem_p_two_decimals_half_up);
     RUN_TEST(sem_json_str_honours_escapes);

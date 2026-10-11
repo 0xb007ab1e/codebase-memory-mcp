@@ -5459,7 +5459,7 @@ TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds) {
  * complete replacement even when every semantic-input byte is unchanged; the
  * replacement must write current metadata so the next identical run is a
  * true no-op. Cheaper requests retain fuller published coverage separately. */
-TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
+static int pipeline_exact_inputs_migrate_metadata_and_mode(int legacy_version) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_manifest_metadata_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
@@ -5491,7 +5491,7 @@ TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
     cbm_coverage_meta_t current_meta = {0};
     ASSERT_EQ(cbm_store_coverage_meta_get(metadata_store, project, &current_meta), CBM_STORE_OK);
     cbm_coverage_meta_t legacy_meta = current_meta;
-    legacy_meta.coverage_version = 1;
+    legacy_meta.coverage_version = legacy_version;
     ASSERT_EQ(cbm_store_coverage_replace_ex(metadata_store, project, coverage_rows, coverage_count,
                                             &legacy_meta),
               CBM_STORE_OK);
@@ -5556,6 +5556,16 @@ TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
     ASSERT_STR_EQ(full_mode, "full");
     ASSERT_EQ(exact_full_route, CBM_INCREMENTAL_ROUTE_NOOP);
     PASS();
+}
+
+TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
+    return pipeline_exact_inputs_migrate_metadata_and_mode(1);
+}
+
+/* Published branch version 8 predates language doc links and diagrams.
+ * Unchanged inputs still need a rebuild, followed by an exact no-op. */
+TEST(pipeline_semantic_version_8_index_is_rebuilt_once) {
+    return pipeline_exact_inputs_migrate_metadata_and_mode(8);
 }
 
 typedef struct {
@@ -19282,11 +19292,12 @@ TEST(pipeline_semantic_edges_carry_p) {
     PASS();
 }
 
-/* The p a stored candidate row must carry: the curve of the row's kind and
- * position (read from its evidence) at its score, two decimals; -1 for an
- * unknown kind or position. *is_function: a function candidate (top 5). */
-static double doc_row_want(const char *evidence, cbm_sem_doc_format_t fmt, float score,
-                           bool *is_function) {
+/* The p a stored candidate row of a section embedding diagrams of family fam
+ * must carry: the curve of the row's kind and position (read from its
+ * evidence) at its score, two decimals; -1 for an unknown kind or position.
+ * *is_function: a function candidate (top 5). */
+static double doc_row_want_family(const char *evidence, cbm_sem_doc_format_t fmt,
+                                  cbm_sem_diag_family_t fam, float score, bool *is_function) {
     static const struct {
         const char *name;
         cbm_sem_doc_kind_t kind;
@@ -19307,8 +19318,14 @@ static double doc_row_want(const char *evidence, cbm_sem_doc_format_t fmt, float
     }
     *is_function = k == 0;
     return k < 0 || p < 0 ? -1.0
-                          : cbm_sem_p_2dp(cbm_sem_doc_calibrated_p(fmt, KINDS[k].kind,
-                                                                   POSITIONS[p].pos, score));
+                          : cbm_sem_p_2dp(cbm_sem_doc_section_p(fmt, fam, KINDS[k].kind,
+                                                                POSITIONS[p].pos, score));
+}
+
+/* doc_row_want_family for a section without a diagram. */
+static double doc_row_want(const char *evidence, cbm_sem_doc_format_t fmt, float score,
+                           bool *is_function) {
+    return doc_row_want_family(evidence, fmt, CBM_SEM_DIAG_NONE, score, is_function);
 }
 
 /* Count a section's stored doc -> code candidates (section QN containing
@@ -19550,6 +19567,133 @@ TEST(pipeline_doc_candidates_skip_exact_links_and_use_format_curves) {
     ASSERT_EQ(md_bad, 0);
     ASSERT_GT(rst, 0);
     ASSERT_EQ(rst_bad, 0);
+    PASS();
+}
+
+/* The rows of a section (its QN contains heading): their count; *bad the
+ * rows off the curve of the section's diagram family fam; *own the rows
+ * whose p differs from a section without a diagram. */
+static int doc_family_rows(cbm_store_t *s, const char *heading, cbm_sem_diag_family_t fam, int *bad,
+                           int *own) {
+    sqlite3_stmt *st = NULL;
+    *bad = 0;
+    *own = 0;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT score, p, evidence FROM doc_link_candidates "
+                           "WHERE instr(section_qn, ?1) > 0",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, heading, -1, SQLITE_TRANSIENT);
+    int n = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        float score = (float)sqlite3_column_double(st, 0);
+        double p = sqlite3_column_double(st, 1);
+        const char *ev = (const char *)sqlite3_column_text(st, 2);
+        bool is_function = false;
+        double want = doc_row_want_family(ev, CBM_SEM_DOC_FMT_MARKDOWN, fam, score, &is_function);
+        *bad += want <= 0.0 || p != want;
+        *own += want != doc_row_want(ev, CBM_SEM_DOC_FMT_MARKDOWN, score, &is_function);
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* The diagram_kind of the Diagram a section (its QN contains heading)
+ * DEFINES, "" without one. */
+static void doc_section_diagram_kind(cbm_store_t *s, const char *heading, char *out,
+                                     size_t out_sz) {
+    sqlite3_stmt *st = NULL;
+    out[0] = '\0';
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT json_extract(d.properties, '$.diagram_kind') FROM edges e "
+                           "JOIN nodes a ON a.id = e.source_id JOIN nodes d ON d.id = e.target_id "
+                           "WHERE e.type = 'DEFINES' AND a.label = 'Section' "
+                           "AND d.label = 'Diagram' AND instr(a.qualified_name, ?1) > 0",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_text(st, 1, heading, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) {
+        snprintf(out, out_sz, "%s", (const char *)sqlite3_column_text(st, 0));
+    }
+    sqlite3_finalize(st);
+}
+
+/* A Markdown section that embeds a diagram takes its diagram family's judged
+ * curve (DIAG-C): a sequence diagram is structural, a flowchart is prose; a
+ * section without a diagram keeps the Markdown curve. Some rows of each
+ * diagram section must carry a p the Markdown curve would not give. */
+TEST(pipeline_doc_candidates_diagram_family_curves) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_docdiag_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char *const subjects[] = {"mail", "cache", "queue", "user", "server", "client"};
+    for (size_t i = 0; i < sizeof(subjects) / sizeof(subjects[0]); i++) {
+        write_py_family(tmp, subjects[i]);
+    }
+    char docs[512];
+    snprintf(docs, sizeof(docs), "%s/docs", tmp);
+    ASSERT_TRUE(cbm_mkdir_p(docs, 0755));
+    write_temp_file(
+        tmp, "docs/mail.md",
+        "# Mail loading\n\n"
+        "Load the mail config from disk and validate every mail field before the "
+        "parsed mail settings are returned; missing mail fields fail the validation.\n\n"
+        "```mermaid\nsequenceDiagram\n"
+        "    participant Loader\n    participant Validator\n"
+        "    Loader->>Validator: validate mail config\n```\n\n"
+        "# Mail writing\n\n"
+        "Write the mail config back to disk after validating it, so the written "
+        "mail config file always carries every mail field it needs.\n\n"
+        "```mermaid\nflowchart TD\n"
+        "    validate[validate mail config] --> write[write mail config]\n```\n\n"
+        "# Mail parsing\n\n"
+        "Parse the mail config file and return the parsed mail settings; the mail "
+        "config is loaded from disk and every mail field is validated first.\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/docdiag.db", tmp);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    char seq_kind[32];
+    char flow_kind[32];
+    char none_kind[32];
+    doc_section_diagram_kind(s, "Mail-loading", seq_kind, sizeof(seq_kind));
+    doc_section_diagram_kind(s, "Mail-writing", flow_kind, sizeof(flow_kind));
+    doc_section_diagram_kind(s, "Mail-parsing", none_kind, sizeof(none_kind));
+    int seq_bad = 0;
+    int seq_own = 0;
+    int flow_bad = 0;
+    int flow_own = 0;
+    int none_bad = 0;
+    int none_own = 0;
+    int seq = doc_family_rows(s, "Mail-loading", CBM_SEM_DIAG_STRUCTURAL, &seq_bad, &seq_own);
+    int flow = doc_family_rows(s, "Mail-writing", CBM_SEM_DIAG_PROSE, &flow_bad, &flow_own);
+    int none = doc_family_rows(s, "Mail-parsing", CBM_SEM_DIAG_NONE, &none_bad, &none_own);
+    cbm_store_close(s);
+    th_rmtree(tmp);
+    cbm_pipeline_incremental_test_reset_faults();
+    ASSERT_STR_EQ(seq_kind, "sequence");
+    ASSERT_STR_EQ(flow_kind, "flowchart");
+    ASSERT_STR_EQ(none_kind, "");
+    ASSERT_EQ(cbm_sem_diag_family("mermaid", seq_kind), CBM_SEM_DIAG_STRUCTURAL);
+    ASSERT_EQ(cbm_sem_diag_family("mermaid", flow_kind), CBM_SEM_DIAG_PROSE);
+    ASSERT_GT(seq, 0);
+    ASSERT_EQ(seq_bad, 0);
+    ASSERT_GT(seq_own, 0);
+    ASSERT_GT(flow, 0);
+    ASSERT_EQ(flow_bad, 0);
+    ASSERT_GT(flow_own, 0);
+    ASSERT_GT(none, 0);
+    ASSERT_EQ(none_bad, 0);
+    ASSERT_EQ(none_own, 0);
     PASS();
 }
 
@@ -20652,6 +20796,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_doc_candidates_published_and_kept_by_delta);
     RUN_TEST(pipeline_doc_candidates_skip_exact_links_and_use_format_curves);
     RUN_TEST(pipeline_doc_candidates_home_position_and_kinds);
+    RUN_TEST(pipeline_doc_candidates_diagram_family_curves);
     RUN_TEST(pipeline_cpp_static_factory_pointer_receiver_issue1153);
     RUN_TEST(pipeline_cpp_static_factory_reference_receiver_issue1153);
     RUN_TEST(pipeline_cpp_static_factory_unique_ptr_receiver_issue1153);
@@ -20692,6 +20837,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode);
+    RUN_TEST(pipeline_semantic_version_8_index_is_rebuilt_once);
     RUN_TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds);
     RUN_TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex);
     RUN_TEST(pipeline_full_cancel_after_predump_preserves_previous_generation);

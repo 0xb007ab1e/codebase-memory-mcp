@@ -264,13 +264,7 @@ bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_
  * "no incremental route; continue with a full index" sentinel. */
 #define CBM_PIPELINE_FORCE_FULL_REINDEX (-3)
 
-/* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
- * "${...}") to a single "{}" token so that client call sites and server
- * handlers rendezvous on the same Route QN regardless of framework syntax.
- * Parameter names are intentionally discarded ("/u/{id}" and "/u/{slug}" both
- * canonicalize to "/u/{}"). The result never exceeds the input length, so
- * out_sz >= strlen(in) + 1 always suffices. Returns out. */
-const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz);
+/* cbm_route_canon_path: cbm.h (route_path.c). */
 
 /* True when a graph node is a structural directory container (Folder/Project)
  * rather than a code node. In a directory-based-module language (Java/Go, see
@@ -563,6 +557,15 @@ static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *c
     }
     return 0;
 }
+
+/* Diagrams (pass_diagrams.c). The DEFINES edge from a Diagram's or a
+ * DiagramElement's container (the Section a diagram block sits in, the
+ * Diagram of an element) to the definition's node; nothing for other
+ * definitions. */
+void cbm_pipeline_diagram_parent_edge(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
+                                      int64_t node_id);
+/* The DIAGRAM_ARROW edges of one file's diagrams. */
+void cbm_pipeline_diagram_arrows(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result);
 
 /* Get the current pipeline's package map (NULL if none). */
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
@@ -1279,13 +1282,21 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      properties are read with their escapes, admission is best-first and
  *      every edge carries "p"; doc_link_candidates holds doc section -> code
  *      candidates. An index built before has the old pairs and no
- *      candidates, so it rebuilds once on upgrade.
- *   8: combine these changes with unresolved-call evidence capture and its
- *      candidate index. This branch's earlier versions 5 and 6 did not have
- *      the document-link and TF-IDF layers; upstream version 7 did not have
- *      unresolved-call capture. Both require a full rebuild on upgrade.
+ *      candidates, so it rebuilds once on upgrade. Released together with
+ *      7 (no release in between, so no number of its own): doc comments of
+ *      Go, Java, Kotlin, Rust, Perl, TS/JS, PHP and C hold MENTIONS edges;
+ *      diagrams are Diagram/DiagramElement nodes with DIAGRAM_ARROW edges;
+ *      OpenAPI operations are Routes; a Markdown section's text keeps a
+ *      diagram fence's labels instead of its syntax, and its candidates
+ *      carry the p of its diagrams' kind family.
+ *   8: combine document links and TF-IDF with unresolved-call evidence
+ *      capture and its candidate index. This branch's earlier versions 5
+ *      and 6 lacked the document layers; upstream 7 lacked call capture.
+ *   9: combine unresolved-call capture with the language documentation and
+ *      diagram layers above. This branch's version 8 predates those layers,
+ *      so unchanged files must rebuild once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 8 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

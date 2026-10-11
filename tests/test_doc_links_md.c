@@ -602,6 +602,18 @@ TEST(doc_links_md_ship_gate) {
         ASSERT_FALSE(cbm_doclink_syntax_ships(DM_HELD_FAMILIES[i]));
     }
     ASSERT_TRUE(cbm_doclink_syntax_ships(CBM_DOCLINK_MD_LINK));
+    /* the doc-comment families whose held-out tiers passed (2026-10-11) */
+    static const int passed[] = {
+        CBM_DOCLINK_GO_DOC_LINK,  CBM_DOCLINK_JAVA_LINK,    CBM_DOCLINK_JAVA_LINKPLAIN,
+        CBM_DOCLINK_JAVA_SEE,     CBM_DOCLINK_JAVA_THROWS,  CBM_DOCLINK_JAVA_VALUE,
+        CBM_DOCLINK_KT_KDOC_LINK, CBM_DOCLINK_KT_SEE,       CBM_DOCLINK_KT_THROWS,
+        CBM_DOCLINK_KT_SAMPLE,    CBM_DOCLINK_RS_INTRA_DOC, CBM_DOCLINK_RS_LINK_DEF,
+        CBM_DOCLINK_PERL_POD_L,   CBM_DOCLINK_TS_LINK,      CBM_DOCLINK_PHP_SEE,
+        CBM_DOCLINK_C_REF,        CBM_DOCLINK_C_SEE,
+    };
+    for (size_t i = 0; i < sizeof(passed) / sizeof(passed[0]); i++) {
+        ASSERT_TRUE(cbm_doclink_syntax_ships(passed[i]));
+    }
     ASSERT_TRUE(cbm_doclink_syntax_ships(CBM_DOCLINK_RST_ROLE));
     ASSERT_TRUE(cbm_doclink_syntax_ships(CBM_DOCLINK_ADOC_INCLUDE));
     ASSERT_TRUE(cbm_doclink_syntax_ships(CBM_DOCLINK_RST_LITERALINCLUDE));

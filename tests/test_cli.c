@@ -1309,9 +1309,19 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         test_rmdir_r(tmpdir);
         FAIL("pipe failed");
     }
+    /* The parent closes the write end once its install has returned, so the
+     * child's watch for the maintenance request ends on a definite event. */
+    int install_done_pipe[2] = {-1, -1};
+    if (pipe(install_done_pipe) != 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        test_rmdir_r(tmpdir);
+        FAIL("pipe failed");
+    }
     pid_t child = fork();
     if (child == 0) {
         close(ready_pipe[0]);
+        close(install_done_pipe[1]);
         cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(runtime_parent);
         cbm_version_cohort_manager_t *manager =
             endpoint ? cbm_version_cohort_manager_new(endpoint) : NULL;
@@ -1330,21 +1340,21 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         bool setup =
             endpoint && manager &&
             cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), fingerprint) &&
-            cbm_version_cohort_acquire(manager, &identity, cbm_now_ms() + 45000U, &lease,
-                                       &conflict) == CBM_VERSION_COHORT_OK &&
+            /* UINT64_MAX: wait as long as a lock is held, never for a
+             * conflicting holder, so no deadline decides the join. */
+            cbm_version_cohort_acquire(manager, &identity, UINT64_MAX, &lease, &conflict) ==
+                CBM_VERSION_COHORT_OK &&
             cbm_daemon_ipc_startup_lock_try_acquire(endpoint, &startup) == 1 && startup;
         char ready = setup ? 'R' : 'E';
         (void)write(ready_pipe[1], &ready, 1);
         bool saw_maintenance = false;
         /* The installer only reaches the cohort barrier after STAGING the
-         * candidate — three tamper-defense SHA-256 passes over the whole
-         * binary. The candidate here is this test runner itself (~1 GB with
-         * sanitizers), which costs ~40 s on container/CI I/O, so the
-         * observation window must cover worst-case staging. On success the
-         * child exits the moment it observes the request, so the fast path
-         * stays fast. */
-        uint64_t maintenance_deadline = cbm_now_ms() + 120000U;
-        while (setup && cbm_now_ms() < maintenance_deadline) {
+         * candidate, three tamper-defense SHA-256 passes over this test runner
+         * itself (~1 GB with sanitizers), which can take long on loaded I/O.
+         * No deadline decides the watch (USER RULE: no timeout decides a test).
+         * It ends on the request, on a definite UNSAFE/IO answer, or when the
+         * parent's install has returned without requesting maintenance. */
+        while (setup) {
             cbm_version_cohort_maintenance_presence_t presence =
                 cbm_version_cohort_maintenance_presence(manager);
             if (presence == CBM_VERSION_COHORT_MAINTENANCE_REQUESTED) {
@@ -1353,6 +1363,11 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
             }
             if (presence == CBM_VERSION_COHORT_MAINTENANCE_UNSAFE ||
                 presence == CBM_VERSION_COHORT_MAINTENANCE_IO) {
+                break;
+            }
+            struct pollfd install_done = {
+                .fd = install_done_pipe[0], .events = POLLIN, .revents = 0};
+            if (poll(&install_done, 1, 0) > 0) {
                 break;
             }
             /* REQUESTED is level-triggered: the installer holds maintenance EX
@@ -1377,9 +1392,11 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         }
         cbm_daemon_ipc_endpoint_free(endpoint);
         close(ready_pipe[1]);
+        close(install_done_pipe[0]);
         _exit(setup && saw_maintenance ? 0 : 1);
     }
     close(ready_pipe[1]);
+    close(install_done_pipe[0]);
     char ready = 0;
     bool child_ready = child > 0 && read(ready_pipe[0], &ready, 1) == 1 && ready == 'R';
     close(ready_pipe[0]);
@@ -1405,6 +1422,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
     char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
     int install_rc = child_ready ? cli_test_cmd_install(4, install_argv) : -1;
+    close(install_done_pipe[1]); /* the child's watch ends here at the latest */
     cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
     cbm_set_auto_answer_for_test(0);
 
@@ -1572,36 +1590,24 @@ TEST(cli_install_recovers_markerless_stale_rendezvous) {
  * install under test and asks the daemon itself afterwards. */
 #define CLI_SCOPE_HOST_DRAINED 3
 #define CLI_SCOPE_TIMEOUT_MS 5000U
-/* The host child's readiness has NO deadline (USER RULE: no timeout decides a
- * test). The child answers 'R' or 'E', or the pipe reaches EOF when it dies,
- * and the fixture names the failing step in every case. A child that wedges
- * before answering is left to the harness's per-suite ceiling. A 90 s bound
- * used to decide this wait, and on a starved machine (2026-10-09, during a
- * kernel index) ASSERT(ready) failed with nothing in the log to say why.
- * Generous, bounded waits remain for reaping and status probes below. */
-#define CLI_SCOPE_HOST_REAP_TIMEOUT_MS 60000U
-#define CLI_SCOPE_HOST_SERVING_TIMEOUT_MS 15000U
+/* No timeout decides a cli_scope test (USER RULE). That covers the host child's
+ * readiness, its cohort join, the parent's client connect, the "still serving"
+ * probe, and the reap:
+ * - the child answers 'R' or 'E', or the pipe reaches EOF when it dies, and the
+ *   fixture names the failing step in every case;
+ * - each IPC attempt keeps the API's finite CLI_SCOPE_TIMEOUT_MS budget, but an
+ *   attempt that reaches a live, mute endpoint (a loaded runner answering
+ *   slowly) is repeated, and only a reply or a definite refusal decides
+ *   (cli_scope_until_answered);
+ * - a child that wedges is left to the harness's per-suite ceiling.
+ * A 90 s readiness bound, a 15 s status budget and a 60 s reap used to decide
+ * these; on a starved machine (2026-10-09, during a kernel index)
+ * ASSERT(ready) failed with nothing in the log to say why. */
 /* Teardown budget for a child the activation ALREADY drained: its service is
  * gone, so each free/release succeeds immediately and this is only the
  * give-up point if one unexpectedly does not. The undrained path keeps the
  * full 2 x CLI_SCOPE_TIMEOUT_MS, which is where a wedged teardown is real. */
 #define CLI_SCOPE_CLEANUP_DRAINED_MS 1000U
-/* Budget for probing that an ALREADY-drained host has stopped serving.
- *
- * The generous CLI_SCOPE_HOST_SERVING_TIMEOUT_MS exists for the POSITIVE
- * question -- "is this daemon still up?" -- where a slow reply on a loaded
- * runner must not be misread as drained. Asked in the negative it inverts:
- * there is no reply coming, so the whole budget is spent proving silence, and
- * the assertion is decided by a timeout expiring rather than by the system's
- * own behaviour. That was 15 s of the drain test's wall clock and the largest
- * single idle block in the cli suite.
- *
- * The drain is proven POSITIVELY elsewhere in that test: install returns 0
- * only after the activation completed, and the host child exits with
- * CLI_SCOPE_HOST_DRAINED. By the time this probe runs the daemon is already
- * gone, so a short budget confirms the same fact a long one would -- it just
- * stops charging the suite for the wait. */
-#define CLI_SCOPE_HOST_DRAINED_PROBE_MS 2000U
 
 typedef struct {
     char tmpdir[256];
@@ -1620,6 +1626,7 @@ typedef struct {
     char *old_home;
     char *old_cache;
     char *old_shell;
+    bool env_saved;        /* HOME, CBM_CACHE_DIR and SHELL were saved for finish */
     char failed_step[160]; /* the setup step that failed, "" when ready */
 } cli_scope_fixture_t;
 
@@ -1634,8 +1641,10 @@ static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, i
     cbm_daemon_runtime_service_t *service = NULL;
     int acquire_status = -1;
     if (endpoint && manager) {
-        acquire_status = (int)cbm_version_cohort_acquire(manager, &fixture->identity,
-                                                         cbm_now_ms() + 45000U, &lease, &conflict);
+        /* UINT64_MAX: wait as long as a lock is held, never for a conflicting
+         * holder (that is answered at once), so no deadline decides the join. */
+        acquire_status = (int)cbm_version_cohort_acquire(manager, &fixture->identity, UINT64_MAX,
+                                                         &lease, &conflict);
     }
     bool admitted = acquire_status == (int)CBM_VERSION_COHORT_OK;
     if (admitted) {
@@ -1745,30 +1754,58 @@ static bool cli_scope_setup_failed(cli_scope_fixture_t *fixture, const char *tag
     return false;
 }
 
-/* Reap the host child within a bound: the release signal makes a healthy child
- * break within ~50 ms and finish teardown in a few seconds, so a child still
- * alive past the deadline is wedged — SIGKILL it and reap so the suite always
- * makes progress. Returns the child's exit code, or -1 when it had to be
- * killed or did not exit cleanly; a -1 fails the caller's host_exit assertion
- * cleanly rather than hanging. */
-static int cli_scope_reap_host(pid_t host, uint32_t timeout_ms) {
-    uint64_t deadline = cbm_now_ms() + timeout_ms;
+/* Reap the host child, with no deadline: the release signal makes a healthy
+ * child exit within seconds, and a wedged one is left to the harness's
+ * per-suite ceiling (see CLI_SCOPE_TIMEOUT_MS). Returns the child's exit code,
+ * or -1 when it did not exit normally. */
+static int cli_scope_reap_host(pid_t host) {
     int status = 0;
     for (;;) {
-        pid_t reaped = waitpid(host, &status, WNOHANG);
+        pid_t reaped = waitpid(host, &status, 0);
         if (reaped == host) {
             return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         }
         if (reaped < 0 && errno != EINTR) {
             return -1;
         }
-        if (cbm_now_ms() >= deadline) {
-            (void)kill(host, SIGKILL);
-            (void)waitpid(host, &status, 0);
-            return -1;
-        }
-        cbm_usleep(2000);
     }
+}
+
+/* One IPC attempt's outcome for cli_scope_until_answered. */
+typedef enum {
+    CLI_SCOPE_ANSWERED, /* a reply arrived */
+    CLI_SCOPE_REFUSED,  /* definite: no endpoint, a refusal, or a conflict */
+    CLI_SCOPE_MUTE,     /* a live process holds the endpoint but did not answer in time */
+} cli_scope_attempt_t;
+
+typedef cli_scope_attempt_t (*cli_scope_attempt_fn)(void *context);
+
+/* Repeat an IPC attempt while it reaches a live but mute endpoint, so a slow
+ * reply on a loaded runner is waited for instead of failing the test. A reply
+ * or a definite refusal ends it. Each attempt keeps the API's finite budget.
+ * Returns true when an attempt was answered. */
+static bool cli_scope_until_answered(cli_scope_attempt_fn attempt, void *context) {
+    for (;;) {
+        cli_scope_attempt_t outcome = attempt(context);
+        if (outcome != CLI_SCOPE_MUTE) {
+            return outcome == CLI_SCOPE_ANSWERED;
+        }
+    }
+}
+
+/* One attempt to connect the parent's committed client to the host. */
+static cli_scope_attempt_t cli_scope_connect_attempt(void *context) {
+    cli_scope_fixture_t *fixture = context;
+    cbm_daemon_runtime_connect_result_t result = {0};
+    fixture->client = cbm_daemon_runtime_client_connect(fixture->endpoint, &fixture->identity,
+                                                        CLI_SCOPE_TIMEOUT_MS, &result);
+    if (fixture->client) {
+        return CLI_SCOPE_ANSWERED;
+    }
+    return result.status == CBM_DAEMON_RUNTIME_CONNECT_ERROR &&
+                   result.muted_endpoint_holder_pid != 0
+               ? CLI_SCOPE_MUTE
+               : CLI_SCOPE_REFUSED;
 }
 
 static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *tag) {
@@ -1842,6 +1879,7 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     cli_activation_save_env(&fixture->old_home, &fixture->old_cache);
     const char *shell = getenv("SHELL");
     fixture->old_shell = shell ? strdup(shell) : NULL;
+    fixture->env_saved = true;
     cbm_setenv("SHELL", "/bin/zsh", 1);
     if (child < 0) {
         return cli_scope_setup_failed(fixture, tag, "forking the host", fork_error);
@@ -1854,11 +1892,9 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
                                       0);
     }
     fixture->endpoint = cbm_daemon_bootstrap_endpoint_new(fixture->runtime_parent);
-    cbm_daemon_runtime_connect_result_t connect_result = {0};
-    fixture->client = fixture->endpoint
-                          ? cbm_daemon_runtime_client_connect(fixture->endpoint, &fixture->identity,
-                                                              CLI_SCOPE_TIMEOUT_MS, &connect_result)
-                          : NULL;
+    if (fixture->endpoint) {
+        (void)cli_scope_until_answered(cli_scope_connect_attempt, fixture);
+    }
     if (!fixture->client) {
         return cli_scope_setup_failed(fixture, tag,
                                       fixture->endpoint ? "connecting the parent's client"
@@ -1868,23 +1904,33 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     return true;
 }
 
-static bool cli_scope_host_serving_within(const cli_scope_fixture_t *fixture, uint32_t timeout_ms) {
-    cbm_daemon_runtime_status_t status = {0};
-    return fixture->endpoint &&
-           cbm_daemon_runtime_request_status(fixture->endpoint, &fixture->identity, timeout_ms,
-                                             &status) &&
-           !status.stopping && status.committed_clients == 1;
+typedef struct {
+    const cli_scope_fixture_t *fixture;
+    cbm_daemon_runtime_status_t status;
+} cli_scope_status_probe_t;
+
+/* One status request. A failed request still reports the PID of a live but
+ * mute endpoint holder, which is what tells slow apart from gone. */
+static cli_scope_attempt_t cli_scope_status_attempt(void *context) {
+    cli_scope_status_probe_t *probe = context;
+    memset(&probe->status, 0, sizeof(probe->status));
+    if (cbm_daemon_runtime_request_status(probe->fixture->endpoint, &probe->fixture->identity,
+                                          CLI_SCOPE_TIMEOUT_MS, &probe->status)) {
+        return CLI_SCOPE_ANSWERED;
+    }
+    return probe->status.muted_endpoint_holder_pid != 0 ? CLI_SCOPE_MUTE : CLI_SCOPE_REFUSED;
 }
 
 /* Ask the host daemon itself: still running, not stopping, and the parent's
- * committed client still admitted. */
+ * committed client still admitted. A foreign-namespace install leaves this
+ * daemon serving, so a slow reply on a loaded runner must not be misread as
+ * "drained" (the flaky failure this fixture showed): a mute attempt is
+ * repeated until the daemon answers, while a drained daemon is unreachable or
+ * reports stopping, which decides at once. */
 static bool cli_scope_host_serving(const cli_scope_fixture_t *fixture) {
-    /* A generous, bounded status deadline: a foreign-namespace install leaves
-     * this daemon serving, so a slow response on a loaded runner must not be
-     * misread as "drained" (the flaky failure this fixture showed). The call
-     * still fails cleanly — a genuinely drained daemon is unreachable or
-     * reports stopping — it just no longer decides survival on a 5 s budget. */
-    return cli_scope_host_serving_within(fixture, CLI_SCOPE_HOST_SERVING_TIMEOUT_MS);
+    cli_scope_status_probe_t probe = {.fixture = fixture};
+    return fixture->endpoint && cli_scope_until_answered(cli_scope_status_attempt, &probe) &&
+           !probe.status.stopping && probe.status.committed_clients == 1;
 }
 
 static int cli_scope_install(cli_scope_fixture_t *fixture, const char *home, const char *cache,
@@ -1917,7 +1963,7 @@ static int cli_scope_fixture_finish(cli_scope_fixture_t *fixture) {
     }
     int host_exit = -1;
     if (fixture->host > 0) {
-        host_exit = cli_scope_reap_host(fixture->host, CLI_SCOPE_HOST_REAP_TIMEOUT_MS);
+        host_exit = cli_scope_reap_host(fixture->host);
         fixture->host = -1;
     }
     cbm_daemon_ipc_endpoint_free(fixture->endpoint);
@@ -1925,14 +1971,20 @@ static int cli_scope_fixture_finish(cli_scope_fixture_t *fixture) {
     if (fixture->previous_supervisor_build[0]) {
         cbm_index_supervisor_set_build_fingerprint_for_test(fixture->previous_supervisor_build);
     }
-    if (fixture->old_shell) {
-        cbm_setenv("SHELL", fixture->old_shell, 1);
-    } else {
-        cbm_unsetenv("SHELL");
+    /* Restore only what start saved: a setup that failed before saving left
+     * HOME, CBM_CACHE_DIR and SHELL untouched, and restoring "nothing saved"
+     * would unset them for every later test in the suite. */
+    if (fixture->env_saved) {
+        if (fixture->old_shell) {
+            cbm_setenv("SHELL", fixture->old_shell, 1);
+        } else {
+            cbm_unsetenv("SHELL");
+        }
+        cli_activation_restore_env(fixture->old_home, fixture->old_cache);
+        fixture->env_saved = false;
     }
     free(fixture->old_shell);
     fixture->old_shell = NULL;
-    cli_activation_restore_env(fixture->old_home, fixture->old_cache);
     fixture->old_home = NULL;
     fixture->old_cache = NULL;
     test_rmdir_r(fixture->tmpdir);
@@ -2022,10 +2074,13 @@ TEST(cli_install_into_host_namespace_still_drains_host_cohort) {
     int install_rc =
         ready ? cli_scope_install(&fixture, fixture.host_home, fixture.host_cache, host_bin, false)
               : -1;
-    /* Negative probe: see CLI_SCOPE_HOST_DRAINED_PROBE_MS. The drain itself is
-     * asserted positively below via host_exit == CLI_SCOPE_HOST_DRAINED. */
-    bool host_serving =
-        ready && cli_scope_host_serving_within(&fixture, CLI_SCOPE_HOST_DRAINED_PROBE_MS);
+    /* Negative probe, decided by a definite answer like the positive one: a
+     * drained host is unreachable or reports stopping at once, while a slow
+     * host that still serves is asked again until it answers, so it can no
+     * longer pass as drained when its reply misses a short budget. The drain
+     * itself is asserted positively below via host_exit ==
+     * CLI_SCOPE_HOST_DRAINED. */
+    bool host_serving = ready && cli_scope_host_serving(&fixture);
     const char *events = read_test_file(activation_log);
     bool drained_in_log = events && strstr(events, "cohort drained") != NULL &&
                           strstr(events, "\"daemon_active_clients\":1") != NULL;
@@ -2077,6 +2132,71 @@ TEST(cli_scope_fixture_names_its_failing_setup_step) {
     bool ready = cli_scope_fixture_start(&fixture, "no-such-parent/x");
     ASSERT_FALSE(ready);
     ASSERT_STR_EQ(fixture.failed_step, "creating the fixture directory");
+    PASS();
+}
+
+/* Every cli_scope test calls finish even when start failed. A start that
+ * failed before saving HOME, CBM_CACHE_DIR and SHELL used to have finish
+ * "restore" them to nothing, unsetting them for every later test. */
+TEST(cli_scope_fixture_finish_keeps_env_after_an_early_failure) {
+    char *saved_home = save_test_env("HOME");
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    char *saved_shell = save_test_env("SHELL");
+    cbm_setenv("HOME", "/tmp/cli-scope-sentinel-home", 1);
+    cbm_setenv("CBM_CACHE_DIR", "/tmp/cli-scope-sentinel-cache", 1);
+    cbm_setenv("SHELL", "/bin/sentinel-shell", 1);
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "no-such-parent/y");
+    (void)cli_scope_fixture_finish(&fixture);
+    const char *home = getenv("HOME");
+    const char *cache = getenv("CBM_CACHE_DIR");
+    const char *shell = getenv("SHELL");
+    bool home_kept = home && strcmp(home, "/tmp/cli-scope-sentinel-home") == 0;
+    bool cache_kept = cache && strcmp(cache, "/tmp/cli-scope-sentinel-cache") == 0;
+    bool shell_kept = shell && strcmp(shell, "/bin/sentinel-shell") == 0;
+    restore_test_env("HOME", saved_home);
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    restore_test_env("SHELL", saved_shell);
+
+    ASSERT_FALSE(ready);
+    ASSERT_TRUE(home_kept);
+    ASSERT_TRUE(cache_kept);
+    ASSERT_TRUE(shell_kept);
+    PASS();
+}
+
+/* A scripted sequence of attempt outcomes for cli_scope_until_answered. */
+typedef struct {
+    const cli_scope_attempt_t *outcomes;
+    int count;
+    int calls;
+} cli_scope_scripted_attempts_t;
+
+static cli_scope_attempt_t cli_scope_scripted_attempt(void *context) {
+    cli_scope_scripted_attempts_t *script = context;
+    int index = script->calls < script->count ? script->calls : script->count - 1;
+    script->calls++;
+    return script->outcomes[index];
+}
+
+/* The rule that replaced the status and connect timeouts: a mute endpoint is
+ * asked again, and only a reply or a definite refusal decides. */
+TEST(cli_scope_retries_a_mute_endpoint_until_it_answers) {
+    static const cli_scope_attempt_t slow_then_answer[] = {CLI_SCOPE_MUTE, CLI_SCOPE_MUTE,
+                                                           CLI_SCOPE_MUTE, CLI_SCOPE_ANSWERED};
+    cli_scope_scripted_attempts_t slow = {slow_then_answer, 4, 0};
+    ASSERT_TRUE(cli_scope_until_answered(cli_scope_scripted_attempt, &slow));
+    ASSERT_EQ(slow.calls, 4);
+
+    static const cli_scope_attempt_t slow_then_refused[] = {CLI_SCOPE_MUTE, CLI_SCOPE_REFUSED};
+    cli_scope_scripted_attempts_t refused = {slow_then_refused, 2, 0};
+    ASSERT_FALSE(cli_scope_until_answered(cli_scope_scripted_attempt, &refused));
+    ASSERT_EQ(refused.calls, 2);
+
+    static const cli_scope_attempt_t answered_at_once[] = {CLI_SCOPE_ANSWERED};
+    cli_scope_scripted_attempts_t at_once = {answered_at_once, 1, 0};
+    ASSERT_TRUE(cli_scope_until_answered(cli_scope_scripted_attempt, &at_once));
+    ASSERT_EQ(at_once.calls, 1);
     PASS();
 }
 
@@ -17940,6 +18060,8 @@ SUITE(cli) {
     RUN_TEST(cli_install_into_host_namespace_still_drains_host_cohort);
     RUN_TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing);
     RUN_TEST(cli_scope_fixture_names_its_failing_setup_step);
+    RUN_TEST(cli_scope_fixture_finish_keeps_env_after_an_early_failure);
+    RUN_TEST(cli_scope_retries_a_mute_endpoint_until_it_answers);
     RUN_TEST(cli_install_foreign_home_unreadable_cohort_cache_keeps_host_daemon);
     RUN_TEST(cli_install_foreign_home_busy_cohort_keeps_host_daemon);
 #endif
