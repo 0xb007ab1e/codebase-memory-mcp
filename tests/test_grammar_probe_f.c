@@ -1880,6 +1880,89 @@ static char *gpf_runs(const GpfFile *files, int nfiles) {
         free(got_);                                                                                \
     } while (0)
 
+/* Every DEPENDS_ON edge into an Image as "@<file> -> <repository> (via)",
+ * sorted, one per line. */
+static char *gpf_images(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT '@' || s.file_path "
+            "|| ' -> ' || t.name || ' (' || json_extract(e.properties,'$.via') || ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='DEPENDS_ON' AND t.label='Image' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+#define GPF_ASSERT_IMAGES(files, n, want)                                                          \
+    do {                                                                                           \
+        char *got_ = gpf_images(files, n);                                                         \
+        if (!got_ || strcmp(got_, want) != 0) {                                                    \
+            fprintf(stderr, "images got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want);         \
+            free(got_);                                                                            \
+            FAIL("Image DEPENDS_ON edge set");                                                     \
+        }                                                                                          \
+        free(got_);                                                                                \
+    } while (0)
+
+/* A Dockerfile DEPENDS_ON each image it builds on: FROM and COPY --from,
+ * with ARG defaults expanded, under the image's repository (docker.io and
+ * library/ filled in, a registry host kept, tag and digest dropped). A stage
+ * (by name or index), scratch and an ARG without a value are no image. */
+TEST(probe_dockerfile_bases_are_images) {
+    static const GpfFile files[] = {
+        {"svc/Dockerfile", "ARG GO=1.22\nARG BASE\n"
+                           "FROM golang:${GO} AS build\n"
+                           "RUN go build -o /out/app ./cmd/app\n"
+                           "FROM ${BASE} AS unknown\n"
+                           "FROM build AS test\n"
+                           "FROM gcr.io/distroless/static@sha256:0123 AS run\n"
+                           "COPY --from=build /out/app /app\n"
+                           "COPY --from=0 /out/app /app2\n"
+                           "COPY --from=docker.io/bitnami/kubectl:1.30 /opt/kubectl /kubectl\n"
+                           "FROM scratch\n"
+                           "COPY --from=registry.example.com:5000/team/tools:2 /bin/x /x\n"}};
+    GPF_ASSERT_IMAGES(files, 1,
+                      "@svc/Dockerfile -> docker.io/bitnami/kubectl (copy-from)\n"
+                      "@svc/Dockerfile -> docker.io/library/golang (from)\n"
+                      "@svc/Dockerfile -> gcr.io/distroless/static (from)\n"
+                      "@svc/Dockerfile -> registry.example.com:5000/team/tools (copy-from)");
+    PASS();
+}
+
+/* A build file named for its variant is a Dockerfile of its own (its own
+ * Module, beside the plain Dockerfile): Dockerfile.debug, Dockerfile-test,
+ * Containerfile, pipeline.Dockerfile. A template of one (Dockerfile.j2) and a
+ * BuildKit ignore file (Dockerfile.dockerignore) are not. */
+TEST(probe_dockerfile_variants_are_dockerfiles) {
+    static const GpfFile files[] = {
+        {"svc/Dockerfile", "FROM alpine:3.20\n"},
+        {"svc/Dockerfile.debug", "FROM debian:12\n"},
+        {"svc/Dockerfile-test", "FROM ubuntu:24.04\n"},
+        {"svc/Dockerfile.dockerignore", "FROM busybox\n"},
+        {"Containerfile", "FROM quay.io/podman/stable\n"},
+        {"tools/pipeline.Dockerfile", "FROM node:20\n"},
+        {"tools/Dockerfile.j2", "FROM {{ base_image }}\n"}};
+    GPF_ASSERT_IMAGES(files, 7,
+                      "@Containerfile -> quay.io/podman/stable (from)\n"
+                      "@svc/Dockerfile -> docker.io/library/alpine (from)\n"
+                      "@svc/Dockerfile-test -> docker.io/library/ubuntu (from)\n"
+                      "@svc/Dockerfile.debug -> docker.io/library/debian (from)\n"
+                      "@tools/pipeline.Dockerfile -> docker.io/library/node (from)");
+    PASS();
+}
+
 #define GPF_CM(name) "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " name "\n"
 #define GPF_KUST "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
 
@@ -4143,6 +4226,8 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_mcp_trace_topology);
     RUN_TEST(probe_mcp_trace_topology_follows_deploys);
     RUN_TEST(probe_mcp_trace_deploy);
+    RUN_TEST(probe_dockerfile_bases_are_images);
+    RUN_TEST(probe_dockerfile_variants_are_dockerfiles);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
     RUN_TEST(probe_shell_helm_deploys_its_chart);

@@ -93,6 +93,7 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* Dockerfile */
     {".dockerfile", CBM_LANG_DOCKERFILE},
+    {".Dockerfile", CBM_LANG_DOCKERFILE},
 
     /* Elixir */
     {".ex", CBM_LANG_ELIXIR},
@@ -713,6 +714,7 @@ typedef struct {
 
 static const filename_entry_t FILENAME_TABLE[] = {
     {"CMakeLists.txt", CBM_LANG_CMAKE},
+    {"Containerfile", CBM_LANG_DOCKERFILE},
     {"Dockerfile", CBM_LANG_DOCKERFILE},
     {"GNUmakefile", CBM_LANG_MAKEFILE},
     {"Makefile", CBM_LANG_MAKEFILE},
@@ -957,6 +959,32 @@ CBMLanguage cbm_language_for_extension(const char *ext) {
     return lang_for_extension(cbm_get_user_lang_config(), ext);
 }
 
+/* A container build file named for its variant: "Dockerfile.dev",
+ * "Dockerfile-test", "Containerfile.arm64". Not when the suffix is a language
+ * extension of its own (Dockerfile.j2 is a Jinja template) nor a BuildKit
+ * ignore file (Dockerfile.dockerignore). */
+static bool lang_dockerfile_variant(const cbm_userconfig_t *ucfg, const char *filename) {
+    static const char *const BASES[] = {"Dockerfile", "Containerfile"};
+    static const char IGNORE[] = ".dockerignore";
+    for (size_t i = 0; i < sizeof(BASES) / sizeof(BASES[0]); i++) {
+        size_t bl = strlen(BASES[i]);
+        char sep = filename[bl];
+        if (strncmp(filename, BASES[i], bl) != 0 || (sep != '.' && sep != '-' && sep != '_') ||
+            !filename[bl + SKIP_ONE]) {
+            continue;
+        }
+        size_t fl = strlen(filename);
+        if (fl >= sizeof(IGNORE) - SKIP_ONE &&
+            strcmp(filename + fl - (sizeof(IGNORE) - SKIP_ONE), IGNORE) == 0) {
+            return false;
+        }
+        const char *last_dot = strrchr(filename, '.');
+        return !last_dot || last_dot < filename + bl ||
+               lang_for_extension(ucfg, last_dot) == CBM_LANG_COUNT;
+    }
+    return false;
+}
+
 static CBMLanguage lang_for_filename(const cbm_userconfig_t *ucfg, const char *filename) {
     if (!filename || !filename[0]) {
         return CBM_LANG_COUNT;
@@ -976,6 +1004,9 @@ static CBMLanguage lang_for_filename(const cbm_userconfig_t *ucfg, const char *f
      * direct extraction. */
     if (strncmp(filename, ".env.", SLEN(".env.")) == 0) {
         return CBM_LANG_DOTENV;
+    }
+    if (lang_dockerfile_variant(ucfg, filename)) {
+        return CBM_LANG_DOCKERFILE;
     }
 
     /* Fall back to extension-based lookup.

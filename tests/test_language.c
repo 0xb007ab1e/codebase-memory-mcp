@@ -549,6 +549,21 @@ TEST(lang_fn_dockerfile) {
     ASSERT_EQ(cbm_language_for_filename("Dockerfile"), CBM_LANG_DOCKERFILE);
     PASS();
 }
+/* Build files named for a variant; a template or ignore file of one is not. */
+TEST(lang_fn_dockerfile_variants) {
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile.debug"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile.multiarch"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile-test"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile_base"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Containerfile"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Containerfile.arm64"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("pipeline.Dockerfile"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile.j2"), CBM_LANG_JINJA2);
+    ASSERT_NEQ(cbm_language_for_filename("Dockerfile.dockerignore"), CBM_LANG_DOCKERFILE);
+    ASSERT_NEQ(cbm_language_for_filename("Dockerfile."), CBM_LANG_DOCKERFILE);
+    ASSERT_NEQ(cbm_language_for_filename("Dockerfiles"), CBM_LANG_DOCKERFILE);
+    PASS();
+}
 TEST(lang_fn_meson_build) {
     ASSERT_EQ(cbm_language_for_filename("meson.build"), CBM_LANG_MESON);
     PASS();
@@ -1635,6 +1650,7 @@ SUITE(language) {
     RUN_TEST(lang_fn_makefile_lower);
     RUN_TEST(lang_fn_cmake);
     RUN_TEST(lang_fn_dockerfile);
+    RUN_TEST(lang_fn_dockerfile_variants);
     RUN_TEST(lang_fn_meson_build);
     RUN_TEST(lang_fn_meson_opts);
     RUN_TEST(lang_fn_meson_opts_txt);

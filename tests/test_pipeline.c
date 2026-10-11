@@ -3508,6 +3508,52 @@ TEST(incremental_deleted_spawner_drops_its_process) {
     PASS();
 }
 
+/* Deleting the only Dockerfile naming an image leaves no Image node behind;
+ * the image another Dockerfile still names stays. `legacy`: through the
+ * full-load route, else the closure-repair route. Returns the Image count
+ * after the deletion, or -1; *route: the route taken. */
+static int incremental_dockerfile_delete(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_imagegc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return -1;
+    }
+    write_temp_file(tmp, "a/Dockerfile",
+                    "FROM alpine:3.20\nCOPY --from=docker.io/bitnami/kubectl:1.30 /k /k\n");
+    write_temp_file(tmp, "b/Dockerfile", "FROM alpine:3.19\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/imagegc.db", tmp);
+    static const char images[] = "SELECT COUNT(*) FROM nodes WHERE label='Image'";
+    int full = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, images) : -1;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/a/Dockerfile", tmp);
+    (void)remove(path);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    int after = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, images) : -1;
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return full == 2 ? after : -1;
+}
+
+TEST(incremental_deleted_dockerfile_drops_its_image) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    int left = incremental_dockerfile_delete(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(left, 1);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    left = incremental_dockerfile_delete(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(left, 1);
+#endif
+    PASS();
+}
+
 /* SQL DDL becomes first-class Table/View nodes wired into FROM/JOIN lineage,
  * while the shared name registry must NOT leak those relations into other
  * languages' textual resolution: a Python call or identifier sharing the
@@ -19134,6 +19180,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_k8s_edits_reach_other_files);
     RUN_TEST(incremental_shell_deploy_edit_keeps_its_edges);
     RUN_TEST(incremental_deleted_spawner_drops_its_process);
+    RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);

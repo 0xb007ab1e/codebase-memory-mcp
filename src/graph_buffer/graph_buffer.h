@@ -110,11 +110,12 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label);
  * Used by incremental indexing to remove stale nodes before re-extraction. */
 int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path);
 
-/* Delete every `label` node that no `edge_type` edge targets (with any edges
- * it still has); returns how many. For nodes that exist only as such a
- * target and carry no file (Process): incremental indexing drops them when
- * their last referrer is gone, as a full index never makes them. */
-int cbm_gbuf_delete_unreferenced(cbm_gbuf_t *gb, const char *label, const char *edge_type);
+/* Delete every `label` node that no edge of `edge_types` (NULL-terminated)
+ * touches, as source or target (with any edges it still has); returns how
+ * many. For nodes that exist only through such edges and carry no file
+ * (Process, Image): incremental indexing drops them when their last referrer
+ * is gone, as a full index never makes them. */
+int cbm_gbuf_delete_unreferenced(cbm_gbuf_t *gb, const char *label, const char *const *edge_types);
 
 /* Bulk-load all nodes and edges for a project from an existing SQLite DB
  * into this graph buffer. Returns 0 on success. */

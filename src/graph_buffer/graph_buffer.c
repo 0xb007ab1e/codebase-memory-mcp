@@ -1498,8 +1498,23 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
     return deleted_count;
 }
 
-int cbm_gbuf_delete_unreferenced(cbm_gbuf_t *gb, const char *label, const char *edge_type) {
-    if (!gb || !label || !edge_type) {
+/* Whether an edge of `types` (NULL-terminated) touches node `id`. */
+static bool gbuf_node_touched(const cbm_gbuf_t *gb, int64_t id, const char *const *types) {
+    for (int t = 0; types[t]; t++) {
+        const cbm_gbuf_edge_t **edges = NULL;
+        int count = 0;
+        if ((cbm_gbuf_find_edges_by_target_type(gb, id, types[t], &edges, &count) == 0 &&
+             count > 0) ||
+            (cbm_gbuf_find_edges_by_source_type(gb, id, types[t], &edges, &count) == 0 &&
+             count > 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int cbm_gbuf_delete_unreferenced(cbm_gbuf_t *gb, const char *label, const char *const *edge_types) {
+    if (!gb || !label || !edge_types || !edge_types[0]) {
         return CBM_NOT_FOUND;
     }
     node_ptr_array_t *arr = cbm_ht_get(gb->nodes_by_label, label);
@@ -1514,13 +1529,9 @@ int cbm_gbuf_delete_unreferenced(cbm_gbuf_t *gb, const char *label, const char *
     }
     int n = 0;
     for (int i = 0; i < arr->count; i++) {
-        const cbm_gbuf_edge_t **edges = NULL;
-        int count = 0;
         const char *qn = arr->items[i]->qualified_name;
         cbm_gbuf_node_t *node = qn ? cbm_ht_get(gb->node_by_qn, qn) : NULL;
-        if (node &&
-            cbm_gbuf_find_edges_by_target_type(gb, node->id, edge_type, &edges, &count) == 0 &&
-            count == 0) {
+        if (node && !gbuf_node_touched(gb, node->id, edge_types)) {
             victims[n++] = node;
         }
     }

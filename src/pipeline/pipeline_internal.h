@@ -1079,6 +1079,11 @@ void cbm_ci_commands(CBMArena *a, const char *rel, const char *src, size_t len, 
 void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                  int file_count);
 
+/* Container builds (pass_docker.c): a Dockerfile DEPENDS_ON the Images it
+ * builds on (FROM, COPY --from). Run at the end of the K8s pass. */
+void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                              int file_count);
+
 /* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
 int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
 
@@ -1290,10 +1295,15 @@ int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const ch
 void cbm_delta_free_snapshot(cbm_delta_saved_edge_t *items, int count);
 int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *paths,
                     int path_count);
-/* Delete the project's `label` nodes no `edge_type` edge targets (a Process
- * whose last spawner was purged); returns how many, or -1 on failure. */
+/* Delete the project's `label` nodes no edge of `edge_types` (NULL-terminated)
+ * touches as source or target (a Process whose last spawner was purged, an
+ * Image no Dockerfile or workload names any more); returns how many, or -1
+ * on failure. */
 int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const char *label,
-                                const char *edge_type);
+                                const char *const *edge_types);
+/* The edges that keep a file-less shared node alive. */
+#define SH_PROCESS_EDGES ((const char *const[]){"SPAWNS", NULL})
+#define DK_IMAGE_EDGES ((const char *const[]){"DEPENDS_ON", "USAGE", NULL})
 /* Pre-seed proxy nodes with their REAL database ids and move the gbuf id
  * watermark above MAX(id); returns that max id, or -1 on failure. */
 int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf);

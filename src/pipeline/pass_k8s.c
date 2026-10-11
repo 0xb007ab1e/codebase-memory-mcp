@@ -3471,6 +3471,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     /* Shell and Make deploy commands, against the nodes linked above. */
     cbm_pipeline_pass_shell(ctx, files, file_count);
     cbm_pipeline_pass_terraform(ctx, files, file_count);
+    cbm_pipeline_pass_docker(ctx, files, file_count);
 
     cbm_log_info("pass.done", "pass", "k8s", "manifests", itoa_k8s(manifest_count));
     (void)helm_count;

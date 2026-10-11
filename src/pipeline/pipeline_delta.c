@@ -248,22 +248,36 @@ int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *
 }
 
 int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const char *label,
-                                const char *edge_type) {
+                                const char *const *edge_types) {
     sqlite3 *db = cbm_store_get_db(store);
-    if (!db) {
+    if (!db || !edge_types) {
+        return CBM_NOT_FOUND;
+    }
+    /* One statement: a pair of NOT EXISTS per listed type (target, source),
+     * each served by an (id, type) index. */
+    char sql[CBM_SZ_2K];
+    int len = snprintf(sql, sizeof(sql), "DELETE FROM nodes WHERE project = ?1 AND label = ?2");
+    int t = 0;
+    for (; edge_types[t] && len > 0 && (size_t)len < sizeof(sql); t++) {
+        len += snprintf(sql + len, sizeof(sql) - (size_t)len,
+                        " AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.project = ?1"
+                        " AND e.target_id = nodes.id AND e.type = ?%d)"
+                        " AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.project = ?1"
+                        " AND e.source_id = nodes.id AND e.type = ?%d)",
+                        t + 3, t + 3);
+    }
+    if (t == 0 || len <= 0 || (size_t)len >= sizeof(sql)) {
         return CBM_NOT_FOUND;
     }
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db,
-                           "DELETE FROM nodes WHERE project = ?1 AND label = ?2 AND NOT EXISTS"
-                           " (SELECT 1 FROM edges e WHERE e.project = ?1"
-                           " AND e.target_id = nodes.id AND e.type = ?3)",
-                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         return CBM_NOT_FOUND;
     }
     sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, label, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, edge_type, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    for (int i = 0; i < t; i++) {
+        sqlite3_bind_text(stmt, i + 3, edge_types[i], CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    }
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE ? sqlite3_changes(db) : CBM_NOT_FOUND;
