@@ -1045,8 +1045,85 @@ static void k8s_mapping_ref(k8s_walk_t *w, TSNode mapping, const char *kind, con
                  edge);
 }
 
+// Where an env[] item's value comes from: "value", or its valueFrom kind
+// (configMapKeyRef, secretKeyRef, fieldRef, resourceFieldRef, fileKeyRef;
+// "valueFrom" for any other). The value itself is never read.
+static const char *k8s_env_source(k8s_walk_t *w, TSNode item) {
+    static const char *const KINDS[] = {"configMapKeyRef", "secretKeyRef", "fieldRef",
+                                        "resourceFieldRef", "fileKeyRef"};
+    k8s_kids_t pairs = k8s_kids(item);
+    TSNode pair;
+    while (k8s_kid(&pairs, true, &pair)) {
+        if (!k8s_is_pair(pair)) {
+            continue;
+        }
+        TSNode key = ts_node_named_child(pair, 0);
+        const char *k =
+            ts_node_is_null(key) ? NULL : get_scalar_text(w->ctx->arena, key, w->ctx->source);
+        if (!k || strcmp(k, "valueFrom") != 0) {
+            continue;
+        }
+        k8s_kids_done(&pairs);
+        TSNode from = k8s_unwrap(unwrap_pair_value(pair));
+        k8s_kids_t kinds = k8s_kids(from);
+        TSNode kp;
+        const char *kind = NULL;
+        while (k8s_kid(&kinds, true, &kp)) {
+            TSNode kk = k8s_is_pair(kp) ? ts_node_named_child(kp, 0) : (TSNode){0};
+            const char *s =
+                ts_node_is_null(kk) ? NULL : get_scalar_text(w->ctx->arena, kk, w->ctx->source);
+            if (s && !kind) {
+                kind = s;
+            }
+        }
+        for (size_t i = 0; kind && i < sizeof(KINDS) / sizeof(KINDS[0]); i++) {
+            if (strcmp(kind, KINDS[i]) == 0) {
+                return KINDS[i];
+            }
+        }
+        return "valueFrom";
+    }
+    return "value";
+}
+
+// The environment variables a container (`path` ends in containers[],
+// initContainers[] or ephemeralContainers[], any depth) sets: each env[]
+// name, with where its value comes from -- never the value.
+static void k8s_container_env(k8s_walk_t *w, const char *path, TSNode container) {
+    static const char *const ITEMS[] = {"containers[]", "initContainers[]",
+                                        "ephemeralContainers[]"};
+    size_t pl = strlen(path);
+    bool at = false;
+    for (size_t i = 0; i < sizeof(ITEMS) / sizeof(ITEMS[0]) && !at; i++) {
+        size_t il = strlen(ITEMS[i]);
+        at = pl >= il && strcmp(path + pl - il, ITEMS[i]) == 0 &&
+             (pl == il || path[pl - il - SKIP_ONE] == '.');
+    }
+    if (!at) {
+        return;
+    }
+    const char *cname = k8s_text(w, container, "name");
+    cname = cname && cname[0] && !strstr(cname, "{{") ? cname : NULL;
+    k8s_iter_t env = k8s_iter(k8s_child(w, container, "env"));
+    TSNode item;
+    while (k8s_next(&env, &item)) {
+        const char *key = k8s_is_mapping(item) ? k8s_text(w, item, "name") : NULL;
+        if (!key || !key[0] || strstr(key, "{{")) {
+            continue;
+        }
+        CBMK8sFact f = {.fact = CBM_K8S_FACT_ENV,
+                        .def_index = w->def_index,
+                        .name = key,
+                        .container = cname,
+                        .via = k8s_env_source(w, item),
+                        .line = (int)ts_node_start_point(item).row + SKIP_ONE};
+        cbm_k8sfact_push(&w->ctx->result->k8s_facts, w->ctx->arena, f);
+    }
+}
+
 // A mapping at `path` that holds a reference in its kind/name/namespace.
 static void k8s_mapping(k8s_walk_t *w, const char *path, TSNode mapping) {
+    k8s_container_env(w, path, mapping);
     for (size_t i = 0; i < sizeof(k8s_mapping_refs) / sizeof(k8s_mapping_refs[0]); i++) {
         const k8s_mapping_ref_t *r = &k8s_mapping_refs[i];
         if (k8s_kind_in(r->kinds, w->kind) && strcmp(path, r->path) == 0) {

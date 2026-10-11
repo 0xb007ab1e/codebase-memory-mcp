@@ -3665,6 +3665,87 @@ TEST(incremental_compose_edit_replaces_build_edges) {
     PASS();
 }
 
+/* Renaming a variable in a compose service's environment (and, with
+ * `dockerfile`, in a Dockerfile's ENV) replaces its container-scoped EnvVar;
+ * the unchanged compose file and Dockerfile keep theirs, once. `legacy`:
+ * through the full-load route, else the closure-repair route (a renamed ENV
+ * is a new Variable name, which the closure route leaves to a full
+ * rebuild). Returns "old=N new=M keep=K", or NULL. */
+static char *incremental_env_edit(bool legacy, bool dockerfile, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_envedit_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    write_temp_file(tmp, "Dockerfile",
+                    dockerfile ? "FROM alpine:3.20\nENV OLD_D=1\n" : "FROM alpine:3.20\nENV KEEP_D=1\n");
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  web:\n    image: acme/web\n    environment:\n      OLD_C: x\n");
+    write_temp_file(tmp, "compose.other.yaml",
+                    "services:\n  api:\n    image: acme/api\n    environment:\n      - KEEP_C\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/envedit.db", tmp);
+    static const char old_q[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='EnvVar' AND name IN ('OLD_C','OLD_D')";
+    static const char new_q[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='CONFIGURES' AND json_extract(e.properties,'$.strategy')='env_set' AND "
+        "t.name IN ('NEW_C','NEW_D')";
+    static const char keep_q[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='CONFIGURES' AND json_extract(e.properties,'$.strategy')='env_set' AND "
+        "t.name IN ('KEEP_C','KEEP_D')";
+    if (k8s_inc_index(tmp, db_path) != 0 || k8s_inc_count(db_path, old_q) != (dockerfile ? 2 : 1) ||
+        k8s_inc_count(db_path, keep_q) != (dockerfile ? 1 : 2)) {
+        th_rmtree(tmp);
+        return NULL;
+    }
+    if (dockerfile) {
+        write_temp_file(tmp, "Dockerfile", "FROM alpine:3.20\nENV NEW_D=1\n");
+    }
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  web:\n    image: acme/web\n    environment:\n      NEW_C: x\n");
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    char *out = NULL;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "old=%d new=%d keep=%d", k8s_inc_count(db_path, old_q),
+                 k8s_inc_count(db_path, new_q), k8s_inc_count(db_path, keep_q));
+        out = strdup(buf);
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return out;
+}
+
+TEST(incremental_env_edit_replaces_scoped_envvars) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    char *got = incremental_env_edit(false, false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "old=0 new=1 keep=2");
+    free(got);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    got = incremental_env_edit(true, false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "old=0 new=1 keep=2");
+    free(got);
+    got = incremental_env_edit(true, true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "old=0 new=2 keep=1");
+    free(got);
+#endif
+    PASS();
+}
+
 /* A compose project's .env feeds its compose file (variables in image,
  * build): changing it is no closure repair -- the unchanged compose file's
  * services would keep the old image. It rebuilds; no stale image remains. */
@@ -19431,6 +19512,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);
     RUN_TEST(incremental_compose_edit_replaces_build_edges);
+    RUN_TEST(incremental_env_edit_replaces_scoped_envvars);
     RUN_TEST(incremental_compose_dotenv_change_rebuilds);
     RUN_TEST(incremental_dockerfile_edit_keeps_docker_build_edges);
     RUN_TEST(incremental_second_build_declarer_keeps_the_edge);

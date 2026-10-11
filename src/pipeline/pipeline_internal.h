@@ -1090,14 +1090,19 @@ typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
 
 /* A compose service (pass_ci.c): its image (a reference, variables
  * expanded; NULL: none or unknown), the Dockerfile its build names
- * (repository path; NULL: no build, or unknown), and the service names its
- * depends_on and links list. */
+ * (repository path; NULL: no build, or unknown), the service names its
+ * depends_on and links list, and the names of the environment variables its
+ * environment sets (map keys / list items' names -- never a value), with
+ * their 1-based lines. */
 typedef struct {
     const char *name;
     const char *image;
     const char *dockerfile;
     const char **deps;
     int ndeps;
+    const char **env;
+    const int *env_lines;
+    int nenv;
     int line;
     int end_line;
 } cbm_compose_service_t;
@@ -1128,6 +1133,19 @@ void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t 
  * docker.io for no registry host, library/ for an official image; tag and
  * digest dropped), made when new; 0 for scratch or no image. */
 int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref);
+
+/* Environment variable `key` that `owner` sets (pass_docker.c): a K8s or
+ * compose Resource for its container `container`, a Dockerfile Module for
+ * its image (container NULL). Makes the container-scoped EnvVar
+ * `<owner QN>#env/<container | ->/<key>` {env_key, scope, container,
+ * source}, owned by the owner's file at `line`, and owner -CONFIGURES
+ * {strategy:env_set, source}-> it. No edge to the global EnvVar of the key:
+ * the same name read elsewhere is another program's. `source` says where the
+ * value comes from; the value is never stored. 0 when `key` is no variable
+ * name ([A-Za-z_][A-Za-z0-9_.-]*). */
+int64_t cbm_pipeline_env_setter(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *owner,
+                                const char *container, const char *key, const char *source,
+                                int line);
 
 /* Container builds (pass_docker.c): a Dockerfile DEPENDS_ON the Images it
  * builds on (FROM, COPY --from). Run at the end of the K8s pass. */

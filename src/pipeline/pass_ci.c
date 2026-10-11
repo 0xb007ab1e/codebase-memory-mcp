@@ -74,6 +74,7 @@ typedef struct {
 typedef struct {
     const char *key;
     TSNode value; /* may be null: `key:` without a value */
+    int row;      /* the key's 0-based row */
 } ci_pair_t;
 
 static bool ci_type(TSNode n, const char *t) {
@@ -264,9 +265,10 @@ static ci_pair_t *ci_pairs(const ci_t *c, TSNode m, int *n) {
         if (!ci_type(p, "block_mapping_pair") && !ci_type(p, "flow_pair")) {
             continue;
         }
-        const char *key = ci_scalar(c, ts_node_child_by_field_name(p, TS_FIELD("key")), NULL);
+        int row = 0;
+        const char *key = ci_scalar(c, ts_node_child_by_field_name(p, TS_FIELD("key")), &row);
         if (key) {
-            out[(*n)++] = (ci_pair_t){key, ts_node_child_by_field_name(p, TS_FIELD("value"))};
+            out[(*n)++] = (ci_pair_t){key, ts_node_child_by_field_name(p, TS_FIELD("value")), row};
         }
     }
     return out;
@@ -986,6 +988,38 @@ static int ci_compose_deps(const ci_t *c, TSNode svc, const char ***out) {
     return n;
 }
 
+/* The variable names a service's environment sets: a mapping's keys, a
+ * list's "NAME=value" / "NAME" items (the name only -- a value is never
+ * kept), with their 1-based lines. */
+static int ci_compose_env(const ci_t *c, TSNode svc, const char ***out, const int **lines) {
+    int n = 0;
+    TSNode env = ci_get(c, svc, "environment");
+    TSNode *items = ci_items(c, env, &n);
+    ci_pair_t *pairs = items ? NULL : ci_pairs(c, env, &n);
+    const char **names = cbm_arena_alloc(c->a, (size_t)(n + SKIP_ONE) * sizeof(*names));
+    int *rows = cbm_arena_alloc(c->a, (size_t)(n + SKIP_ONE) * sizeof(*rows));
+    int k = 0;
+    for (int i = 0; names && rows && i < n; i++) {
+        int row = 0;
+        const char *name = NULL;
+        if (items) {
+            const char *s = ci_scalar(c, items[i], &row);
+            const char *eq = s ? strchr(s, '=') : NULL;
+            name = eq ? cbm_arena_strndup(c->a, s, (size_t)(eq - s)) : s;
+        } else {
+            name = pairs[i].key;
+            row = pairs[i].row;
+        }
+        if (name && name[0]) {
+            names[k] = name;
+            rows[k++] = row + SKIP_ONE;
+        }
+    }
+    *out = names;
+    *lines = rows;
+    return k;
+}
+
 static void ci_compose(const ci_t *c, TSNode root, const char *dir, const ci_env_t *env) {
     int ns = 0;
     ci_pair_t *svcs = ci_pairs(c, ci_get(c, root, "services"), &ns);
@@ -1010,6 +1044,7 @@ static void ci_compose(const ci_t *c, TSNode root, const char *dir, const ci_env
                                        .line = (int)ts_node_start_point(svc).row,
                                        .end_line = (int)ts_node_end_point(svc).row + SKIP_ONE};
             s.ndeps = ci_compose_deps(c, svc, &s.deps);
+            s.nenv = ci_compose_env(c, svc, &s.env, &s.env_lines);
             c->service_fn(&s, c->ud);
         }
     }

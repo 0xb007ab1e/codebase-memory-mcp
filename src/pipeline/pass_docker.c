@@ -28,6 +28,15 @@
  * the file (or Go main package) wanted, else nothing; COPY --from=<stage>
  * continues in that stage. WORKDIR makes paths absolute. `sh -c`, a variable
  * program and arguments to an inherited ENTRYPOINT are no edge.
+ *
+ * PHASE 4 P4.5: the environment a container is given. Each variable a K8s
+ * container's env, a compose service's environment or the last stage's ENV
+ * (with the stages it is built FROM) sets is an EnvVar of that container
+ * (image, for ENV) -- `<owner QN>#env/<container | ->/<name>`, owned by the
+ * declaring file -- the owner CONFIGURES {strategy:env_set, source}. The
+ * global EnvVar a program's readers share is not joined: the same name is
+ * read by other programs (measured: 23 % of such joins in scope). Values are
+ * never read into the graph.
  * Run at the end of the K8s pass.
  */
 #include "foundation/constants.h"
@@ -77,9 +86,17 @@ typedef struct {
     bool set;
 } dk_entry_t;
 
+typedef struct dk_envkey {
+    const char *name;
+    int line;
+    struct dk_envkey *next; /* the stage's previous ENV key */
+} dk_envkey_t;
+
 typedef struct {
     dk_copy_t *copies;  /* newest first */
     dk_build_t *builds; /* newest first */
+    dk_envkey_t *envs;  /* newest first */
+    int parent;         /* the stage FROM builds on; -1: an image */
 } dk_stage_t;
 
 typedef struct {
@@ -321,6 +338,28 @@ static bool dk_is_stage(const dk_t *d, const char *ref) {
     return false;
 }
 
+/* The stage a --from names: an index, else the last stage of that name. */
+static int dk_stage_of(const dk_t *d, const char *ref) {
+    if (!ref || !ref[0]) {
+        return -1;
+    }
+    bool digits = true;
+    for (const char *p = ref; *p; p++) {
+        digits = digits && isdigit((unsigned char)*p);
+    }
+    if (digits) {
+        int k = atoi(ref);
+        return k < DK_MAX_STAGES ? k : -1;
+    }
+    int found = -1;
+    for (int i = 0; i <= d->stage && i < DK_MAX_STAGES; i++) {
+        if (d->stages[i] && dk_ieq(d->stages[i], ref)) {
+            found = i;
+        }
+    }
+    return found;
+}
+
 int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref) {
     char repo[CBM_SZ_512];
     if (!ref || dk_ieq(ref, "scratch") || !dk_normalize(ref, repo, sizeof(repo))) {
@@ -333,6 +372,55 @@ int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref) {
     char node_props[CBM_SZ_2K];
     snprintf(node_props, sizeof(node_props), "{\"repository\":\"%s\"}", esc_repo);
     return cbm_gbuf_upsert_node(ctx->gbuf, "Image", repo, qn, "", 0, 0, node_props);
+}
+
+/* An environment variable name: [A-Za-z_][A-Za-z0-9_.-]*. */
+static bool dk_env_key(const char *k) {
+    if (!k || !(isalpha((unsigned char)k[0]) || k[0] == '_')) {
+        return false;
+    }
+    for (const char *p = k + SKIP_ONE; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '_' && *p != '.' && *p != '-') {
+            return false;
+        }
+    }
+    return strlen(k) < CBM_SZ_256;
+}
+
+int64_t cbm_pipeline_env_setter(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *owner,
+                                const char *container, const char *key, const char *source,
+                                int line) {
+    if (!owner || !owner->qualified_name || !dk_env_key(key) || !source) {
+        return 0;
+    }
+    char qn[CBM_SZ_2K];
+    int n = snprintf(qn, sizeof(qn), "%s#env/%s/%s", owner->qualified_name,
+                     container ? container : "-", key);
+    if (n <= 0 || (size_t)n >= sizeof(qn)) {
+        return 0;
+    }
+    char esc_c[CBM_SZ_512];
+    cbm_json_escape(esc_c, (int)sizeof(esc_c), container ? container : "");
+    char scope[CBM_SZ_1K];
+    if (container) {
+        snprintf(scope, sizeof(scope), "\"scope\":\"container\",\"container\":\"%s\"", esc_c);
+    } else {
+        snprintf(scope, sizeof(scope), "\"scope\":\"image\"");
+    }
+    char node_props[CBM_SZ_2K];
+    snprintf(node_props, sizeof(node_props), "{\"env_key\":\"%s\",%s,\"source\":\"%s\"}", key,
+             scope, source);
+    int64_t id =
+        cbm_gbuf_upsert_node(ctx->gbuf, "EnvVar", key, qn, owner->file_path ? owner->file_path : "",
+                             line, line, node_props);
+    if (id <= 0 || id == owner->id) {
+        return 0;
+    }
+    char props[CBM_SZ_2K];
+    snprintf(props, sizeof(props), "{\"strategy\":\"env_set\",%s,\"source\":\"%s\",\"line\":%d}",
+             scope, source, line);
+    cbm_gbuf_insert_edge(ctx->gbuf, owner->id, id, "CONFIGURES", props);
+    return id;
 }
 
 /* DEPENDS_ON from the Dockerfile to the Image of resolved reference `ref`. */
@@ -394,7 +482,13 @@ static void dk_env(dk_t *d, TSNode ins) {
             continue;
         }
         const char *raw = ts_node_is_null(vl) ? NULL : dk_value(d, vl);
-        dk_set(d, &d->local, dk_text(d, nm), raw ? dk_expand(d, d->local, raw) : NULL);
+        const char *name = dk_text(d, nm);
+        dk_set(d, &d->local, name, raw ? dk_expand(d, d->local, raw) : NULL);
+        dk_envkey_t *k = d->stage < DK_MAX_STAGES ? cbm_arena_alloc(d->a, sizeof(*k)) : NULL;
+        if (k && name) {
+            *k = (dk_envkey_t){name, dk_line(pair), d->st[d->stage].envs};
+            d->st[d->stage].envs = k;
+        }
     }
 }
 
@@ -412,10 +506,12 @@ static void dk_from(dk_t *d, TSNode ins) {
     d->workdir = "/";
     d->entry.set = false;
     d->cmd.set = false;
-    if (ref && !dk_is_stage(d, ref)) {
+    bool stage = ref && dk_is_stage(d, ref);
+    if (ref && !stage) {
         dk_link(d, ref, "from", dk_line(ins));
     }
     if (d->stage < DK_MAX_STAGES) {
+        d->st[d->stage].parent = stage ? dk_stage_of(d, ref) : -1;
         d->stages[d->stage] = ts_node_is_null(alias) ? NULL : dk_text(d, alias);
     }
 }
@@ -650,28 +746,6 @@ static const char *dk_repo(dk_t *d, const char *src, const char *rel, int want) 
         }
     }
     return hits == SKIP_ONE ? hit : NULL;
-}
-
-/* The stage a --from names: an index, else the last stage of that name. */
-static int dk_stage_of(const dk_t *d, const char *ref) {
-    if (!ref || !ref[0]) {
-        return -1;
-    }
-    bool digits = true;
-    for (const char *p = ref; *p; p++) {
-        digits = digits && isdigit((unsigned char)*p);
-    }
-    if (digits) {
-        int k = atoi(ref);
-        return k < DK_MAX_STAGES ? k : -1;
-    }
-    int found = -1;
-    for (int i = 0; i <= d->stage && i < DK_MAX_STAGES; i++) {
-        if (d->stages[i] && dk_ieq(d->stages[i], ref)) {
-            found = i;
-        }
-    }
-    return found;
 }
 
 typedef struct {
@@ -1047,6 +1121,32 @@ static void dk_spawn(dk_t *d) {
     d->edges++;
 }
 
+/* The environment the image of the last stage carries: the ENV keys of that
+ * stage and of the earlier stages it is built FROM (a key's nearest
+ * definition wins) -- image-scoped EnvVars the Dockerfile sets. */
+static void dk_envs(dk_t *d) {
+    const cbm_gbuf_node_t *mod = cbm_gbuf_find_by_id(d->ctx->gbuf, d->module);
+    if (!mod || d->stage < 0 || d->stage >= DK_MAX_STAGES) {
+        return;
+    }
+    CBMHashTable *seen = cbm_ht_create(0);
+    int s = d->stage;
+    for (int depth = 0; seen && s >= 0 && depth < DK_MAX_STAGES; depth++) {
+        for (const dk_envkey_t *k = d->st[s].envs; k; k = k->next) {
+            if (!cbm_ht_get(seen, k->name)) {
+                cbm_ht_set(seen, k->name, (void *)k);
+                if (cbm_pipeline_env_setter(d->ctx, mod, NULL, k->name, "dockerfile", k->line) >
+                    0) {
+                    d->edges++;
+                }
+            }
+        }
+        int p = d->st[s].parent;
+        s = p >= 0 && p < s ? p : -1;
+    }
+    cbm_ht_free(seen);
+}
+
 static void dk_file(dk_t *d, TSNode root) {
     for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
         TSNode ins = ts_node_named_child(root, i);
@@ -1070,6 +1170,7 @@ static void dk_file(dk_t *d, TSNode root) {
         }
     }
     dk_spawn(d);
+    dk_envs(d);
 }
 
 static char *dk_read(const char *path, size_t *len) {
@@ -1095,6 +1196,66 @@ static char *dk_read(const char *path, size_t *len) {
     memset(buf + got, 0, DK_TS_PAD);
     *len = got;
     return buf;
+}
+
+/* Does the line [b, e) hold a parser directive `# escape=...`? */
+static bool dk_escape_directive(const char *s, size_t b, size_t e) {
+    size_t i = b + SKIP_ONE;
+    while (i < e && (s[i] == ' ' || s[i] == '\t')) {
+        i++;
+    }
+    static const char kw[] = "escape";
+    for (size_t k = 0; kw[k]; k++, i++) {
+        if (i >= e || tolower((unsigned char)s[i]) != kw[k]) {
+            return false;
+        }
+    }
+    while (i < e && (s[i] == ' ' || s[i] == '\t')) {
+        i++;
+    }
+    return i < e && s[i] == '=';
+}
+
+/* Docker drops comment lines before it joins continued lines; the grammar
+ * ends an instruction at one (kubermatic: `ENV A=1 \` / `# url` / `B=2`).
+ * A comment line inside a continuation becomes a bare continuation (`#` ->
+ * `\`, the rest blank) -- rows and offsets stay. A file with an escape
+ * directive is left as it is. */
+static void dk_uncomment(char *s, size_t len) {
+    bool cont = false;
+    bool top = true; /* still in the leading directives */
+    for (size_t i = 0; i < len;) {
+        size_t e = i;
+        while (e < len && s[e] != '\n') {
+            e++;
+        }
+        size_t b = i;
+        while (b < e && (s[b] == ' ' || s[b] == '\t')) {
+            b++;
+        }
+        if (b < e && s[b] == '#') {
+            if (top && dk_escape_directive(s, b, e)) {
+                return;
+            }
+            if (cont) {
+                s[b] = '\\';
+                for (size_t k = b + SKIP_ONE; k < e && s[k] != '\r'; k++) {
+                    s[k] = ' ';
+                }
+            }
+        } else if (b < e && s[b] != '\r') {
+            size_t t = e;
+            while (t > b &&
+                   (s[t - SKIP_ONE] == ' ' || s[t - SKIP_ONE] == '\t' || s[t - SKIP_ONE] == '\r')) {
+                t--;
+            }
+            cont = s[t - SKIP_ONE] == '\\';
+            top = false;
+        } else {
+            top = false;
+        }
+        i = e + SKIP_ONE;
+    }
 }
 
 typedef struct {
@@ -1170,6 +1331,13 @@ static void dk_compose_service(const cbm_compose_service_t *s, void *ud) {
                                           cbm_arena_sprintf(c->a, "Service/%s", s->name), qn,
                                           c->file, s->line + SKIP_ONE, s->end_line, props);
         dk_compose_edge(c, c->file_node, id, "DEFINES", "{}");
+        const cbm_gbuf_node_t *self = id > 0 ? cbm_gbuf_find_by_id(c->ctx->gbuf, id) : NULL;
+        for (int i = 0; self && i < s->nenv; i++) {
+            if (cbm_pipeline_env_setter(c->ctx, self, s->name, s->env[i], "compose",
+                                        s->env_lines[i]) > 0) {
+                c->edges++;
+            }
+        }
         return;
     }
     const cbm_gbuf_node_t *self = cbm_gbuf_find_by_qn(c->ctx->gbuf, qn);
@@ -1321,6 +1489,7 @@ void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fi
         if (!src) {
             continue;
         }
+        dk_uncomment(src, len);
         if (!parser) {
             parser = ts_parser_new();
         }

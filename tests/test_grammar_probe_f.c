@@ -2205,6 +2205,103 @@ TEST(probe_shell_docker_builds_build_images) {
     PASS();
 }
 
+/* Every CONFIGURES {strategy:env_set} edge as
+ * "<owner> -> <container | ->/<name> (<source>)"; then the joins a scoped
+ * EnvVar must not have: "#PORT=<EnvVar nodes named PORT>" and
+ * "#joined=<edges out of an EnvVar, or env_set edges into a global one>". */
+static char *gpf_env_setters(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT CASE s.label WHEN "
+            "'Module' THEN s.file_path ELSE s.name END || ' -> ' || "
+            "coalesce(json_extract(t.properties,'$.container'),'-') || '/' || t.name || ' (' || "
+            "json_extract(e.properties,'$.source') || ')' AS x FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+            "e.type='CONFIGURES' AND json_extract(e.properties,'$.strategy')='env_set' ORDER BY "
+            "x)), '') || char(10) || '#PORT=' || (SELECT count(*) FROM nodes WHERE project=?1 "
+            "AND label='EnvVar' AND name='PORT') || char(10) || '#joined=' || (SELECT count(*) "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND (s.label='EnvVar' OR (substr(t.qualified_name,1,7)='__env__' "
+            "AND json_extract(e.properties,'$.strategy')='env_set')))";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* The environment a container is given: each name a K8s container's env
+ * (any pod template; value or valueFrom), a compose service's environment
+ * (map or list) or the last Dockerfile stage's ENV (with the stages it is
+ * built FROM, a comment inside the continuation skipped) sets is an EnvVar
+ * of that container -- two containers' PORT are two nodes, neither joined to
+ * the PORT a program reads. No value reaches the graph. */
+TEST(probe_container_env_sets_scoped_envvars) {
+    static const GpfFile files[] = {
+        {"app.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n"
+         "    spec:\n      initContainers:\n        - name: init\n          image: busybox\n"
+         "          env:\n            - name: MODE\n              value: v-init-mode\n"
+         "      containers:\n        - name: web\n          image: nginx\n          env:\n"
+         "            - name: PORT\n              value: \"v-8080\"\n"
+         "            - name: DB_PASS\n              valueFrom:\n                secretKeyRef:\n"
+         "                  name: db\n                  key: pass\n"
+         "            - name: POD_IP\n              valueFrom:\n                fieldRef:\n"
+         "                  fieldPath: status.podIP\n"
+         "---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n"
+         "  template:\n    spec:\n      containers:\n        - name: api\n"
+         "          image: acme/api\n          env:\n            - name: PORT\n"
+         "              value: \"v-9090\"\n"},
+        {"compose.yaml", "services:\n  web:\n    image: acme/web\n    environment:\n"
+                         "      LOG_LEVEL: v-debug\n      API_KEY: v-s3cr3t\n"
+                         "  worker:\n    image: acme/worker\n    environment:\n"
+                         "      - QUEUE=v-jobs\n      - VERBOSE\n"},
+        {"Dockerfile", "FROM golang:1.22 AS build\nENV CGO_ENABLED=0\n"
+                       "FROM alpine:3.20 AS base\nENV TZ=v-utc\n"
+                       "FROM base\nENV APP_HOME=/v-app \\\n    # where it lives\n"
+                       "    GREETING=\"v-hello world\"\n"},
+        {"main.go", "package main\n\nimport \"os\"\n\nfunc main() { _ = os.Getenv(\"PORT\") }\n"}};
+    char *got = gpf_env_setters(files, 4);
+    static const char want[] = "Deployment/api -> api/PORT (value)\n"
+                               "Deployment/web -> init/MODE (value)\n"
+                               "Deployment/web -> web/DB_PASS (secretKeyRef)\n"
+                               "Deployment/web -> web/POD_IP (fieldRef)\n"
+                               "Deployment/web -> web/PORT (value)\n"
+                               "Dockerfile -> -/APP_HOME (dockerfile)\n"
+                               "Dockerfile -> -/GREETING (dockerfile)\n"
+                               "Dockerfile -> -/TZ (dockerfile)\n"
+                               "Service/web -> web/API_KEY (compose)\n"
+                               "Service/web -> web/LOG_LEVEL (compose)\n"
+                               "Service/worker -> worker/QUEUE (compose)\n"
+                               "Service/worker -> worker/VERBOSE (compose)\n"
+                               "#PORT=3\n#joined=0";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "env setters got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("env_set edge set");
+    }
+    free(got);
+    static const char *const values[] = {"v-init-mode", "v-8080", "v-9090", "v-debug",
+                                         "v-s3cr3t",    "v-jobs", "v-utc",  "v-hello"};
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        int hits = gpf_graph_mentions(files, 4, values[i]);
+        if (hits != 0) {
+            fprintf(stderr, "value %s: %d graph mentions\n", values[i], hits);
+            FAIL("an env value reached the graph");
+        }
+    }
+    PASS();
+}
+
 #define GPF_CM(name) "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " name "\n"
 #define GPF_KUST "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
 
@@ -4475,6 +4572,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_build_configs_build_images_from_dockerfiles);
     RUN_TEST(probe_compose_services_are_resources);
     RUN_TEST(probe_shell_docker_builds_build_images);
+    RUN_TEST(probe_container_env_sets_scoped_envvars);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
     RUN_TEST(probe_shell_helm_deploys_its_chart);

@@ -1143,6 +1143,15 @@ typedef struct {
     char *source; /* the sourceRef kind, NULL when unset */
 } k8s_hr_t;
 
+/* An environment variable an object's container sets (never its value). */
+typedef struct {
+    int64_t node;
+    char *key;
+    char *container;    /* NULL: unnamed */
+    const char *source; /* static: "value" or the valueFrom kind */
+    int line;
+} k8s_env_t;
+
 typedef struct {
     k8s_ref_t *refs;
     int ref_n;
@@ -1162,6 +1171,9 @@ typedef struct {
     k8s_hr_t *imgs; /* an object (node) and a container image it runs (chart) */
     int img_n;
     int img_cap;
+    k8s_env_t *envs;
+    int env_n;
+    int env_cap;
 } k8s_facts_t;
 
 static void k8s_facts_free(k8s_facts_t *f) {
@@ -1189,6 +1201,11 @@ static void k8s_facts_free(k8s_facts_t *f) {
     for (int i = 0; i < f->img_n; i++) {
         cbm_free(CBM_MEM_CLASS_OTHER, f->imgs[i].chart);
     }
+    for (int i = 0; i < f->env_n; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, f->envs[i].key);
+        cbm_free(CBM_MEM_CLASS_OTHER, f->envs[i].container);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, f->envs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->hrs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->srcs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->imgs);
@@ -1273,6 +1290,13 @@ static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64
             if (x->name && k8s_grow((void **)&f->imgs, &f->img_cap, f->img_n, sizeof(*f->imgs))) {
                 f->imgs[f->img_n++] =
                     (k8s_hr_t){node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name), NULL};
+            }
+        } else if (x->fact == CBM_K8S_FACT_ENV) {
+            if (x->name && k8s_grow((void **)&f->envs, &f->env_cap, f->env_n, sizeof(*f->envs))) {
+                f->envs[f->env_n++] = (k8s_env_t){
+                    node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name),
+                    x->container ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->container) : NULL, x->via,
+                    x->line};
             }
         } else if (x->fact == CBM_K8S_FACT_CRD) {
             if (k8s_grow((void **)&f->crds, &f->crd_cap, f->crd_n, sizeof(*f->crds))) {
@@ -3300,6 +3324,19 @@ static void k8s_link_images(cbm_pipeline_ctx_t *ctx, const k8s_facts_t *f) {
     }
 }
 
+/* The environment variables an object's containers set: container-scoped
+ * EnvVar nodes the object CONFIGURES {strategy:env_set}. */
+static void k8s_link_envs(cbm_pipeline_ctx_t *ctx, const k8s_facts_t *f) {
+    for (int i = 0; i < f->env_n; i++) {
+        const k8s_env_t *e = &f->envs[i];
+        const cbm_gbuf_node_t *owner = cbm_gbuf_find_by_id(ctx->gbuf, e->node);
+        if (owner) {
+            cbm_pipeline_env_setter(ctx, owner, e->container ? e->container : "-", e->key,
+                                    e->source, e->line);
+        }
+    }
+}
+
 static void k8s_link_deploys(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundles_t *b,
                              const k8s_facts_t *f) {
     if (f->dep_n == 0 && f->hr_n == 0 && f->src_n == 0) {
@@ -3489,6 +3526,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_link_crds(ctx, &bundles, &facts);
     k8s_link_deploys(ctx, &kusts, &bundles, &facts);
     k8s_link_images(ctx, &facts);
+    k8s_link_envs(ctx, &facts);
     k8s_facts_free(&facts);
     k8s_records_free(&recs);
     /* Link `file://` chart dependencies now that every Chart.yaml is read,

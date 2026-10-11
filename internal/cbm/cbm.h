@@ -616,14 +616,18 @@ typedef struct {
  *     from the URL `name`; a HelmRelease whose chartRef names it deploys the
  *     chart there.
  *   CBM_K8S_FACT_IMAGE: object def_index runs a container of image `name`
- *     (a literal reference); via "container". */
+ *     (a literal reference); via "container".
+ *   CBM_K8S_FACT_ENV: object def_index sets environment variable `name` in
+ *     its container `container` (NULL: unnamed) at `line`; via = where the
+ *     value comes from ("value", or the valueFrom kind) -- never the value. */
 typedef enum {
     CBM_K8S_FACT_REF = 0,
     CBM_K8S_FACT_CRD,
     CBM_K8S_FACT_DEPLOY,
     CBM_K8S_FACT_ROUTE,
     CBM_K8S_FACT_SOURCE,
-    CBM_K8S_FACT_IMAGE
+    CBM_K8S_FACT_IMAGE,
+    CBM_K8S_FACT_ENV
 } CBMK8sFactKind;
 typedef struct {
     CBMK8sFactKind fact;
@@ -634,6 +638,8 @@ typedef struct {
     const char *via;
     const char *edge;
     const char *route;
+    const char *container;
+    int line;
 } CBMK8sFact;
 
 typedef struct {
