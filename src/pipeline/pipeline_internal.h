@@ -1290,6 +1290,10 @@ int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const ch
 void cbm_delta_free_snapshot(cbm_delta_saved_edge_t *items, int count);
 int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *paths,
                     int path_count);
+/* Delete the project's `label` nodes no `edge_type` edge targets (a Process
+ * whose last spawner was purged); returns how many, or -1 on failure. */
+int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const char *label,
+                                const char *edge_type);
 /* Pre-seed proxy nodes with their REAL database ids and move the gbuf id
  * watermark above MAX(id); returns that max id, or -1 on failure. */
 int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf);

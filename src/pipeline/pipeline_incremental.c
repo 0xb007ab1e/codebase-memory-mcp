@@ -3085,6 +3085,12 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         goto out;
     }
     cbm_log_info("delta.patch_done", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    /* The proxy buffer holds no edges, so only the patched staging graph can
+     * tell a Process node no SPAWNS reaches any more (its last spawner was
+     * purged). */
+    if (cbm_delta_drop_unreferenced(staging, project, "Process", "SPAWNS") < 0) {
+        goto out;
+    }
 
     /* Importance, in SQL, over the now-complete staging graph. This is the
      * FIRST point on this route where the whole project is queryable: the
@@ -3690,6 +3696,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         phase_rc = cbm_pipeline_check_cancel(&ctx);
     }
     if (phase_rc == 0) {
+        /* A Process node exists only as a SPAWNS target (pass_spawns.c,
+         * pass_shell.c) and carries no file: when the last file starting the
+         * program is gone, nothing else removes it -- a full index never
+         * makes it. This buffer holds the whole graph. */
+        (void)cbm_gbuf_delete_unreferenced(existing, "Process", "SPAWNS");
         phase_rc = run_postpasses(&ctx, changed_files, ci, project, true);
     }
 

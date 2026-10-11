@@ -1498,6 +1498,64 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
     return deleted_count;
 }
 
+int cbm_gbuf_delete_unreferenced(cbm_gbuf_t *gb, const char *label, const char *edge_type) {
+    if (!gb || !label || !edge_type) {
+        return CBM_NOT_FOUND;
+    }
+    node_ptr_array_t *arr = cbm_ht_get(gb->nodes_by_label, label);
+    if (!arr || arr->count == 0) {
+        return 0;
+    }
+    /* The victims first: the per-node unlinking below edits `arr`. */
+    cbm_gbuf_node_t **victims =
+        cbm_calloc(CBM_MEM_CLASS_GBUF_INDEX, (size_t)arr->count * sizeof(*victims));
+    if (!victims) {
+        return CBM_NOT_FOUND;
+    }
+    int n = 0;
+    for (int i = 0; i < arr->count; i++) {
+        const cbm_gbuf_edge_t **edges = NULL;
+        int count = 0;
+        const char *qn = arr->items[i]->qualified_name;
+        cbm_gbuf_node_t *node = qn ? cbm_ht_get(gb->node_by_qn, qn) : NULL;
+        if (node &&
+            cbm_gbuf_find_edges_by_target_type(gb, node->id, edge_type, &edges, &count) == 0 &&
+            count == 0) {
+            victims[n++] = node;
+        }
+    }
+    if (n == 0) {
+        cbm_free(CBM_MEM_CLASS_GBUF_INDEX, victims);
+        return 0;
+    }
+    CBMHashTable *deleted_set = cbm_ht_create((uint32_t)n);
+    for (int i = 0; i < n; i++) {
+        cbm_gbuf_node_t *node = victims[i];
+        if (!node->qualified_name) {
+            continue;
+        }
+        char id_buf[CBM_SZ_32];
+        make_id_key(id_buf, sizeof(id_buf), node->id);
+        cbm_ht_set(deleted_set, cbm_mem_strdup(CBM_MEM_CLASS_GBUF_INDEX, id_buf),
+                   intptr_to_ptr(SKIP_ONE));
+        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, node->label), node->id);
+        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, node->name), node->id);
+        gb_drop_variant_spans(gb, node->qualified_name);
+        cbm_ht_delete(gb->node_by_qn, node->qualified_name);
+        if (node->id >= 0 && node->id < gb->by_id_cap) {
+            gb->by_id[node->id] = NULL;
+        }
+        /* As delete_by_file: a NULL QN fails the dump's liveness check. */
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->qualified_name);
+        node->qualified_name = NULL;
+    }
+    cascade_delete_edges(gb, deleted_set);
+    cbm_ht_foreach(deleted_set, free_index_key, NULL);
+    cbm_ht_free(deleted_set);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, victims);
+    return n;
+}
+
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {
     if (!gb || !db_path || !project) {
         return CBM_NOT_FOUND;

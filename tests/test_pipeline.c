@@ -3457,6 +3457,57 @@ TEST(incremental_shell_deploy_edit_keeps_its_edges) {
     PASS();
 }
 
+/* Deleting the only file that starts a program leaves no Process node
+ * behind -- a full index never makes one without a SPAWNS edge. One script
+ * (pass_shell.c) and one Python call (pass_spawns.c) go; the program a kept
+ * script starts stays. `legacy`: through the full-load route, else the
+ * closure-repair route. Returns the Process count after the deletion, or -1;
+ * *route: the route taken. */
+static int incremental_spawner_delete(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_spawngc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return -1;
+    }
+    write_temp_file(tmp, "hack/a.sh", "#!/bin/sh\n./bin/tool-a --x\n");
+    write_temp_file(tmp, "hack/b.sh", "#!/bin/sh\n./bin/tool-b\n");
+    write_temp_file(tmp, "app.py",
+                    "import subprocess\n\n\ndef run():\n    subprocess.run([\"tool-c\"])\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/spawngc.db", tmp);
+    static const char processes[] = "SELECT COUNT(*) FROM nodes WHERE label='Process'";
+    int full = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/hack/a.sh", tmp);
+    (void)remove(path);
+    snprintf(path, sizeof(path), "%s/app.py", tmp);
+    (void)remove(path);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    int after = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return full == 3 ? after : -1;
+}
+
+TEST(incremental_deleted_spawner_drops_its_process) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    int left = incremental_spawner_delete(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(left, 1);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    left = incremental_spawner_delete(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(left, 1);
+#endif
+    PASS();
+}
+
 /* SQL DDL becomes first-class Table/View nodes wired into FROM/JOIN lineage,
  * while the shared name registry must NOT leak those relations into other
  * languages' textual resolution: a Python call or identifier sharing the
@@ -19082,6 +19133,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_staged_publish_commits_below_full_sync_issue1419);
     RUN_TEST(incremental_k8s_edits_reach_other_files);
     RUN_TEST(incremental_shell_deploy_edit_keeps_its_edges);
+    RUN_TEST(incremental_deleted_spawner_drops_its_process);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);

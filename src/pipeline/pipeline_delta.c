@@ -247,6 +247,28 @@ int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *
     return 0;
 }
 
+int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const char *label,
+                                const char *edge_type) {
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "DELETE FROM nodes WHERE project = ?1 AND label = ?2 AND NOT EXISTS"
+                           " (SELECT 1 FROM edges e WHERE e.project = ?1"
+                           " AND e.target_id = nodes.id AND e.type = ?3)",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, label, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, edge_type, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? sqlite3_changes(db) : CBM_NOT_FOUND;
+}
+
 /* Every project node becomes a proxy. The first cut filtered by label and
  * the fail-closed patch immediately found the counterexamples (synthetic
  * Decorator nodes on django; Macro is six of the kernel's 8.5M nodes) — any
