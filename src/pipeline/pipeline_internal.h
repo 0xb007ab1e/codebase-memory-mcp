@@ -1046,6 +1046,12 @@ int cbm_pipeline_pass_operator(cbm_pipeline_ctx_t *ctx);
  * manifests, kustomizations or charts on a cluster DEPLOYS them. Run at the
  * end of the K8s pass, over the same files. */
 void cbm_pipeline_pass_shell(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
+
+/* Terraform / OpenTofu modules (pass_terraform.c): a helm_release DEPLOYS its
+ * chart. Run at the end of the K8s pass, over the same files. */
+void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                 int file_count);
+
 /* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
 int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
 

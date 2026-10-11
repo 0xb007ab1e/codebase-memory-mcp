@@ -1974,6 +1974,40 @@ TEST(probe_make_programs_by_path_spawn) {
     PASS();
 }
 
+/* A Terraform helm_release DEPLOYS its chart: a chart dir of the module
+ * (./charts/x, ${path.module}/charts/x), else -- with a repository, or as
+ * oci://.../<name> -- the external chart of that name. A variable chart or a
+ * directory without a Chart.yaml is no edge; a file opening with comments is
+ * read all the same. */
+TEST(probe_terraform_helm_release_deploys_its_chart) {
+    static const GpfFile files[] = {
+        {"infra/charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 0.1.0\n"},
+        {"infra/charts/api/Chart.yaml", "apiVersion: v2\nname: api\nversion: 0.1.0\n"},
+        {"infra/main.tf", "################\n# Helm releases\n################\n\n"
+                          "resource \"helm_release\" \"app\" {\n"
+                          "  name  = \"app\"\n  chart = \"./charts/app\"\n}\n\n"
+                          "resource \"helm_release\" \"api\" {\n"
+                          "  name  = \"api\"\n  chart = \"${path.module}/charts/api\"\n"
+                          "  set {\n    name  = \"replicas\"\n    value = \"2\"\n  }\n}\n\n"
+                          "resource \"helm_release\" \"cache\" {\n"
+                          "  name       = \"cache\"\n"
+                          "  repository = \"https://charts.example.com\"\n"
+                          "  chart      = \"redis\"\n}\n\n"
+                          "resource \"helm_release\" \"queue\" {\n"
+                          "  name  = \"queue\"\n"
+                          "  chart = \"oci://registry.example.com/charts/nats\"\n}\n\n"
+                          "resource \"helm_release\" \"dynamic\" {\n"
+                          "  name  = \"dynamic\"\n  chart = var.chart\n}\n\n"
+                          "resource \"helm_release\" \"missing\" {\n"
+                          "  name  = \"missing\"\n  chart = \"./charts/missing\"\n}\n"}};
+    GPF_ASSERT_DEPLOYS(files, 3,
+                       "resource.helm_release.api -> chart:api (terraform)\n"
+                       "resource.helm_release.app -> chart:app (terraform)\n"
+                       "resource.helm_release.cache -> chart:redis(ext) (terraform)\n"
+                       "resource.helm_release.queue -> chart:nats(ext) (terraform)");
+    PASS();
+}
+
 /* Go code that loads a chart DEPLOYS it: a call of a loader (a function
  * reading <param>/Chart.yaml, or the Helm SDK's loader.Load) whose argument
  * evaluates over the package's constants, filepath.Join and a local assigned
@@ -3746,6 +3780,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_shell_programs_by_path_spawn);
     RUN_TEST(probe_make_programs_by_path_spawn);
     RUN_TEST(probe_go_installer_deploys_charts);
+    RUN_TEST(probe_terraform_helm_release_deploys_its_chart);
     RUN_TEST(probe_helm_templated_objects_are_resources);
     RUN_TEST(probe_helm_include_resolves_in_the_chart_family);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
