@@ -13,8 +13,7 @@
  *  - Alt+Left and Alt+Right act only while this workspace is the active one,
  *    never while typing and never while another surface takes the keys.
  *
- * Rules and limits: src/graph/navigation-history.ts and
- * docs/development/pr-2068-galaxy-history.md.
+ * Shared rules and limits: src/graph/navigation-history.ts.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {

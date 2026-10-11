@@ -345,17 +345,8 @@ export const EAGER_LEVEL_BUDGET = 40;
 export const TWIN_CARET_DEBOUNCE_MS = 250;
 
 /**
- * Womit das Panel startet.
- *
- * Kein eingebautes Profil, und das ist eine Aussage: die fuenf Presets des
- * Referenzprojekts hoeren zu einer Werkbank mit fuenf Panels, und jedes von
- * ihnen schaltet Linsen ab, die dort ein anderes Panel beantwortet. Hier gibt
- * es nur den Twin, also waere jedes der fuenf eine Startlage, in der eine
- * Sektion fehlt und niemand sagt, warum. Die Tiefe zwei zeigt die
- * aufgezeichneten Fakten, so wie design/design.png es zeigt; die Linsen sind
- * alle, die dieses Backend beantworten kann. Runtime und Changes sind aus, weil
- * sie hier nur ihre eigene Unfertigkeit melden koennten, und der Leser kann sie
- * mit einem Klick einschalten und genau das lesen.
+ * Start with the supported facts at depth two. Runtime and Changes remain
+ * opt-in because their unavailable states otherwise add noise to the panel.
  */
 export const TWIN_PROFILE: PresentationProfile = {
     id: 'custom:codeatlasweb-twin',
@@ -2374,7 +2365,7 @@ function ProjectWindowView({ projectWindow }: { projectWindow: ProjectWindow<Win
      * Wie oft der Index ein Symbol erreicht, aus dem geladenen Layout.
      *
      * Die flache Suchform des Servers traegt keine solche Spalte
-     * (UPSTREAM-ASKS.md, Ask 5), das Layout traegt sie an jedem Knoten. Solange
+     * des Fan-in; das Layout traegt sie an jedem Knoten. Solange
      * keines geladen ist, hat kein Kandidat eine Zahl, und das entscheidet nur
      * bei Gleichstand.
      */

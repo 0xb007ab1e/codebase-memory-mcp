@@ -272,17 +272,10 @@ export const ERRORS_HANDLING_NOT_VISIBLE =
  * this block would hold, so that its emptiness is legible as a gap in the index
  * rather than as a claim that this symbol is pure.
  *
- * Until 2026-08-29 the sentence ended with a date for the effect relations that
- * nobody here sets. That was a promise about another product's roadmap made in
- * this product's voice: this
- * side does not decide what the analysis server records, and a reader who waited
- * for it would have been waiting on a schedule nobody here holds. What is true is
- * that the gap is written down and handed over, and the sentence says that.
  */
 export const EFFECTS_NOT_IN_INDEX =
-    'The index of this server records no routes, no outbound calls and no writes, so this block stays empty: '
-    + 'that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in '
-    + 'UPSTREAM-ASKS.md.';
+    'No evidence for routes, outbound calls or writes is available in this view for this symbol. '
+    + 'Missing evidence does not establish that the symbol has no effects.';
 
 /** Group headings inside the effects block, used once the relations exist. */
 export const EFFECTS_ROUTES_LABEL = 'Exposes routes';

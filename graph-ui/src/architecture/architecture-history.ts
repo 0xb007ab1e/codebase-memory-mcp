@@ -10,8 +10,7 @@
  * Context changes update the current stop. It holds identities, names and small
  * numbers only, never projections, scenes or
  * cameras, so nothing grows with the session. The model behind it is the one
- * Galaxy uses (src/graph/navigation-history.ts); the concept is in
- * docs/development/pr-2068-galaxy-history.md.
+ * Galaxy uses (src/graph/navigation-history.ts), which documents shared limits.
  */
 import type { NavigationHistoryOptions } from '../graph/navigation-history';
 import type { ArchitectureView } from './architecture-model';

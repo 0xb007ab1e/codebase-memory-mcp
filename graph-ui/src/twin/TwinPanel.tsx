@@ -143,7 +143,7 @@ import { workspaceStrings } from '../app/workspace-strings';
 /** Wie das Panel gerade dasteht. Nie einfach leer. */
 export type TwinStatus = 'empty' | 'loading' | 'ready' | 'not-indexed' | 'failed';
 
-/** Das Wort ueber dem Panel, wie im Vorbild design/design.png. */
+/** Stable heading for the symbol context panel. */
 export const TWIN_TITLE = 'SEMANTIC_TWIN';
 
 export interface TwinPanelProps {

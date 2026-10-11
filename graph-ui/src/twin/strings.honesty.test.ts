@@ -145,8 +145,8 @@ describe('die sichtbaren Saetze des Twins', () => {
         expect(strings.CHANGES_NOT_IN_TWIN).toContain('detect_changes');
     });
 
-    it('sagt bei Effects, dass die Luecke im Index steht und wo sie notiert ist', () => {
-        expect(strings.EFFECTS_NOT_IN_INDEX).toContain('UPSTREAM-ASKS.md');
+    it('distinguishes unavailable effect evidence from absence of effects', () => {
+        expect(strings.EFFECTS_NOT_IN_INDEX).toContain('Missing evidence does not establish');
         expect(strings.EFFECTS_NOT_IN_INDEX).toMatch(/routes/);
     });
 

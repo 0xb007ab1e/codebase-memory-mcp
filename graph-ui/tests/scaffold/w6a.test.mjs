@@ -3,7 +3,7 @@
 // and a fresh clone stands on its own. Run: node --test tests/scaffold/w6a.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,9 +18,6 @@ test('AC1: the whole click path ran air-gapped in one proof', () => {
   assert.equal(a.pageErrors, 0);
   assert.equal(a.consoleErrors, 0);
   assert.equal(a.leftoverProcesses, 0, 'auch Sidecar und Server muessen weg sein');
-  const shots = readdirSync(join(ROOT, 'verification', 'w6', 'walk'))
-    .filter((f) => f.endsWith('.png'));
-  assert.ok(shots.length >= 10, `>= 10 Screenshots erwartet, war ${shots.length}`);
   assert.equal(a.chatCitationClicked, true, 'die Chat-Zitat-Navigation gehoert zur Strecke');
   assert.equal(a.overlapViolations, 0,
     'kein sichtbarer Text darf sich ueberlagern (Bernhards Schlussanforderung)');

@@ -8,7 +8,7 @@
  * ohne Server pruefbar ist: was hier steht, ist Anordnung und Tastenlogik, und
  * beides braucht kein /api.
  *
- * Tastatur ist Pflicht, nicht Zugabe (PLAN.md Abschnitt 4: keyboard-first).
+ * Tastatur ist Pflicht, nicht Zugabe.
  * Die Liste selbst nimmt den Fokus, die Zeilen tragen einen wandernden Cursor.
  * Waeren die Zeilen einzeln fokussierbar, muesste man sich durch einen ganzen
  * Baum tabben, um an den Editor zu kommen.

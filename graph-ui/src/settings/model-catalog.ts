@@ -6,7 +6,7 @@
  *
  * Es gibt nichts abzufragen. Hugging Face kennt Millionen Repositories und
  * dieses Fenster erreicht keines davon: die Oberflaeche ist per Vorgabe
- * abgeschottet (PLAN Abschnitt 3). Was sie anbieten kann, ist das, was dieses
+ * abgeschottet (lokale Modellvorschlaege). Was sie anbieten kann, ist das, was dieses
  * Projekt selbst GEMESSEN hat, und das sind genau diese sechs Dateien: 44
  * goldene Fragen, Temperatur 0, Seed 42, eine Maschine, ein Tag
  * (verification/w5/eval.json, Tabelle in docs/adr/0001-modellwahl.md).
@@ -18,7 +18,7 @@
  * und docs/adr/0001-modellwahl.md und vergleicht jeden Eintrag dieser Tabelle
  * Feld fuer Feld: Trefferquote, Zitattreue und Tempo gegen die Aufzeichnung des
  * Laufs, die Bytes gegen die Groessenangabe der ADR, und jede Repo-Kennung
- * gegen ihren woertlichen Vorkommen in einer der beiden Papierdateien.
+ * gegen ihre Quellen-URL in der ADR.
  * Verschiebt sich eine Zahl in der Quelle, faellt dieser Katalog um, statt
  * still weiter etwas anderes zu behaupten.
  *
@@ -27,7 +27,7 @@
  * Sie ist keine Rangliste des Feldes und keine Aussage darueber, was auf einer
  * anderen Maschine passiert. Die Eval hat gemessen, was sie messen konnte; was
  * ein 9B-Modell auf einem groesseren Rechner tut, hat niemand gemessen, und der
- * Katalog behauptet darueber nichts (docs/adr/0001, Nachtrag W10). Er ist die
+ * Katalog behauptet darueber nichts (docs/adr/0001-modellwahl.md). Er ist die
  * Auskunft, die ein Leser bekommt, bevor er selbst entscheidet, und das freie
  * Feld daneben ist die Zusicherung, dass er nicht auf diese sechs festgelegt
  * ist.
@@ -44,11 +44,11 @@ export interface ModelSuggestion {
     name: string;
     /** Die Datei, die die Eval geladen hat. */
     file: string;
-    /** Das Hugging-Face-Repository. Steht woertlich in einer der zwei Papierdateien. */
+    /** Hugging Face repository, documented with its source URL in ADR 0001. */
     repo: string;
     /** Die Quantisierung, die gemessen wurde. */
     quant: string;
-    /** Die Kontextklasse: A ist 3072 Token, B ist 8192 (PLAN Paragraph 5). */
+    /** Die Kontextklasse: A ist 3072 Token, B ist 8192 (siehe ADR 0001). */
     modelClass: ModelClassLabel;
     /** Anteil bestandener Fragen, aus verification/w5/eval.json. */
     passRate: number;

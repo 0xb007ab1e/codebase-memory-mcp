@@ -2,7 +2,7 @@
  * Vom Dateipfad zum qualifizierten Namen, den der Graph fuer diese Datei fuehrt.
  *
  * Der Reader braucht diese Umrechnung, weil der Server keinen Endpunkt hat, der
- * eine Datei ausliefert (siehe INVENTAR.md Abschnitt 3 und Ask 1). Was es gibt,
+ * in diesem Providerpfad eine Datei ausliefert. Was es gibt,
  * ist `get_code_snippet` auf einem indizierten Symbol, und der Modul-Knoten ist
  * das Symbol, das die ganze Datei umspannt.
  *

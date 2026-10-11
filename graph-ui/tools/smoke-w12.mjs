@@ -95,7 +95,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -3515,7 +3515,6 @@ async function main() {
             + `${closed.missingFilters.length} Filter fehlen`);
     }
 
-    const shots = existsSync(SHOT_DIR) ? readdirSync(SHOT_DIR).length : 0;
     const lastTwo = report.rounds.slice(-2);
     const ok =
         failure === null
@@ -3541,7 +3540,6 @@ async function main() {
         && lastTwo.every((round) => round.newFindings === 0)
         && report.port >= MIN_PORT
         && report.leftoverProcesses === 0
-        && shots >= 10
         && stage.blockedRequests.length === 0;
 
     if (!ok) {

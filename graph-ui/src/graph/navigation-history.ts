@@ -1,23 +1,14 @@
 /**
- * Ein begrenzter Verlauf mit Zurueck und Vor, wie beim Blaettern (K2).
+ * Bounded history shared by Galaxy and Architecture, independent of React.
  *
- * Rein und ohne React, damit Galaxy (K2) und Architecture (K27) dasselbe
- * Modell benutzen und nicht zwei. Das Konzept steht in
- * docs/development/pr-2068-galaxy-history.md; hier stehen nur die Regeln, die
- * der Code einhaelt:
+ * Entries contain navigation identity and context, never loaded graph data or
+ * camera objects. The default cap is 25; overflow drops the oldest entry.
+ * Consecutive equal keys do not add a stop. Navigation after Back discards the
+ * forward branch. Context-only changes replace the current stop.
  *
- *  - Hoechstens `limit` Eintraege (Vorgabe 25). Wer darueber hinaus schiebt,
- *    verliert den aeltesten, nicht den neuesten.
- *  - Ein Eintrag, der dem aktuellen gleicht (gleicher Schluessel), wird nicht
- *    noch einmal abgelegt. Derselbe Ort spaeter ist ein neuer Schritt.
- *  - Eine neue Navigation nach Zurueck verwirft den Vorwaertszweig.
- *  - Daneben eine kurze Liste der zuletzt besuchten Orte (`recentKey`), neueste
- *    zuerst und ohne Doppelte. Sie haengt nicht am Zeiger: Zurueck kuerzt sie
- *    nicht, ein Besuch zieht seinen Ort nach vorn.
- *
- * Gespeichert werden nur die Eintraege, die der Aufrufer baut. Was sie
- * bedeuten (welche Knoten, welche Kamera), weiss dieses Modul nicht, und es
- * waechst darum auch nicht mit dem, was ein Bild an Daten traegt.
+ * Recent places are independently deduplicated, newest first, and capped at
+ * eight. Back does not truncate that list. Project or graph-generation changes
+ * are handled by callers so stale identities cannot restore unrelated data.
  */
 
 export interface NavigationHistory<T> {

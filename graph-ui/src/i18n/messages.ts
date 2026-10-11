@@ -1,7 +1,7 @@
 /**
  * Der typisierte Katalog der sichtbaren Chrome-Strings.
  *
- * Die Mechanik ist die des PR-Frontends (INVENTAR.md Abschnitt 1): EIN Objekt,
+ * Die Mechanik ist die des PR-Frontends: EIN Objekt,
  * `as const`, nach Bereichen geordnet, und alles, was eine Zahl oder einen Namen
  * einsetzen muss, ist eine Funktion statt einer Zeichenkette mit Platzhaltern.
  * Eine Funktion kann der Uebersetzer nicht falsch zusammensetzen, und der
@@ -321,11 +321,10 @@ export const messages = {
 
         referencesTitle: 'Where to read further, in this repository',
         references: [
-            { path: 'PLAN.md', about: 'the plan this surface was built against, and its honesty rules' },
-            { path: 'INVENTAR.md', about: 'what the analysis server delivers, and what it does not' },
-            { path: 'UPSTREAM-ASKS.md', about: 'the gaps that were handed back to the server' },
-            { path: 'docs/adr/0001-modellwahl.md', about: 'why this local model and no other' },
-            { path: 'verification/', about: 'the proof runs: screenshots, measurements, gate reports' },
+            { path: 'README.md', about: 'exploration, local inference and development setup' },
+            { path: 'CONFIGURATION.md', about: 'settings, precedence and the local configuration API' },
+            { path: 'THIRD_PARTY.md', about: 'source provenance, dependencies and model licenses' },
+            { path: 'docs/adr/0001-modellwahl.md', about: 'local inference choices and model evidence' },
         ],
         referencesNote:
             'Paths in this repository, not links. This window is offline by design, so a link into the '

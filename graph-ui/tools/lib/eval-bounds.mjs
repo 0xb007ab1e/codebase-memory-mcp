@@ -40,8 +40,8 @@ export const EVAL_BOUNDS = Object.freeze({
     passRate: 0.6,
     citationCompliance: 0.9,
     appliesTo: 'der Sieger JEDER Modellklasse, nicht das Feld im Schnitt',
-    source: 'docs/adr/0001-modellwahl.md (Abschnitt Entscheidung), '
-        + 'tests/scaffold/w5b.test.mjs Zeilen 51 und 53, PLAN.md Abschnitt 5',
+    source: 'docs/adr/0001-modellwahl.md (Evaluation limits), '
+        + 'tests/scaffold/w5b.test.mjs',
 });
 
 /**

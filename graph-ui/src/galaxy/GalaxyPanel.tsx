@@ -11,7 +11,7 @@
  *    Ein Fehler wird gezeigt, nicht verschluckt (src/galaxy/layout-source.ts).
  *    Was geladen wurde, meldet das Panel nach oben (`onLayout`), weil die
  *    Bedeutungssuche daraus ihre Fan-in-Zahlen nimmt und der Server sie in der
- *    flachen Suchform nicht mitschickt (UPSTREAM-ASKS.md, Ask 5).
+ *    flachen Suchform nicht mitschickt.
  * 2. **Einmal sichtbar heisst gemountet.** Wird das Panel zugeklappt, bleibt
  *    die Szene im Baum und nur der Renderloop steht still (`active`). Ein
  *    Aushaengen wuerde den WebGL-Kontext wegwerfen, und der naechste Aufklapper
@@ -1952,8 +1952,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
      * Antwort. Er wird aus dem Zustand ABGELEITET und nicht an jeder Stelle
      * abgelegt, die ihn aendert; so kann kein Weg in einen neuen Ausschnitt den
      * Verlauf vergessen. Was ein Zurueck selbst herstellt, legt keinen neuen
-     * Eintrag ab (`restoringKey`). Regeln und Grenzen: src/graph/navigation-history.ts
-     * und docs/development/pr-2068-galaxy-history.md.
+     * Eintrag ab (`restoringKey`). Regeln und Grenzen: src/graph/navigation-history.ts.
      */
     const historyTrail: ScopeTrail | undefined = trail?.key !== organicKey ? undefined
         : trail.kind === 'calls' ? { kind: 'calls' } : { kind: 'path', target: trail.target, name: trail.name };

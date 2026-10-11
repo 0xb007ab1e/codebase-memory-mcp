@@ -1,299 +1,132 @@
 # CBM Lens Beta
 
-## In this repository
+CBM Lens is the local exploration frontend served by `codebase-memory-mcp --ui=true`.
+It combines source, the indexed graph and optional browser inference. Source files
+are read-only; project architecture decisions can be edited in the ADR workspace.
+The frontend was contributed by Bernhard Jackiewicz as CodeAtlasWeb.
 
-This directory is the frontend that `codebase-memory-mcp --ui=true` serves.
-It came in as CodeAtlasWeb by Bernhard Jackiewicz (design and tracking in
-issue #1964); the text below this section is his README, kept as written.
-What the maintainers added on top:
+## Explore a project
 
-- **Config** at the right of the top bar groups daemon overrides, immediate
-  browser preferences, and external configuration references. Saves validate
-  the whole batch, detect concurrent changes, and show restart requirements.
-  See [configuration and precedence](CONFIGURATION.md).
-- **Focused exploration.** Galaxy is the search surface for nodes, files and
-  folder groups. Select a scope, then expand incoming/outgoing relationships
-  one layer at a time, restricted to the chosen edge types. Natural clusters
-  reflect connectivity, not inferred architectural components; existing nodes
-  stay in place when another layer arrives. Return to the repository map at
-  any time. Node and edge
-  budgets control the overview. Explorer requests the current file or marked
-  symbols' direct neighbors separately from the capped global layout.
-  Verified neighborhoods and layout positions are reused in bounded session
-  caches. Fresh index generations invalidate graph evidence; a capped layout
-  never counts as a complete neighborhood. Expanding fetches missing adjacency.
-- **Compact evidence.** Explorer shows a file-level impact summary from the
-  graph and local Git, with affected files on demand. Hotspots group findings
-  by source area. Architecture keeps its spatial view without a duplicate
-  report underneath. Moving arrows indicate edge direction, not runtime
-  execution; reduced-motion preferences keep direction markers stationary.
+- **Explore** follows the current file or marked source. Its graph requests direct
+  dependencies separately from the capped repository layout. File-level impact
+  summaries use graph and local Git evidence, with details available on demand.
+- **Galaxy** searches nodes, files and folders. Select a scope and expand incoming
+  or outgoing relationships by depth and edge type. Overview budgets limit drawing;
+  a capped layout does not establish a complete neighborhood. Bounded caches reuse
+  positions and verified adjacency, and fresh index generations invalidate evidence.
+- **Architecture** presents the repository map, routes, hotspots, system structure
+  and behavior. Connectivity clusters are not proof of architectural boundaries.
+  Moving arrows show edge direction, not observed execution. Reduced-motion settings
+  retain stationary direction markers.
+- **Coverage** explains indexing gaps. **System** contains daemon status, indexes,
+  diagnostics and MCP configuration. See [configuration and precedence](CONFIGURATION.md).
+- **ADR** stores one editable Markdown decision document per project through
+  `GET/POST /api/adr`, shared with `manage_adr`. It does not edit repository files.
 
-- **Build and embed.** `make -f Makefile.cbm cbm-with-ui` runs `npm ci`
-  (with `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`) and `npm run build` here, then
-  embeds `dist/` into the binary. The dev server (`npm run dev`) listens on
-  5173 and proxies `/rpc` and `/api` to a server on 9749, which is the
-  contract `tests/test_ui_dev_proxy_security.sh` pins.
-- **CSP.** The served page may reach the server itself plus the loopback
-  service explicitly allowed for optional local inference (`src/ui/http_server.h`,
-  `CBM_UI_CSP_VALUE`). Nothing else, and a test holds that.
-- **Add project index** (project dropdown or alt+p, `src/projects/`): choose
-  a repository with the daemon's local folder picker, name its index, follow
-  indexing status, then open it. Files are indexed in place, not uploaded.
-  The dialog can close while indexing continues; reopen its activity in the
-  project dropdown. Status comes from the daemon, without invented percentages.
-  This replaces the broad project-management dialog; coverage details stay in
-  Coverage and daemon activity stays in System.
-- **The ADR workspace** (`?workspace=adr`, `src/adr/`): read, create, and
-  explicitly save one Markdown decision document per project. Its sections
-  can hold multiple decisions. This uses the existing `GET/POST /api/adr`
-  store shared with `manage_adr`; it does not edit repository files.
-  Unpublished drafts are retained per project in this browser tab's session
-  storage. Before saving, the UI compares the current server document with
-  the editing baseline and retains the draft if it detects a change. The
-  existing API has no atomic version check, so this is not a document lock.
-  The editor limits new saves to 8,000 UTF-8 bytes for compatibility with
-  MCP section updates, and checks the 16 KiB serialized request limit.
-  Editable preview examples live in `fixtures/adr/`; they are never
-  automatically inserted into real projects or used as inferred graph facts.
-- **The frontend log** (`src/app/ui-log.ts`, installed in `src/main.tsx`):
-  the console keeps printing, and a copy of every console line, uncaught
-  error, unhandled rejection and failed `/rpc` or `/api` call is batched
-  to `POST /api/ui-log`, which the server appends as JSON lines to
-  `<cache_dir>/logs/ui.log` (rotating once at 5 MiB). `GET /api/ui-log`
-  tails it for diagnostics, and a bug report can attach the file.
-  The caught request failures reach the log
-  through `src/provider/error-observer.ts`, the seam the two clients
-  announce on before they throw.
-- **Gates in CI** (`.github/workflows/_test.yml`, job `test-ui`, which
-  runs `scripts/ci/test-ui.sh`; run that script locally for the identical
-  leg): `npm run test:unit`, `npm run check:style`,
-  `npm run check:promises`, `npm run test:acceptance` and
-  `npm run build`. `test:acceptance` is
-  every frozen check except the two release-binding files
-  (`release-current`, `release-proof-binding`), which tie the recorded
-  release report to the commits of the original repository and cannot
-  pass here. The browser proofs (`npm run smoke:*`) need a running server
-  and Playwright browsers and stay a local venue; run them by hand with
-  `npx playwright install chromium` first.
+Use **Add project index** in the project dropdown (or Alt+P) to choose a local
+repository, name its index and follow daemon-reported progress. Files are indexed
+in place, not uploaded. Closing the dialog does not cancel indexing.
 
-Eine lokale Lese-IDE fuer ein indiziertes Repository: Baum, Editor,
-Galaxie, Erklaerungen. Sie laeuft im Browser, sie hat kein eigenes Backend, und
-sie ist per Vorgabe abgeschottet. Der genehmigte Plan steht in `PLAN.md`, die
-Projektregeln in `CLAUDE.md`, der aufgenommene Fremdcode in `THIRD_PARTY.md`.
+ADR drafts stay in this tab's session storage. Before saving, the UI compares the
+server document with the editing baseline and retains conflicting drafts. This is
+not an atomic document lock. Saves are limited to 8,000 UTF-8 bytes and a 16 KiB
+serialized request. The examples in `fixtures/adr/` are explicitly synthetic and
+are never inserted into real projects automatically.
 
-## Was hier laeuft
+## Local agent
 
-```
-npm run build          # tsc + vite, Ergebnis in dist/
-npm run test:unit      # vitest
-node --test tests/scaffold/    # die eingefrorenen Abnahmetests
-npm run check:style    # lange Striche, Attribution, hartkodierte Texte
-npm run check:promises # Saetze, die etwas zusagen, und Flaechen ohne Wirkung
+The top-bar agent status opens model configuration; the adjacent chat control folds
+or unfolds the conversation. Model downloads require explicit activation. The chat
+uses browser-local inference; the selected source is not sent to a remote model.
+Model provenance and license limitations are in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+Explorer provides the exact marked text, or the loaded file when nothing is marked.
+A caret alone does not narrow the context. One replaceable source block precedes
+conversation history; each message captures the current selection. Navigation does
+not alter an in-flight request, and Retry uses its original snapshot. Missing or
+partial source is disclosed. Token counting uses the selected model's tokenizer;
+oversized requests are rejected rather than silently shortened.
+
+Automatic explanations respond to new selections independently of follow-up chat.
+Browser history is separated by project, retained for 24 hours, and can be cleared
+in Agent configuration.
+
+## Build and preview
+
+From the repository root:
+
+```sh
+make -f Makefile.cbm cbm-with-ui
 ```
 
-Die Beweislaeufe je Zyklus heissen `npm run smoke:<zyklus>` und schreiben ihr
-Ergebnis nach `verification/`. Jeder von ihnen laeuft unter einem
-Netz-Deny-Gate; was dabei an Verbindungen hinausging, steht als
-`outboundViolations` im Artefakt.
+This installs the locked frontend dependencies, builds `dist/` and embeds it in the
+native binary. For frontend development, run `npm ci` and `npm run dev` in this
+directory. Vite listens on 5173 and proxies `/api` and `/rpc` to the local server on
+9749. `npm run build` creates a production bundle.
 
-Der Analyse-Server (`cbm/`) wird getrennt gebaut und indiziert die Repositories.
-Diese Oberflaeche indiziert nichts selbst: sie liest `/api` und `/rpc`.
+The standalone test preview in `tools/lib/static-proxy.mjs` snapshots `dist/` when
+it starts. Restart that preview after building and compare the served `index.html`
+asset name with `dist/index.html` before reviewing changes.
 
-## Die Vorschau: nach jedem Bau neu starten
+The canonical frontend CI entry point is `scripts/ci/test-ui.sh` from the repository
+root. It runs unit tests, style and promise checks, acceptance checks and a production
+build. Browser smoke commands require a running server and Playwright Chromium;
+install that browser explicitly with `npx playwright install chromium` when needed.
 
-Eine Vorschau-Instanz besteht aus zwei Prozessen: dem C-Server auf einem
-eigenen Port und einem kleinen Auslieferer, der `dist/` bedient und `/api` sowie
-`/rpc` an den Server weiterreicht (`tools/lib/static-proxy.mjs`).
+## Experimental agent activity
 
-**Der Auslieferer KOPIERT `dist/` beim Start.** Er tut das mit Absicht: sonst
-liefe ein `npm run build` mitten in eine offene Seite hinein und ersetzte
-Dateien, waehrend der Browser sie laedt. Die Folge ist aber, dass er spaetere
-Bauten **nie** sieht. Wer baut und dann die alte Vorschau neu laedt, sieht den
-Stand von vorhin, und nichts an der Oberflaeche sagt das.
+Build with `VITE_EXPERIMENTAL_AGENTS=true` to expose recorded tool activity, hook
+setup and graph overlays. The value must be exactly `true`; URL parameters and saved
+preferences cannot enable it. Browser-local chat is independent of this flag.
+Activity remains off until enabled in the UI. It requires an event adapter and is
+not automatic observation of arbitrary coding agents.
 
-Also gilt, ohne Ausnahme:
-
-1. `npm run build`
-2. die laufende Vorschau beenden (SIGTERM an ihren Prozess)
-3. die Vorschau neu starten
-4. **pruefen, was wirklich ausgeliefert wird**, bevor irgendetwas beurteilt wird
-
-Der vierte Schritt ist der, den man weglassen moechte, und genau der, der den
-Fehler findet. Er vergleicht die Bundle-Kennung im ausgelieferten `index.html`
-mit der im gebauten `dist/`:
-
-```
-ls dist/assets/index-*.js                       # was der Bau erzeugt hat
-curl -s http://127.0.0.1:<ui-port>/ | grep -o 'index-[A-Za-z0-9_-]*\.js'
-```
-
-Stimmen die beiden Kennungen nicht ueberein, liefert die Vorschau einen alten
-Bau aus, und jeder Befund an ihr ist ein Befund ueber Code von vorhin.
-
-Warum das hier steht: zwischen 13:08 und 23:10 am 2026-08-29 sind fuenf Zyklen
-gebaut und nicht gesehen worden, weil die Vorschau vom Vormittag weiterlief. Ein
-Ablauf, der nur im Kopf einer Sitzung steht, ist beim naechsten Mal weg.
-
-## Explorer chat context
-
-Local browser chat automatically includes the current reader source: the exact
-marked text when a selection exists, otherwise the loaded file. A caret alone
-does not narrow the context. The source is a single replaceable data block in
-the system message, followed by conversation history. Each new message captures
-the current source; previous source blocks are not appended to the conversation.
-Optional graph evidence remains explicitly attachable.
-
-The composer shows which file or selection will be used. Missing source and
-partial file loads are disclosed. The exact request is token-counted before
-generation; oversized files are rejected without silently shortening them.
-Mark a smaller range or start a new conversation to reduce context. Navigation
-does not alter an in-flight request, and Retry replays its original snapshot.
-Model loading remains opt-in, and inference runs in the browser.
-
-## Die Agentenebene: was live arbeitende Agenten auf dem Graphen zeigen
-
-Agent activity is experimental and hidden in normal builds. To include its
-workspace, hook setup, graph overlay, commands, and display controls, explicitly
-build with `VITE_EXPERIMENTAL_AGENTS=true npm run build` (or start the dev server
-with `VITE_EXPERIMENTAL_AGENTS=true npm run dev`). The value must be exactly
-`true`; URL parameters and saved preferences cannot enable it. Without this
-flag, activity polling is disabled and an old Agents workspace selection opens
-Explore. Browser-local chat is independent of this feature.
-
-This is recorded tool activity from configured adapters, not automatic agent
-observability. The bundled adapter supports the PostToolUse hook installed
-below; other clients need their own adapter. The flag does not install hooks or
-delete any existing events in the daemon's SQLite store. Even in an enabled
-build, the reader must turn activity on before the browser polls for events.
-
-Arbeiten KI-Agenten in demselben Repository, kann die Galaxie sie zeigen: je
-Agent ein kleiner leuchtender Koerper, der den Symbolknoten umkreist, an dem er
-gerade arbeitet, und unten rechts ein kompaktes Instrument, das erklaert, was
-man sieht. Der Weg dorthin hat drei Stationen.
-
-### Recorded tool activity through the daemon
-
-`agents/hooks/atlas-trace.py` is the supported PostToolUse producer. Configure
-`ATLAS_PROJECT` to the exact indexed project name, `ATLAS_AGENT_NAME` for its
-label, and (only for a custom port) `ATLAS_DAEMON_URL=http://127.0.0.1:PORT`.
-The **Connect your agent** disclosure in Agent activity downloads this exact
-hook and generates a project-specific install command using `/api/repo-info`.
-On macOS/Linux with Python 3, run the reviewed command:
+The supported adapter is `agents/hooks/atlas-trace.py`. **Connect your agent**
+downloads it and offers a project-specific install command. Review and run it locally:
 
 ```sh
 python3 ~/Downloads/cbm-atlas-trace.py --install-claude --root /absolute/repository --project INDEXED_NAME --daemon-url http://127.0.0.1:9749
 ```
 
-Installation is explicit and local: it preserves unrelated Claude settings,
-adds a PostToolUse entry to `.claude/settings.local.json`, and copies the hook
-into `.claude/hooks/`. It refuses conflicting hooks, symlinks and malformed
-configuration. It makes no network request or account change. Start a new Claude
-Code session after installation, then load recorded activity in the browser.
-Other coding clients require their own event adapter; they are not automatically
-observed. For manual configuration, run `python3 <path>/atlas-trace.py` in the
-client's PostToolUse hook. Its JSON tool event arrives on stdin. During normal
-hook execution it always exits zero and does not change the tool call's result.
+The installer preserves unrelated settings and hooks, rejects conflicts, symlinks
+and malformed configuration, and writes only the selected repository's
+`.claude/settings.local.json` and `.claude/hooks/`.
+Start a new session in your configured client after installation. Other clients
+need their own adapter.
 
-The hook records timestamp, tool name, run ID, sequence number, path and optional
-line span/command. The hook records no file contents and no tool output. Commands
-and paths may still contain sensitive information: the entire data path stays
-on this workstation. The hook refuses external destinations, proxies and redirects.
+For manual hook setup, set `ATLAS_PROJECT` to the indexed name, optionally
+`ATLAS_AGENT_NAME` and `ATLAS_DAEMON_URL`, and pass the tool event on stdin. The hook
+records tool, run, sequence, timestamp, path and explicit line ranges. It omits source
+contents, tool output and free-form commands, search patterns and descriptions. Paths
+can still be sensitive. Destinations must be local; proxies and redirects are refused.
 
-A transactional SQLite outbox at `~/.atlas-trace/events.jsonl.outbox.sqlite3`
-allocates sequence numbers safely across concurrent hooks. `ATLAS_TRACE_FILE`
-changes this path prefix. Up to 10,000 pending events survive daemon downtime;
-old pending entries expire at that limit. Delivery retries on the next hook,
-or explicitly with `python3 <repo>/graph-ui/agents/hooks/atlas-trace.py --flush`.
-A flush delivers up to 100 pending events from one project. No background bridge
-or additional listener is required. The old JSONL watcher and replay bridge remain
-historical fixture tools; they are not connected to the application by default.
+A transactional outbox at `~/.atlas-trace/events.jsonl.outbox.sqlite3` buffers up to
+10,000 pending events. `ATLAS_TRACE_FILE` changes the path prefix. Delivery resumes
+on the next hook or `python3 agents/hooks/atlas-trace.py --flush`; one flush sends up
+to 100 events from one project. The older JSONL/replay tools are fixture utilities.
 
-Daemon log provenance is explicit. `GET /api/logs?project=NAME&min_level=warn`
-returns only records attributed to that exact indexed project; the filter applies
-before pagination and counts. Omitting `project` keeps the daemon-wide history;
-`scope=unattributed` shows records without known project ownership. Migration v3
-adds a nullable project column without assigning old records to the current
-repository. Paths, page URLs and message text are never used to guess ownership.
-Each record exposes `project: string | null`; responses expose `scope` and the
-selected `project`. A failed scoped database read returns an error instead of
-substituting unrelated memory-ring logs. New UI entries capture optional project
-ownership when recorded, before buffering; an explicit empty/null entry project
-stays unattributed even if a batch carries a project.
+## Activity and diagnostic APIs
 
 `POST /api/agent-events` accepts `{project, events: [...]}` with at most 100 events.
-Required event fields are `ts`, `agent`, `run`, integer `seq`, `phase: start|end`
-and `tool`. Optional fields include `path`, `lines`, `detail`, `source`, `intent`
-(self-report), and explicit `replay`. Unknown fields are discarded.
+Each event needs `ts`, `agent`, `run`, integer `seq`, `phase: start|end` and `tool`.
+Optional fields include `path`, `lines`, `detail`, `source`, self-reported `intent`
+and explicit `replay`. Unknown fields are discarded. The UI distinguishes recorded
+facts from self-reports and leaves unmapped paths visible.
 
-The daemon owns `<cache>/activity.db`, independent of replaceable project indexes.
-Its additive migrations use SQLite WAL and a busy timeout. Events have monotonic
-daemon cursors and unique `(project, run, seq)` identities. A small per-run retired sequence floor prevents expired events from reappearing after a delayed retry.
-10,000 events are retained globally; expired history is explicitly incomplete.
-A database generation distinguishes a restart (same state) from a replaced database.
+The daemon stores activity in `<cache>/activity.db`, independently of replaceable
+project indexes. Monotonic cursors, `(project, run, seq)` identities and retired
+sequence floors prevent duplicate or expired events from reappearing. Retention is
+bounded to 10,000 events; expired history is incomplete. Poll with
+`GET /api/agent-events?project=NAME&after=CURSOR&limit=200` on the graph's origin.
 
-### The view and logs
+Daemon and frontend logs share the SQLite journal. `GET /api/logs` accepts `project`,
+`scope=unattributed`, `min_level`, literal `q`, `after` and `lines`; filters apply
+before counts and pagination. Unattributed records are not assigned to the selected
+project. Responses identify severity, source, receipt time, durable ID and database
+generation. A bounded memory fallback is explicitly marked `persistent:false`.
 
-Agent activity is off until enabled by the reader. It then polls
-`GET /api/agent-events?project=NAME&after=CURSOR&limit=200` over the same origin and
-port as the graph and MCP HTTP API. Failed requests retain the last accepted
-cursor; reconnects do not duplicate retained rows. Changing repositories resets
-the browser's activity state. `?agents=PORT` no longer selects another server.
-
-Daemon log callbacks and every accepted frontend log level persist in the same SQLite
-journal. `GET /api/logs` preserves its `lines`/`total` response and adds structured
-`records`, receipt timestamps, severity, source, durable IDs and a database
-generation. `min_level=warn` selects warnings and errors, `min_level=error` only errors.
-`q=TEXT` applies a literal, ASCII case-insensitive substring search to timestamps,
-sources, messages and explicit project names. Scope, severity, search, counts and
-cursors all apply before the display limit. System Logs uses these same filters; 2,000 warning/error records
-are reserved independently of 3,000 routine records. `after=CURSOR` reads forward,
-while requests without a cursor return a recent snapshot. A failed SQLite store
-is reported as `persistent:false`, with the bounded in-memory fallback available.
-`GET /api/ui-log` now reads frontend JSON lines from that same journal. Its
-`path` names `activity.db`, `export_path` names the compatibility JSONL file, and
-`source: "sqlite"` / `persistent: true` identify the source. Version 4 adds explicit
-frontend origin and retains full bounded JSON evidence. On first open, at most the
-last 256 KiB of each old `ui.log.1` and `ui.log` are imported in one transaction;
-original receipt timestamps are preserved, project ownership remains unknown,
-and a partial import is disclosed. No log is reassigned to the selected project.
-
-UI posts retain the existing `accepted`, `dropped`, `path` and `file_error` fields,
-adding `duplicates`, `persistent` and `storage_error`; a failed journal write
-returns HTTP 503 for retry. A retired per-session sequence floor prevents expired
-UI events from returning on an old retry. JSONL remains a rotating local export
-for existing `tail` workflows; changing it does not change the HTTP history.
-No local report or event is published externally by these routes.
-
-Was die Ansicht zeigt und was sie ausdruecklich nicht zeigt:
-
-- **Ein Agent ist ein Koerper, kein Knoten.** Die Ebene legt sich ueber den
-  Graphen; Knoten- und Kantenfarben bleiben unangetastet. Die Farbe eines
-  Agenten kommt aus seiner Kennung und ist nach einem Reload dieselbe; dazu
-  traegt jeder Koerper einen Buchstaben, damit die Unterscheidung nicht allein
-  an der Farbe haengt.
-- **Die Art der Arbeit steht in Form und Verhalten**: lesen ein weiter, ruhiger
-  Orbit; schreiben ein enger; suchen kurze Pings an den Knoten, deren Name das
-  Suchmuster traegt; testen ein pulsierender Koerper mit einer gestrichelten
-  Linie zum geprueften Bereich, sofern der Befehl eine Datei nennt, die der
-  Index kennt.
-- **Die Zuordnung ist so genau, wie sie sein kann.** Datei plus Zeilenbereich
-  trifft den engsten passenden Symbolknoten, nur Datei den Modulknoten, ein
-  Knoten ohne Endzeile wird als unsicher gekennzeichnet, und was sich nicht
-  verorten laesst, steht im Instrument samt dem Rohereignis, statt zu
-  verschwinden.
-- **Nichts wird gedeutet.** Kein Fortschritt, keine Prozentzahl, keine
-  Bewertung. Eine Absichtszeile erscheint nur, wenn das Ereignis ein
-  `intent`-Feld mitbringt, das der Agent selbst geschrieben hat, und dann
-  gekennzeichnet als Selbstauskunft.
-- **Der Leser ist auch ein Akteur.** Welches Symbol er oeffnet, laeuft als
-  eigener Akteur "you" durch dieselbe Ebene. Diese Ereignisse entstehen im
-  Browser und gehen NICHT in die Ereignisdatei.
-
-Der Schalter, der die ganze Ebene abschaltet, liegt im Einstellungen-Panel in
-der Gruppe "Drawing, and what it costs", zusammen mit allem anderen, was
-Rechenzeit kostet, und nennt dort seinen auf dieser Maschine gemessenen Effekt
-auf die Bildrate.
-
-Die aufgezeichnete Datei, gegen die der Beweislauf faehrt, liegt unter
-`fixtures/agent-events/`; woraus sie entstanden ist und was daran geaendert
-wurde, steht vollstaendig in `fixtures/agent-events/HERKUNFT.md`.
+`POST /api/ui-log` batches frontend errors and request failures. Failed journal writes
+return 503 for retry. `GET /api/ui-log` reads the same journal; `path` names
+`activity.db`, while `export_path` names the rotating compatibility JSONL export.
+Changing that export does not change HTTP history. These APIs publish nothing
+externally.

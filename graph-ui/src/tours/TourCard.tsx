@@ -1,14 +1,14 @@
 /**
  * The step card, under the reader and over the command line.
  *
- * Layout from design/design.png: a header that is a step count and a chain of
+ * Layout: a header with a step count and a chain of
  * shaded blocks, then the step's title, then two or three sentences, then the
  * keys as buttons. Two things about it are decisions rather than drawing.
  *
  * **It sits in the editor column, not over it.** The card is where the walk is
  * explained and the editor beside it is what the walk is explaining; a card that
  * covered the code would make the reader choose between the two. It pushes the
- * editor up instead, which is what the reference image shows.
+ * editor up instead, keeping the explanation and source visible together.
  *
  * **Every key is also a button.** The keys are the fast path for somebody who
  * has both hands on the keyboard, and the buttons are what makes the same four

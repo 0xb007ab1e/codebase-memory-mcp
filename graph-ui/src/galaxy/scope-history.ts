@@ -1,13 +1,8 @@
 /**
- * Der Galaxy-Eintrag fuer den Verlauf (K2): welche Frage der Ausschnitt gerade
- * beantwortet, ohne die Antwort selbst.
- *
- * Ein Eintrag haelt Identitaeten und Parameter (Wurzel, Tiefe, Richtung,
- * Kantenarten, offener Pfad, Ansicht) und nie geladene Knoten, Kanten oder eine
- * Kamera. Zurueck laedt den Ausschnitt neu; der kleine Scope-Cache und der
- * Nachbarschafts-Cache machen das in der Regel sofort. Das Modell dahinter ist
- * src/graph/navigation-history.ts, das Konzept steht in
- * docs/development/pr-2068-galaxy-history.md.
+ * Galaxy history stores the root, depth, direction, edge types, trail and view.
+ * It contains no nodes, edges or camera state. Restoring reloads the scope using
+ * the bounded scope and adjacency caches. Shared rules live in
+ * src/graph/navigation-history.ts.
  */
 import type { NavigationHistoryOptions } from '../graph/navigation-history';
 import type { GraphScope, TraceDirection } from './graph-scope';

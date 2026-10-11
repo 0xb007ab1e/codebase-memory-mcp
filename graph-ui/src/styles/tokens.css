@@ -1,7 +1,7 @@
 /*
  * Die Farben und der Schriftstapel des CODEATLAS-Terminals, an einer Stelle.
  *
- * Vorlage ist design/design.png und PLAN.md Abschnitt 4. Die Werte stehen hier
+ * Gemeinsame Farben und Schriften fuer die Terminal-Oberflaeche. Die Werte stehen hier
  * als Tokens und nicht in den Komponenten, weil das Design in W2b (Twin) und
  * W3 (Galaxy) weitere Flaechen bekommt und eine zweite Farbtabelle die erste
  * still falsch machen wuerde.

@@ -3,7 +3,7 @@
 // limits first. Run: node --test tests/scaffold/w7a.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -41,11 +41,6 @@ test('AC2: the help page is real, offline and names the limits', () => {
   assert.equal(h.clippingViolations, 0);
   assert.ok(h.port >= 4370, `Port >= 4370 erwartet, war ${h.port}`);
   assert.equal(h.leftoverProcesses, 0);
-  for (const shot of ['menu.png', 'help.png']) {
-    const p = join(ROOT, 'verification', 'w7', shot);
-    assert.ok(existsSync(p), `${shot} fehlt`);
-    assert.ok(statSync(p).size > 30 * 1024, `${shot} verdaechtig klein`);
-  }
 });
 
 test('AC3: no sentence promises a feature for later', () => {

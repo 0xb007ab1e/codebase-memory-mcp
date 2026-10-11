@@ -1,14 +1,7 @@
 /*
- * Das Chrome der Lese-IDE: Kopfzeile, Tabs, Explorer, Reader, Kommandozeile,
- * Statusleiste. Die Farben kommen aus tokens.css, hier steht nur Anordnung.
- *
- * Der Aufbau folgt design/design.png: eine Spalte fuer den Baum, daneben der
- * Editor, rechts das SEMANTIC_TWIN-Panel, oben zwei Zeilen (Marke plus Menue,
- * dann Tabs), unten zwei Zeilen (Kommandozeile, Statusleiste).
- *
- * Die dritte Spalte gibt es nur, wenn ein Panel hereingereicht wurde
- * (`[data-twin='true']`). Eine leere Spalte zu reservieren waere die
- * Behauptung, es gaebe dort etwas, das gerade nichts sagt.
+ * Workspace layout; colors come from tokens.css. The explorer and reader
+ * share the main area. Reserve a third column only when a context panel is
+ * present (`[data-twin='true']`).
  */
 
 * {
@@ -2944,11 +2937,7 @@ button.atlas-galaxy-legend-swatch:hover {
 
 /* ---------------------------------------------------------- Schrittkarte - */
 
-/*
- * Die Karte sitzt in der Editorspalte unter dem Reader und schiebt ihn hoch,
- * statt ihn zu verdecken: sie erklaert den Schritt, und der Quelltext daneben
- * ist das, was sie erklaert. Vorlage ist design/design.png.
- */
+/* Keep the step card below the reader so its source remains visible. */
 .atlas-tour {
     flex: 0 0 auto;
     padding: 10px 16px 12px;

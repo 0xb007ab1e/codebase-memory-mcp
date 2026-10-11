@@ -10,10 +10,8 @@
 /**
  * The two block characters the progress chain is drawn from.
  *
- * From design/design.png, where the header of the step card is `STEP 10/10`
- * followed by a run of shaded blocks. They are text, not a bar element, for the
- * same reason everything else here is monospace: a graphical bar in a terminal
- * would be the one element that does not line up with anything.
+ * Shaded text blocks keep the progress indicator aligned with the monospace
+ * step count, such as `STEP 10/10`.
  */
 export const PROGRESS_FILLED = '▓';
 export const PROGRESS_EMPTY = '░';

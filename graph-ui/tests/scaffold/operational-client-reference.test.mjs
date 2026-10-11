@@ -1,8 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import { WATCHED_NAMES } from '../../tools/lib/forbidden-names.mjs';
-import { DOWNLOADED_HOOK_ARTIFACT, operationalClientReference } from '../../tools/lib/operational-client-reference.mjs';
+import { operationalClientReference } from '../../tools/lib/operational-client-reference.mjs';
 
 const client = WATCHED_NAMES[0];
 test('permits only operational client terms in the exact setup source/test files', () => {
@@ -19,6 +18,9 @@ test('permits only operational client terms in the exact setup source/test files
     assert.equal(operationalClientReference('README.md', `${client} Code`), false);
     const instruction = `adds a PostToolUse entry to \`.${client}/settings.local.json\`, and copies the hook`;
     assert.equal(operationalClientReference('README.md', instruction), true);
+    const installPaths = `\`.${client}/settings.local.json\` and \`.${client}/hooks/\`.`;
+    assert.equal(operationalClientReference('README.md', installPaths), true);
+    assert.equal(operationalClientReference('README.md', installPaths + ` written by ${client}`), false);
     assert.equal(operationalClientReference('other/README.md', instruction), false);
     assert.equal(operationalClientReference('README.md', instruction + `; written by ${client}`), false);
 });
@@ -55,25 +57,7 @@ test('local verification exemptions are limited to named configuration and comma
     assert.equal(operationalClientReference('verification/unrelated.json', `"path": "/repo/.${client}/settings.json"`), false);
 });
 
-test('the named downloaded hook is exempt only while identical to its canonical source', () => {
-    const source = `def install_${client}(root):\n    pass\n`;
-    const bytes = text => new TextEncoder().encode(text);
-    assert.equal(operationalClientReference(DOWNLOADED_HOOK_ARTIFACT, source.split('\n')[0]), false);
-    assert.equal(operationalClientReference(DOWNLOADED_HOOK_ARTIFACT, source.split('\n')[0], { artifact: bytes(source), canonicalHook: bytes(source) }), true);
-    assert.equal(operationalClientReference(DOWNLOADED_HOOK_ARTIFACT, source.split('\n')[0], { artifact: bytes(source + '# modified'), canonicalHook: bytes(source) }), false);
-    assert.equal(operationalClientReference(DOWNLOADED_HOOK_ARTIFACT, source.split('\n')[0], { artifact: Uint8Array.of(0xff), canonicalHook: Uint8Array.of(0xfe) }), false);
-    const claim = `# written by ${client} Code`;
-    assert.equal(operationalClientReference(DOWNLOADED_HOOK_ARTIFACT, claim, { artifact: bytes(claim), canonicalHook: bytes(claim) }), false);
-});
-
-test('the recorded hook download matches the canonical source and the scanner path', async () => {
-    const root = new URL('../../', import.meta.url);
-    const [artifact, canonicalHook] = await Promise.all([
-        readFile(new URL(DOWNLOADED_HOOK_ARTIFACT, root)),
-        readFile(new URL('agents/hooks/atlas-trace.py', root)),
-    ]);
-    assert.deepEqual(artifact, canonicalHook);
-    const line = artifact.toString('utf8').split('\n').find(row => row.includes(`def install_${client}(`));
-    assert.ok(line);
-    assert.equal(operationalClientReference(DOWNLOADED_HOOK_ARTIFACT, line, { artifact, canonicalHook }), true);
+test('archived hook captures are not operational integration sources', () => {
+    assert.equal(operationalClientReference('verification/pr-2068/final-downloaded-hook.txt',
+        `def install_${client}(root):`), false);
 });

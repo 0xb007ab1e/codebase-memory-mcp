@@ -47,3 +47,14 @@ llm/.pid
 .atlas-trace/
 events.jsonl
 events.jsonl.seq
+
+# Local visual captures and development reports; JSON/JSONL fixtures stay tracked.
+/verification/**/*.png
+/verification/**/*.jpg
+/verification/**/*.jpeg
+/verification/**/*.gif
+/verification/**/*.webp
+/verification/**/*.svg
+/verification/**/*.webm
+/verification/**/*.mp4
+/verification/**/*.md

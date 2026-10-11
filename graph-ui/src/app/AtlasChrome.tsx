@@ -1,6 +1,6 @@
 /**
- * Das Chrome: Kopfzeile, Menue, Tabs, Explorer, Breadcrumb, Reader-Flaeche,
- * Kommandozeile, Statusleiste. Vorlage ist design/design.png.
+ * Workspace chrome: header, menu, tabs, explorer, breadcrumbs, reader,
+ * command line, and status bar.
  *
  * Rein darstellend, und das ist der Punkt: der Reader kommt als `children`
  * herein, nicht als Import. So laesst sich das ganze Chrome in jsdom pruefen,
@@ -15,7 +15,7 @@
  * Verdrahtung wird NICHT gezeichnet. Ein Tooltip macht aus einer Attrappe keine
  * Auskunft, sondern eine Attrappe mit Fussnote, und ein Menue, das sich
  * anklicken laesst und schweigt, ist die Sorte stille Luege, gegen die dieses
- * Produkt gebaut ist (PLAN.md Abschnitt 6, Ehrlichkeitsregeln).
+ * Produkt gebaut ist.
  *
  * Das ist hier die Notbremse und nicht der Normalfall: welche Punkte es gibt,
  * entscheidet `messages.menu.items`, und dass jeder davon einen Buchstaben in

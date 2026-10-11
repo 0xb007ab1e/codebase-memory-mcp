@@ -3,7 +3,7 @@
 // measured effect. Run: node --test tests/scaffold/w10.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -99,17 +99,14 @@ test('AC6/AC7: proof run, papers and wiring', () => {
   assert.equal(m.cutWithoutHint, 0);
   assert.ok(m.port >= 4480, `Port >= 4480 erwartet, war ${m.port}`);
   assert.equal(m.leftoverProcesses, 0);
-  for (const shot of ['settings.png', 'settings-switch.png', 'settings-fetch.png']) {
-    const p = join(ROOT, 'verification', 'w10', shot);
-    assert.ok(existsSync(p), `${shot} fehlt`);
-    assert.ok(statSync(p).size > 30 * 1024, `${shot} verdaechtig klein`);
-  }
   const nd = JSON.parse(read('verification/w10/netdeny.json'));
   assert.equal(nd.outboundViolations, 0);
   assert.ok(/smoke-w10/.test(nd.command));
   const pkg = JSON.parse(read('package.json'));
   assert.ok(pkg.scripts?.['smoke:w10'], 'Script smoke:w10 fehlt');
   const adr = read('docs/adr/0001-modellwahl.md');
-  assert.ok(/W10|Nachtrag/.test(adr),
-    'die ADR braucht den Nachtrag: entschieden wurde die Engine, nicht ein Modell');
+  assert.match(adr, /Model selection remains a\s+user choice\./,
+    'the ADR must leave model selection to the user');
+  assert.match(adr, /Weights are downloaded only after the\s+user opts in; they are not embedded in the executable\./,
+    'the ADR must document opt-in weights rather than bundling a model');
 });

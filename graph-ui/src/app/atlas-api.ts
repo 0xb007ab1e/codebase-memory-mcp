@@ -9,7 +9,7 @@
  *
  * Same-origin ist der Normalfall. Der Server nimmt `/api` nur an, wenn der
  * Host-Kopf genau seine eigene Loopback-Adresse nennt und der Origin-Kopf
- * entweder fehlt oder dieselbe Adresse nennt (INVENTAR.md Abschnitt 5). Ein
+ * entweder fehlt oder dieselbe Adresse nennt. Ein
  * `base` ist darum nur fuer Node-Aufrufer da, die keinen Origin senden.
  */
 

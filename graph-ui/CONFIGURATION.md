@@ -1,6 +1,6 @@
 # Frontend configuration
 
-Open **Config** at the right of the top bar. Settings are grouped by indexing,
+Open **System**, then **Configuration**. Settings are grouped by indexing,
 resources, server, diagnostics, and browser. The **External inputs** reference
 covers repository files, installation, launch flags, integration paths, and
 development settings whose owner is outside the running daemon.
@@ -42,7 +42,7 @@ share a versioned, per-project browser store with the controls in those views.
 Changing these values preserves the current selection. If storage is unavailable,
 preferences remain usable for the current session.
 
-Local agent configuration opens the existing model controls. Opening Config never
+The top-bar agent status opens separate local model controls. Opening configuration never
 downloads weights or starts a model. Repository extension mappings and ignore files
 remain repository-owned and take effect on subsequent indexing.
 

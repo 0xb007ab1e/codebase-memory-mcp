@@ -12,7 +12,7 @@
  *
  *  - verification/w5/eval.json fuer passRate, citationCompliance und tok/s,
  *  - docs/adr/0001-modellwahl.md fuer die Bytes,
- *  - dieselbe ADR und verification/w5/modellrecherche.md fuer die Repo-Kennung.
+ *  - dieselbe ADR fuer die dokumentierten Repo-Kennungen.
  *
  * Er liest sie als DATEIEN und nicht ueber einen Import: der Katalog laeuft im
  * Browser, und eval.json ist eine Viertelmegabyte grosse Aufzeichnung mit den
@@ -49,7 +49,6 @@ interface EvalModel {
 
 const evalRun = JSON.parse(read('verification/w5/eval.json')) as { models: EvalModel[] };
 const adr = read('docs/adr/0001-modellwahl.md');
-const research = read('verification/w5/modellrecherche.md');
 
 describe('die Vorschlaege sind die sechs Kandidaten der ADR', () => {
     it('fuehrt genau sechs, so viele wie die Eval gemessen hat', () => {
@@ -130,10 +129,10 @@ describe('jede Groessenangabe steht so in docs/adr/0001-modellwahl.md', () => {
 describe('jede Repo-Kennung ist dokumentiert und nicht erfunden', () => {
     for (const suggestion of MODEL_SUGGESTIONS) {
         it(`${suggestion.name}: ${suggestion.repo}`, () => {
-            const documented = adr.includes(suggestion.repo) || research.includes(suggestion.repo);
+            const documented = adr.includes(`https://huggingface.co/${suggestion.repo}`);
             expect(
                 documented,
-                `${suggestion.repo} steht weder in der ADR noch in der Modellrecherche`,
+                `${suggestion.repo} has no model-source URL in the ADR`,
             ).toBe(true);
         });
     }

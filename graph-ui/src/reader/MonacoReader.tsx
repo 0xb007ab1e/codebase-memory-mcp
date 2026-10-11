@@ -9,7 +9,7 @@
  * hineinschreibt. Der Beweislauf prueft beides: er liest die Option UND tippt.
  *
  * Es gibt keine Bearbeitungsabsicht in diesem Produkt. Dies ist eine Lese-IDE
- * (PLAN.md Abschnitt 1): man guckt, versteht und navigiert; editiert wird
+ * zum Lesen, Verstehen und Navigieren; editiert wird
  * woanders.
  */
 import type { JSX } from 'react';

@@ -277,8 +277,8 @@ describe('die Sektionen der technischen Tiefe', () => {
         await render();
         // Der Effekt-Block sagt, was in ihm staende, statt sich als "keine
         // Effekte" zu lesen; die Fehler-Sektion sagt, was der Index nicht sieht.
-        expect(text()).toContain('records no routes, no outbound calls and no writes');
-        expect(text()).toContain('Ask 2 in UPSTREAM-ASKS.md');
+        expect(text()).toContain('No evidence for routes, outbound calls or writes is available');
+        expect(text()).toContain('Missing evidence does not establish that the symbol has no effects');
         expect(text()).toContain('Where these are handled is not visible to the index');
     });
 

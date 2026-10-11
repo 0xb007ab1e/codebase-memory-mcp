@@ -1,20 +1,10 @@
-# Herkunft dieses Korpus
+# Large-source fixture provenance
 
-Generiert am 2026-08-28 fuer CodeAtlasWeb. Nichts daran ist kopiert:
-`src/big.ts` ist deterministisch erzeugt (100 kleine exportierte Funktionen
-plus ein `runAll`, das sie der Reihe nach faehrt), `src/support.ts` und
-`src/index.ts` sind von Hand geschrieben und klein gehalten.
+Generated for this frontend on 2026-08-28; no external code was copied.
+`src/big.ts` deterministically contains 100 small exported functions and `runAll`.
+`src/support.ts` and `src/index.ts` were written for the fixture.
 
-Zweck: **Cap-Messung**. `get_code_snippet` kappt jeden Schnipsel bei 500
-Zeilen (`MCP_SNIPPET_MAX_LINES`, cbm/src/mcp/mcp.c) und meldet das mit
-`source_clipped`. `src/big.ts` hat mit 717 Zeilen sicher mehr, damit der
-Reader beweisen muss, dass er den fehlenden Rest ehrlich benennt statt eine
-gekappte Datei als ganze Datei auszugeben.
-
-Warum ein eigener Korpus und nicht `fixtures/atlas-sample`: an dessen Zahlen
-haengt der W1b-Smoke (73 Knoten, 175 Kanten, 6 Callees, 3 Caller). Eine Datei
-mehr dort wuerde diese Zahlen verschieben und einen bestandenen Beweislauf
-umschreiben. Dieser Korpus wird nur fuer die Cap-Messung indiziert.
-
-Nicht bauen, nicht installieren, nicht ausfuehren. Der Korpus ist
-Messmaterial.
+The 717-line source exceeds the 500-line `get_code_snippet` limit and exercises
+`source_clipped`. The reader must disclose missing source rather than presenting
+an incomplete file as complete. This corpus is separate from `atlas-sample` to
+preserve that fixture's graph counts. It is indexing input, not a runnable package.

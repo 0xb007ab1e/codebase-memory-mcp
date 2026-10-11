@@ -11,8 +11,8 @@
  * explizite Dateipfad-Anfragen vor der Wort-Rangfolge (PR 2068).
  * Was diese Datei an Signalen NICHT bekommt, entscheidet der
  * Aufrufer: an diesem Backend bleiben `isTest` und `isExported` undefiniert,
- * weil die flache search_graph-Form sie nicht traegt (UPSTREAM-ASKS.md,
- * Ask 5). Undefiniert heisst hier weder wahr noch falsch: der Bonus und der
+ * weil die flache search_graph-Form sie nicht traegt. Undefiniert heisst hier
+ * weder wahr noch falsch: der Bonus und der
  * Abzug fallen einfach aus, und niemand erfindet eine Flagge.
  */
 
