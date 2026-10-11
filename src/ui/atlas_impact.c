@@ -7,6 +7,7 @@
 #include "foundation/constants.h"
 #include "foundation/json_writer.h"
 #include "ui/atlas.h"
+#include "cli/cli.h"
 #include "foundation/compat_fs.h"
 #include "foundation/subprocess.h"
 #include "foundation/platform.h"
@@ -230,26 +231,40 @@ static char *ia_git(const char *root, const char *const *args, size_t *size, tim
         *bounded = true;
         return NULL;
     }
+    const char *git = "git";
+#ifdef _WIN32
+    /* CreateProcess needs an executable path; it does not resolve a bare
+     * application name through PATH. Keep the resolver's result locally. */
+    char git_path[1024];
+    const char *resolved = cbm_find_cli("git", NULL);
+    if (!resolved || !*resolved || strlen(resolved) >= sizeof(git_path))
+        return NULL;
+    snprintf(git_path, sizeof(git_path), "%s", resolved);
+    git = git_path;
+#endif
     char dir[256] = "/tmp/cbm-impact-XXXXXX";
     if (!cbm_mkdtemp(dir))
         return NULL;
     char log[512];
     snprintf(log, sizeof(log), "%s/output", dir);
-    const char *argv[40] = {"git",
-                            "--no-lazy-fetch",
-                            "--no-optional-locks",
-                            "-c",
-                            "core.fsmonitor=false",
-                            "-c",
-                            "core.untrackedCache=false",
-                            "-C",
-                            root};
-    int n = 9;
+    /* Git before 2.44 rejects --no-lazy-fetch. The environment form is safe
+     * to pass to older Git; an empty protocol allowlist also denies every
+     * fetch transport, even when repository configuration enables one. */
+    const char *const git_env[] = {"GIT_NO_LAZY_FETCH=1",
+                                   "GIT_ALLOW_PROTOCOL=", "GIT_TERMINAL_PROMPT=0", NULL};
+    const char *argv[40] = {git,  "--no-optional-locks",
+                            "-c", "protocol.allow=never",
+                            "-c", "core.fsmonitor=false",
+                            "-c", "core.untrackedCache=false",
+                            "-C", root};
+    int n = 10;
     while (*args && n < 39)
         argv[n++] = *args++;
     argv[n] = NULL;
-    cbm_proc_opts_t opts = {.bin = "git",
+    cbm_proc_opts_t opts = {.bin = git,
                             .argv = argv,
+                            .env_overrides = git_env,
+                            .strip_git_repo_env = true,
                             .log_file = log,
                             .quiet_timeout_ms = 2000,
                             .cancel_grace_ms = 100};

@@ -502,6 +502,16 @@ void cbm_ui_log_append(const char *line) {
     ui_log_append_record(line, line);
 }
 
+void cbm_ui_log_close(void) {
+    cbm_ui_log_init();
+    cbm_mutex_lock(&g_log_mutex);
+    if (sqlite3_close(g_activity_db) == SQLITE_OK) {
+        g_activity_db = NULL;
+        g_activity_path[0] = '\0';
+    }
+    cbm_mutex_unlock(&g_log_mutex);
+}
+
 /* Append a printf-formatted fragment at *pos within a bufsz buffer, never
  * advancing *pos past bufsz. snprintf returns the length it WOULD have written,
  * so `pos += snprintf(...)` runs pos past the end on truncation and the next
@@ -3512,11 +3522,7 @@ bool cbm_http_server_free(cbm_http_server_t *srv) {
         return false;
     cbm_atlas_impact_analysis_shutdown();
     cbm_mcp_server_free(srv->mcp);
-    cbm_ui_log_init();
-    cbm_mutex_lock(&g_log_mutex);
-    sqlite3_close(g_activity_db);
-    g_activity_db = NULL;
-    cbm_mutex_unlock(&g_log_mutex);
+    cbm_ui_log_close();
     cbm_secure_zero(srv->readiness_secret, sizeof(srv->readiness_secret));
     free(srv);
     return true;

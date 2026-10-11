@@ -89,7 +89,8 @@ const char *cbm_detect_shell_rc(const char *home_dir);
 
 /* Find a CLI binary by name.
  * Checks PATH first, then common install locations.
- * Returns static buffer — do NOT free. Returns "" if not found. */
+ * Returns a per-thread buffer, overwritten by the next call on that thread.
+ * Do NOT free. Returns "" if not found. */
 const char *cbm_find_cli(const char *name, const char *home_dir);
 
 /* ── File utilities ───────────────────────────────────────────── */

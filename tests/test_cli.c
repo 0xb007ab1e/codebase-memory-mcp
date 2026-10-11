@@ -4129,6 +4129,56 @@ TEST(cli_find_cli_not_found) {
     PASS();
 }
 
+typedef struct {
+    const char *name;
+    bool found;
+} cli_find_thread_t;
+
+static void *cli_find_on_other_thread(void *opaque) {
+    cli_find_thread_t *context = opaque;
+    const char *result = cbm_find_cli(context->name, NULL);
+    context->found = result && strstr(result, context->name) != NULL;
+    return NULL;
+}
+
+TEST(cli_find_cli_result_is_thread_local) {
+    char temp[256] = "/tmp/cli-find-thread-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(temp));
+    char first[512], second[512];
+    snprintf(first, sizeof(first), "%s/cbm-first.exe", temp);
+    snprintf(second, sizeof(second), "%s/cbm-second.exe", temp);
+    write_test_file(first, "fixture\n");
+    write_test_file(second, "fixture\n");
+    th_make_executable(first);
+    th_make_executable(second);
+    const char *raw = getenv("PATH");
+    char *old_path = raw ? strdup(raw) : NULL;
+    ASSERT_TRUE(!raw || old_path);
+    bool environment_ready = cbm_setenv("PATH", temp, 1) == 0;
+    const char *retained = cbm_find_cli("cbm-first.exe", NULL);
+    cli_find_thread_t context = {.name = "cbm-second.exe"};
+    cbm_thread_t thread;
+    bool started =
+        environment_ready && cbm_thread_create(&thread, 0, cli_find_on_other_thread, &context) == 0;
+    bool joined = started && cbm_thread_join(&thread) == 0;
+    /* The other call has completed: this is an ordered overwrite check,
+     * not a timing-dependent attempt to observe a concurrent data race. */
+    bool retained_first = retained && strcmp(retained, first) == 0;
+    if (old_path)
+        cbm_setenv("PATH", old_path, 1);
+    else
+        cbm_unsetenv("PATH");
+    free(old_path);
+    bool cleaned = th_rmtree(temp) == 0;
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(joined);
+    ASSERT_TRUE(context.found);
+    ASSERT_TRUE(retained_first);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
 TEST(cli_find_cli_on_path) {
     /* Port of TestFindCLI_FoundOnPATH */
     char tmpdir[256];
@@ -18118,6 +18168,7 @@ SUITE(cli) {
 
     /* CLI binary detection (3 tests — install_test.go) */
     RUN_TEST(cli_find_cli_not_found);
+    RUN_TEST(cli_find_cli_result_is_thread_local);
     RUN_TEST(cli_find_cli_on_path);
     RUN_TEST(cli_find_cli_fallback_paths);
 

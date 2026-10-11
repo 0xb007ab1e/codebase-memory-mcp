@@ -104,6 +104,10 @@ void cbm_ui_log_init(void);
 /* Persist a daemon log line in SQLite and the emergency memory ring. */
 void cbm_ui_log_append(const char *line);
 
+/* Release the current activity database. A later append can reopen it;
+ * final shutdown must first quiesce log producers. The mutex remains valid. */
+void cbm_ui_log_close(void);
+
 /* Frontend compatibility export: <cache_dir>/logs/ui.log, one JSON line
  * per accepted entry. Both HTTP log readers use the SQLite journal.
  * Returns false when the path does not fit in out. */

@@ -520,7 +520,7 @@ static char *snapshot(sqlite3 *db, const char *cache) {
     yyjson_mut_obj_add_val(doc, root, "settings", items);
     char canonical[SETTINGS_PATH_CAP];
     bool current_process = initialized && cbm_canonical_path(cache, canonical, sizeof(canonical)) &&
-                           strcmp(canonical, initial_cache) == 0;
+                           strcmp(cbm_normalize_path_sep(canonical), initial_cache) == 0;
     for (size_t i = 0; i < SETTINGS_COUNT; i++) {
         const setting_t *setting = &settings[i];
         char buffer[SETTINGS_VALUE_CAP];

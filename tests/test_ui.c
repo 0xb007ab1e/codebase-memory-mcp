@@ -11,6 +11,7 @@
 #include "ui/embedded_assets.h"
 #include "ui/layout3d.h"
 #include "ui/atlas.h"
+#include "cli/cli.h"
 #include "store/store.h"
 #include "foundation/subprocess.h"
 #include "foundation/mem_core.h"
@@ -2316,7 +2317,16 @@ TEST(atlas_impact_completed_worker_memory_returns_to_caller_baseline) {
 }
 
 static bool impact_test_git(const char *root, const char *const *args) {
-    const char *argv[30] = {"git",
+    const char *git = "git";
+#ifdef _WIN32
+    char git_path[1024];
+    const char *resolved = cbm_find_cli("git", NULL);
+    if (!resolved || !*resolved || strlen(resolved) >= sizeof(git_path))
+        return false;
+    snprintf(git_path, sizeof(git_path), "%s", resolved);
+    git = git_path;
+#endif
+    const char *argv[30] = {git,
                             "-C",
                             root,
                             "-c",
@@ -2328,7 +2338,8 @@ static bool impact_test_git(const char *root, const char *const *args) {
     int n = 9;
     while (*args && n < 29)
         argv[n++] = *args++;
-    cbm_proc_opts_t opts = {.bin = "git", .argv = argv, .quiet_timeout_ms = 3000};
+    cbm_proc_opts_t opts = {
+        .bin = git, .argv = argv, .quiet_timeout_ms = 3000, .strip_git_repo_env = true};
     cbm_proc_result_t result;
     return cbm_subprocess_run(&opts, &result) == 0 && result.outcome == CBM_PROC_CLEAN;
 }
