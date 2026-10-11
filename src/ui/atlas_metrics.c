@@ -13,6 +13,7 @@
  */
 #include "foundation/constants.h"
 #include "ui/atlas.h"
+#include "ui/http_server.h"
 #include "foundation/compat_fs.h"
 #include "foundation/hash_table.h"
 #include "foundation/str_util.h"
@@ -199,7 +200,7 @@ static void mx_churn_scan(const char *root_path, mx_churn_t *churn) {
              "git -C \"%s\" log --name-only --pretty=format:COMMIT:%%h:%%ct:%%an:%%s "
              "--since=\"1 year ago\" --max-count=10000 2>%s",
              root_path, null_dev);
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp)
         return;
     churn->commits = malloc((size_t)MX_COMMIT_CAP * sizeof(mx_commit_t));
@@ -890,9 +891,8 @@ char *cbm_atlas_who_json(cbm_store_t *store, const char *project, const char *fi
 
 /* ── Rationale evidence: forge base URL + per-symbol history ────── */
 
-/* Normalize the origin remote to a browsable https base ("" if none):
- * git@host:owner/repo(.git) and ssh://git@host/owner/repo(.git) become
- * https://host/owner/repo; https URLs just lose the .git suffix. The
+/* Normalize the origin remote to a credential-free https base ("" if none):
+ * git@host:owner/repo(.git), ssh:// and http(s) URLs become https://host/owner/repo.
  * UI turns commit hashes and #123 refs in subjects into links with it. */
 static void mx_remote_url(const char *root_path, char *out, size_t cap) {
     out[0] = '\0';
@@ -906,7 +906,7 @@ static void mx_remote_url(const char *root_path, char *out, size_t cap) {
     char cmd[CBM_SZ_2K];
     snprintf(cmd, sizeof(cmd), "git -C \"%s\" config --get remote.origin.url 2>%s", root_path,
              null_dev);
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp)
         return;
     char line[CBM_SZ_1K] = {0};
@@ -920,31 +920,15 @@ static void mx_remote_url(const char *root_path, char *out, size_t cap) {
         line[--len] = '\0';
     if (len == 0)
         return;
-    char https[CBM_SZ_1K] = {0};
-    if (strncmp(line, "git@", 4) == 0) {
-        /* git@host:owner/repo -> https://host/owner/repo */
-        char *colon = strchr(line + 4, ':');
-        if (!colon)
-            return;
-        *colon = '\0';
-        snprintf(https, sizeof(https), "https://%s/%s", line + 4, colon + 1);
-    } else if (strncmp(line, "ssh://", 6) == 0) {
-        const char *rest = line + 6;
-        const char *at = strchr(rest, '@');
-        if (at)
-            rest = at + 1;
-        snprintf(https, sizeof(https), "https://%s", rest);
-    } else if (strncmp(line, "https://", 8) == 0 || strncmp(line, "http://", 7) == 0) {
-        snprintf(https, sizeof(https), "%s", line);
-    } else {
+    if (strncmp(line, "git@", 4) != 0 && strncmp(line, "ssh://", 6) != 0 &&
+        strncmp(line, "https://", 8) != 0 && strncmp(line, "http://", 7) != 0) {
         return; /* local paths and exotic transports: no link base */
     }
-    size_t hlen = strlen(https);
-    if (hlen > 4 && strcmp(https + hlen - 4, ".git") == 0)
-        https[hlen - 4] = '\0';
-    while ((hlen = strlen(https)) > 0 && https[hlen - 1] == '/')
-        https[hlen - 1] = '\0';
+    char *https = cbm_ui_git_web_base(line);
+    if (!https)
+        return;
     snprintf(out, cap, "%s", https);
+    free(https);
 }
 
 char *cbm_atlas_symbol_history_json(cbm_store_t *store, const char *project, const char *file_path,
@@ -989,7 +973,7 @@ char *cbm_atlas_symbol_history_json(cbm_store_t *store, const char *project, con
              "git -C \"%s\" log --no-patch --max-count=12 "
              "--pretty=format:COMMIT:%%h:%%ct:%%an:%%s -L %lld,%lld:\"%s\" 2>%s",
              root_path, start_line, end_line, file_path, null_dev);
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         yyjson_mut_obj_add_bool(doc, root, "available", false);
         char *json = yyjson_mut_write(doc, 0, NULL);

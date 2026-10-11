@@ -2230,6 +2230,152 @@ static bool impact_test_write(const char *root, const char *file, const char *va
     return fclose(fp) == 0;
 }
 
+static bool atlas_history_test_repo(const char *root, const char *subject, const char *remote) {
+    const char *init[] = {"init", "-q", NULL};
+    const char *add[] = {"add", "sample.c", NULL};
+    const char *commit[] = {"-c", "core.hooksPath=", "commit", "-qm", subject, NULL};
+    const char *origin[] = {"remote", "add", "origin", remote, NULL};
+    return impact_test_git(root, init) &&
+           impact_test_write(root, "sample.c", "int sample(void) {\n    return 1;\n}\n") &&
+           impact_test_git(root, add) && impact_test_git(root, commit) &&
+           impact_test_git(root, origin);
+}
+
+static bool atlas_history_test_commit(const char *json, const char *array, const char *subject) {
+    yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    if (!doc)
+        return false;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *commits = yyjson_obj_get(root, array);
+    const char *got = yyjson_get_str(yyjson_obj_get(yyjson_arr_get(commits, 0), "subject"));
+    bool matches = yyjson_get_bool(yyjson_obj_get(root, "available")) &&
+                   yyjson_arr_size(commits) == 1 && got && strcmp(got, subject) == 0;
+    yyjson_doc_free(doc);
+    return matches;
+}
+
+static bool atlas_history_test_remote(const char *json, const char *expected) {
+    yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    if (!doc)
+        return false;
+    const char *got = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "remote_url"));
+    bool matches = got && strcmp(got, expected) == 0;
+    yyjson_doc_free(doc);
+    return matches;
+}
+
+TEST(atlas_history_ignores_inherited_git_context) {
+    char temp[256] = "/tmp/cbm_atlas_git_context_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(temp));
+    char selected[1024], decoy[1024], git_dir[1100], git_config[1100];
+    snprintf(selected, sizeof(selected), "%s/selected", temp);
+    snprintf(decoy, sizeof(decoy), "%s/decoy", temp);
+    ASSERT_EQ(th_mkdir_p(selected), 0);
+    ASSERT_EQ(th_mkdir_p(decoy), 0);
+    ASSERT_TRUE(atlas_history_test_repo(selected, "selected repository history",
+                                        "https://example.invalid/selected/repo.git"));
+    ASSERT_TRUE(atlas_history_test_repo(decoy, "decoy repository history",
+                                        "https://example.invalid/decoy/repo.git"));
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", decoy);
+    snprintf(git_config, sizeof(git_config), "%s/.git/config", decoy);
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    cbm_store_upsert_project(store, "atlas-git-context", selected);
+
+    const char *names[] = {
+        "GIT_DIR",          "GIT_WORK_TREE",      "GIT_CONFIG",           "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_PARAMETERS"};
+    const char *values[] = {git_dir,
+                            decoy,
+                            git_config,
+                            "1",
+                            "remote.origin.url",
+                            "https://example.invalid/injected/repo.git",
+                            "'remote.origin.url=https://example.invalid/parameters/repo.git'"};
+    char *saved[7] = {0};
+    bool save_ok = true;
+    for (int i = 0; i < 7; i++) {
+        const char *value = getenv(names[i]);
+        saved[i] = value ? strdup(value) : NULL;
+        save_ok = save_ok && (!value || saved[i]);
+    }
+    ASSERT_TRUE(save_ok);
+    bool env_ready = true;
+    for (int i = 0; i < 7; i++)
+        env_ready = cbm_setenv(names[i], values[i], 1) == 0 && env_ready;
+
+    /* Force the churn scan under the hostile environment, even if another
+     * history test populated the process-wide cache. */
+    cbm_atlas_metrics_cache_clear();
+    char *metrics = cbm_atlas_metrics_json(store, "atlas-git-context");
+    char *file = cbm_atlas_file_history_json(store, "atlas-git-context", "sample.c");
+    char *symbol = cbm_atlas_symbol_history_json(store, "atlas-git-context", "sample.c", 1, 3);
+    bool file_history_ok = atlas_history_test_commit(file, "recent", "selected repository history");
+    bool symbol_history_ok =
+        atlas_history_test_commit(symbol, "commits", "selected repository history");
+    bool file_remote_ok = atlas_history_test_remote(file, "https://example.invalid/selected/repo");
+    bool symbol_remote_ok =
+        atlas_history_test_remote(symbol, "https://example.invalid/selected/repo");
+    bool parent_unchanged = true;
+    for (int i = 0; i < 7; i++) {
+        const char *value = getenv(names[i]);
+        parent_unchanged = parent_unchanged && value && strcmp(value, values[i]) == 0;
+        if (saved[i])
+            cbm_setenv(names[i], saved[i], 1);
+        else
+            cbm_unsetenv(names[i]);
+        free(saved[i]);
+    }
+    free(metrics);
+    free(file);
+    free(symbol);
+    cbm_store_close(store);
+    cbm_atlas_metrics_cache_clear();
+    (void)th_rmtree(temp);
+    ASSERT_TRUE(env_ready);
+    ASSERT_TRUE(parent_unchanged);
+    ASSERT_TRUE(file_history_ok);
+    ASSERT_TRUE(symbol_history_ok);
+    ASSERT_TRUE(file_remote_ok);
+    ASSERT_TRUE(symbol_remote_ok);
+    PASS();
+}
+
+TEST(atlas_history_remote_urls_strip_credentials_and_force_https) {
+    char temp[256] = "/tmp/cbm_atlas_remote_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(temp));
+    /* All credentials are synthetic fixtures; neither endpoint may echo them. */
+    const char *remotes[] = {"https://fixture-user:fixture-token@example.invalid/org/repo.git",
+                             "http://fixture-user:fixture-token@example.invalid/org/repo.git"};
+    ASSERT_TRUE(atlas_history_test_repo(temp, "remote fixture history", remotes[0]));
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    cbm_store_upsert_project(store, "atlas-remote-credentials", temp);
+    cbm_atlas_metrics_cache_clear();
+    bool setup_ok = true;
+    bool file_ok[2] = {false, false}, symbol_ok[2] = {false, false};
+    for (int i = 0; i < 2; i++) {
+        const char *set_url[] = {"remote", "set-url", "origin", remotes[i], NULL};
+        setup_ok = impact_test_git(temp, set_url) && setup_ok;
+        char *file = cbm_atlas_file_history_json(store, "atlas-remote-credentials", "sample.c");
+        char *symbol =
+            cbm_atlas_symbol_history_json(store, "atlas-remote-credentials", "sample.c", 1, 3);
+        file_ok[i] = atlas_history_test_remote(file, "https://example.invalid/org/repo");
+        symbol_ok[i] = atlas_history_test_remote(symbol, "https://example.invalid/org/repo");
+        free(file);
+        free(symbol);
+    }
+    cbm_store_close(store);
+    cbm_atlas_metrics_cache_clear();
+    (void)th_rmtree(temp);
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(file_ok[0]);
+    ASSERT_TRUE(symbol_ok[0]);
+    ASSERT_TRUE(file_ok[1]);
+    ASSERT_TRUE(symbol_ok[1]);
+    PASS();
+}
+
 TEST(atlas_selection_impact_git_filters_and_worktree) {
     char tmpl[256] = "/tmp/cbm_impact_git_XXXXXX";
     char *root = cbm_mkdtemp(tmpl);
@@ -2452,6 +2598,8 @@ SUITE(ui) {
     RUN_TEST(atlas_attach_observed_marks_hops);
     RUN_TEST(atlas_who_reports_authorship_evidence);
     RUN_TEST(atlas_symbol_history_log_l_and_remote);
+    RUN_TEST(atlas_history_ignores_inherited_git_context);
+    RUN_TEST(atlas_history_remote_urls_strip_credentials_and_force_https);
     RUN_TEST(atlas_why_extracts_guard_chains);
     RUN_TEST(atlas_selection_impact_evidence_and_missing_history);
     RUN_TEST(atlas_selection_impact_git_filters_and_worktree);

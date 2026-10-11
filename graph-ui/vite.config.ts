@@ -5,8 +5,10 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { defineConfig, type ProxyOptions } from 'vite';
 import react from '@vitejs/plugin-react';
+import { licenseBuildInventory } from './tools/license-build-inventory';
 
 const projectRoot = dirname(fileURLToPath(import.meta.url));
+const licenseInventory = licenseBuildInventory(projectRoot);
 
 /**
  * Der Versions-Chip der Kopfzeile, zur Buildzeit festgeschrieben.
@@ -73,8 +75,8 @@ const uiBackendProxy = (): ProxyOptions => ({
 });
 
 export default defineConfig({
-  plugins: [react()],
-  worker: { format: 'es' },
+  plugins: [react(), licenseInventory.app],
+  worker: { format: 'es', plugins: licenseInventory.workers },
   define: {
     __ATLAS_VERSION__: JSON.stringify(atlasVersion()),
   },
