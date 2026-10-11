@@ -2969,6 +2969,153 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
 #endif
 }
 
+/* 2026-10-09: /tmp filled up mid-update, and the update said only "signed
+ * update candidate preparation failed", although the cause was a full disk.
+ * The failing staging write must be reported by step and OS error, through the
+ * staging cleanup, and the old executable must stay. */
+TEST(cli_update_names_the_failing_staging_step_and_os_error) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows staging reports through GetLastError, not errno");
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-update-enospc-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    const char *download_env = getenv("CBM_DOWNLOAD_URL");
+    char *old_download = download_env ? strdup(download_env) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    char release_dir[512];
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(release_dir, sizeof(release_dir), "%s/release", tmpdir);
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+    test_mkdirp(release_dir);
+    test_mkdirp(bin_dir);
+    static const char old_binary[] = "old binary before a failed update";
+    write_test_file(bin_target, old_binary);
+
+#if defined(__APPLE__)
+#if defined(__aarch64__) || defined(__arm64__)
+    const char *asset_name = "codebase-memory-mcp-darwin-arm64.tar.gz";
+#else
+    const char *asset_name = "codebase-memory-mcp-darwin-amd64.tar.gz";
+#endif
+    char native_fixture_path[CBM_SZ_4K] = {0};
+    uint32_t native_fixture_size = (uint32_t)sizeof(native_fixture_path);
+    ASSERT_EQ(_NSGetExecutablePath(native_fixture_path, &native_fixture_size), 0);
+    const char *native_fixture = native_fixture_path;
+#else
+#if defined(__aarch64__)
+    const char *asset_name = "codebase-memory-mcp-linux-arm64-portable.tar.gz";
+#else
+    const char *asset_name = "codebase-memory-mcp-linux-amd64-portable.tar.gz";
+#endif
+    const char *native_fixture = "/bin/true";
+#endif
+    FILE *native_file = fopen(native_fixture, "rb");
+    ASSERT_NOT_NULL(native_file);
+    ASSERT_EQ(fseek(native_file, 0, SEEK_END), 0);
+    long native_size = ftell(native_file);
+    ASSERT_GT(native_size, 0);
+    ASSERT_LTE(native_size, INT_MAX);
+    ASSERT_EQ(fseek(native_file, 0, SEEK_SET), 0);
+    unsigned char *replacement = malloc((size_t)native_size);
+    ASSERT_NOT_NULL(replacement);
+    ASSERT_EQ(fread(replacement, 1, (size_t)native_size, native_file), (size_t)native_size);
+    ASSERT_EQ(fclose(native_file), 0);
+    int archive_len = 0;
+    unsigned char *archive =
+        create_test_targz("codebase-memory-mcp", replacement, (int)native_size, &archive_len);
+    free(replacement);
+    ASSERT_NOT_NULL(archive);
+    char archive_path[768];
+    snprintf(archive_path, sizeof(archive_path), "%s/%s", release_dir, asset_name);
+    FILE *archive_file = fopen(archive_path, "wb");
+    ASSERT_NOT_NULL(archive_file);
+    ASSERT_EQ(fwrite(archive, 1, (size_t)archive_len, archive_file), (size_t)archive_len);
+    ASSERT_EQ(fclose(archive_file), 0);
+    free(archive);
+    char digest[65];
+    ASSERT_EQ(cbm_cli_sha256_file(archive_path, digest, sizeof(digest)), 0);
+    char checksum_path[640];
+    snprintf(checksum_path, sizeof(checksum_path), "%s/checksums.txt", release_dir);
+    FILE *checksum_file = fopen(checksum_path, "w");
+    ASSERT_NOT_NULL(checksum_file);
+    ASSERT_TRUE(fprintf(checksum_file, "%s  %s\n", digest, asset_name) > 0);
+    ASSERT_EQ(fclose(checksum_file), 0);
+    char download_url[640];
+    snprintf(download_url, sizeof(download_url), "file://%s", release_dir);
+    cbm_setenv("CBM_DOWNLOAD_URL", download_url, 1);
+
+    cli_activation_fake_t fake = {
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    FILE *capture = tmpfile();
+    int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
+    int saved_stderr = capture ? dup(STDERR_FILENO) : -1;
+    int rc = -1;
+    if (capture && saved_stdout >= 0 && saved_stderr >= 0) {
+        fflush(NULL);
+        if (dup2(fileno(capture), STDOUT_FILENO) >= 0 &&
+            dup2(fileno(capture), STDERR_FILENO) >= 0) {
+            /* The first staging write of the update fails as on a full disk. */
+            cbm_activation_transaction_write_failures_set_for_testing(1U, ENOSPC);
+            char *argv[] = {"--force"};
+            rc = cli_test_cmd_update(1, argv);
+            cbm_activation_transaction_write_failures_set_for_testing(0U, 0);
+        }
+        fflush(NULL);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+        (void)dup2(saved_stderr, STDERR_FILENO);
+    }
+    if (saved_stdout >= 0) {
+        close(saved_stdout);
+    }
+    if (saved_stderr >= 0) {
+        close(saved_stderr);
+    }
+    cbm_cli_set_activation_ops_for_test(NULL);
+    char output[16384] = {0};
+    if (capture) {
+        rewind(capture);
+        size_t count = fread(output, 1, sizeof(output) - 1U, capture);
+        output[count] = '\0';
+        fclose(capture);
+    }
+    const char *kept = read_test_file(bin_target);
+    bool old_kept = kept && strcmp(kept, old_binary) == 0;
+
+    if (old_download) {
+        cbm_setenv("CBM_DOWNLOAD_URL", old_download, 1);
+    } else {
+        cbm_unsetenv("CBM_DOWNLOAD_URL");
+    }
+    free(old_download);
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_NEQ(rc, 0);
+    ASSERT_NOT_NULL(strstr(output, strerror(ENOSPC)));
+#ifdef __APPLE__
+    ASSERT_NOT_NULL(strstr(output, "failed while writing the unsigned candidate"));
+#else
+    ASSERT_NOT_NULL(strstr(output, "failed to stage verified update"));
+#endif
+    ASSERT_TRUE(old_kept);
+    PASS();
+#endif
+}
+
 TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-uninstall-XXXXXX");
@@ -17776,6 +17923,7 @@ SUITE(cli) {
     RUN_TEST(cli_clients_selector_filters_registry_installs_issue1798);
     RUN_TEST(cli_update_accepts_retired_variant_flags_issue1544);
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
+    RUN_TEST(cli_update_names_the_failing_staging_step_and_os_error);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
     RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);
     RUN_TEST(cli_uninstall_auto_answers_keep_indexes_without_delete_indexes);
