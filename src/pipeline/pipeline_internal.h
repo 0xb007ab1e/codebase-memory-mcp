@@ -1282,7 +1282,13 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      properties are read with their escapes, admission is best-first and
  *      every edge carries "p"; doc_link_candidates holds doc section -> code
  *      candidates. An index built before has the old pairs and no
- *      candidates, so it rebuilds once on upgrade. */
+ *      candidates, so it rebuilds once on upgrade. Released together with
+ *      7 (no release in between, so no number of its own): doc comments of
+ *      Go, Java, Kotlin, Rust, Perl, TS/JS, PHP and C hold MENTIONS edges;
+ *      diagrams are Diagram/DiagramElement nodes with DIAGRAM_ARROW edges;
+ *      OpenAPI operations are Routes; a Markdown section's text keeps a
+ *      diagram fence's labels instead of its syntax, and its candidates
+ *      carry the p of its diagrams' kind family. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 7 };
 
 typedef struct {
