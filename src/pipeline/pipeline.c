@@ -3595,11 +3595,13 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
 
     p->mode = p->requested_mode;
     pipeline_reset_doc_links(p);
+    cbm_log_debug("pipeline.setup", "step", "coverage");
     bool mode_promoted = p->frozen ? false : promote_mode_to_existing_coverage(p);
 
     /* cbm_pipeline_new() may precede the actual run by an arbitrary interval.
      * Refresh once here, then use this exact snapshot for both Branch graph
      * construction and the baseline semantic manifest. */
+    cbm_log_debug("pipeline.setup", "step", "git_context");
     if (!p->frozen && pipeline_refresh_git_context(p) != 0) {
         return CBM_NOT_FOUND;
     }
@@ -3611,6 +3613,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
 
     /* One project read supplies extensions, declarations and manifest digest.
      * Snapshot ownership extends through the outer publication guard. */
+    cbm_log_debug("pipeline.setup", "step", "test_config");
     CBM_PROF_START(t_userconfig);
     if (!p->frozen && !pipeline_load_test_config(p)) {
         cbm_log_error("pipeline.err", "phase", "test_declarations_config");
@@ -3620,6 +3623,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     CBM_PROF_END("pipeline", "0_userconfig_load", t_userconfig);
 
     /* Phase 1: Discover files */
+    cbm_log_debug("pipeline.setup", "step", "discover");
     CBM_PROF_START(t_discover);
     p->resource_violation = (cbm_index_resource_violation_t){0};
     cbm_discover_opts_t opts = {
@@ -4310,6 +4314,9 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    /* Debug-level setup markers up to discovery, the first info line: a run
+     * that stops before it is named by the last step printed. */
+    cbm_log_debug("pipeline.setup", "step", "stage");
     pipeline_release_test_config(p);
     p->export_error[0] = '\0';
     char *final_path = resolve_db_path(p);
@@ -4350,6 +4357,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         free(final_path);
         return CBM_NOT_FOUND;
     }
+    cbm_log_debug("pipeline.setup", "step", "staged");
     int rc = cbm_pipeline_run_staged(p);
     free(p->db_path);
     p->db_path = configured_db_path;
