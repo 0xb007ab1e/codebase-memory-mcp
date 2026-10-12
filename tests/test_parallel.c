@@ -958,6 +958,157 @@ TEST(gbuf_next_id_accessors) {
     PASS();
 }
 
+TEST(gbuf_raise_next_id_never_lowers) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/");
+    cbm_gbuf_raise_next_id(gb, 100);
+    ASSERT_EQ(cbm_gbuf_next_id(gb), 100);
+    cbm_gbuf_raise_next_id(gb, 40);
+    ASSERT_EQ(cbm_gbuf_next_id(gb), 100);
+    int64_t id = cbm_gbuf_upsert_node(gb, "Function", "foo", "proj.foo", "f.go", 1, 5, "{}");
+    ASSERT_EQ(id, 100);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* Edge ids in the main buffer stay unique through the parallel phases.
+ * Merged worker nodes keep their shared ids, and merged edges take fresh ids
+ * from the main counter after the highest of them, so the main counter can
+ * end above the shared one (12 of 17 infra corpora, deckhouse by 229,233).
+ * The sync after each parallel phase used to set the main counter to the
+ * shared value anyway, and later passes reused the merged edges' ids. Where
+ * the counter ends depends on worker timing, so the seam pins it: right before
+ * each sync the hook takes ID_SYNC_PUSH edge ids from the main buffer. */
+enum { ID_FILES = 64, ID_SYNC_PUSH = 3 };
+
+typedef struct {
+    bool push;
+    int syncs;
+} id_sync_probe_t;
+
+static void id_sync_hook(cbm_gbuf_t *gb, void *ctx) {
+    id_sync_probe_t *probe = ctx;
+    probe->syncs++;
+    const cbm_gbuf_node_t **fns = NULL;
+    int n = 0;
+    if (!probe->push || cbm_gbuf_find_by_label(gb, "Function", &fns, &n) != 0 || n < 2) {
+        return;
+    }
+    char props[CBM_SZ_64];
+    for (int i = 0; i < ID_SYNC_PUSH; i++) {
+        snprintf(props, sizeof(props), "{\"id_sync_probe\":%d}", probe->syncs * ID_SYNC_PUSH + i);
+        cbm_gbuf_insert_edge(gb, fns[0]->id, fns[1]->id, "CALLS", props);
+    }
+}
+
+typedef struct {
+    int edges;
+    int duplicates;
+} edge_id_probe_t;
+
+static void probe_edge_ids(const cbm_gbuf_t *gb, void *ctx) {
+    edge_id_probe_t *probe = ctx;
+    probe->edges = cbm_gbuf_edge_count(gb);
+    probe->duplicates = cbm_gbuf_duplicate_edge_ids(gb);
+}
+
+/* `count` Go files; each function calls the next file's. */
+static bool write_id_fixture(const char *repo, int count) {
+    char path[512];
+    char source[256];
+    for (int i = 0; i < count; i++) {
+        snprintf(path, sizeof(path), "%s/f%02d.go", repo, i);
+        snprintf(source, sizeof(source),
+                 "package main\n\nfunc F%02d() int {\n\treturn F%02d() + 1\n}\n", i,
+                 (i + 1) % count);
+        if (th_write_file(path, source) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TEST(parallel_full_index_keeps_edge_ids_unique) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm_par_ids_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    /* More files than MIN_FILES_FOR_PARALLEL (50): the parallel route. */
+    if (!write_id_fixture(repo, ID_FILES)) {
+        th_rmtree(repo);
+        FAIL("failed to write the edge-id fixture");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ids.db", repo);
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    id_sync_probe_t syncs = {.push = true};
+    edge_id_probe_t probe = {0};
+    cbm_pipeline_set_id_sync_hook_for_tests(id_sync_hook, &syncs);
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    int rc = CBM_NOT_FOUND;
+    if (p) {
+        cbm_pipeline_set_before_dump_hook_for_tests(p, probe_edge_ids, &probe);
+        rc = cbm_pipeline_run(p);
+        cbm_pipeline_free(p);
+    }
+    cbm_pipeline_set_id_sync_hook_for_tests(NULL, NULL);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(repo);
+
+    ASSERT_EQ(rc, 0);
+    /* Both full-route syncs (after extract, after resolve) go through the helper. */
+    ASSERT_EQ(syncs.syncs, 2);
+    ASSERT_GT(probe.edges, ID_FILES);
+    ASSERT_EQ(probe.duplicates, 0);
+    PASS();
+}
+
+/* The closure-repair route always runs the parallel phases; both of its
+ * syncs go through the same helper. */
+TEST(parallel_closure_repair_syncs_ids_through_the_helper) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm_par_ids_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    if (!write_id_fixture(repo, 3)) {
+        th_rmtree(repo);
+        FAIL("failed to write the edge-id fixture");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ids.db", repo);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *first = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    int first_rc = first ? cbm_pipeline_run(first) : CBM_NOT_FOUND;
+    cbm_pipeline_free(first);
+
+    /* A body-only edit (no new names) routes to closure repair. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/f01.go", repo);
+    int write_rc =
+        th_write_file(path, "package main\n\nfunc F01() int {\n\treturn F02() + 40 + 2\n}\n");
+    id_sync_probe_t syncs = {.push = false};
+    cbm_pipeline_set_id_sync_hook_for_tests(id_sync_hook, &syncs);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *second = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    int second_rc = second ? cbm_pipeline_run(second) : CBM_NOT_FOUND;
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(second);
+    cbm_pipeline_set_id_sync_hook_for_tests(NULL, NULL);
+    th_rmtree(repo);
+
+    ASSERT_EQ(first_rc, 0);
+    ASSERT_EQ(write_rc, 0);
+    ASSERT_EQ(second_rc, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(syncs.syncs, 2);
+    PASS();
+}
+
 /* ── Parallel-pipeline LSP-override regression ────────────────────── */
 /* Pin the wiring fix that unified pass_calls.c (sequential) and
  * pass_parallel.c (parallel) on cbm_pipeline_find_lsp_resolution +
@@ -4768,6 +4919,9 @@ SUITE(parallel) {
     RUN_TEST(gbuf_merge_empty_src);
     RUN_TEST(gbuf_merge_src_free_safe);
     RUN_TEST(gbuf_next_id_accessors);
+    RUN_TEST(gbuf_raise_next_id_never_lowers);
+    RUN_TEST(parallel_full_index_keeps_edge_ids_unique);
+    RUN_TEST(parallel_closure_repair_syncs_ids_through_the_helper);
 
     /* Parallel pipeline parity tests */
     RUN_TEST(parallel_node_count);

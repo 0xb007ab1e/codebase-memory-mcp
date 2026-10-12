@@ -1742,7 +1742,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             free_incremental_result_cache(cache, ci);
             return rc;
         }
-        cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
+        cbm_pipeline_sync_next_id(ctx->gbuf, &shared_ids);
 
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         rc = cbm_build_registry_from_cache(ctx, changed_files, ci, cache);
@@ -1902,7 +1902,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         }
         cbm_log_info("pass.timing", "pass", "incr_resolve", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
-        cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
+        cbm_pipeline_sync_next_id(ctx->gbuf, &shared_ids);
         free_incremental_result_cache(cache, ci);
         if (legacy_cross_arena_live) {
             free(all_defs); /* array returned by the existing collect helper */
