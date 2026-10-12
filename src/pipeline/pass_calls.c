@@ -457,10 +457,11 @@ static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, c
 
 /* Insert an edge, splicing the call-site line (,"line":N) in before the closing
  * brace when one was captured. Mirrors finalize_and_emit() on the parallel path
- * so CALLS edges carry their source line regardless of resolution path. Restricted
- * to CALLS: route/config edge props feed full-only predump passes
- * (create_route_nodes/create_data_flows), so altering them desyncs full vs
- * incremental indexing. */
+ * so CALLS edges carry their source line regardless of resolution path. Line and
+ * args here are restricted to CALLS; HTTP_CALLS / ASYNC_CALLS props are finished
+ * by the parallel formatter itself (emit_http_async_edge), because route/service
+ * edge props feed full-only predump passes (create_route_nodes /
+ * create_data_flows) and must not differ between the two passes. */
 /* Append a ,"args":[{"i":0,"e":"<expr>","v":"<value>"},...] field onto a CALLS
  * edge's JSON props (the props buffer ends in '}'). The sequential pass omitted
  * this, so data_flow mode had no argument expressions to surface for small
@@ -585,8 +586,10 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
      * emit_http_async_service_edge: the old single format string closed the
      * method value's quote but not the broker's, emitting
      * "broker":"bullmq} on EVERY brokered ASYNC_CALLS edge — and its fixup
-     * only handled truncation, which never fires in the normal case (#898). */
-    char props[CBM_SZ_512];
+     * only handled truncation, which never fires in the normal case (#898).
+     * The call's args and the closing brace come from the parallel path's own
+     * formatter, so a service edge is byte-identical whichever pass emits it. */
+    char props[CBM_SZ_2K];
     int n = snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"", esc_callee,
                      esc_url);
     if (method && n > 0 && (size_t)n < sizeof(props)) {
@@ -595,11 +598,8 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     if (broker && n > 0 && (size_t)n < sizeof(props)) {
         n += snprintf(props + n, sizeof(props) - (size_t)n, ",\"broker\":\"%s\"", broker);
     }
-    if (n > 0 && (size_t)n < sizeof(props) - 1) {
-        props[n] = '}';
-        props[n + 1] = '\0';
-    }
-    calls_emit_edge(ctx->gbuf, source->id, route_id, edge_type, props, sizeof(props), call);
+    cbm_pipeline_close_call_props(props, n, call, false);
+    cbm_gbuf_insert_edge(ctx->gbuf, source->id, route_id, edge_type, props);
 }
 
 /* Classify a resolved call and emit the appropriate edge. */
@@ -671,7 +671,8 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count, CBMLanguage lang,
-                               const CBMImportArray *imports, const char *route_mount) {
+                               const CBMImportArray *imports, const char *route_mount,
+                               const cbm_php_vendor_names_t *php_vendor) {
     const CBMResolvedCallArray *lsp_calls = &result->resolved_calls;
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
     if (!source_node) {
@@ -683,6 +684,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
     const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_in_graph(
         lsp_calls, call, allow_tail, ctx->gbuf, ctx->project_name);
+    /* #1186: a PHP call on a vendor type (`new Request`, or a receiver the LSP
+     * typed as an imported vendor class) takes the LSP result or no target: a
+     * same-named project symbol found by name alone is never the vendor's.
+     * Service/route classification below still runs. Mirrors pass_parallel.c. */
+    bool php_vendor_call = cbm_pipeline_php_vendor_call(php_vendor, result, call) ||
+                           cbm_pipeline_lsp_external_receiver(lsp);
     if (lsp) {
         bool exact_external_target = call->requires_lsp_resolution &&
                                      cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
@@ -750,14 +757,19 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         emit_http_async_edge(ctx, &routed, source_node, NULL, &svc_res, CBM_SVC_HTTP, false);
         return SKIP_ONE;
     }
-    cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
+    /* A PHP call on a proven vendor class is classified by that class
+     * (#1186): it skips the registry below, so the route-verb fallback would
+     * otherwise mint a route registration for `GuzzleClient::get('/x')`. An
+     * LSP row with a graph target returned above. MUST match pass_parallel.c. */
+    cbm_svc_kind_t csvc;
+    const char *svc_name = cbm_pipeline_service_name(call, lsp, &csvc);
     if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
         const char *cu = call->first_string_arg;
         bool chas_url = cu && cu[0] != '\0' &&
                         (cu[0] == '/' || strstr(cu, "://") != NULL ||
                          (csvc == CBM_SVC_ASYNC && strlen(cu) > PAIR_LEN));
         if (chas_url) {
-            cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+            cbm_resolution_t svc_res = {.qualified_name = svc_name,
                                         .confidence = PC_SVC_PATTERN_CONF,
                                         .strategy = "service_pattern",
                                         .candidate_count = 0};
@@ -774,7 +786,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     bool rust_external = lsp && cbm_pipeline_rust_external_target(
                                     lang, lsp->strategy, lsp->callee_qn, ctx->project_name);
     cbm_resolution_t res = {0};
-    if (!rust_external) {
+    if (!rust_external && !php_vendor_call) {
         res = cbm_registry_resolve_lang(ctx->registry, call->callee_name, module_qn, imp_keys,
                                         imp_vals, imp_count, lang);
         /* Cross-language veto: a name-only guess never binds another
@@ -1147,6 +1159,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         const char **imp_vals = NULL;
         int imp_count = 0;
         build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        cbm_php_vendor_names_t php_vendor;
+        cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
 
         /* Compute module QN for same-module resolution (directory-based for
          * Java/Go so it matches their def-node QNs in the registry). */
@@ -1166,7 +1180,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             }
             total_calls++;
             if (resolve_single_call(ctx, call, result, rel, module_qn, imp_keys, imp_vals,
-                                    imp_count, files[i].language, &result->imports, route_mount)) {
+                                    imp_count, files[i].language, &result->imports, route_mount,
+                                    &php_vendor)) {
                 resolved++;
             } else {
                 unresolved++;
@@ -1174,6 +1189,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         }
 
         free(module_qn);
+        cbm_pipeline_php_vendor_names_free(&php_vendor);
         free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);

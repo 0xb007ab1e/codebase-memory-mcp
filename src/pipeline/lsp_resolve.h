@@ -27,6 +27,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 #include "pipeline/pipeline.h" /* cbm_registry_unique_field_qn, cbm_resolution_t */
+#include "service_patterns.h"  /* cbm_service_pattern_match for cbm_pipeline_service_name */
 
 #include <ctype.h>
 #include <stdio.h>
@@ -331,6 +332,34 @@ static inline int cbm_pipeline_invocation_site_rank(const CBMResolvedCall *resol
         return 0;
     }
     return call->requires_lsp_resolution || call->source_origin != resolved->source_origin ? 0 : 1;
+}
+
+/* A resolver row that proves the call's receiver is a type OUTSIDE the project:
+ * PHP `$r->m()` / `R::m()` where `R` is imported from a vendor namespace
+ * (#1186). When its target has no graph node, it rules out every name-only
+ * fallback: the method of a vendor class is not a same-named project method. */
+static inline bool cbm_pipeline_lsp_external_receiver(const CBMResolvedCall *resolved) {
+    return resolved && resolved->strategy &&
+           strcmp(resolved->strategy, "php_external_receiver") == 0;
+}
+
+/* The service-pattern name of a call: its callee text, or, when that names no
+ * service and the LSP proved the receiver a vendor class, the vendor method
+ * (`GuzzleClient::get` -> `GuzzleHttp.Client.get`). The extractor names a
+ * scoped call by its method alone, and such a call never reaches the
+ * registry, so the vendor class is its only service evidence (#1186). */
+static inline const char *cbm_pipeline_service_name(const CBMCall *call,
+                                                    const CBMResolvedCall *external,
+                                                    cbm_svc_kind_t *kind) {
+    *kind = cbm_service_pattern_match(call->callee_name);
+    if (*kind == CBM_SVC_NONE && cbm_pipeline_lsp_external_receiver(external) &&
+        external->callee_qn && external->callee_qn[0]) {
+        *kind = cbm_service_pattern_match(external->callee_qn);
+        if (*kind != CBM_SVC_NONE) {
+            return external->callee_qn;
+        }
+    }
+    return call->callee_name;
 }
 
 static inline bool cbm_pipeline_invocation_reason_join_strategy(const char *strategy) {

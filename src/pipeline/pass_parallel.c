@@ -1832,20 +1832,25 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
         free(file_qn);
         return 0;
     }
-    for (int j = 0; j < result->imports.count; j++) {
-        CBMImport *imp = &result->imports.items[j];
-        if (!imp->module_path) {
-            continue;
-        }
-        const cbm_gbuf_node_t *target =
-            cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
-        if (target && target->id != source_node->id) {
-            char esc_ln[CBM_SZ_128];
-            cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
-            char imp_props[CBM_SZ_256];
-            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
-            cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
-            count++;
+    if (cbm_language_for_filename(rel) == CBM_LANG_PHP) {
+        count = cbm_pipeline_php_create_import_edges(ctx, result, rel, file_qn, source_node,
+                                                     namespace_map);
+    } else {
+        for (int j = 0; j < result->imports.count; j++) {
+            CBMImport *imp = &result->imports.items[j];
+            if (!imp->module_path) {
+                continue;
+            }
+            const cbm_gbuf_node_t *target =
+                cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
+            if (target && target->id != source_node->id) {
+                char esc_ln[CBM_SZ_128];
+                cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
+                char imp_props[CBM_SZ_256];
+                snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
+                cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
+                count++;
+            }
         }
     }
     free(file_qn);
@@ -2243,13 +2248,13 @@ static const char *find_route_path_in_args(const CBMCall *call, const char **out
     return found;
 }
 
-/* Build props JSON, append args, close brace, emit edge. */
-static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
-                              const char *edge_type, char *props, int n, const CBMCall *call) {
+/* Append the call's args (and, for CALLS, its line) to props and close the
+ * brace. Shared with the sequential pass, whose service edges must carry the
+ * same bytes (pass_calls.c emit_http_async_edge). */
+void cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool with_line) {
     if (n > 0 && (size_t)n < CBM_SZ_2K - PP_ESC_SPACE) {
         size_t pos = append_args_json(props, CBM_SZ_2K, (size_t)n, call);
-        if (call->start_line > 0 && strcmp(edge_type, "CALLS") == 0 &&
-            pos < CBM_SZ_2K - PP_LINE_MARGIN) {
+        if (with_line && call->start_line > 0 && pos < CBM_SZ_2K - PP_LINE_MARGIN) {
             int ln = snprintf(props + pos, CBM_SZ_2K - pos, ",\"line\":%d", call->start_line);
             if (ln > 0) {
                 pos += (size_t)ln;
@@ -2260,6 +2265,12 @@ static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
             props[pos + SKIP_ONE] = '\0';
         }
     }
+}
+
+/* Build props JSON, append args, close brace, emit edge. */
+static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
+                              const char *edge_type, char *props, int n, const CBMCall *call) {
+    cbm_pipeline_close_call_props(props, n, call, strcmp(edge_type, "CALLS") == 0);
     cbm_gbuf_insert_edge(gbuf, src_id, tgt_id, edge_type, props);
 }
 
@@ -3029,7 +3040,8 @@ static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, const CB
 /* Resolve calls for one file and emit CALLS/HTTP_CALLS/ASYNC_CALLS edges. */
 static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
-                               const char **imp_vals, int imp_count, CBMLanguage lang) {
+                               const char **imp_vals, int imp_count, CBMLanguage lang,
+                               const cbm_php_vendor_names_t *php_vendor) {
     /* Framework mount of this file's routes (Laravel 11+ withRouting, #1146). */
     char route_mount[CBM_SZ_128];
     cbm_laravel_file_route_mount(rc->repo_path, rel, lang, result, route_mount,
@@ -3198,10 +3210,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * node. The textual registry would bind it to a same-named project
          * method instead, so it must not run for such a row. Mirrors
          * pass_calls.c; the service fallbacks below still see the call. */
+        bool php_vendor_call = cbm_pipeline_php_vendor_call(php_vendor, result, call) ||
+                               (lsp && !lsp_target && cbm_pipeline_lsp_external_receiver(lsp));
         bool rust_external = lsp && cbm_pipeline_rust_external_target(
                                         lang, lsp->strategy, lsp->callee_qn, rc->project_name);
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
-            !rust_external) {
+            !rust_external && !php_vendor_call) {
             res = cbm_registry_resolve_lang(rc->registry, call->callee_name, module_qn, imp_keys,
                                             imp_vals, imp_count, lang);
         }
@@ -3319,14 +3333,19 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                          CBM_SVC_HTTP, client_url);
             continue;
         }
-        cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
+        /* A PHP call on a proven vendor class is classified by that class
+         * (#1186): it skipped the registry above, so the route-verb fallback
+         * would otherwise mint a route registration for
+         * `GuzzleClient::get('/x')`. MUST match pass_calls.c. */
+        cbm_svc_kind_t csvc;
+        const char *svc_name = cbm_pipeline_service_name(call, lsp_target ? NULL : lsp, &csvc);
         if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
             const char *cu = call->first_string_arg;
             bool chas_url = cu && cu[0] != '\0' &&
                             (cu[0] == '/' || strstr(cu, "://") != NULL ||
                              (csvc == CBM_SVC_ASYNC && strlen(cu) > PP_ESC_SPACE));
             if (chas_url) {
-                cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+                cbm_resolution_t svc_res = {.qualified_name = svc_name,
                                             .confidence = PP_HALF_CONF,
                                             .strategy = "service_pattern"};
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
@@ -3467,7 +3486,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
 static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                 CBMFileResult *result, const char *rel, const char *module_qn,
                                 const char **imp_keys, const char **imp_vals, int imp_count,
-                                CBMLanguage lang) {
+                                CBMLanguage lang, const cbm_php_vendor_names_t *php_vendor) {
     cbm_pipeline_lsp_reference_index_t reference_index = {0};
     bool reference_index_ready =
         cbm_pipeline_lsp_reference_index_build(&result->resolved_calls, &reference_index);
@@ -3546,6 +3565,11 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             /* Exact semantic ownership beats textual name fallback even when
              * the semantic target is not materialized in this graph. */
             if (semantic_reference) {
+                continue;
+            }
+            /* #1186: a PHP name imported from a vendor namespace is not the
+             * same-named project symbol. Mirrors pass_usages.c. */
+            if (cbm_pipeline_php_vendor_usage(php_vendor, result, usage)) {
                 continue;
             }
             /* SQL usages are FROM/JOIN lineage refs and may bind Table/View
@@ -3727,11 +3751,18 @@ typedef struct {
 static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                  const CBMDefinition *def, const cbm_gbuf_node_t *node,
                                  const pp_file_scope_t *fs, const char *mq, const char **ik,
-                                 const char **iv, int ic) {
+                                 const char **iv, int ic,
+                                 const cbm_php_vendor_names_t *php_vendor) {
     if (!def->base_classes) {
         return;
     }
     for (int b = 0; def->base_classes[b]; b++) {
+        /* #1186: `extends Request` with `use Saloon\Http\Request` names the
+         * vendor class, never a same-named project class. Mirrors
+         * pass_semantic.c. */
+        if (cbm_pipeline_php_vendor_bound(php_vendor, def->base_classes[b])) {
+            continue;
+        }
         const char *bqn =
             resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic, fs->lang);
         /* Same external-base gate as the sequential semantic pass. */
@@ -3827,7 +3858,8 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
 static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                   CBMFileResult *result, const char *rel, CBMLanguage lang,
                                   const char *module_qn, const char **imp_keys,
-                                  const char **imp_vals, int imp_count) {
+                                  const char **imp_vals, int imp_count,
+                                  const cbm_php_vendor_names_t *php_vendor) {
     const pp_file_scope_t fs = {&result->imports, rel, lang};
     for (int d = 0; d < result->defs.count; d++) {
         CBMDefinition *def = &result->defs.items[d];
@@ -3838,7 +3870,8 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!node) {
             continue;
         }
-        resolve_def_inherits(rc, ws, def, node, &fs, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_def_inherits(rc, ws, def, node, &fs, module_qn, imp_keys, imp_vals, imp_count,
+                             php_vendor);
         resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count, lang);
     }
     for (int t = 0; t < result->impl_traits.count; t++) {
@@ -4121,6 +4154,9 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                                  &imp_vals, &imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_import_map, extract_now_ns() - _imp_t0,
                                   memory_order_relaxed);
+        cbm_php_vendor_names_t php_vendor;
+        cbm_pipeline_php_vendor_names_build(rc->main_gbuf, rc->project_name, rel, result,
+                                            &php_vendor);
 
         /* Per-file is_import_reachable memoization. Spans all 5 resolve
          * sub-passes (calls/usages/throws/rw/semantic) which all flow
@@ -4187,10 +4223,10 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                  * this file, not to a stale extraction marker. */
                 cbm_index_mark_start(rel);
                 bool had_error = result->has_error;
-                cbm_pxc_dispatch_file(lang, result, lsp_source, lsp_source_len, rel, def_module,
-                                      rc->cross_registries, rc->module_def_index, rc->all_defs,
-                                      rc->def_count, imp_keys, imp_vals, imp_count,
-                                      pp_rust_shared_registry_get, rc);
+                cbm_pxc_dispatch_file_with_php_bindings(
+                    lang, result, lsp_source, lsp_source_len, rel, def_module, rc->cross_registries,
+                    rc->module_def_index, rc->all_defs, rc->def_count, imp_keys, imp_vals,
+                    imp_count, pp_rust_shared_registry_get, rc, &php_vendor);
                 cbm_index_mark_done(rel);
                 if (!had_error && result->has_error && result->error_msg &&
                     (strcmp(result->error_msg, CBM_C_LSP_MEMO_ERROR) == 0 ||
@@ -4247,13 +4283,15 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* ── CALLS resolution ──────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_calls(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang);
+        resolve_file_calls(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang,
+                           &php_vendor);
         atomic_fetch_add_explicit(&rc->time_ns_calls, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 
         /* ── USAGE resolution ──────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_usages(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang);
+        resolve_file_usages(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang,
+                            &php_vendor);
         atomic_fetch_add_explicit(&rc->time_ns_usages, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 
@@ -4270,7 +4308,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* ── INHERITS + DECORATES + IMPLEMENTS ──────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_semantic(rc, ws, result, rel, lang, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_file_semantic(rc, ws, result, rel, lang, module_qn, imp_keys, imp_vals, imp_count,
+                              &php_vendor);
         atomic_fetch_add_explicit(&rc->time_ns_semantic, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 
@@ -4286,6 +4325,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         cbm_registry_resolve_cache_end();
 
         free(module_qn);
+        cbm_pipeline_php_vendor_names_free(&php_vendor);
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
 
         atomic_fetch_add_explicit(&rc->time_ns_total_loop, extract_now_ns() - _loop_t0,

@@ -158,6 +158,9 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
     cbm_pipeline_lsp_field_index_t field_index = {0};
     bool field_index_ready =
         cbm_pipeline_lsp_field_index_build(&result->resolved_calls, &field_index);
+    /* imp_keys is the IMPORTS-edge map (cbm_pxc_build_import_map). */
+    cbm_php_vendor_names_t php_vendor;
+    cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
         if (!usage->ref_name) {
@@ -238,6 +241,11 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (semantic_reference) {
                 continue;
             }
+            /* #1186: a PHP name imported from a vendor namespace is not the
+             * same-named project symbol. Mirrors pass_parallel.c. */
+            if (cbm_pipeline_php_vendor_usage(&php_vendor, result, usage)) {
+                continue;
+            }
             /* SQL usages are FROM/JOIN lineage refs and may bind Table/View
              * targets (cbm_registry_resolve_lineage); every other language
              * resolves through the default variant, whose central relation
@@ -294,6 +302,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
     }
     cbm_pipeline_lsp_reference_index_free(&reference_index);
     cbm_pipeline_lsp_field_index_free(&field_index);
+    cbm_pipeline_php_vendor_names_free(&php_vendor);
     return resolved;
 }
 

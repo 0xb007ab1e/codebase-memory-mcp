@@ -1024,10 +1024,20 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
 
     int metadata_count =
         (lang == CBM_LANG_PYTHON || lang == CBM_LANG_KOTLIN) && result ? result->imports.count : 0;
-    if (edge_count == 0 && metadata_count == 0)
+    /* A completed PHP binding snapshot can establish a genuinely empty map.
+     * The ordinary map remains a compatibility projection; only the separate
+     * typed snapshot may prove that an import was left unresolved. */
+    cbm_php_vendor_names_t php_bindings = {0};
+    if (lang == CBM_LANG_PHP)
+        cbm_pipeline_php_vendor_names_build(gbuf, project_name, rel_path, result, &php_bindings);
+    bool authoritative_empty = php_bindings.targets != NULL;
+    cbm_pipeline_php_vendor_names_free(&php_bindings);
+    if (edge_count == 0 && metadata_count == 0 && !authoritative_empty)
         return 0;
 
     size_t capacity = (size_t)edge_count + (size_t)metadata_count;
+    if (capacity == 0)
+        capacity = 1;
     const char **keys = (const char **)calloc(capacity, sizeof(const char *));
     const char **vals = (const char **)calloc(capacity, sizeof(const char *));
     if (!keys || !vals) {
@@ -1236,6 +1246,45 @@ void cbm_pxc_thread_scratch_end(void) {
  * resolved very many cross-calls turned the whole append into O(n^2) and could
  * peg a core for minutes (observed: an index hung in pxc_append_results/strcmp).
  * The key strings live in a scratch arena that is destroyed after the table. */
+/* Replace the records of `src`'s exact parser occurrence with `src`. The
+ * occurrence keeps ONE record: every earlier record there is superseded by
+ * the same evidence, and rewriting each of them would leave identical copies
+ * that the dedup table in pxc_append_results only indexes, never collapses. */
+static void pxc_supersede_occurrence(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
+                                     const CBMResolvedCall *src) {
+    bool replaced = false;
+    int kept = 0;
+    for (int i = 0; i < dst_calls->count; i++) {
+        const CBMResolvedCall *cur = &dst_calls->items[i];
+        bool same_site = cur->caller_qn && cur->kind == src->kind &&
+                         cur->site_start_byte == src->site_start_byte &&
+                         cur->site_end_byte == src->site_end_byte &&
+                         cur->source_origin == src->source_origin &&
+                         strcmp(cur->caller_qn, src->caller_qn) == 0;
+        if (same_site && replaced) {
+            continue; /* dropped: the occurrence already holds the evidence */
+        }
+        if (kept != i) {
+            dst_calls->items[kept] = *cur;
+        }
+        CBMResolvedCall *dst = &dst_calls->items[kept++];
+        if (!same_site) {
+            continue;
+        }
+        replaced = true;
+        dst->caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
+        dst->callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
+        dst->strategy = cbm_arena_strdup(dst_arena, src->strategy);
+        dst->confidence = src->confidence;
+        dst->reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
+        dst->kind = src->kind;
+        dst->site_start_byte = src->site_start_byte;
+        dst->site_end_byte = src->site_end_byte;
+        dst->source_origin = src->source_origin;
+    }
+    dst_calls->count = kept;
+}
+
 static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
                                const CBMResolvedCallArray *src_out) {
     if (!dst_calls || !src_out)
@@ -1250,32 +1299,18 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
      * proves that `member` is a declared Cargo workspace member, replace only
      * records for that exact parser occurrence before constructing the dedup
      * table. This preserves distinct same-named calls at other spans while
-     * preventing the stale local result from out-ranking manifest evidence. */
+     * preventing the stale local result from out-ranking manifest evidence.
+     * PHP external-receiver evidence likewise supersedes a speculative local
+     * row at that exact occurrence after complete typed import classification. */
     for (int j = 0; j < src_out->count; j++) {
         const CBMResolvedCall *src = &src_out->items[j];
-        if (!src->strategy || strcmp(src->strategy, "lsp_cross_crate") != 0 || !src->caller_qn ||
-            !src->callee_qn || src->site_end_byte <= src->site_start_byte) {
+        if (!src->strategy ||
+            (strcmp(src->strategy, "lsp_cross_crate") != 0 &&
+             strcmp(src->strategy, "php_external_receiver") != 0) ||
+            !src->caller_qn || !src->callee_qn || src->site_end_byte <= src->site_start_byte) {
             continue;
         }
-        for (int i = 0; i < dst_calls->count; i++) {
-            CBMResolvedCall *dst = &dst_calls->items[i];
-            if (!dst->caller_qn || dst->kind != src->kind ||
-                dst->site_start_byte != src->site_start_byte ||
-                dst->site_end_byte != src->site_end_byte ||
-                dst->source_origin != src->source_origin ||
-                strcmp(dst->caller_qn, src->caller_qn) != 0) {
-                continue;
-            }
-            dst->caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
-            dst->callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
-            dst->strategy = cbm_arena_strdup(dst_arena, src->strategy);
-            dst->confidence = src->confidence;
-            dst->reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
-            dst->kind = src->kind;
-            dst->site_start_byte = src->site_start_byte;
-            dst->site_end_byte = src->site_end_byte;
-            dst->source_origin = src->source_origin;
-        }
+        pxc_supersede_occurrence(dst_arena, dst_calls, src);
     }
 
     for (int i = 0; i < dst_calls->count; i++) {
@@ -1473,6 +1508,14 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
                      const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
                      const char **imp_qns, int imp_count) {
+    cbm_pxc_run_one_with_php_bindings(lang, r, source, source_len, module_qn, defs, def_count,
+                                      imp_names, imp_qns, imp_count, NULL);
+}
+
+void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const char *source,
+                                       int source_len, const char *module_qn, CBMLSPDef *defs,
+                                       int def_count, const char **imp_names, const char **imp_qns,
+                                       int imp_count, const CBMPHPImportBindings *bindings) {
     TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
 
     CBMArena scratch;
@@ -1520,8 +1563,9 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
             cbm_py_lsp_record_failure(r, status);
     } break;
     case CBM_LANG_PHP:
-        cbm_run_php_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
-                              imp_qns, imp_count, tree, &out);
+        cbm_run_php_lsp_cross_with_bindings(&scratch, source, source_len, module_qn, defs,
+                                            def_count, imp_names, imp_qns, imp_count, tree, &out,
+                                            bindings);
         break;
     case CBM_LANG_JAVA:
         cbm_run_java_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
@@ -1628,6 +1672,19 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            int all_def_count, const char **imp_keys, const char **imp_vals,
                            int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
                            void *rust_shared_ctx) {
+    cbm_pxc_dispatch_file_with_php_bindings(lang, result, source, source_len, rel, def_module,
+                                            cross_registries, module_def_index, all_defs,
+                                            all_def_count, imp_keys, imp_vals, imp_count,
+                                            rust_shared_get, rust_shared_ctx, NULL);
+}
+
+void cbm_pxc_dispatch_file_with_php_bindings(
+    CBMLanguage lang, CBMFileResult *result, const char *source, int source_len, const char *rel,
+    const char *def_module, const CBMCrossLspRegistries *cross_registries,
+    const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs, int all_def_count,
+    const char **imp_keys, const char **imp_vals, int imp_count,
+    CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx,
+    const CBMPHPImportBindings *bindings) {
     if (result && result->lsp_skipped) {
         if (result->has_test_definition_owners) {
             cbm_pipeline_test_owner_error(result);
@@ -1800,8 +1857,9 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
             pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
         } else {
-            cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                            imp_keys, imp_vals, imp_count);
+            cbm_pxc_run_one_with_php_bindings(lang, result, source, source_len, def_module,
+                                              file_defs, file_def_count, imp_keys, imp_vals,
+                                              imp_count, bindings);
         }
     } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
         bool js;
@@ -1811,8 +1869,8 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
         cbm_pxc_run_one_ts(result, source, source_len, def_module, file_defs, file_def_count,
                            imp_keys, imp_vals, imp_count, js, jsx, dts);
     } else {
-        cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                        imp_keys, imp_vals, imp_count);
+        cbm_pxc_run_one_with_php_bindings(lang, result, source, source_len, def_module, file_defs,
+                                          file_def_count, imp_keys, imp_vals, imp_count, bindings);
     }
     free(filtered);
 }
@@ -2022,9 +2080,14 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
          * failure mode). */
         cbm_index_mark_start(files[i].rel_path);
         bool had_error = cache[i]->has_error;
-        cbm_pxc_dispatch_file(lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
-                              &cross_registries, module_def_index, all_defs, def_count, imp_keys,
-                              imp_vals, imp_count, NULL, NULL);
+        cbm_php_vendor_names_t php_bindings;
+        cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, files[i].rel_path,
+                                            cache[i], &php_bindings);
+        cbm_pxc_dispatch_file_with_php_bindings(
+            lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
+            &cross_registries, module_def_index, all_defs, def_count, imp_keys, imp_vals, imp_count,
+            NULL, NULL, &php_bindings);
+        cbm_pipeline_php_vendor_names_free(&php_bindings);
         cbm_index_mark_done(files[i].rel_path);
         if (!had_error && cache[i]->has_error && ctx->pipeline)
             cbm_pipeline_add_file_error(ctx->pipeline, files[i].rel_path, cache[i]->error_msg,
