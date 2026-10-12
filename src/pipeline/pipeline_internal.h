@@ -1056,6 +1056,14 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count);
 
+/* Sync the main buffer's id counter after a parallel extract or resolve.
+ * Merged worker nodes keep their shared ids, and merged edges take fresh ids
+ * from the main counter after the highest of them, so the main counter can
+ * end above the shared one. */
+void cbm_pipeline_sync_next_id(cbm_gbuf_t *gb, _Atomic int64_t *shared_ids);
+/* Test seam: runs on the syncing thread right before each such sync. */
+void cbm_pipeline_set_id_sync_hook_for_tests(void (*hook)(cbm_gbuf_t *, void *), void *ctx);
+
 /* Phase 3B: Serial registry build from cached extraction results.
  * Creates DEFINES, DEFINES_METHOD, and IMPORTS edges in ctx->gbuf.
  * Registers callable symbols (Function/Method/Class) in ctx->registry. */
@@ -1440,6 +1448,11 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
  * before the cancellation check + atomic replace. Not part of the public API. */
 void cbm_pipeline_set_before_publish_hook_for_tests(
     cbm_pipeline_t *p, void (*hook)(cbm_pipeline_t *, const char *, void *), void *ctx);
+/* Test seam: invoked with the complete graph buffer just before the full
+ * route dumps it (the dump releases the buffer's indexes). */
+void cbm_pipeline_set_before_dump_hook_for_tests(cbm_pipeline_t *p,
+                                                 void (*hook)(const cbm_gbuf_t *, void *),
+                                                 void *ctx);
 void cbm_pipeline_set_rename_hook_for_tests(cbm_pipeline_t *p,
                                             int (*hook)(const char *, const char *, void *),
                                             void *ctx);

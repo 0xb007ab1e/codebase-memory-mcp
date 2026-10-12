@@ -283,6 +283,9 @@ struct cbm_pipeline {
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
     void (*before_publish_hook)(cbm_pipeline_t *, const char *, void *);
     void *before_publish_hook_ctx;
+    /* Test-only: sees the complete graph buffer before the dump releases its indexes. */
+    void (*before_dump_hook)(const cbm_gbuf_t *, void *);
+    void *before_dump_hook_ctx;
     int (*rename_hook)(const char *, const char *, void *);
     void *rename_hook_ctx;
 };
@@ -1045,6 +1048,32 @@ void cbm_pipeline_set_before_publish_hook_for_tests(
         p->before_publish_hook = hook;
         p->before_publish_hook_ctx = ctx;
     }
+}
+
+void cbm_pipeline_set_before_dump_hook_for_tests(cbm_pipeline_t *p,
+                                                 void (*hook)(const cbm_gbuf_t *, void *),
+                                                 void *ctx) {
+    if (p) {
+        p->before_dump_hook = hook;
+        p->before_dump_hook_ctx = ctx;
+    }
+}
+
+static CBM_TLS void (*g_id_sync_hook)(cbm_gbuf_t *, void *);
+static CBM_TLS void *g_id_sync_hook_ctx;
+
+void cbm_pipeline_set_id_sync_hook_for_tests(void (*hook)(cbm_gbuf_t *, void *), void *ctx) {
+    g_id_sync_hook = hook;
+    g_id_sync_hook_ctx = ctx;
+}
+
+void cbm_pipeline_sync_next_id(cbm_gbuf_t *gb, _Atomic int64_t *shared_ids) {
+    if (g_id_sync_hook) {
+        g_id_sync_hook(gb, g_id_sync_hook_ctx);
+    }
+    /* Raise only: lowering it to the shared value handed the merged edges'
+     * ids out a second time. */
+    cbm_gbuf_raise_next_id(gb, atomic_load(shared_ids));
 }
 
 void cbm_pipeline_set_rename_hook_for_tests(cbm_pipeline_t *p,
@@ -2291,7 +2320,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         cbm_pipeline_spill_close(ctx);
         return rc != 0 ? rc : CBM_NOT_FOUND;
     }
-    cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
+    cbm_pipeline_sync_next_id(p->gbuf, &shared_ids);
     /* extract -> registry handoff: return the extract phase's freed-but-retained
      * allocator pages to the OS before registry_build allocates. On a 2x Linux
      * index the extract peak holds ~13 GB of reclaimable pages (peak_mb 20.7 vs
@@ -2465,7 +2494,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         }
         free(def_modules);
     }
-    cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
+    cbm_pipeline_sync_next_id(p->gbuf, &shared_ids);
     cbm_pipeline_extract_infra_routes(ctx, p->gbuf, files, cache, file_count);
     cbm_pipeline_process_infra_bindings(ctx, p->gbuf, files, cache, file_count);
     for (int i = 0; i < file_count; i++) {
@@ -3415,6 +3444,9 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
      * release_gbuf_indexes(), which frees node_by_qn (graph_buffer.c), after
      * which cbm_gbuf_node_count() returns 0. Reading these post-dump left
      * committed_nodes at 0, so the #334 plausibility gate never fired. */
+    if (p->before_dump_hook) {
+        p->before_dump_hook(p->gbuf, p->before_dump_hook_ctx);
+    }
     p->committed_nodes = cbm_gbuf_node_count(p->gbuf);
     p->committed_edges = cbm_gbuf_edge_count(p->gbuf);
     int rc = publish_generation_impl(&generation, p->frozen ? p : NULL);
