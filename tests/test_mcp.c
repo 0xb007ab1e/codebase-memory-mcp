@@ -15257,6 +15257,157 @@ TEST(tool_index_repository_resolves_root_path_from_project_name_issue1211) {
     PASS();
 }
 
+/* A Go config family per subject (parse / load / validate) and a README
+ * section about the Mail one: enough for doc -> code candidates. */
+static void doccand_fixture(const char *repo) {
+    static const char *const subjects[] = {"User", "Server", "Cache", "Mail"};
+    for (size_t i = 0; i < sizeof(subjects) / sizeof(subjects[0]); i++) {
+        const char *s = subjects[i];
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s_config.go", repo, s);
+        char body[2048];
+        snprintf(body, sizeof(body),
+                 "package main\n\n"
+                 "// Parse%sConfig reads the %s config file and returns the parsed %s config.\n"
+                 "func Parse%sConfig(path string) (*%sConfig, error) {\n"
+                 "\treturn Load%sConfig(path)\n}\n\n"
+                 "// Load%sConfig loads the %s config from disk and validates it.\n"
+                 "func Load%sConfig(path string) (*%sConfig, error) {\n"
+                 "\tcfg := &%sConfig{}\n\tValidate%sConfig(cfg)\n\treturn cfg, nil\n}\n\n"
+                 "// Validate%sConfig checks the %s config for missing fields.\n"
+                 "func Validate%sConfig(cfg *%sConfig) bool {\n\treturn cfg != nil\n}\n\n"
+                 "type %sConfig struct{ Name string }\n",
+                 s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s);
+        th_write_file(path, body);
+    }
+    char readme[512];
+    snprintf(readme, sizeof(readme), "%s/README.md", repo);
+    th_write_file(readme, "# Mail configuration\n\n"
+                          "The mail config file is parsed by ParseMailConfig, which loads the mail "
+                          "config from disk and validates the mail config fields before anything "
+                          "reads them. Missing fields fail the validation, and the parsed mail "
+                          "config can be written back to disk afterwards.\n");
+}
+
+/* The one project DB in a private cache (not _config.db or activity.db), so
+ * the test does not depend on how the server canonicalized the repo path. */
+static bool doccand_project_db(const char *cache, char *out, size_t out_size) {
+    cbm_dir_t *d = cbm_opendir(cache);
+    if (!d) {
+        return false;
+    }
+    bool found = false;
+    cbm_dirent_t *e;
+    while (!found && (e = cbm_readdir(d)) != NULL) {
+        size_t len = strlen(e->name);
+        if (!e->is_dir && len > 3 && strcmp(e->name + len - 3, ".db") == 0 &&
+            strcmp(e->name, "_config.db") != 0 && strcmp(e->name, "activity.db") != 0) {
+            snprintf(out, out_size, "%s/%s", cache, e->name);
+            found = true;
+        }
+    }
+    cbm_closedir(d);
+    return found;
+}
+
+/* Remove the project DB (and its WAL/SHM) so the next index is a full one. */
+static void doccand_clear(const char *cache) {
+    char path[CBM_SZ_4K];
+    if (!doccand_project_db(cache, path, sizeof(path))) {
+        return;
+    }
+    char side[CBM_SZ_4K + 8];
+    snprintf(side, sizeof(side), "%s-wal", path);
+    cbm_unlink(side);
+    snprintf(side, sizeof(side), "%s-shm", path);
+    cbm_unlink(side);
+    cbm_unlink(path);
+}
+
+/* The project's doc_link_candidates rows (0 without the table); -1 on an
+ * error. */
+static int doccand_rows(const char *cache) {
+    char path[CBM_SZ_4K];
+    if (!doccand_project_db(cache, path, sizeof(path))) {
+        return -1;
+    }
+    cbm_store_t *s = cbm_store_open_path(path);
+    if (!s) {
+        return -1;
+    }
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT count(*) FROM sqlite_master WHERE type='table' AND "
+                           "name='doc_link_candidates'",
+                           -1, &st, NULL) == SQLITE_OK) {
+        bool has_table = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) > 0;
+        sqlite3_finalize(st);
+        st = NULL;
+        n = 0;
+        if (has_table && sqlite3_prepare_v2(db, "SELECT count(*) FROM doc_link_candidates", -1,
+                                            &st, NULL) == SQLITE_OK) {
+            n = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+            sqlite3_finalize(st);
+        }
+    }
+    cbm_store_close(s);
+    return n;
+}
+
+/* One fresh full index (the project DB removed first, so no incremental route
+ * can keep earlier rows); returns the candidate rows, -1 on an index error. */
+static int doccand_index(cbm_mcp_server_t *srv, const char *cache, const char *repo,
+                         const char *extra) {
+    doccand_clear(cache);
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"%s}", repo, extra);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool ok = resp && response_contains_json_fragment(resp, "\"status\":\"indexed\"");
+    free(resp);
+    return ok ? doccand_rows(cache) : -1;
+}
+
+/* index_repository doc_candidates: an explicit false stores no candidate
+ * rows; without the argument the doc_candidates setting decides (default on,
+ * off stores none); an explicit true wins over the setting. */
+TEST(tool_index_repository_doc_candidates_switch) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-doccand-repo-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-doccand-cache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    doccand_fixture(repo);
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    int explicit_off = doccand_index(srv, cache, repo, ",\"doc_candidates\":false");
+    int setting_default = doccand_index(srv, cache, repo, "");
+    cbm_config_set(cfg, CBM_CONFIG_DOC_CANDIDATES, "false");
+    int setting_off = doccand_index(srv, cache, repo, "");
+    int explicit_on = doccand_index(srv, cache, repo, ",\"doc_candidates\":true");
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_rmtree(cache);
+    th_rmtree(repo);
+    ASSERT_EQ(explicit_off, 0);
+    ASSERT_GT(setting_default, 0);
+    ASSERT_EQ(setting_off, 0);
+    ASSERT_GT(explicit_on, 0);
+    PASS();
+}
+
 /* Same gap, opposite outcome: a project name that was never indexed has no
  * stored root_path to resolve, so it must still fail with the same clear
  * "repo_path is required" error rather than a resolver crash or silent
@@ -24535,6 +24686,7 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_set_sections_is_advertised);
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_resolves_root_path_from_project_name_issue1211);
+    RUN_TEST(tool_index_repository_doc_candidates_switch);
     RUN_TEST(tool_index_repository_unknown_project_name_still_requires_repo_path);
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
     RUN_TEST(index_repository_relative_path_uses_explicit_session_root);

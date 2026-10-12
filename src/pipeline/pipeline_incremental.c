@@ -3172,7 +3172,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             .doc_link_rows = doc_rows,
             .doc_link_row_count = doc_row_count,
             .doc_links_failed = doc_failed,
-            .doc_candidates_in_place = true, /* the clone keeps the previous rows */
+            /* The clone keeps the previous rows; with doc_candidates off they
+             * are replaced by none, so turning it off leaves no stale rows. */
+            .doc_candidates_in_place = cbm_pipeline_doc_candidates_enabled(p),
         };
         cbm_store_close(staging);
         staging = NULL;

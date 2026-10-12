@@ -19084,14 +19084,10 @@ static int doc_candidate_rows_for(cbm_store_t *s, const char *heading, char *top
     return ok ? n : -1;
 }
 
-/* Doc -> code candidates end to end: a full index publishes a section's
- * calibrated candidates (the best match first, a test function never, a
- * changelog section none), and a delta-route reindex keeps them -- its proxy
- * buffer cannot recompute them, so the clone's rows must survive. */
-TEST(pipeline_doc_candidates_published_and_kept_by_delta) {
-    char tmp[256];
-    snprintf(tmp, sizeof(tmp), "/tmp/cbm_doccand_XXXXXX");
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+/* The doc -> code candidate fixture: six Go config families, a test whose
+ * comment is the section's own text, and a README with a Mail-configuration
+ * section and a Changelog section. */
+static void write_doc_candidate_fixture(const char *tmp) {
     static const char *const subjects[] = {"User", "Server", "Client", "Cache", "Queue", "Mail"};
     for (size_t i = 0; i < sizeof(subjects) / sizeof(subjects[0]); i++) {
         char file[64];
@@ -19118,6 +19114,17 @@ TEST(pipeline_doc_candidates_published_and_kept_by_delta) {
                     "The mail config loader now validates missing fields and writes the mail "
                     "config back to disk after parsing, so a parsed mail config file always "
                     "carries every field it needs.\n");
+}
+
+/* Doc -> code candidates end to end: a full index publishes a section's
+ * calibrated candidates (the best match first, a test function never, a
+ * changelog section none), and a delta-route reindex keeps them -- its proxy
+ * buffer cannot recompute them, so the clone's rows must survive. */
+TEST(pipeline_doc_candidates_published_and_kept_by_delta) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_doccand_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_doc_candidate_fixture(tmp);
     char db[512];
     snprintf(db, sizeof(db), "%s/doccand.db", tmp);
 
@@ -19160,6 +19167,135 @@ TEST(pipeline_doc_candidates_published_and_kept_by_delta) {
     cbm_store_close(s);
     ASSERT_EQ(mail_after, mail);
     ASSERT_STR_EQ(top_after, top);
+    th_rmtree(tmp);
+    cbm_pipeline_incremental_test_reset_faults();
+    PASS();
+}
+
+/* Every doc_link_candidates row in a store (0 without the table); -1 on an
+ * error. */
+static int doc_candidate_row_count(cbm_store_t *s) {
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT count(*) FROM sqlite_master WHERE type='table' AND "
+                           "name='doc_link_candidates'",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    bool has_table = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) > 0;
+    sqlite3_finalize(st);
+    if (!has_table) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(db, "SELECT count(*) FROM doc_link_candidates", -1, &st, NULL) !=
+        SQLITE_OK) {
+        return -1;
+    }
+    int n = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* doc_candidates off: the same repository indexed with the switch off has no
+ * candidate rows and exactly the nodes and edges of the default run, which has
+ * candidates (the default is on). */
+TEST(pipeline_doc_candidates_off_stores_none_and_keeps_graph) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_doccand_off_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_doc_candidate_fixture(tmp);
+    /* The databases live outside the indexed tree, so both runs discover the
+     * same files. */
+    char dbdir[256];
+    snprintf(dbdir, sizeof(dbdir), "/tmp/cbm_doccand_db_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(dbdir));
+    char db_on[512];
+    char db_off[512];
+    snprintf(db_on, sizeof(db_on), "%s/on.db", dbdir);
+    snprintf(db_off, sizeof(db_off), "%s/off.db", dbdir);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_on, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT(cbm_pipeline_doc_candidates_enabled(p));
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char project[512];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    p = cbm_pipeline_new(tmp, db_off, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_doc_candidates_enabled(p, false);
+    ASSERT(!cbm_pipeline_doc_candidates_enabled(p));
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *on = cbm_store_open_path(db_on);
+    cbm_store_t *off = cbm_store_open_path(db_off);
+    ASSERT_NOT_NULL(on);
+    ASSERT_NOT_NULL(off);
+    int rows_on = doc_candidate_row_count(on);
+    int rows_off = doc_candidate_row_count(off);
+    int nodes_on = cbm_store_count_nodes(on, project);
+    int nodes_off = cbm_store_count_nodes(off, project);
+    int edges_on = cbm_store_count_edges(on, project);
+    int edges_off = cbm_store_count_edges(off, project);
+    cbm_store_close(on);
+    cbm_store_close(off);
+    ASSERT_GT(rows_on, 0);
+    ASSERT_EQ(rows_off, 0);
+    ASSERT_GT(nodes_on, 0);
+    ASSERT_EQ(nodes_off, nodes_on);
+    ASSERT_EQ(edges_off, edges_on);
+    th_rmtree(tmp);
+    th_rmtree(dbdir);
+    cbm_pipeline_incremental_test_reset_faults();
+    PASS();
+}
+
+/* doc_candidates off on a delta-route reindex: the route that otherwise keeps
+ * the clone's candidate rows replaces them by none, so switching off leaves no
+ * stale candidates behind. */
+TEST(pipeline_doc_candidates_off_clears_rows_on_delta) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_doccand_delta_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_doc_candidate_fixture(tmp);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/doccand.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    int before = doc_candidate_row_count(s);
+    cbm_store_close(s);
+    ASSERT_GT(before, 0);
+
+    /* The same name-preserving edit as the delta test above: the closure
+     * repair route. */
+    char edited[512];
+    snprintf(edited, sizeof(edited), "%s/User_config.go", tmp);
+    FILE *ef = cbm_fopen(edited, "a");
+    ASSERT_NOT_NULL(ef);
+    (void)fputs("\n// edited after the first index\n", ef);
+    (void)fclose(ef);
+    cbm_pipeline_incremental_test_reset_faults();
+    p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_doc_candidates_enabled(p, false);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    cbm_pipeline_free(p);
+    s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    int after = doc_candidate_row_count(s);
+    cbm_store_close(s);
+    ASSERT_EQ(after, 0);
     th_rmtree(tmp);
     cbm_pipeline_incremental_test_reset_faults();
     PASS();
@@ -20507,6 +20643,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_semantic_pair_signals_never_change_the_graph);
     RUN_TEST(pipeline_semantic_edges_carry_p);
     RUN_TEST(pipeline_doc_candidates_published_and_kept_by_delta);
+    RUN_TEST(pipeline_doc_candidates_off_stores_none_and_keeps_graph);
+    RUN_TEST(pipeline_doc_candidates_off_clears_rows_on_delta);
     RUN_TEST(pipeline_doc_candidates_skip_exact_links_and_use_format_curves);
     RUN_TEST(pipeline_doc_candidates_home_position_and_kinds);
     RUN_TEST(pipeline_doc_candidates_diagram_family_curves);
