@@ -35,7 +35,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **162 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
 - **45 supported automatic/conditional client surfaces** — `install` configures detected clients and safely activates conditional clients only when their documented platform, marker, or explicit existing config path is present. See [Multi-Agent Support](#multi-agent-support) for the complete matrix and manual/UI-only boundaries.
-- **Built-in graph visualization** — 3D interactive UI at `localhost:9749`, served from the binary itself.
+- **CBM Atlas** — the built-in human interface at `localhost:9749`: a reading IDE over the index (explorer and read-only Monaco reader, a semantic twin that follows the caret, flow, bug-hunt and change-scope reading modes, the 3D galaxy, source-cited answers, project management), served from the binary itself.
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
 - **17 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
@@ -131,15 +131,30 @@ Package-manager setup (npm, PyPI, or Go) verifies and publishes a coherent priva
 
 The ordinary `cli` mode runs one command locally, but it is not disconnected from the daemon above: it connects to the shared coordination daemon — starting one if none is already running — for that same admission barrier plus per-project locks on graph mutations. Its connection is a `cli_session`: it never registers with the background watcher and never starts a UI, and it holds the admission lease only for the command's lifetime. If the command's own connection is what started the daemon, that daemon exits again once the command closes and no other session is attached; if a daemon was already running, the command simply joins and leaves it exactly as found. While the command is running, a temporary monitor separately lets activation cancel that operation and its supervised worker safely; the monitor exits with the command and never becomes a standing daemon. See [CLI Mode](#cli-mode) for details.
 
-### Graph Visualization UI
+### CBM Lens Beta — the human interface
 
-The graph UI is built into the binary — every install on every channel has it. Then run it:
+The MCP tools are the agent's interface to the code graph; **CBM Lens Beta** is the human's. It is built into the binary — every install on every channel has it:
 
 ```bash
 codebase-memory-mcp --ui=true --port=9749
 ```
 
 Open `http://localhost:9749` in your browser. The UI is owned by the shared coordination daemon, so concurrent agent sessions do not start duplicate HTTP servers.
+
+CBM Lens builds on **CodeAtlasWeb**, a reading IDE built by [Bernhard Jackiewicz](https://github.com/BernhardJackiewicz) on the CBM read surface (design and tracking in #1964). It runs air-gapped on loopback, reaches no cloud, and every panel names where its facts come from; what the index did not record is shown as a gap, never filled in with a guess.
+
+When something in CBM Lens does not load, the page has already written it down: its console output, uncaught errors and failed requests go to `${CBM_CACHE_DIR}/logs/ui.log` (default `~/.cache/codebase-memory-mcp/logs/ui.log`, one JSON line per entry, rotated once at 5 MiB). The projects panel (alt+p) shows the tail under "This server", `GET http://localhost:9749/api/ui-log?lines=200` returns it, and a bug report can attach the file.
+
+- **Explorer and reader** — the indexed file tree and a read-only Monaco reader whose source comes from the index.
+- **Semantic twin** — follows the caret: what the symbol under it holds, calls, raises and touches, as facts or as pseudocode, pitched at who is reading.
+- **Reading modes** — `[w]hy am I here` picks a way in (hunt a bug, scope a change, understand the project, pick an entry point); **flow** walks the calls in the order they run; **bug hunt** compares the expected path into a symbol with what `ingest_traces` observed; **change scope** shows what a change reaches and what covers it.
+- **Galaxy** — the persistent 3D graph with focus following in both directions, and a hierarchy view of the entry subgraph.
+- **Command line** — search by meaning while you type; a line ending in `?` builds a source-cited answer from indexed fact cards, with an optional local-model wording pass (a llama-server sidecar you start yourself; off by default, and no model or binary ships).
+- **Live agents** — an opt-in overlay of AI agents working in the same repository, fed by a loopback bridge over tool-hook events (`graph-ui/agents/`).
+- **`[p]rojects`** — index a repository, check or remove an index, edit the project's decision record, and see the server's processes and log.
+- **`[?]help`** — what it reads, what it cannot do, and every key it listens to, derived from the wiring itself.
+
+Open a project with `?project=<name>` in the address, or pick it in the projects panel. The frontend's own README, plan, honesty rules and recorded proof runs live under `graph-ui/`.
 
 ### Auto-Index
 

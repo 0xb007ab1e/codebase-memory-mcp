@@ -535,6 +535,23 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export(
     const char *source, int source_len, const char *project_name, const char *rel_path,
     const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table);
 
+/* Explicit per-class parse deadline for bounded extraction and ownership tests.
+ * Zero disables the parse deadline; production callers use the wrapper above. */
+CBMFileResult *cbm_pipeline_extract_objectscript_export_with_timeout(
+    const char *source, int source_len, const char *project_name, const char *rel_path,
+    const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table,
+    int64_t timeout_micros);
+
+/* Synchronous thread-local extraction seam for verifying timeout forwarding.
+ * NULL restores cbm_extract_file_ex; tests must restore it before asserting. */
+typedef CBMFileResult *(*cbm_objectscript_export_extractor_t)(const char *, int, CBMLanguage,
+                                                              const char *, const char *, int64_t,
+                                                              const char **, const char **,
+                                                              const CBMMacroTable *,
+                                                              const CBMReturnTypeTable *);
+void cbm_pipeline_set_objectscript_export_extractor_for_tests(
+    cbm_objectscript_export_extractor_t extractor);
+
 /* Materialize CONFIGURES edges from one extracted file's env-access carriers.
  * Shared by sequential definition processing and the parallel cache registry. */
 int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,

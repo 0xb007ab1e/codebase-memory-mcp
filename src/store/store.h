@@ -777,6 +777,23 @@ int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char
 
 /* Fetch/free the metadata paired with the current coverage row set. */
 int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverage_meta_t *out);
+
+/* ── Observed runtime calls (ingest_traces) ──────────────────────────
+ * Separate from the graph tables and keyed by qualified name: node ids are
+ * reassigned on reindex, names survive. A "label" identifies one run
+ * (e.g. "pytest 2026-08-27"); counts accumulate per (pair, label). */
+int cbm_store_observed_upsert_pair(cbm_store_t *s, const char *project, const char *caller_qn,
+                                   const char *callee_qn, const char *label, long long count);
+int cbm_store_observed_upsert_path(cbm_store_t *s, const char *project, const char *path_json,
+                                   const char *label, long long count);
+long long cbm_store_observed_pair_total(cbm_store_t *s, const char *project);
+int cbm_store_observed_evict_oldest_label(cbm_store_t *s, const char *project,
+                                          char **evicted_label_out);
+/* *count_out = 0 when never observed (absence is data, not an error);
+ * label/last_seen receive the NEWEST run's values. */
+int cbm_store_observed_lookup(cbm_store_t *s, const char *project, const char *caller_qn,
+                              const char *callee_qn, long long *count_out, char *label_buf,
+                              size_t label_cap, char *last_seen_buf, size_t last_seen_cap);
 void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta);
 
 /* Name of the derived miss-graph shadow project ("<project>::missed").
@@ -1217,7 +1234,8 @@ typedef struct {
  * the partition can no longer be coarsened. Refinement guarantees every
  * reported community is internally connected. The resolution parameter
  * controls granularity (higher -> more, smaller communities); 1.0 is standard.
- * Allocates *out (length *out_count == node_count); the caller frees it. */
+ * Allocates *out (length *out_count == node_count) in CBM_MEM_CLASS_OTHER;
+ * the caller releases it with cbm_free(CBM_MEM_CLASS_OTHER, *out). */
 int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                int edge_count, double resolution, cbm_louvain_result_t **out, int *out_count);
 

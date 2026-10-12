@@ -1427,10 +1427,9 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"check_index_coverage", true, false, true, false},
         {"detect_changes", true, false, true, false},
         {"manage_adr", false, true, false, false},
-        /* ingest_traces only validates and counts its input; it writes
-         * nothing, so it is read-only and idempotent until edge creation
-         * actually lands (#2118). */
-        {"ingest_traces", true, false, true, false},
+        /* Observation counts accumulate on retries, and ingestion can evict
+         * old runs to enforce retention. Both effects change stored data. */
+        {"ingest_traces", false, true, false, false},
     };
 
     char *json = cbm_mcp_tools_list();
@@ -1513,10 +1512,12 @@ static bool tool_in_list(const char *name, const char *const *list, size_t count
 TEST(mcp_tool_annotations_only_mutators_are_writable_issue2118) {
     /* Handlers that write user-visible state: index_repository (builds the
      * index), manage_adr (writes/overwrites ADR sections), delete_project
-     * (removes the index). Everything else must be read-only. */
-    static const char *const mutating[] = {"index_repository", "manage_adr", "delete_project"};
+     * (removes the index), ingest_traces (accumulates observations and evicts
+     * old runs). Everything else must be read-only. */
+    static const char *const mutating[] = {"index_repository", "manage_adr", "delete_project",
+                                           "ingest_traces"};
     /* Of those, only the ones that can remove/overwrite existing data. */
-    static const char *const destructive[] = {"manage_adr", "delete_project"};
+    static const char *const destructive[] = {"manage_adr", "delete_project", "ingest_traces"};
     const size_t n_mut = sizeof(mutating) / sizeof(mutating[0]);
     const size_t n_des = sizeof(destructive) / sizeof(destructive[0]);
 
@@ -1696,10 +1697,10 @@ TEST(mcp_get_architecture_aspects_schema_enum_pr560) {
     ASSERT_TRUE(yyjson_is_arr(enum_arr));
 
     /* The enum must be exactly the valid-token set — no more, no less. */
-    static const char *expected[] = {"all",      "overview",   "structure", "dependencies",
-                                     "routes",   "languages",  "packages",  "entry_points",
-                                     "hotspots", "boundaries", "layers",    "file_tree",
-                                     "clusters", "cycles"};
+    static const char *expected[] = {"all",      "overview",   "structure",       "dependencies",
+                                     "routes",   "languages",  "packages",        "entry_points",
+                                     "hotspots", "boundaries", "layers",          "file_tree",
+                                     "clusters", "cycles",     "system_structure"};
     size_t expected_count = sizeof(expected) / sizeof(expected[0]);
     ASSERT_EQ(yyjson_arr_size(enum_arr), expected_count);
     for (size_t i = 0; i < expected_count; i++) {
@@ -1718,6 +1719,28 @@ TEST(mcp_get_architecture_aspects_schema_enum_pr560) {
 
     yyjson_doc_free(doc);
     free(json);
+    PASS();
+}
+
+TEST(mcp_get_architecture_behavior_evidence_schema) {
+    const char *schema = cbm_mcp_tool_input_schema("get_architecture");
+    ASSERT_NOT_NULL(schema);
+    yyjson_doc *doc = yyjson_read(schema, strlen(schema), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *properties = yyjson_obj_get(yyjson_doc_get_root(doc), "properties");
+    yyjson_val *flag = yyjson_obj_get(properties, "include_behavior_evidence");
+    ASSERT_NOT_NULL(flag);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(flag, "type")), "boolean");
+    ASSERT_TRUE(yyjson_is_false(yyjson_obj_get(flag, "default")));
+    const char *description = cbm_mcp_tool_description("get_architecture");
+    ASSERT_NOT_NULL(description);
+    ASSERT_NOT_NULL(strstr(description, "include_behavior_evidence=true"));
+    ASSERT_NOT_NULL(strstr(description, "indexed"));
+    ASSERT_NOT_NULL(strstr(description, "call arguments"));
+    ASSERT_NOT_NULL(strstr(description, "parameter declarations"));
+    ASSERT_NOT_NULL(strstr(description, "return types"));
+    ASSERT_NOT_NULL(strstr(description, "not full dataflow"));
+    yyjson_doc_free(doc);
     PASS();
 }
 
@@ -6006,6 +6029,312 @@ TEST(tool_index_status_no_project) {
     PASS();
 }
 
+static const char *const mcp_ingest_guard_request =
+    "{\"project\":\"guard-traces\",\"label\":\"guarded\",\"traces\":["
+    "{\"path\":[\"guard-traces::alpha\",\"guard-traces::beta\"]}]}";
+
+static cbm_mcp_server_t *mcp_ingest_guard_server(void) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *store = srv ? cbm_mcp_server_store(srv) : NULL;
+    if (!store ||
+        cbm_store_upsert_project(store, "guard-traces", "/tmp/guard-traces") != CBM_STORE_OK) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    cbm_mcp_server_set_project(srv, "guard-traces");
+    static const char *const names[] = {"alpha", "beta"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "guard-traces::%s", names[i]);
+        cbm_node_t node = {.project = "guard-traces",
+                           .label = "Function",
+                           .name = names[i],
+                           .qualified_name = qn,
+                           .file_path = "trace.c",
+                           .start_line = 1,
+                           .end_line = 2};
+        if (cbm_store_upsert_node(store, &node) <= 0) {
+            cbm_mcp_server_free(srv);
+            return NULL;
+        }
+    }
+    return srv;
+}
+
+static long long mcp_ingest_guard_observed_count(cbm_mcp_server_t *srv) {
+    long long count = -1;
+    if (cbm_store_observed_lookup(cbm_mcp_server_store(srv), "guard-traces", "guard-traces::alpha",
+                                  "guard-traces::beta", &count, NULL, 0, NULL, 0) != CBM_STORE_OK) {
+        return -1;
+    }
+    return count;
+}
+
+TEST(tool_ingest_traces_mutation_guard_denial_prevents_writes) {
+    cbm_mcp_server_t *srv = mcp_ingest_guard_server();
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {.deny_begin_call = 1};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+    bool blocked = resp && strstr(resp, "\"isError\":true") && strstr(resp, "blocked");
+    long long count = mcp_ingest_guard_observed_count(srv);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(blocked);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 0);
+    ASSERT_STR_EQ(probe.begin_projects[0], "guard-traces");
+    PASS();
+}
+
+TEST(tool_ingest_traces_mutation_guard_balances_repeated_writes) {
+    cbm_mcp_server_t *srv = mcp_ingest_guard_server();
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    bool stored = true;
+    for (int i = 0; i < 2; i++) {
+        char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+        char *inner = resp ? extract_text_content(resp) : NULL;
+        stored = stored && inner && strstr(inner, "\"status\":\"stored\"") &&
+                 strstr(inner, "\"pairs_stored\":1") && strstr(inner, "\"paths_stored\":1");
+        free(inner);
+        free(resp);
+    }
+    long long count = mcp_ingest_guard_observed_count(srv);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(stored);
+    ASSERT_EQ(count, 2);
+    ASSERT_EQ(probe.begin_count, 2);
+    ASSERT_EQ(probe.end_count, 2);
+    for (int i = 0; i < 2; i++) {
+        ASSERT_STR_EQ(probe.begin_projects[i], "guard-traces");
+        ASSERT_STR_EQ(probe.end_projects[i], "guard-traces");
+    }
+    PASS();
+}
+
+TEST(tool_ingest_traces_mutation_guard_cancel_releases_without_writes) {
+    cbm_mcp_server_t *srv = mcp_ingest_guard_server();
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {.cancel_on_begin_call = 1, .cancel_server = srv};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+    bool cancelled = resp && strstr(resp, "\"isError\":true") && strstr(resp, "cancelled");
+    long long count = mcp_ingest_guard_observed_count(srv);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(cancelled);
+    ASSERT_TRUE(probe.cancel_attempted);
+    ASSERT_TRUE(probe.cancel_accepted);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[0], "guard-traces");
+    ASSERT_STR_EQ(probe.end_projects[0], "guard-traces");
+    PASS();
+}
+
+TEST(tool_ingest_traces_mutation_guard_missing_store_releases) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-traces-guard-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+    char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+    bool missing = resp && strstr(resp, "\"isError\":true") &&
+                   (strstr(resp, "not found") || strstr(resp, "not indexed"));
+    char path[512];
+    snprintf(path, sizeof(path), "%s/guard-traces.db", cache);
+    bool created = cbm_file_exists(path);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, "guard-traces");
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(missing);
+    ASSERT_FALSE(created);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[0], "guard-traces");
+    ASSERT_STR_EQ(probe.end_projects[0], "guard-traces");
+    PASS();
+}
+
+/* Reject exactly the endpoint lookup at prepare time; this exercises the
+ * handler's query failure exit without corrupting a database or timing a lock. */
+static int mcp_ingest_guard_deny_nodes(void *context, int action, const char *table,
+                                       const char *column, const char *database,
+                                       const char *trigger) {
+    (void)context;
+    (void)column;
+    (void)database;
+    (void)trigger;
+    return action == SQLITE_READ && table && strcmp(table, "nodes") == 0 ? SQLITE_DENY : SQLITE_OK;
+}
+
+TEST(tool_ingest_traces_mutation_guard_query_failure_releases) {
+    cbm_mcp_server_t *srv = mcp_ingest_guard_server();
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+    sqlite3 *db = cbm_store_get_db(cbm_mcp_server_store(srv));
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(sqlite3_set_authorizer(db, mcp_ingest_guard_deny_nodes, NULL), SQLITE_OK);
+    char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+    int reset_result = sqlite3_set_authorizer(db, NULL, NULL);
+    bool failed = resp && strstr(resp, "\"isError\":true") && strstr(resp, "not queryable");
+    long long count = mcp_ingest_guard_observed_count(srv);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_EQ(reset_result, SQLITE_OK);
+    ASSERT_TRUE(failed);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[0], "guard-traces");
+    ASSERT_STR_EQ(probe.end_projects[0], "guard-traces");
+    PASS();
+}
+
+/* ingest_traces stores observed runtime calls qn-keyed (reindex-proof):
+ * paths decompose into pairs, counts accumulate per run label, unresolved
+ * names are reported (not silently dropped), whole runs evict together. */
+TEST(tool_ingest_traces_stores_observed_calls) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *project = "traces-test";
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/traces-test"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    static const char *const names[3] = {"alpha", "beta", "gamma"};
+    for (int i = 0; i < 3; i++) {
+        cbm_node_t node;
+        memset(&node, 0, sizeof(node));
+        node.project = project;
+        node.label = "Function";
+        node.name = names[i];
+        char qn[64];
+        snprintf(qn, sizeof(qn), "traces-test::%s", names[i]);
+        node.qualified_name = qn;
+        node.file_path = "src/t.c";
+        node.start_line = 1;
+        node.end_line = 3;
+        ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    }
+
+    /* One 3-hop path, one bare pair with a count, one path with an
+     * unindexed hop (skipped, reported), one malformed 1-hop path. */
+    char *resp = cbm_mcp_handle_tool(
+        srv, "ingest_traces",
+        "{\"project\":\"traces-test\",\"label\":\"run1\",\"traces\":["
+        "{\"path\":[\"traces-test::alpha\",\"traces-test::beta\",\"traces-test::gamma\"]},"
+        "{\"caller\":\"traces-test::alpha\",\"callee\":\"traces-test::gamma\",\"count\":5},"
+        "{\"path\":[\"traces-test::alpha\",\"traces-test::missing\"]},"
+        "{\"path\":[\"traces-test::alpha\"]}]}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"stored\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"pairs_stored\":3"));
+    ASSERT_NOT_NULL(strstr(inner, "\"paths_stored\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "\"pairs_unmatched\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "traces-test::missing"));
+    ASSERT_NOT_NULL(strstr(inner, "\"malformed\":1"));
+    free(inner);
+    free(resp);
+
+    long long count = -1;
+    char label[64], seen[64];
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::alpha", "traces-test::beta",
+                                        &count, label, sizeof(label), seen, sizeof(seen)),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 1);
+    ASSERT_STR_EQ(label, "run1");
+    ASSERT_TRUE(seen[0] != '\0');
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::alpha", "traces-test::gamma",
+                                        &count, NULL, 0, NULL, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 5);
+    /* Never observed: zero count, not an error. */
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::beta", "traces-test::alpha",
+                                        &count, NULL, 0, NULL, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 0);
+
+    /* Same pair again under the same label accumulates; a second label
+     * aggregates in the lookup and reports as the newest run. */
+    resp = cbm_mcp_handle_tool(
+        srv, "ingest_traces",
+        "{\"project\":\"traces-test\",\"label\":\"run1\",\"traces\":[{\"caller\":"
+        "\"traces-test::alpha\",\"callee\":\"traces-test::gamma\",\"count\":2}]}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::alpha", "traces-test::gamma",
+                                        &count, NULL, 0, NULL, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 7);
+    resp = cbm_mcp_handle_tool(
+        srv, "ingest_traces",
+        "{\"project\":\"traces-test\",\"label\":\"run2\",\"traces\":[{\"caller\":"
+        "\"traces-test::alpha\",\"callee\":\"traces-test::beta\"}]}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::alpha", "traces-test::beta",
+                                        &count, label, sizeof(label), NULL, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 2);
+    ASSERT_STR_EQ(label, "run2");
+
+    /* Whole-run eviction: run1's newest observation is older, so run1 goes
+     * first and run2 survives intact. */
+    char *evicted = NULL;
+    ASSERT_EQ(cbm_store_observed_evict_oldest_label(st, project, &evicted), CBM_STORE_OK);
+    ASSERT_NOT_NULL(evicted);
+    ASSERT_STR_EQ(evicted, "run1");
+    free(evicted);
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::alpha", "traces-test::gamma",
+                                        &count, NULL, 0, NULL, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 0);
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::alpha", "traces-test::beta",
+                                        &count, NULL, 0, NULL, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 1);
+
+    /* Empty traces is a tool error, not a silent accept. */
+    resp = cbm_mcp_handle_tool(srv, "ingest_traces", "{\"project\":\"traces-test\",\"traces\":[]}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Reproduce the exact-file false negative in the current Read hook: index_status
  * intentionally caps each coverage category at 500 entries, so a later path is
  * absent even though the authoritative index_coverage table contains it.  The
@@ -8637,6 +8966,143 @@ TEST(tool_get_architecture_empty) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_architecture_behavior_evidence_validation) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "arch-flag");
+    ASSERT_EQ(cbm_store_upsert_project(store, "arch-flag", "/tmp/arch-flag"), CBM_STORE_OK);
+
+    const char *invalid[] = {"\"true\"", "1", "0", "null", "[]", "{}"};
+    const char *aspects[] = {"", ",\"aspects\":[\"system_structure\"]"};
+    for (size_t a = 0; a < sizeof(aspects) / sizeof(aspects[0]); a++) {
+        for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+            char args[256];
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"arch-flag\"%s,\"include_behavior_evidence\":%s}", aspects[a],
+                     invalid[i]);
+            char *response = cbm_mcp_handle_tool(srv, "get_architecture", args);
+            ASSERT_NOT_NULL(response);
+            ASSERT_TRUE(response_contains_json_fragment(response, "\"isError\":true"));
+            ASSERT_NOT_NULL(strstr(response, "include_behavior_evidence must be a boolean"));
+            free(response);
+        }
+    }
+    char *wrong_scope = cbm_mcp_handle_tool(
+        srv, "get_architecture", "{\"project\":\"arch-flag\",\"include_behavior_evidence\":true}");
+    ASSERT_NOT_NULL(wrong_scope);
+    ASSERT_TRUE(response_contains_json_fragment(wrong_scope, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(wrong_scope, "requires aspects"));
+    free(wrong_scope);
+
+    char *implicit = cbm_mcp_handle_tool(srv, "get_architecture", "{\"project\":\"arch-flag\"}");
+    char *explicit_false = cbm_mcp_handle_tool(
+        srv, "get_architecture", "{\"project\":\"arch-flag\",\"include_behavior_evidence\":false}");
+    ASSERT_NOT_NULL(implicit);
+    ASSERT_NOT_NULL(explicit_false);
+    ASSERT_STR_EQ(implicit, explicit_false);
+    free(implicit);
+    free(explicit_false);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Wait for the stable terminal job state, without asserting a transient pending
+ * window or a particular number of worker polls. */
+static char *architecture_wait_for_result(cbm_mcp_server_t *srv, const char *args) {
+    uint64_t deadline = cbm_now_ms() + 10000;
+    for (;;) {
+        char *response = cbm_mcp_handle_tool(srv, "get_architecture", args);
+        char *text = extract_text_content(response);
+        free(response);
+        yyjson_doc *doc = text ? yyjson_read(text, strlen(text), 0) : NULL;
+        yyjson_val *status = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "status") : NULL;
+        const char *value = yyjson_get_str(status);
+        bool pending = value && strcmp(value, "pending") == 0;
+        yyjson_doc_free(doc);
+        if (!pending || cbm_now_ms() >= deadline) {
+            return text;
+        }
+        free(text);
+        sqlite3_sleep(1);
+    }
+}
+
+TEST(tool_get_architecture_behavior_evidence_cache_isolation) {
+    char cache[CBM_SZ_1K];
+    snprintf(cache, sizeof(cache), "%s/cbm-arch-flag-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "arch-evidence-cache";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(project);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, cache), CBM_STORE_OK);
+    cbm_node_t entry = {.project = project,
+                        .label = "Function",
+                        .name = "entry",
+                        .qualified_name = "arch-evidence-cache.entry",
+                        .file_path = "src/entry.c",
+                        .start_line = 1,
+                        .end_line = 5,
+                        .properties_json = "{\"return_type\":\"EvidenceCacheSentinel\"}"};
+    int64_t entry_id = cbm_store_upsert_node(store, &entry);
+    ASSERT_GT(entry_id, 0);
+    cbm_node_t target = {.project = project,
+                         .label = "Function",
+                         .name = "target",
+                         .qualified_name = "arch-evidence-cache.target",
+                         .file_path = "src/target.c",
+                         .start_line = 1,
+                         .end_line = 3,
+                         .properties_json = "{\"return_type\":\"EvidenceCacheSentinel\"}"};
+    int64_t target_id = cbm_store_upsert_node(store, &target);
+    ASSERT_GT(target_id, 0);
+    cbm_edge_t edge = {.project = project,
+                       .source_id = entry_id,
+                       .target_id = target_id,
+                       .type = "CALLS",
+                       .properties_json = "{\"line\":2}"};
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+
+    char args[512];
+    const char *flags[] = {"", ",\"include_behavior_evidence\":true",
+                           ",\"include_behavior_evidence\":false",
+                           ",\"include_behavior_evidence\":true"};
+    char *results[4] = {0};
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"aspects\":[\"system_structure\"],"
+                 "\"entry_node_id\":%lld%s}",
+                 project, (long long)entry_id, flags[i]);
+        results[i] = architecture_wait_for_result(srv, args);
+        ASSERT_NOT_NULL(results[i]);
+        ASSERT_TRUE(response_contains_json_fragment(results[i], "\"status\":\"ready\""));
+        if (i % 2 == 0) {
+            ASSERT_NULL(strstr(results[i], "EvidenceCacheSentinel"));
+            ASSERT_NULL(strstr(results[i], "\"return_type\""));
+        } else {
+            ASSERT_NOT_NULL(strstr(results[i], "EvidenceCacheSentinel"));
+            ASSERT_NOT_NULL(strstr(results[i], "\"return_type\""));
+        }
+    }
+    ASSERT_STR_EQ(results[0], results[2]);
+    ASSERT_STR_EQ(results[1], results[3]);
+    for (size_t i = 0; i < sizeof(results) / sizeof(results[0]); i++) {
+        free(results[i]);
+    }
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    ASSERT_EQ(th_rmtree(cache), 0);
     PASS();
 }
 
@@ -13383,8 +13849,17 @@ TEST(tool_outer_request_scope_preserves_predispatch_cancel) {
                                  strstr(cancelled_response, "\"isError\":true");
     cbm_mcp_server_request_scope_end(srv);
 
-    char *next_response = srv ? cbm_mcp_handle_tool(srv, "ingest_traces", "{\"traces\":[]}") : NULL;
-    bool next_response_clean = next_response && strstr(next_response, "accepted") &&
+    /* Clean-token probe: a valid ingest (unresolved names store nothing)
+     * must succeed normally — the cancel must not leak into it. The old
+     * probe sent traces:[] and expected the stub's "accepted"; empty
+     * traces are a tool error under the real contract. */
+    char *next_response =
+        srv ? cbm_mcp_handle_tool(
+                  srv, "ingest_traces",
+                  "{\"project\":\"outer-scope-cancel-adr\",\"traces\":"
+                  "[{\"caller\":\"never-indexed-a\",\"callee\":\"never-indexed-b\"}]}")
+            : NULL;
+    bool next_response_clean = next_response && strstr(next_response, "\"status\":\"stored\"") &&
                                !strstr(next_response, "cancelled") &&
                                !strstr(next_response, "\"isError\":true");
 
@@ -13444,9 +13919,12 @@ TEST(tool_index_repository_early_raw_cancel_survives_index_entry) {
     snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project ? project : "missing-project");
     bool no_project_published = !cbm_file_exists(db_path);
 
-    char *next_response = srv ? cbm_mcp_handle_tool(srv, "ingest_traces", "{\"traces\":[]}") : NULL;
-    bool next_response_clean = next_response && strstr(next_response, "accepted") &&
-                               !strstr(next_response, "cancelled") &&
+    /* Clean-token probe: no project exists here by design (the index was
+     * cancelled), so probe with the project-free list_projects — the next
+     * request must simply run clean, unpoisoned by the cancel. The old
+     * probe leaned on the ingest_traces stub, which accepted anything. */
+    char *next_response = srv ? cbm_mcp_handle_tool(srv, "list_projects", "{}") : NULL;
+    bool next_response_clean = next_response && !strstr(next_response, "cancelled") &&
                                !strstr(next_response, "\"isError\":true");
 
     free(cancelled_response);
@@ -17430,6 +17908,9 @@ TEST(detect_changes_default_output_is_byte_identical_golden) {
     PASS();
 }
 
+/* ingest_traces stores for real now (the stub answered "accepted" and
+ * discarded). Without a resolvable project there is nothing to store
+ * against — a tool error, not a polite lie. */
 TEST(tool_ingest_traces_basic) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -17438,8 +17919,8 @@ TEST(tool_ingest_traces_basic) {
              "\"params\":{\"name\":\"ingest_traces\","
              "\"arguments\":{\"traces\":[{\"caller\":\"a\",\"callee\":\"b\"}]}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "accepted"));
-    ASSERT_NOT_NULL(strstr(resp, "traces_received"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NULL(strstr(resp, "accepted"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -17454,7 +17935,7 @@ TEST(tool_ingest_traces_empty) {
                                    "\"params\":{\"name\":\"ingest_traces\","
                                    "\"arguments\":{\"traces\":[]}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "accepted"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -23812,6 +24293,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
     RUN_TEST(mcp_get_architecture_aspects_schema_enum_pr560);
+    RUN_TEST(mcp_get_architecture_behavior_evidence_schema);
     RUN_TEST(mcp_text_result);
     RUN_TEST(mcp_text_result_omits_structured_content_for_plain_text);
     RUN_TEST(mcp_text_result_reversibly_encodes_invalid_utf8_as_standard_json);
@@ -23920,6 +24402,7 @@ SUITE(mcp) {
     RUN_TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct);
     RUN_TEST(tool_list_projects_preserves_root_beyond_one_kib);
     RUN_TEST(tool_index_status_no_project);
+    RUN_TEST(tool_ingest_traces_stores_observed_calls);
     RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
     RUN_TEST(tool_check_index_coverage_reports_truncation_marker_issue963);
     RUN_TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges);
@@ -23959,6 +24442,8 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
+    RUN_TEST(tool_get_architecture_behavior_evidence_validation);
+    RUN_TEST(tool_get_architecture_behavior_evidence_cache_isolation);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
     RUN_TEST(tool_get_architecture_overview_compact_subset_pr560);
     RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);
@@ -24178,6 +24663,11 @@ SUITE(mcp) {
 /* Kept separate so daemon-coordination regressions can be iterated without
  * running the much larger MCP behavior suite. */
 SUITE(mcp_mutation_guard) {
+    RUN_TEST(tool_ingest_traces_mutation_guard_denial_prevents_writes);
+    RUN_TEST(tool_ingest_traces_mutation_guard_balances_repeated_writes);
+    RUN_TEST(tool_ingest_traces_mutation_guard_cancel_releases_without_writes);
+    RUN_TEST(tool_ingest_traces_mutation_guard_missing_store_releases);
+    RUN_TEST(tool_ingest_traces_mutation_guard_query_failure_releases);
     RUN_TEST(tool_delete_project_mutation_guard_blocks_then_releases);
     RUN_TEST(tool_index_repository_mutation_guard_blocks_before_local_worker);
     RUN_TEST(tool_manage_adr_mutation_guard_balances_success);
