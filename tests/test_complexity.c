@@ -491,11 +491,12 @@ static bool cx_pyext_control(cbm_store_t *store, const char *project, const cbm_
         for (int i = 0; i < count; i++) {
             if (edges[i].target_id != target.id || !edges[i].properties_json)
                 continue;
+            /* an LSP resolution records an lsp_* strategy (lsp_direct here) */
             yyjson_doc *doc =
                 yyjson_read(edges[i].properties_json, strlen(edges[i].properties_json), 0);
-            const char *source =
-                doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "source")) : NULL;
-            found = found || (source && strcmp(source, "lsp") == 0);
+            const char *strategy =
+                doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "strategy")) : NULL;
+            found = found || (strategy && strncmp(strategy, "lsp_", 4) == 0);
             yyjson_doc_free(doc);
         }
     }
