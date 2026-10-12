@@ -4640,20 +4640,21 @@ TEST(pylsp_range_class_binding_keeps_order_shadow_and_package_filters) {
             pylsp_range_reset_failures();
             ok = shadowed && !ctx.callable_value_proof_disabled &&
                  ctx.eval_failure == CBM_LSP_COMPLETE &&
-                 pylsp_init_named_type(cbm_scope_lookup_local(ctx.current_scope, "Shared"),
+                 pylsp_init_named_type(pylsp_local_type(ctx.current_scope, "Shared"),
                                        "test.pkg.Tail") &&
-                 pylsp_init_named_type(cbm_scope_lookup_local(ctx.current_scope, "HeadSame"),
+                 pylsp_init_named_type(pylsp_local_type(ctx.current_scope, "HeadSame"),
                                        "test.pkg.Same") &&
-                 pylsp_init_named_type(cbm_scope_lookup_local(ctx.current_scope, "MiddleOnly"),
+                 pylsp_init_named_type(pylsp_local_type(ctx.current_scope, "MiddleOnly"),
                                        "test.pkg.Deep") &&
-                 pylsp_init_named_type(cbm_scope_lookup_local(ctx.current_scope, "TailOnly"),
+                 pylsp_init_named_type(pylsp_local_type(ctx.current_scope, "TailOnly"),
                                        "test.pkg.Deep") &&
                  !cbm_scope_lookup_local(ctx.current_scope, "Masked") &&
                  !cbm_scope_lookup_local(ctx.current_scope, "Local") && ok;
-            const CBMType *hidden = cbm_scope_lookup_local(ctx.current_scope, "Hidden");
-            ok =
-                (package ? hidden == NULL : pylsp_init_named_type(hidden, "test.pkg.sub.Hidden")) &&
-                ok;
+            const CBMVarBinding *hidden = cbm_scope_lookup_local(ctx.current_scope, "Hidden");
+            ok = (package ? hidden == NULL
+                          : pylsp_init_named_type(hidden ? hidden->type : NULL,
+                                                  "test.pkg.sub.Hidden")) &&
+                 ok;
             cbm_arena_destroy(&arena);
             cbm_arena_destroy(&owner);
         }
@@ -4725,9 +4726,9 @@ TEST(pylsp_range_wildcard_and_scratch_failures_keep_exact_later_calls) {
             atomic_load_explicit(&cbm_py_wildcard_invalidations, memory_order_relaxed);
         py_lsp_process_file(&ctx, ts_tree_root_node(tree));
         pylsp_range_reset_failures();
-        const CBMType *shadow = cbm_scope_lookup_local(ctx.current_scope, "shadow_only");
+        const CBMVarBinding *shadow = cbm_scope_lookup_local(ctx.current_scope, "shadow_only");
         ok = built && ctx.eval_failure == CBM_LSP_COMPLETE && !ctx.callable_value_proof_disabled &&
-             shadow && cbm_type_is_unknown(shadow) &&
+             shadow && cbm_type_is_unknown(shadow->type) &&
              atomic_load_explicit(&cbm_py_wildcard_invalidations, memory_order_relaxed) > before &&
              pylsp_module_site_joins(&raw->calls, &out, source, "external.ping()", "test.main",
                                      "test.main.External.ping") &&
