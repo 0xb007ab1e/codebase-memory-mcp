@@ -757,14 +757,19 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         emit_http_async_edge(ctx, &routed, source_node, NULL, &svc_res, CBM_SVC_HTTP, false);
         return SKIP_ONE;
     }
-    cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
+    /* A PHP call on a proven vendor class is classified by that class
+     * (#1186): it skips the registry below, so the route-verb fallback would
+     * otherwise mint a route registration for `GuzzleClient::get('/x')`. An
+     * LSP row with a graph target returned above. MUST match pass_parallel.c. */
+    cbm_svc_kind_t csvc;
+    const char *svc_name = cbm_pipeline_service_name(call, lsp, &csvc);
     if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
         const char *cu = call->first_string_arg;
         bool chas_url = cu && cu[0] != '\0' &&
                         (cu[0] == '/' || strstr(cu, "://") != NULL ||
                          (csvc == CBM_SVC_ASYNC && strlen(cu) > PAIR_LEN));
         if (chas_url) {
-            cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+            cbm_resolution_t svc_res = {.qualified_name = svc_name,
                                         .confidence = PC_SVC_PATTERN_CONF,
                                         .strategy = "service_pattern",
                                         .candidate_count = 0};

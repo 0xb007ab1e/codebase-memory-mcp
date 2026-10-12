@@ -1448,6 +1448,16 @@ static void emit_external_or_unindexed(PHPLSPContext *ctx, const char *class_qn,
     emit_resolved_kind(ctx, target, unindexed_strategy, 0.55f, kind);
 }
 
+/* A method the registry DOES hold on a class reached through a vendor `use`
+ * (a seeded library type such as GuzzleHttp.Client) is just as far outside
+ * the project: the graph has no node for it either, so its row must carry the
+ * same php_external_receiver proof, or the pipeline falls through to a
+ * name-only binding of the call to a same-named project method (#1186). */
+static const char *php_receiver_strategy(const PHPLSPContext *ctx, const char *class_qn,
+                                         const char *strategy) {
+    return php_external_qn(ctx, class_qn) ? "php_external_receiver" : strategy;
+}
+
 static void emit_unresolved(PHPLSPContext *ctx, const char *expr_text, const char *reason) {
     if (!ctx->resolved_calls || !ctx->enclosing_func_qn)
         return;
@@ -1747,7 +1757,8 @@ static void resolve_member_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind
         const char *strategy = (f->receiver_type && strcmp(f->receiver_type, class_qn) == 0)
                                    ? "php_method_typed"
                                    : "php_method_inherited";
-        emit_resolved_kind(ctx, f->qualified_name, strategy, 0.95f, kind);
+        emit_resolved_kind(ctx, f->qualified_name, php_receiver_strategy(ctx, class_qn, strategy),
+                           0.95f, kind);
         return;
     }
     /* Receiver known but method missing — magic __call? The call dispatches to
@@ -1794,6 +1805,7 @@ static void resolve_static_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind
                 strategy = "php_self_static";
             } else {
                 class_qn = php_resolve_class_name(ctx, cls);
+                strategy = php_receiver_strategy(ctx, class_qn, strategy);
             }
         }
     }

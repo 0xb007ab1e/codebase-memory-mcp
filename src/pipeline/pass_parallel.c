@@ -3327,14 +3327,19 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                          CBM_SVC_HTTP, client_url);
             continue;
         }
-        cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
+        /* A PHP call on a proven vendor class is classified by that class
+         * (#1186): it skipped the registry above, so the route-verb fallback
+         * would otherwise mint a route registration for
+         * `GuzzleClient::get('/x')`. MUST match pass_calls.c. */
+        cbm_svc_kind_t csvc;
+        const char *svc_name = cbm_pipeline_service_name(call, lsp_target ? NULL : lsp, &csvc);
         if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
             const char *cu = call->first_string_arg;
             bool chas_url = cu && cu[0] != '\0' &&
                             (cu[0] == '/' || strstr(cu, "://") != NULL ||
                              (csvc == CBM_SVC_ASYNC && strlen(cu) > PP_ESC_SPACE));
             if (chas_url) {
-                cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+                cbm_resolution_t svc_res = {.qualified_name = svc_name,
                                             .confidence = PP_HALF_CONF,
                                             .strategy = "service_pattern"};
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
