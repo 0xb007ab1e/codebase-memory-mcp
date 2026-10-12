@@ -612,9 +612,10 @@ static bool cx_pyrange_exact_control(cbm_store_t *store, const char *project,
             edges[i].properties_json
                 ? yyjson_read(edges[i].properties_json, strlen(edges[i].properties_json), 0)
                 : NULL;
-        const char *source =
-            doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "source")) : NULL;
-        if (source && strcmp(source, "lsp") == 0)
+        /* an LSP resolution records an lsp_* strategy */
+        const char *strategy =
+            doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "strategy")) : NULL;
+        if (strategy && strncmp(strategy, "lsp_", 4) == 0)
             exact++;
         yyjson_doc_free(doc);
     }
