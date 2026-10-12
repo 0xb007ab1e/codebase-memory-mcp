@@ -16540,14 +16540,15 @@ TEST(clsp_preprocessed_destructor_rewrite_respects_origin_during_rewrite) {
 
 /* ── #1527: no per-file eval budget; cost fixed at the root ────────────── */
 
-/* Resolved rows that name a real target (not an lsp_unresolved marker) whose
- * callee QN contains sub. */
+/* Resolved invocations that name a real target (not an lsp_unresolved marker)
+ * whose callee QN contains sub. Member-access rows (one per function, type and
+ * member) are a different kind and are not counted. */
 static int count_real_resolved(const CBMFileResult *r, const char *sub) {
     int n = 0;
     for (int i = 0; i < r->resolved_calls.count; i++) {
         const CBMResolvedCall *rc = &r->resolved_calls.items[i];
-        if (rc->callee_qn && strstr(rc->callee_qn, sub) && rc->confidence > 0.0f &&
-            !(rc->strategy && strcmp(rc->strategy, "lsp_unresolved") == 0))
+        if (rc->kind == CBM_RESOLVED_INVOCATION && rc->callee_qn && strstr(rc->callee_qn, sub) &&
+            rc->confidence > 0.0f && !(rc->strategy && strcmp(rc->strategy, "lsp_unresolved") == 0))
             n++;
     }
     return n;
