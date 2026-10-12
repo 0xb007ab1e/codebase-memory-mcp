@@ -909,7 +909,8 @@ static const CBMRegisteredFunc *lookup_func_self(const CBMTypeRegistry *reg,
 
     for (int i = 0; i < reg->func_count; i++) {
         CBM_LSP_WORK(1);
-        if (strcmp(reg->funcs[i].qualified_name, qualified_name) == 0) {
+        if (reg->funcs[i].qualified_name &&
+            strcmp(reg->funcs[i].qualified_name, qualified_name) == 0) {
             return &reg->funcs[i];
         }
     }
