@@ -1,5 +1,6 @@
 import type { ContainerTopology } from './container-topology';
 import type { SemanticGraph } from './semantic-graph';
+import { SCENE_PALETTE } from './scene-palette';
 
 /** Condense cycles before layering. Direction describes callers, not data movement. */
 export function layoutContainers(topology: ContainerTopology): { graph: SemanticGraph; cycles: string[][] } {
@@ -51,12 +52,15 @@ export function layoutContainers(topology: ContainerTopology): { graph: Semantic
         nodes: services.map(service => ({ id: service.id, kind: 'area', label: service.name,
             detail: `${service.project} · ${service.image ?? 'built from source'}`, position: positions.get(service.id)!,
             count: service.sourcePaths.length, members: [], footprint: [18, 18],
-            tint: service.sourcePaths.length ? '#85b4c5' : '#b6a087', kindLabel: 'Declared service' })),
-        edges: [...topology.connections].sort((a, b) => a.id.localeCompare(b.id)).map(edge => ({ id: edge.id, source: edge.source, target: edge.target,
-            type: edge.kind === 'startup' ? 'STARTUP_DEPENDENCY' : edge.kind === 'configuration' ? 'CONFIGURES'
+            tint: service.sourcePaths.length ? SCENE_PALETTE.serviceSource : SCENE_PALETTE.serviceImage, kindLabel: 'Declared service' })),
+        edges: [...topology.connections].sort((a, b) => a.id.localeCompare(b.id)).map(edge => {
+            const type = edge.kind === 'startup' ? 'STARTUP_DEPENDENCY' : edge.kind === 'configuration' ? 'CONFIGURES'
                 : /redis|postgres|mysql|database|sql/i.test(edge.protocol) ? 'SERVICE_CALLS'
-                    : /grpc/i.test(edge.protocol) ? 'GRPC_CALLS' : /http/i.test(edge.protocol) ? 'HTTP_CALLS' : 'SERVICE_CALLS',
-            count: edge.evidence.length, evidence: [] })),
+                    : /grpc/i.test(edge.protocol) ? 'GRPC_CALLS' : /http/i.test(edge.protocol) ? 'HTTP_CALLS' : 'SERVICE_CALLS';
+            // A plain service link is the line of this map: the green of the scheme, as in the "Calls" key.
+            return { id: edge.id, source: edge.source, target: edge.target, type, count: edge.evidence.length, evidence: [],
+                ...(type === 'SERVICE_CALLS' ? { tint: SCENE_PALETTE.call } : {}) };
+        }),
         totalNodes: services.length, totalEdges: topology.connections.length, omittedNodes: 0, omittedEdges: 0, warnings: [],
     };
     return { graph, cycles: groups.filter(group => group.length > 1 || adjacent.get(group[0])!.has(group[0])) };

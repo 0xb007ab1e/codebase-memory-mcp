@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { edgePulseGeometry, type EdgePulsePath } from './EdgePulseLayer';
+import { Color } from 'three';
+import { edgeArrowGeometry, edgePulseGeometry, type EdgePulsePath } from './EdgePulseLayer';
 
 const path = (id: string, type = 'CALLS'): EdgePulsePath => ({ id, type, points: [{ x: 4, y: 0, z: 0 }, { x: 3, y: 0, z: 0 }, { x: 3, y: 0, z: -3 }] });
 describe('batched direction pulse geometry', () => {
@@ -29,5 +30,15 @@ describe('batched direction pulse geometry', () => {
         expect(geometry.getAttribute('position').count).toBe(4);
         expect([...geometry.getAttribute('position').array].every(Number.isFinite)).toBe(true);
         geometry.dispose();
+    });
+    it('draws a pulse and its arrow in the colour the view chose for the line, else in the hue of its type', () => {
+        const chosen = new Color('#62d2a2'), calls = new Color('#579fc7');
+        for (const build of [edgePulseGeometry, edgeArrowGeometry]) {
+            const geometry = build([{ ...path('journey'), color: '#62d2a2' }, path('plain')]);
+            const colors = geometry.getAttribute('color'), last = colors.count - 1;
+            expect([colors.getX(0), colors.getY(0), colors.getZ(0)].map(value => Number(value.toFixed(4)))).toEqual([chosen.r, chosen.g, chosen.b].map(value => Number(value.toFixed(4))));
+            expect([colors.getX(last), colors.getY(last), colors.getZ(last)].map(value => Number(value.toFixed(4)))).toEqual([calls.r, calls.g, calls.b].map(value => Number(value.toFixed(4))));
+            geometry.dispose();
+        }
     });
 });

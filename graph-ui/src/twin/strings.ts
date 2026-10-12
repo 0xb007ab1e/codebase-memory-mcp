@@ -79,7 +79,7 @@ export function countOf(count: number, singular: string, plural: string): string
 // ---------------------------------------------------------------------------
 
 export const TWIN_EMPTY_MESSAGE = 'Place the cursor inside a function, method, or class.';
-export const TWIN_EMPTY_HINT = 'CodeAtlas follows the caret and explains whatever it lands in.';
+export const TWIN_EMPTY_HINT = 'CBM Lens follows the caret and explains whatever it lands in.';
 
 // ---------------------------------------------------------------------------
 // Twin identity and provenance
@@ -94,13 +94,13 @@ export const TWIN_FILE_NOT_INDEXED = 'This file is not indexed yet.';
 
 /** Says what would change the sentence above. */
 export const TWIN_FILE_NOT_INDEXED_HINT =
-    'CodeAtlas is still reading this workspace. Facts about this symbol appear as soon as it has.';
+    'CBM Lens is still reading this workspace. Facts about this symbol appear as soon as it has.';
 
 /** Shown while the IR for a symbol is being built. */
 export const TWIN_LOADING = 'Reading what the index knows about this symbol.';
 
 /** Shown when the IR call itself failed, which is a different failure from an empty fact. */
-export const TWIN_LOAD_FAILED = 'CodeAtlas could not reach the analysis backend for this symbol.';
+export const TWIN_LOAD_FAILED = 'CBM Lens could not reach the analysis backend for this symbol.';
 
 /**
  * What the flow switch in the twin head says, in both states.
@@ -272,17 +272,10 @@ export const ERRORS_HANDLING_NOT_VISIBLE =
  * this block would hold, so that its emptiness is legible as a gap in the index
  * rather than as a claim that this symbol is pure.
  *
- * Until 2026-08-29 the sentence ended with a date for the effect relations that
- * nobody here sets. That was a promise about another product's roadmap made in
- * this product's voice: this
- * side does not decide what the analysis server records, and a reader who waited
- * for it would have been waiting on a schedule nobody here holds. What is true is
- * that the gap is written down and handed over, and the sentence says that.
  */
 export const EFFECTS_NOT_IN_INDEX =
-    'The index of this server records no routes, no outbound calls and no writes, so this block stays empty: '
-    + 'that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in '
-    + 'UPSTREAM-ASKS.md.';
+    'No evidence for routes, outbound calls or writes is available in this view for this symbol. '
+    + 'Missing evidence does not establish that the symbol has no effects.';
 
 /** Group headings inside the effects block, used once the relations exist. */
 export const EFFECTS_ROUTES_LABEL = 'Exposes routes';
@@ -550,7 +543,7 @@ export function proseMoreParts(hidden: number): string {
 
 /** Said out loud, because the sentence above it was assembled rather than written. */
 export const PROSE_GENERATED_NOTE =
-    'Nobody wrote that description. CodeAtlas put it together from what the index recorded, so it can be wrong about intent and right about counts.';
+    'Nobody wrote that description. CBM Lens put it together from what the index recorded, so it can be wrong about intent and right about counts.';
 
 export const PROSE_TESTS_NONE =
     'Nothing that looks like a test calls this, so no automatic check would notice a change here.';
@@ -573,13 +566,13 @@ export const PLAIN_SUBJECT_ERRORS = 'How this can fail';
 export function plainAbsence(state: KnowledgeState, subject: string): string {
     switch (state) {
         case 'notIndexed':
-            return `${subject} is unknown: CodeAtlas has not read this file yet.`;
+            return `${subject} is unknown: CBM Lens has not read this file yet.`;
         case 'unsupported':
-            return `${subject} is unknown: CodeAtlas cannot see this for this language.`;
+            return `${subject} is unknown: CBM Lens cannot see this for this language.`;
         case 'inferred':
             return `${subject} was worked out from what calls it, not read from the code itself.`;
         case 'unknown':
-            return `${subject} is unknown: nothing answered when CodeAtlas asked.`;
+            return `${subject} is unknown: nothing answered when CBM Lens asked.`;
         case 'ambiguous':
         case 'known':
             return '';
@@ -752,7 +745,7 @@ export const TERM_EXPLANATIONS: Readonly<Record<string, string>> = {
         'a value this code takes from outside itself, such as a setting or a configuration key, rather than '
         + 'from what it was handed.',
     'test caller':
-        'a caller that lives in test code. It is how CodeAtlas answers "is this checked", because this index '
+        'a caller that lives in test code. It is how CBM Lens answers "is this checked", because this index '
         + 'records no test relation of its own for TypeScript.',
     'entry point':
         'a place the outside world can start this program: a route, a command, a handler. Work arrives here '
@@ -814,7 +807,7 @@ export const GROUND_LEAD_SITS_ON =
 export const GROUND_LEAD_CARRIED =
     'What holds this up: the callers, and whether the outside world can reach it directly.';
 export const GROUND_LEAD_DEBTS =
-    'What is owed against this symbol, from the rules CodeAtlas applies to the recorded facts. Every line is a '
+    'What is owed against this symbol, from the rules CBM Lens applies to the recorded facts. Every line is a '
     + 'rule over facts and not a fact, which is why they all wear the derived marker.';
 export const GROUND_LEAD_LIMITS =
     'What is not on this page, and why. This is part of the answer and not a footnote: an architect who cannot '
@@ -827,7 +820,7 @@ export const GROUND_EMPTY_CARRIED =
     'Nothing carries this: no recorded caller, and nothing marking it as reachable from outside. A symbol with '
     + 'no carrier is either an entry the index cannot see or a piece nobody uses.';
 export const GROUND_EMPTY_DEBTS =
-    'No rule fired against this symbol. That is not a clean bill: the rules CodeAtlas can apply are the ones '
+    'No rule fired against this symbol. That is not a clean bill: the rules CBM Lens can apply are the ones '
     + 'listed under what this index stops at, and the ones it cannot apply stay silent either way.';
 
 /** How many call sites reach into one module. */
@@ -877,7 +870,7 @@ export const LIMIT_NO_HANDLER_SITES =
     'Raised error types are recorded; the places they are caught are not. A short error list is therefore not '
     + 'evidence that the failure is contained.';
 export const LIMIT_NO_ROUTES =
-    'Routes for TypeScript are read out of the source text by CodeAtlas, not reported by the engine, so an '
+    'Routes for TypeScript are read out of the source text by CBM Lens, not reported by the engine, so an '
     + 'entry point the engine did not mark can still exist.';
 export const LIMIT_CALLS_DEDUPLICATED =
     'Two calls to the same target inside one body are recorded once, with the last site. A count of call sites '
@@ -895,12 +888,12 @@ export const VOICE_TITLE =
 export const VOICE_RUNNING = 'The local model is rewording the sentences above.';
 export const VOICE_RESTORE_LABEL = 'Back to the built text';
 export const VOICE_RESTORE_TITLE =
-    'Drop the reworded sentences and show the ones CodeAtlas assembled from the index.';
+    'Drop the reworded sentences and show the ones CBM Lens assembled from the index.';
 
 /** The marker beside a sentence the model worded. Same idiom as the state markers. */
 export const VOICE_MARKER = '[~]';
 export const VOICE_MARKER_NOTE =
-    'Worded by the local model from the sentence CodeAtlas built. The facts in it were checked against the '
+    'Worded by the local model from the sentence CBM Lens built. The facts in it were checked against the '
     + 'original one by one; the wording is the model.';
 export const VOICE_APPLIED =
     'The sentences above were reworded by the local model. Every name, number, file and line in them was '
@@ -911,7 +904,7 @@ export function voiceRefused(reason: string): string {
 }
 
 export const VOICE_UNAVAILABLE =
-    'The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.';
+    'The local model is off, so these sentences are the ones CBM Lens assembled. Nothing here waits for it.';
 
 export const FACET_LABELS: Readonly<Record<Facet, string>> = {
     [Facet.Logic]: 'Logic',
@@ -1075,7 +1068,7 @@ export const RUNTIME_UNEXPECTED_TOOLTIP =
 
 /** Why the runtime section wears its marker: nothing is missing from the index here. */
 export const RUNTIME_SECTION_NOTE =
-    'Read from an imported recording, not from the index. CodeAtlas did not watch this run.';
+    'Read from an imported recording, not from the index. CBM Lens did not watch this run.';
 
 // The runtime badge in the evidence popover ---------------------------------
 

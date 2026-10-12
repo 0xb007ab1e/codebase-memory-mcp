@@ -10,7 +10,6 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { IMPACT_MENU_LABEL } from '../impact/impact-strings';
 import { llmMenuLabel } from '../llm/strings';
 import { BUG_WIZARD_MENU_LABEL } from '../traces/bug-wizard-strings';
 import { WHY_MENU_LABEL } from '../why/why-model';
@@ -170,7 +169,6 @@ describe('jeder Eintrag der Atlas-Zeile traegt einen Buchstaben, der etwas tut',
     const entries = [
         { name: 'why', label: WHY_MENU_LABEL, expected: 'w' },
         { name: 'bug', label: BUG_WIZARD_MENU_LABEL, expected: 'b' },
-        { name: 'impact', label: IMPACT_MENU_LABEL, expected: 'c' },
         { name: 'llm off', label: llmMenuLabel('off'), expected: 'l' },
         { name: 'llm on', label: llmMenuLabel('ready'), expected: 'l' },
     ];
@@ -193,7 +191,7 @@ describe('jeder Eintrag der Atlas-Zeile traegt einen Buchstaben, der etwas tut',
      * Buchstaben duerfen auch nicht im Vorbeigehen wieder belegt werden.
      */
     it('belegt keinen Buchstaben der geloeschten Attrappen', () => {
-        for (const letter of ['f', 'e', 'v', 't']) {
+        for (const letter of ['f', 'e', 'v', 't', 'c']) {
             expect(WIRED_MENU_SHORTCUTS, `${letter} gehoerte einer Attrappe`).not.toContain(letter);
         }
         expect(WIRED_MENU_SHORTCUTS).toContain('a');

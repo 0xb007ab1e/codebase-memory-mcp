@@ -96,8 +96,8 @@ describe('HelpOverlay', () => {
         expect(visibleText()).not.toMatch(/https?:\/\//);
         const paths = [...container.querySelectorAll('[data-testid="atlas-help-path"]')]
             .map((node) => node.textContent?.trim() ?? '');
-        for (const expected of ['PLAN.md', 'INVENTAR.md', 'UPSTREAM-ASKS.md',
-            'docs/adr/0001-modellwahl.md', 'verification/']) {
+        for (const expected of ['README.md', 'CONFIGURATION.md', 'THIRD_PARTY.md',
+            'docs/adr/0001-modellwahl.md']) {
             expect(paths, `${expected} fehlt in den Verweisen`).toContain(expected);
         }
     });

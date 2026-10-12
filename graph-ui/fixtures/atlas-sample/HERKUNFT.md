@@ -1,13 +1,8 @@
-# Herkunft dieses Korpus
+# Sample fixture provenance
 
-Kopiert am 2026-08-28 aus dem Referenz-Repo CodeAtlasIDE
-(`/Users/bernhard/Desktop/CodeAtlasIDE/fixtures/atlas-sample`), gleicher
-Urheber (Bernhard Jackiewicz).
+Copied from Bernhard Jackiewicz's CodeAtlasIDE project on 2026-08-28,
+`fixtures/atlas-sample`, by the same author.
 
-Zweck: Demo- und Test-Korpus. Die zwölf TypeScript- und Konfig-Dateien sind
-absichtlich klein und stabil gehalten, damit die Fakten, die der Graph über
-sie meldet, reproduzierbar bleiben und Abnahmetests darauf festnageln können.
-
-Das Referenz-Repo bleibt read-only: hier wird kopiert, dort nie geändert.
-Änderungen an diesem Korpus gelten nur für CodeAtlasWeb und werden nicht
-zurückgespielt.
+The twelve TypeScript and configuration files form a deliberately small, stable
+demo and test corpus. Graph assertions depend on that stable source. Changes here
+apply only to this fixture; they do not update its source project.

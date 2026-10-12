@@ -39,6 +39,7 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
+import { graphNodeName } from './node-names';
 import type { GraphNode } from './types';
 
 /** Ein gezeichneter Namenskasten in Weltkoordinaten. */
@@ -179,9 +180,11 @@ function NodeLabelSprite({
     /** Der gezeichnete Sprite, damit die Entfernungspruefung ihn erreicht. */
     spriteRef?: ((sprite: THREE.Sprite | null) => void) | undefined;
 }) {
+    // The shown name: a Branch node reads "django-demo · detached HEAD", not "DETACHED" (round 4, N1).
+    const text = graphNodeName(node);
     const label = useMemo(
-        () => createLabelTexture(node.name, node.color, maxTextWidth),
-        [node.name, node.color, maxTextWidth],
+        () => createLabelTexture(text, node.color, maxTextWidth),
+        [text, node.color, maxTextWidth],
     );
 
     useEffect(() => {

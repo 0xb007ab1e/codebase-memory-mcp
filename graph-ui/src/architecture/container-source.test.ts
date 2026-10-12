@@ -21,6 +21,24 @@ describe('container source inspection', () => {
         expect(result.files.size).toBe(4000); expect(result.manifests).toEqual(['compose.yml']);
         expect(result.warnings).toHaveLength(1); expect(queryRows.mock.calls[0][0]).toBe('p');
     });
+    it('finds no deployment files in a large repository instead of failing on its whole file inventory', async () => {
+        // Django: more File, Module and Class rows than the client pages through, and no Compose file.
+        const queryRows = vi.fn(async (_project: string, query: string) => {
+            if (query.includes('=~')) return [{ path: 'docs/compose-notes.txt', qn: 'notes' }];
+            throw new Error('query_graph: Incomplete query results: retrieval bound reached (4200 rows read).');
+        });
+        const result = await loadContainerInventory({ name: 'django', root_path: '/django' }, client({ queryRows }));
+        expect(result.manifests).toEqual([]);
+        expect(queryRows).toHaveBeenCalledTimes(1);
+    });
+    it('keeps a discovered manifest readable even beyond the bounded file inventory', async () => {
+        const queryRows = vi.fn(async (_project: string, query: string) => query.includes('=~')
+            ? [{ path: 'deploy/docker-compose.yml', qn: 'demo.deploy.compose' }]
+            : query.includes('f:File') ? [{ path: 'api/main.py', qn: 'demo.main' }] : []);
+        const result = await loadContainerInventory({ name: 'p', root_path: '/p' }, client({ queryRows }));
+        expect(result.manifests).toEqual(['deploy/docker-compose.yml']);
+        expect(result.files.get('deploy/docker-compose.yml')).toBe('demo.deploy.compose');
+    });
     it('rejects incomplete YAML instead of constructing a partial service declaration', async () => {
         const getCodeSnippet = vi.fn(async () => ({ source: 'services:\n  web:', start_line: 1, source_truncated: true }));
         await expect(readContainerSource(inventory, 'compose.yml', client({ getCodeSnippet }), signal())).rejects.toThrow('incomplete');
@@ -43,7 +61,8 @@ describe('container source inspection', () => {
         expect(getCodeSnippet).toHaveBeenCalledTimes(1);
     });
     it('reads complete indexed class ranges when a whole-file module is unavailable, preserving source lines', async () => {
-        const queryRows = vi.fn(async (_project: string, query: string) => query.includes('f:File')
+        // The source inventory is read for a project that declares services.
+        const queryRows = vi.fn(async (_project: string, query: string) => query.includes('=~') ? [{ path: 'compose.yml', qn: 'compose' }] : query.includes('f:File')
             ? [{ path: 'api/Client.java', qn: 'file' }]
             : query.includes('f:Class') ? [
                 { path: 'api/Client.java', qn: 'outer', first_line: '5', last_line: '8' },

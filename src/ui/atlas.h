@@ -9,8 +9,20 @@
 #define CBM_UI_ATLAS_H
 
 #include "store/store.h"
+#include "foundation/mem_core.h"
 
 #include <stdint.h>
+
+/* Internal UI buffers, including returned JSON/HTML and region-name copies,
+ * are charged to OTHER. Release with cbm_free(CBM_MEM_CLASS_OTHER, ...).
+ * yyjson documents retain their own allocator and use yyjson_*_doc_free. */
+
+/* cbm_calloc takes bytes; retain calloc's array-overflow rejection. */
+static inline void *cbm_atlas_calloc_array(size_t count, size_t element_size) {
+    if (element_size && count > SIZE_MAX / element_size)
+        return NULL;
+    return cbm_calloc(CBM_MEM_CLASS_OTHER, count * element_size);
+}
 
 /* ── Modules tree (GET /api/tree) ─────────────────────────────────
  * Aggregated children of one folder: sub-folders with file/symbol counts,
@@ -103,12 +115,13 @@ void cbm_atlas_impact_analysis_shutdown(void);
 /* Attach runtime observation (observed_calls) to a trace ("path") or
  * flow-detail ("steps") JSON: observed hops gain {count, label,
  * last_seen}; unobserved hops stay merely possible. Takes ownership of
- * `json` and returns it (or a replacement). */
+ * `json` (allocated in OTHER) and returns it (or a replacement in OTHER). */
 char *cbm_atlas_attach_observed(cbm_store_t *store, const char *project, char *json);
 
 /* ── Region lookups (layout_regions.c) ────────────────────────────
  * Cache-backed; computing on first use. name_out (optional) receives a
- * heap copy the caller frees. Returns region id or -1. */
+ * copy the caller releases with cbm_free(CBM_MEM_CLASS_OTHER, ...).
+ * Returns region id or -1. */
 int cbm_layout_region_for_file(cbm_store_t *store, const char *project, const char *file_path,
                                char **name_out);
 

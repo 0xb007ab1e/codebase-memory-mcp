@@ -58,6 +58,37 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 // enclosing-function attribution — drift between private copies caused #438.
 TSNode cbm_resolve_c_declarator_name_node(TSNode func_node);
 
+// tree-sitter error recovery around an unknown leading macro: `API RetT name(...)`
+// (`XXH_PUBLIC_API XXH64_hash_t XXH64(...)`, `JEMALLOC_ALWAYS_INLINE T *f(...)`)
+// carries one identifier more than the declaration grammar admits, so the parser
+// recovers in one of two shapes, and neither names the function:
+//   - C++ inserts a zero-width MISSING "::" and reads `RetT name` as the
+//     out-of-line name `RetT::name`; with a pointer return, the name side is a
+//     pointer_type_declarator that wraps the function_declarator;
+//   - C and C++ keep RetT as the declarator identifier and put the real name in
+//     an ERROR node directly before the parameter list.
+// cbm_c_qualifier_is_recovered: true when `qid` (a qualified_identifier or
+// scoped_identifier) is the first shape, i.e. its "::" token is MISSING.
+// cbm_c_recovered_func_name: the real name node of the second shape for a
+// function_declarator, or a null node when the declarator is not that shape.
+// Shared by every C-family declarator walk (defs, call scope, params, C LSP) so
+// the def QN and every caller QN agree on the recovered name.
+bool cbm_c_qualifier_is_recovered(TSNode qid);
+TSNode cbm_c_recovered_func_name(TSNode func_declarator);
+
+// True for a C keyword that error recovery can surface as a function "name"
+// (`else if (a) (b) {` split by #ifdef reads as a definition named `if`).
+// cbm_func_name_node_text returns NULL for these in the C-declarator grammars,
+// so neither a def nor a call scope is minted; the C LSP applies the same test.
+bool cbm_c_reserved_func_name(const char *name);
+
+// True for the languages whose `#define`s become Macro nodes: C, C++, CUDA,
+// GLSL, Objective-C and ISPC. The one predicate for what follows from the C
+// preprocessor: the `#macro` QN namespace (CBM_MACRO_QN_SUFFIX) and the
+// `variants` property (CBMDefinition.variants), because #if branches are what
+// lets one of these files define a name more than once.
+bool cbm_is_c_preprocessor_lang(CBMLanguage lang);
+
 // Convert a resolved function/method name node to its name string, normalizing a
 // C++ conversion-operator's `operator_cast` node (which spans the full
 // "operator bool() const") down to "operator bool". Shared by the defs and
@@ -122,6 +153,13 @@ char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *sou
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 
+// Find every child node matching `kind` (unlike cbm_find_child_by_kind,
+// which stops at the first match). Writes up to `max` nodes into `out`;
+// returns how many were found. Repeated sibling nodes of the same kind are
+// common in some grammars (e.g. C#/PHP stack each `[Attr]` as its own
+// attribute_list child) — see #1692.
+int cbm_find_children_by_kind(TSNode parent, const char *kind, TSNode *out, int max);
+
 /* --- Lisp-family shared gates ---------------------------------------------
  * The defs, calls and unified extractors each walk the same generic `list`
  * node and must agree on what it means. The predicates below therefore live
@@ -167,7 +205,29 @@ void cbm_kind_in_set_free_cache(void);
 // Check if node has an ancestor of the given kind, within max_depth levels.
 bool cbm_has_ancestor_kind(TSNode node, const char *kind, int max_depth);
 
+// Growable pending-node stack for the iterative AST walkers.
+//
+// No work cap may decide graph content, so walker stacks never truncate: a
+// walker starts on a small caller-owned on-stack chunk (`inline_buf`) and spills
+// to the heap (through the memory core, class EXTRACT) only for trees whose
+// pending set outgrows it. Traversal order is unaffected by where the frames
+// live. Ensures room for `need` frames in total; on success `*items`/`*cap`
+// describe the (possibly moved) stack and true is returned. On allocation
+// failure the stack is left intact, the failure is logged at error level under
+// "extract.walk_stack_alloc_failed" (walker=<walker>), and false is returned —
+// the caller then reports its documented failure sentinel instead of a
+// silently truncated result.
+bool cbm_walk_stack_reserve(void **items, int *cap, int need, size_t elem_size,
+                            const void *inline_buf, const char *walker);
+// Release a stack grown by cbm_walk_stack_reserve (no-op for the inline chunk).
+void cbm_walk_stack_release(void *items, const void *inline_buf);
+
+// Sentinel reported by the walkers below when their pending stack could not be
+// grown (allocation failure): the metric is unavailable, never an undercount.
+#define CBM_WALK_METRIC_UNAVAILABLE (-1)
+
 // Count nodes of given kinds in subtree (for complexity metric).
+// Returns CBM_WALK_METRIC_UNAVAILABLE on allocation failure.
 int cbm_count_branching(TSNode node, const char **branching_types);
 
 // Per-function structural complexity, computed in a single AST walk.
@@ -181,6 +241,7 @@ typedef struct {
 
 // Compute the metrics above in one traversal of `node`'s subtree.
 // `branching_types` is the language's branching node-type set.
+// On allocation failure every field is CBM_WALK_METRIC_UNAVAILABLE.
 void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_complexity_t *out);
 
 // Is `kind` a loop construct node type? Language-agnostic curated set (for/while/
@@ -219,6 +280,17 @@ char *cbm_fqn_module_source_lang(CBMArena *a, const char *project, const char *r
 // language this is exactly cbm_fqn_compute (no behavior change).
 char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *rel_path,
                                   const char *name, CBMLanguage lang);
+
+// C-family platform variants: the same external-linkage function defined in
+// files that differ only by a platform token (foo_win.c / foo_posix.c,
+// src/unix/fs.c / src/win/fs.c) is ONE function with platform variants — two
+// external definitions of one name cannot link into one program, so they are
+// alternatives by construction. Returns the platform-neutral QN (the path with
+// its platform tokens removed) for a non-static file-scope function of
+// C/C++/CUDA/ObjC whose `qn` is the plain file-stem form; otherwise `qn`.
+const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *project,
+                                    const char *rel_path, const char *name, const char *qn,
+                                    TSNode func_node);
 
 // Folder QN: project.dir_parts
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir);

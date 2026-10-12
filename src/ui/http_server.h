@@ -104,6 +104,10 @@ void cbm_ui_log_init(void);
 /* Persist a daemon log line in SQLite and the emergency memory ring. */
 void cbm_ui_log_append(const char *line);
 
+/* Release the current activity database. A later append can reopen it;
+ * final shutdown must first quiesce log producers. The mutex remains valid. */
+void cbm_ui_log_close(void);
+
 /* Frontend compatibility export: <cache_dir>/logs/ui.log, one JSON line
  * per accepted entry. Both HTTP log readers use the SQLite journal.
  * Returns false when the path does not fit in out. */
@@ -119,7 +123,8 @@ bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t ou
 
 /* Normalize a git remote (scp-style / ssh:// / https://) to a canonical
  * "https://host/org/repo" web base, with trailing ".git" and any embedded
- * credentials removed. malloc'd or NULL. Caller frees. */
+ * credentials removed. OTHER-owned or NULL; release with
+ * cbm_free(CBM_MEM_CLASS_OTHER, result). */
 char *cbm_ui_git_web_base(const char *url);
 
 /* Copy `url` with any "user[:password]@" userinfo stripped from a

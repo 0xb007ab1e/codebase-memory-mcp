@@ -1,5 +1,6 @@
 import { galaxyNodeContext } from '../browser-ai/galaxy-context';
 import type { BrowserChatContext } from '../browser-ai/chat-model';
+import { graphNodeName } from './node-names';
 import type { GraphData, GraphNode } from './types';
 
 /** Hierarchy render IDs are local to a projection; symbol names carry identity. */
@@ -32,7 +33,7 @@ export function selectedGraphContext(layout: GraphData | undefined, selected: Gr
     };
     return {
         id: snapshotId,
-        label: `Graph node · ${selected.name.slice(0, 60)}`,
+        label: `Graph node · ${graphNodeName(selected).slice(0, 60)}`,
         text: JSON.stringify({
             kind: 'graph-selection-snapshot',
             source: 'selected-graph-node',

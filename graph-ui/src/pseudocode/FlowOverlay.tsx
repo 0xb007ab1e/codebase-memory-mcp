@@ -605,10 +605,14 @@ function Diagram(props: {
                             className="atlas-flow-arrow-head"
                             points={
                                 arrow.self
-                                    ? headPoints(tip, arrow.y + 16, 1)
+                                    ? headPoints(tip, arrow.y + 16, -1)
                                     : headPoints(tip, arrow.y, direction)
                             }
                         />
+                        <polygon className="atlas-flow-direction-pulse" points="0,0 -4.5,-1.6 -4.5,1.6" aria-hidden="true">
+                            <animateMotion path={arrow.self ? selfPath(arrow.fromX, arrow.y) : `M ${arrow.fromX} ${arrow.y} L ${tip} ${arrow.y}`}
+                                dur="3.4s" begin={`${-(arrow.index % 7) * 0.4}s`} repeatCount="indefinite" rotate="auto" />
+                        </polygon>
                         <text
                             className="atlas-flow-arrow-label"
                             x={arrow.labelX}
@@ -633,8 +637,12 @@ function Diagram(props: {
                     <path className="atlas-flow-raise-line" d={selfPath(loop.x, loop.y)} fill="none" />
                     <polygon
                         className="atlas-flow-raise-head"
-                        points={headPoints(loop.x + 2, loop.y + 16, 1)}
+                        points={headPoints(loop.x + 2, loop.y + 16, -1)}
                     />
+                    <polygon className="atlas-flow-direction-pulse atlas-flow-error-pulse" points="0,0 -4.5,-1.6 -4.5,1.6" aria-hidden="true">
+                        <animateMotion path={selfPath(loop.x, loop.y)} dur="3.4s" begin={`${-(loop.index % 7) * 0.4}s`}
+                            repeatCount="indefinite" rotate="auto" />
+                    </polygon>
                     <text
                         className="atlas-flow-raise-label"
                         x={loop.labelX}
@@ -657,7 +665,7 @@ function selfPath(x: number, y: number): string {
 
 /** Die Pfeilspitze als Dreieck, mit der Spitze auf der Zielkoordinate. */
 function headPoints(x: number, y: number, direction: number): string {
-    const back = x + direction * DIAGRAM_HEAD_SIZE * 1.6;
+    const back = x - direction * DIAGRAM_HEAD_SIZE * 1.6;
     return `${x},${y} ${back},${y - DIAGRAM_HEAD_SIZE} ${back},${y + DIAGRAM_HEAD_SIZE}`;
 }
 

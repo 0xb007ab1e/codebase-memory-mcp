@@ -2,7 +2,7 @@
 
 > Preview examples for cbm-preview. These editable notes capture frontend design choices discussed during development; they are not a historical ADR archive or graph-inferred facts. Status: proposed for review.
 
-## 001 — Explain architecture from evidence
+## 001: Explain architecture from evidence
 
 **Status:** Proposed · **Scope:** Architecture workspace
 
@@ -22,7 +22,7 @@ Combine indexed graph relationships with source evidence. Keep the repository ma
 
 **Implementation references:** `graph-ui/src/architecture/`, `src/store/architecture_projection.c`.
 
-## 002 — Keep browser AI optional
+## 002: Keep browser AI optional
 
 **Status:** Proposed · **Scope:** Local chat
 
@@ -44,7 +44,7 @@ Run the chat model locally in the browser after explicit setup. Download weights
 
 **Implementation references:** `graph-ui/src/browser-ai/`, `graph-ui/src/reader/MonacoReader.tsx`.
 
-## 003 — Keep agent activity experimental
+## 003: Keep agent activity experimental
 
 **Status:** Proposed · **Scope:** Agents workspace
 

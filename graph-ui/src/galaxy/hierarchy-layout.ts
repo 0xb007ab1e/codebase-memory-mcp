@@ -155,6 +155,8 @@ export const HIERARCHY_LABEL_MAX_TEXT_WIDTH = 500;
 
 /** Wie viel Platz die Beschriftungen um die Knoten herum brauchen, fuer die Rahmung. */
 export const HIERARCHY_LABEL_PAD_X = 55;
+/** Der Rand neben einem gemessenen Namen, wo die Rahmung seine Breite kennt (Runde 4, N1). */
+export const HIERARCHY_LABEL_MARGIN_X = 12;
 export const HIERARCHY_LABEL_PAD_TOP = 46;
 export const HIERARCHY_LABEL_PAD_BOTTOM = 22;
 
@@ -184,6 +186,10 @@ export interface HierarchyPlacement {
     name: string;
     /** Hops von der Wurzel. Die Wurzel selbst ist null. */
     hop: number;
+    /** Im Ausschnitt (K5): links eingehend (-1), Mitte Wurzel (0), rechts ausgehend (+1). */
+    side?: -1 | 0 | 1;
+    /** Im Ausschnitt (Review zu K5): ueber gemischte Richtungen erreicht, steht im Band unter den Spalten und auf keiner Seite. */
+    mixed?: boolean;
     /** Die `id` des erzeugten Szene-Knotens. */
     id: number;
     x: number;
@@ -214,6 +220,14 @@ export interface HierarchyProjection {
     missing: number;
     /** Je Knoten: wo er sitzt und warum. Der Beweislauf liest daran die Spalten. */
     placements: HierarchyPlacement[];
+    /** Im Ausschnitt (K5): je Szene-ID die ID im Scope, damit Pfade auch in diesem Bild liegen. */
+    sourceIds?: number[];
+    /** Im Ausschnitt (Review zu K5): das Band der gemischt erreichten Knoten, mit Zahl und Lage seiner Ueberschrift. */
+    band?: { count: number; x: number; y: number; left: number; right: number; bottom: number };
+    /** Im Ausschnitt (Review zu K5): wer einen Namen traegt, alle, nur die Wurzel und ihre direkten Nachbarn, oder niemand. */
+    names?: 'all' | 'neighbours' | 'none';
+    /** Im Ausschnitt (zweites Review zu K5): ohne `names: 'all'` die Szene-IDs, die einen Namen tragen. */
+    namedIds?: number[];
 }
 
 /** Die Knoten, die eine Projektion aus dem Server-Layout uebernehmen darf. */
@@ -519,23 +533,28 @@ export function hierarchyIndexEdges(
  * meldet es (NodeLabels.onLayout). Hier wird gerahmt, nicht behauptet.
  *
  * Total: eine Projektion ohne Knoten ergibt ein Rechteck um den Ursprung.
+ *
+ * `labelWidth` (Runde 4, N1): die Weltbreite des Namens einer Platzierung,
+ * wo die Ansicht sie kennt. In der Hierarchie eines Ausschnitts ist ein Name
+ * bis zu rund 300 Einheiten breit und steht mittig ueber seinem Knoten; der
+ * feste Zuschlag schnitt "django-demo · detached HEAD" links am Rand ab. Ohne
+ * `labelWidth` gilt der feste Zuschlag wie bisher.
  */
-export function hierarchyFrame(projection: HierarchyProjection): FrameBox {
+export function hierarchyFrame(projection: HierarchyProjection, labelWidth?: (placement: HierarchyPlacement) => number): FrameBox {
     if (projection.placements.length === 0) {
         return { centerX: 0, centerY: 0, width: HIERARCHY_COLUMN_WIDTH, height: HIERARCHY_ROW_HEIGHT };
     }
-    let minX = Infinity;
-    let maxX = -Infinity;
+    let left = Infinity;
+    let right = -Infinity;
     let minY = Infinity;
     let maxY = -Infinity;
     for (const placement of projection.placements) {
-        minX = Math.min(minX, placement.x);
-        maxX = Math.max(maxX, placement.x);
+        const reach = labelWidth === undefined ? HIERARCHY_LABEL_PAD_X : Math.max(HIERARCHY_LABEL_PAD_X, labelWidth(placement) / 2 + HIERARCHY_LABEL_MARGIN_X);
+        left = Math.min(left, placement.x - reach);
+        right = Math.max(right, placement.x + reach);
         minY = Math.min(minY, placement.y);
         maxY = Math.max(maxY, placement.y);
     }
-    const left = minX - HIERARCHY_LABEL_PAD_X;
-    const right = maxX + HIERARCHY_LABEL_PAD_X;
     const bottom = minY - HIERARCHY_LABEL_PAD_BOTTOM;
     const top = maxY + HIERARCHY_LABEL_PAD_TOP;
     return {

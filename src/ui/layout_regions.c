@@ -18,7 +18,9 @@
  * scopes reuse one computation.
  */
 #include "foundation/constants.h"
+#include "foundation/json_writer.h"
 #include "ui/layout_internal.h"
+#include "ui/atlas.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 
@@ -69,26 +71,26 @@ typedef struct {
 
 typedef struct {
     char key[1152];
-    char *json;             /* serialized regions payload */
+    char *json; /* serialized regions payload */
     int region_count;
-    char ***region_files;   /* per region: owned file_path strings */
+    char ***region_files; /* per region: owned file_path strings */
     int *region_file_count;
     long long total_nodes;
-    CBMHashTable *file_ht;  /* file_path (borrowed from region_files) → region+1 */
+    CBMHashTable *file_ht; /* file_path (borrowed from region_files) → region+1 */
 } region_cache_t;
 
 static region_cache_t g_region_cache;
 static pthread_mutex_t g_region_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void region_cache_clear_locked(void) {
-    free(g_region_cache.json);
+    cbm_free(CBM_MEM_CLASS_OTHER, g_region_cache.json);
     for (int r = 0; r < g_region_cache.region_count; r++) {
         for (int f = 0; f < g_region_cache.region_file_count[r]; f++)
-            free(g_region_cache.region_files[r][f]);
-        free(g_region_cache.region_files[r]);
+            cbm_free(CBM_MEM_CLASS_OTHER, g_region_cache.region_files[r][f]);
+        cbm_free(CBM_MEM_CLASS_OTHER, g_region_cache.region_files[r]);
     }
-    free(g_region_cache.region_files);
-    free(g_region_cache.region_file_count);
+    cbm_free(CBM_MEM_CLASS_OTHER, g_region_cache.region_files);
+    cbm_free(CBM_MEM_CLASS_OTHER, g_region_cache.region_file_count);
     cbm_ht_free(g_region_cache.file_ht);
     memset(&g_region_cache, 0, sizeof(g_region_cache));
 }
@@ -124,7 +126,7 @@ static char *rg_strdup(const char *s) {
     if (!s)
         return NULL;
     size_t len = strlen(s) + 1;
-    char *copy = malloc(len);
+    char *copy = cbm_alloc(CBM_MEM_CLASS_OTHER, len);
     if (copy)
         memcpy(copy, s, len);
     return copy;
@@ -234,21 +236,21 @@ static void rg_build_free(rg_build_t *b) {
     if (!b)
         return;
     for (int r = 0; r < b->region_count; r++) {
-        free(b->regions[r].name);
-        free(b->regions[r].hub);
-        free(b->regions[r].why);
+        cbm_free(CBM_MEM_CLASS_OTHER, b->regions[r].name);
+        cbm_free(CBM_MEM_CLASS_OTHER, b->regions[r].hub);
+        cbm_free(CBM_MEM_CLASS_OTHER, b->regions[r].why);
         for (int t = 0; t < b->regions[r].top_count; t++)
-            free(b->regions[r].top_nodes[t]);
+            cbm_free(CBM_MEM_CLASS_OTHER, b->regions[r].top_nodes[t]);
     }
-    free(b->regions);
-    free(b->edge_w);
-    free(b->node_map);
+    cbm_free(CBM_MEM_CLASS_OTHER, b->regions);
+    cbm_free(CBM_MEM_CLASS_OTHER, b->edge_w);
+    cbm_free(CBM_MEM_CLASS_OTHER, b->node_map);
     for (int f = 0; f < b->file_count; f++) {
-        free(b->file_paths[f]);
-        free(b->file_recs[f]);
+        cbm_free(CBM_MEM_CLASS_OTHER, b->file_paths[f]);
+        cbm_free(CBM_MEM_CLASS_OTHER, b->file_recs[f]);
     }
-    free(b->file_paths);
-    free(b->file_recs);
+    cbm_free(CBM_MEM_CLASS_OTHER, b->file_paths);
+    cbm_free(CBM_MEM_CLASS_OTHER, b->file_recs);
     memset(b, 0, sizeof(*b));
 }
 
@@ -259,10 +261,11 @@ static file_rec_t *rg_file_intern(CBMHashTable *ht, rg_build_t *b, int *cap, con
         return rec;
     if (b->file_count >= *cap) {
         int nc = *cap ? *cap * 2 : 1024;
-        char **np = realloc(b->file_paths, (size_t)nc * sizeof(char *));
-        file_rec_t **nr = realloc(b->file_recs, (size_t)nc * sizeof(file_rec_t *));
+        char **np = cbm_realloc(CBM_MEM_CLASS_OTHER, b->file_paths, (size_t)nc * sizeof(char *));
+        file_rec_t **nr =
+            cbm_realloc(CBM_MEM_CLASS_OTHER, b->file_recs, (size_t)nc * sizeof(file_rec_t *));
         if (!np || !nr) {
-            free(np ? np : b->file_paths);
+            cbm_free(CBM_MEM_CLASS_OTHER, np ? np : b->file_paths);
             b->file_paths = np ? np : NULL;
             if (nr)
                 b->file_recs = nr;
@@ -272,11 +275,11 @@ static file_rec_t *rg_file_intern(CBMHashTable *ht, rg_build_t *b, int *cap, con
         b->file_recs = nr;
         *cap = nc;
     }
-    rec = calloc(1, sizeof(*rec));
+    rec = cbm_atlas_calloc_array(1, sizeof(*rec));
     char *owned = rg_strdup(path);
     if (!rec || !owned) {
-        free(rec);
-        free(owned);
+        cbm_free(CBM_MEM_CLASS_OTHER, rec);
+        cbm_free(CBM_MEM_CLASS_OTHER, owned);
         return NULL;
     }
     rec->idx = b->file_count;
@@ -317,8 +320,9 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
     char **cnames = NULL;
     int cn = 0, ccap = 0;
     sqlite3_stmt *st = NULL;
-    const char *nsql = "SELECT id, name, file_path FROM nodes WHERE project=?1 AND label IN ("
-        CBM_SQL_CALLABLE_OR_TYPE_LABELS ") AND file_path IS NOT NULL ORDER BY id LIMIT ?2";
+    const char *nsql =
+        "SELECT id, name, file_path FROM nodes WHERE project=?1 AND label IN "
+        "(" CBM_SQL_CALLABLE_OR_TYPE_LABELS ") AND file_path IS NOT NULL ORDER BY id LIMIT ?2";
     if (sqlite3_prepare_v2(db, nsql, -1, &st, NULL) != SQLITE_OK)
         return -1;
     sqlite3_bind_text(st, 1, project, -1, SQLITE_STATIC);
@@ -332,13 +336,13 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
             break;
         if (cn >= ccap) {
             int nc = ccap ? ccap * 2 : 4096;
-            int64_t *ni = realloc(cids, (size_t)nc * sizeof(int64_t));
-            int *nf = realloc(cfile, (size_t)nc * sizeof(int));
-            char **nn = realloc(cnames, (size_t)nc * sizeof(char *));
+            int64_t *ni = cbm_realloc(CBM_MEM_CLASS_OTHER, cids, (size_t)nc * sizeof(int64_t));
+            int *nf = cbm_realloc(CBM_MEM_CLASS_OTHER, cfile, (size_t)nc * sizeof(int));
+            char **nn = cbm_realloc(CBM_MEM_CLASS_OTHER, cnames, (size_t)nc * sizeof(char *));
             if (!ni || !nf || !nn) {
-                free(ni ? ni : cids);
-                free(nf ? nf : cfile);
-                free(nn ? nn : cnames);
+                cbm_free(CBM_MEM_CLASS_OTHER, ni ? ni : cids);
+                cbm_free(CBM_MEM_CLASS_OTHER, nf ? nf : cfile);
+                cbm_free(CBM_MEM_CLASS_OTHER, nn ? nn : cnames);
                 cids = NULL;
                 cfile = NULL;
                 cnames = NULL;
@@ -360,11 +364,11 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
     bool use_leiden = cn > 0 && cn <= REGION_LEIDEN_NODE_CAP;
     int *ccomm = NULL; /* community per callable */
     int community_count = 0;
-    int *cdeg = calloc(cn > 0 ? (size_t)cn : 1, sizeof(int));
+    int *cdeg = cbm_atlas_calloc_array(cn > 0 ? (size_t)cn : 1, sizeof(int));
 
     if (use_leiden && cdeg) {
         /* CALLS edges among the callable set. */
-        rg_id_region_t *idmap = malloc((size_t)cn * sizeof(rg_id_region_t));
+        rg_id_region_t *idmap = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)cn * sizeof(rg_id_region_t));
         cbm_louvain_edge_t *ledges = NULL;
         int le = 0, lcap = 0;
         if (idmap) {
@@ -386,7 +390,8 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
                         continue;
                     if (le >= lcap) {
                         int nc = lcap ? lcap * 2 : 4096;
-                        cbm_louvain_edge_t *ne = realloc(ledges, (size_t)nc * sizeof(*ledges));
+                        cbm_louvain_edge_t *ne =
+                            cbm_realloc(CBM_MEM_CLASS_OTHER, ledges, (size_t)nc * sizeof(*ledges));
                         if (!ne)
                             break;
                         ledges = ne;
@@ -403,9 +408,9 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
         }
         cbm_louvain_result_t *res = NULL;
         int rn = 0;
-        if (idmap &&
-            cbm_leiden(cids, cn, ledges, le, 1.0, &res, &rn) == CBM_STORE_OK && res && rn == cn) {
-            ccomm = malloc((size_t)cn * sizeof(int));
+        if (idmap && cbm_leiden(cids, cn, ledges, le, 1.0, &res, &rn) == CBM_STORE_OK && res &&
+            rn == cn) {
+            ccomm = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)cn * sizeof(int));
             if (ccomm) {
                 for (int i = 0; i < cn; i++) {
                     ccomm[i] = res[i].community;
@@ -414,14 +419,14 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
                 }
             }
         }
-        free(res);
-        free(ledges);
-        free(idmap);
+        cbm_free(CBM_MEM_CLASS_OTHER, res);
+        cbm_free(CBM_MEM_CLASS_OTHER, ledges);
+        cbm_free(CBM_MEM_CLASS_OTHER, idmap);
     }
 
     /* 2. Per-file community vote (majority; ties break on lower community). */
     if (ccomm && community_count > 0 && b->file_count > 0) {
-        rg_vote_t *votes = malloc((size_t)cn * sizeof(rg_vote_t));
+        rg_vote_t *votes = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)cn * sizeof(rg_vote_t));
         if (votes) {
             for (int i = 0; i < cn; i++) {
                 votes[i].file_idx = cfile[i];
@@ -448,39 +453,43 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
                 b->file_recs[f]->votes = best_votes;
                 i = j;
             }
-            free(votes);
+            cbm_free(CBM_MEM_CLASS_OTHER, votes);
         }
     }
 
     /* 3. Community → file counts; keep the biggest as Leiden regions. */
-    int *comm_files = community_count > 0 ? calloc((size_t)community_count, sizeof(int)) : NULL;
+    int *comm_files =
+        community_count > 0 ? cbm_atlas_calloc_array((size_t)community_count, sizeof(int)) : NULL;
     if (comm_files) {
         for (int f = 0; f < b->file_count; f++)
             if (b->file_recs[f]->community >= 0)
                 comm_files[b->file_recs[f]->community]++;
     }
-    int *comm_region = community_count > 0 ? malloc((size_t)community_count * sizeof(int)) : NULL;
+    int *comm_region = community_count > 0
+                           ? cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)community_count * sizeof(int))
+                           : NULL;
     if (comm_region)
         for (int c = 0; c < community_count; c++)
             comm_region[c] = -1;
 
-    region_t *regions = calloc(REGION_MAX_TOTAL, sizeof(region_t));
+    region_t *regions = cbm_atlas_calloc_array(REGION_MAX_TOTAL, sizeof(region_t));
     int region_count = 0;
     if (!regions) {
-        free(comm_files);
-        free(comm_region);
+        cbm_free(CBM_MEM_CLASS_OTHER, comm_files);
+        cbm_free(CBM_MEM_CLASS_OTHER, comm_region);
         for (int i = 0; i < cn; i++)
-            free(cnames[i]);
-        free(cnames);
-        free(cids);
-        free(cfile);
-        free(cdeg);
-        free(ccomm);
+            cbm_free(CBM_MEM_CLASS_OTHER, cnames[i]);
+        cbm_free(CBM_MEM_CLASS_OTHER, cnames);
+        cbm_free(CBM_MEM_CLASS_OTHER, cids);
+        cbm_free(CBM_MEM_CLASS_OTHER, cfile);
+        cbm_free(CBM_MEM_CLASS_OTHER, cdeg);
+        cbm_free(CBM_MEM_CLASS_OTHER, ccomm);
         return -1;
     }
 
     if (comm_files && comm_region) {
-        rg_rank_t *rank = malloc((size_t)community_count * sizeof(rg_rank_t));
+        rg_rank_t *rank =
+            cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)community_count * sizeof(rg_rank_t));
         if (rank) {
             for (int c = 0; c < community_count; c++)
                 rank[c] = (rg_rank_t){c, comm_files[c]};
@@ -492,7 +501,7 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
                 regions[region_count].files = rank[r].files;
                 region_count++;
             }
-            free(rank);
+            cbm_free(CBM_MEM_CLASS_OTHER, rank);
         }
     }
 
@@ -524,11 +533,13 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
             if (!slot) {
                 if (folder_count >= folder_cap) {
                     int nc = folder_cap ? folder_cap * 2 : 64;
-                    char **nk = realloc(folder_keys, (size_t)nc * sizeof(char *));
-                    int *nf = realloc(folder_files, (size_t)nc * sizeof(int));
+                    char **nk =
+                        cbm_realloc(CBM_MEM_CLASS_OTHER, folder_keys, (size_t)nc * sizeof(char *));
+                    int *nf =
+                        cbm_realloc(CBM_MEM_CLASS_OTHER, folder_files, (size_t)nc * sizeof(int));
                     if (!nk || !nf) {
-                        free(nk ? nk : folder_keys);
-                        free(nf ? nf : folder_files);
+                        cbm_free(CBM_MEM_CLASS_OTHER, nk ? nk : folder_keys);
+                        cbm_free(CBM_MEM_CLASS_OTHER, nf ? nf : folder_files);
                         folder_keys = NULL;
                         folder_files = NULL;
                         folder_count = 0;
@@ -551,13 +562,13 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
         }
     }
     if (folder_count > 0) {
-        rg_rank_t *rank = malloc((size_t)folder_count * sizeof(rg_rank_t));
+        rg_rank_t *rank = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)folder_count * sizeof(rg_rank_t));
         if (rank) {
             for (int i = 0; i < folder_count; i++)
                 rank[i] = (rg_rank_t){i, folder_files[i]};
             qsort(rank, (size_t)folder_count, sizeof(rg_rank_t), rg_rank_cmp);
             /* folder slot → region id, only for kept groups */
-            int *folder_region = malloc((size_t)folder_count * sizeof(int));
+            int *folder_region = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)folder_count * sizeof(int));
             if (folder_region) {
                 for (int i = 0; i < folder_count; i++)
                     folder_region[i] = -1;
@@ -583,15 +594,15 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
                             b->file_recs[f]->region = fr;
                     }
                 }
-                free(folder_region);
+                cbm_free(CBM_MEM_CLASS_OTHER, folder_region);
             }
-            free(rank);
+            cbm_free(CBM_MEM_CLASS_OTHER, rank);
         }
     }
     for (int i = 0; i < folder_count; i++)
-        free(folder_keys[i]);
-    free(folder_keys);
-    free(folder_files);
+        cbm_free(CBM_MEM_CLASS_OTHER, folder_keys[i]);
+    cbm_free(CBM_MEM_CLASS_OTHER, folder_keys);
+    cbm_free(CBM_MEM_CLASS_OTHER, folder_files);
     cbm_ht_free(folder_ht);
 
     /* 5. Misc region for whatever is left (created lazily in the node pass
@@ -631,7 +642,8 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
                 if (!canon) {
                     if (dir_count >= dir_cap) {
                         int nc = dir_cap ? dir_cap * 2 : 32;
-                        char **nk = realloc(dir_keys, (size_t)nc * sizeof(char *));
+                        char **nk =
+                            cbm_realloc(CBM_MEM_CLASS_OTHER, dir_keys, (size_t)nc * sizeof(char *));
                         if (!nk)
                             break;
                         dir_keys = nk;
@@ -647,7 +659,7 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
                 cbm_ht_set(dir_ht, canon, (void *)(intptr_t)cnt);
                 if (cnt > best) {
                     best = cnt;
-                    free(best_key);
+                    cbm_free(CBM_MEM_CLASS_OTHER, best_key);
                     best_key = rg_strdup(canon);
                 }
             }
@@ -659,16 +671,18 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
                  regions[r].name ? regions[r].name : "?");
         regions[r].why = rg_strdup(why);
         for (int d = 0; d < dir_count; d++)
-            free(dir_keys[d]);
-        free(dir_keys);
+            cbm_free(CBM_MEM_CLASS_OTHER, dir_keys[d]);
+        cbm_free(CBM_MEM_CLASS_OTHER, dir_keys);
         cbm_ht_free(dir_ht);
     }
 
     /* Top-k per region: the k highest-degree callables (name + hub). */
     {
         int k = REGION_TOP_NODES;
-        int *top_deg = malloc((size_t)region_count * (size_t)k * sizeof(int));
-        int *top_idx = malloc((size_t)region_count * (size_t)k * sizeof(int));
+        int *top_deg =
+            cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)region_count * (size_t)k * sizeof(int));
+        int *top_idx =
+            cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)region_count * (size_t)k * sizeof(int));
         if (top_deg && top_idx) {
             for (int i = 0; i < region_count * k; i++) {
                 top_deg[i] = -1;
@@ -703,19 +717,19 @@ static int rg_assign_regions(cbm_store_t *store, const char *project, CBMHashTab
                     regions[r].hub = rg_strdup(regions[r].top_nodes[0]);
             }
         }
-        free(top_deg);
-        free(top_idx);
+        cbm_free(CBM_MEM_CLASS_OTHER, top_deg);
+        cbm_free(CBM_MEM_CLASS_OTHER, top_idx);
     }
 
     for (int i = 0; i < cn; i++)
-        free(cnames[i]);
-    free(cnames);
-    free(cids);
-    free(cfile);
-    free(cdeg);
-    free(ccomm);
-    free(comm_files);
-    free(comm_region);
+        cbm_free(CBM_MEM_CLASS_OTHER, cnames[i]);
+    cbm_free(CBM_MEM_CLASS_OTHER, cnames);
+    cbm_free(CBM_MEM_CLASS_OTHER, cids);
+    cbm_free(CBM_MEM_CLASS_OTHER, cfile);
+    cbm_free(CBM_MEM_CLASS_OTHER, cdeg);
+    cbm_free(CBM_MEM_CLASS_OTHER, ccomm);
+    cbm_free(CBM_MEM_CLASS_OTHER, comm_files);
+    cbm_free(CBM_MEM_CLASS_OTHER, comm_region);
 
     b->regions = regions;
     b->region_count = region_count;
@@ -777,7 +791,8 @@ static int rg_map_all_nodes(cbm_store_t *store, const char *project, CBMHashTabl
         }
         if (n >= cap) {
             long long nc = cap ? cap * 2 : 65536;
-            rg_id_region_t *nm = realloc(map, (size_t)nc * sizeof(rg_id_region_t));
+            rg_id_region_t *nm =
+                cbm_realloc(CBM_MEM_CLASS_OTHER, map, (size_t)nc * sizeof(rg_id_region_t));
             if (!nm)
                 break;
             map = nm;
@@ -804,13 +819,13 @@ static int rg_map_all_nodes(cbm_store_t *store, const char *project, CBMHashTabl
 /* Edge pass: aggregate weights between regions across ALL edge types. */
 static int rg_aggregate_edges(cbm_store_t *store, const char *project, rg_build_t *b) {
     int rc2 = b->region_count * b->region_count;
-    b->edge_w = calloc(rc2 > 0 ? (size_t)rc2 : 1, sizeof(long long));
+    b->edge_w = cbm_atlas_calloc_array(rc2 > 0 ? (size_t)rc2 : 1, sizeof(long long));
     if (!b->edge_w)
         return -1;
     struct sqlite3 *db = cbm_store_get_db(store);
     sqlite3_stmt *st = NULL;
-    if (!db || sqlite3_prepare_v2(db, "SELECT source_id, target_id FROM edges WHERE project=?1",
-                                  -1, &st, NULL) != SQLITE_OK)
+    if (!db || sqlite3_prepare_v2(db, "SELECT source_id, target_id FROM edges WHERE project=?1", -1,
+                                  &st, NULL) != SQLITE_OK)
         return -1;
     sqlite3_bind_text(st, 1, project, -1, SQLITE_STATIC);
     while (sqlite3_step(st) == SQLITE_ROW) {
@@ -834,7 +849,8 @@ static int rg_aggregate_edges(cbm_store_t *store, const char *project, rg_build_
  * by log2(weight) so heavy couplings pull harder. Deterministic. */
 static void rg_layout(rg_build_t *b, float *out_xyz, float *out_size) {
     int rc = b->region_count;
-    cbm_layout_body_t *bodies = calloc(rc > 0 ? (size_t)rc : 1, sizeof(cbm_layout_body_t));
+    cbm_layout_body_t *bodies =
+        cbm_atlas_calloc_array(rc > 0 ? (size_t)rc : 1, sizeof(cbm_layout_body_t));
     if (!bodies)
         return;
     long long max_members = 1;
@@ -869,11 +885,11 @@ static void rg_layout(rg_build_t *b, float *out_xyz, float *out_size) {
             for (int k = 0; k < rep; k++) {
                 if (ne >= ecap) {
                     int nc = ecap ? ecap * 2 : 256;
-                    int *ns = realloc(es, (size_t)nc * sizeof(int));
-                    int *nd = realloc(ed, (size_t)nc * sizeof(int));
+                    int *ns = cbm_realloc(CBM_MEM_CLASS_OTHER, es, (size_t)nc * sizeof(int));
+                    int *nd = cbm_realloc(CBM_MEM_CLASS_OTHER, ed, (size_t)nc * sizeof(int));
                     if (!ns || !nd) {
-                        free(ns ? ns : es);
-                        free(nd ? nd : ed);
+                        cbm_free(CBM_MEM_CLASS_OTHER, ns ? ns : es);
+                        cbm_free(CBM_MEM_CLASS_OTHER, nd ? nd : ed);
                         es = NULL;
                         ed = NULL;
                         ne = 0;
@@ -899,9 +915,9 @@ layout:
         double frac = max_members > 0 ? (double)b->regions[r].members / (double)max_members : 0.0;
         out_size[r] = 14.0f + (float)(sqrt(frac) * 46.0);
     }
-    free(es);
-    free(ed);
-    free(bodies);
+    cbm_free(CBM_MEM_CLASS_OTHER, es);
+    cbm_free(CBM_MEM_CLASS_OTHER, ed);
+    cbm_free(CBM_MEM_CLASS_OTHER, bodies);
 }
 
 /* Serialize the build to the level=regions payload. */
@@ -958,7 +974,7 @@ static char *rg_to_json(const rg_build_t *b, const float *xyz, const float *size
         }
     }
     yyjson_mut_obj_add_val(doc, root, "edges", earr);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -977,14 +993,16 @@ static int rg_rebuild_locked(cbm_store_t *store, const char *project, const char
         rc = rg_aggregate_edges(store, project, &b);
     char *json = NULL;
     if (rc == 0) {
-        float *xyz = calloc(b.region_count > 0 ? (size_t)b.region_count * 3 : 1, sizeof(float));
-        float *size = calloc(b.region_count > 0 ? (size_t)b.region_count : 1, sizeof(float));
+        float *xyz = cbm_atlas_calloc_array(b.region_count > 0 ? (size_t)b.region_count * 3 : 1,
+                                            sizeof(float));
+        float *size =
+            cbm_atlas_calloc_array(b.region_count > 0 ? (size_t)b.region_count : 1, sizeof(float));
         if (xyz && size) {
             rg_layout(&b, xyz, size);
             json = rg_to_json(&b, xyz, size);
         }
-        free(xyz);
-        free(size);
+        cbm_free(CBM_MEM_CLASS_OTHER, xyz);
+        cbm_free(CBM_MEM_CLASS_OTHER, size);
     }
     if (!json) {
         rg_build_free(&b);
@@ -998,10 +1016,10 @@ static int rg_rebuild_locked(cbm_store_t *store, const char *project, const char
     g_region_cache.json = json;
     g_region_cache.region_count = b.region_count;
     g_region_cache.total_nodes = b.total_nodes;
-    g_region_cache.region_files = calloc(b.region_count > 0 ? (size_t)b.region_count : 1,
-                                         sizeof(char **));
-    g_region_cache.region_file_count = calloc(b.region_count > 0 ? (size_t)b.region_count : 1,
-                                              sizeof(int));
+    g_region_cache.region_files =
+        cbm_atlas_calloc_array(b.region_count > 0 ? (size_t)b.region_count : 1, sizeof(char **));
+    g_region_cache.region_file_count =
+        cbm_atlas_calloc_array(b.region_count > 0 ? (size_t)b.region_count : 1, sizeof(int));
     g_region_cache.file_ht = cbm_ht_create((uint32_t)(b.file_count > 0 ? b.file_count : 16));
     if (g_region_cache.region_files && g_region_cache.region_file_count) {
         for (int f = 0; f < b.file_count; f++) {
@@ -1009,8 +1027,8 @@ static int rg_rebuild_locked(cbm_store_t *store, const char *project, const char
             if (r < 0 || r >= b.region_count)
                 continue;
             int idx = g_region_cache.region_file_count[r];
-            char **grown = realloc(g_region_cache.region_files[r],
-                                   ((size_t)idx + 1) * sizeof(char *));
+            char **grown = cbm_realloc(CBM_MEM_CLASS_OTHER, g_region_cache.region_files[r],
+                                       ((size_t)idx + 1) * sizeof(char *));
             if (!grown)
                 continue;
             g_region_cache.region_files[r] = grown;
@@ -1070,7 +1088,7 @@ cbm_layout_result_t *cbm_layout_compute_region(cbm_store_t *store, const char *p
     }
     /* Copy the file list out so the store queries run unlocked. */
     int file_count = g_region_cache.region_file_count[region_id];
-    char **files = calloc(file_count > 0 ? (size_t)file_count : 1, sizeof(char *));
+    char **files = cbm_atlas_calloc_array(file_count > 0 ? (size_t)file_count : 1, sizeof(char *));
     if (!files) {
         pthread_mutex_unlock(&g_region_mu);
         return NULL;
@@ -1096,8 +1114,7 @@ cbm_layout_result_t *cbm_layout_compute_region(cbm_store_t *store, const char *p
                                "end_line, properties FROM nodes WHERE project=?1 AND file_path "
                                "IN (");
             for (int i = 0; i < cnt && pos < (int)sizeof(sql) - 8; i++)
-                pos += snprintf(sql + pos, sizeof(sql) - (size_t)pos, "%s?%d", i ? "," : "",
-                                i + 2);
+                pos += snprintf(sql + pos, sizeof(sql) - (size_t)pos, "%s?%d", i ? "," : "", i + 2);
             snprintf(sql + pos, sizeof(sql) - (size_t)pos, ") ORDER BY id");
             sqlite3_stmt *st = NULL;
             if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
@@ -1111,7 +1128,8 @@ cbm_layout_result_t *cbm_layout_compute_region(cbm_store_t *store, const char *p
                     continue; /* keep counting the region total */
                 if (n >= cap) {
                     int nc = cap ? cap * 2 : 1024;
-                    cbm_node_t *nn = realloc(nodes, (size_t)nc * sizeof(cbm_node_t));
+                    cbm_node_t *nn =
+                        cbm_realloc(CBM_MEM_CLASS_OTHER, nodes, (size_t)nc * sizeof(cbm_node_t));
                     if (!nn)
                         break;
                     nodes = nn;
@@ -1133,19 +1151,19 @@ cbm_layout_result_t *cbm_layout_compute_region(cbm_store_t *store, const char *p
         }
     }
     for (int f = 0; f < file_count; f++)
-        free(files[f]);
-    free(files);
+        cbm_free(CBM_MEM_CLASS_OTHER, files[f]);
+    cbm_free(CBM_MEM_CLASS_OTHER, files);
 
     cbm_layout_result_t *result =
         cbm_layout_from_nodes(store, project, nodes, n, (int)region_total);
     for (int i = 0; i < n; i++) {
-        free((void *)nodes[i].label);
-        free((void *)nodes[i].name);
-        free((void *)nodes[i].qualified_name);
-        free((void *)nodes[i].file_path);
-        free((void *)nodes[i].properties_json);
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)nodes[i].label);
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)nodes[i].name);
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)nodes[i].qualified_name);
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)nodes[i].file_path);
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)nodes[i].properties_json);
     }
-    free(nodes);
+    cbm_free(CBM_MEM_CLASS_OTHER, nodes);
     return result;
 }
 

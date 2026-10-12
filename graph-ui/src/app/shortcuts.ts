@@ -1,36 +1,11 @@
-/**
- * Welche Tasten in dieser Oberflaeche etwas tun, an einer Stelle.
- *
- * Bis zum 2026-08-29 stand die Liste der Menuebuchstaben in App.tsx, direkt
- * neben den Handlungen, die sie ausloest. Das war richtig, solange sie nur
- * einen Leser hatte. Seit die Hilfe (src/help/HelpOverlay.tsx) eine Tabelle
- * aller Tastenkuerzel zeigt, hat sie zwei, und ein zweiter Ort fuer dieselbe
- * Liste waere genau der Fehler, gegen den die Hilfe geschrieben ist: eine
- * Tabelle, die eine Taste verspricht, die nichts mehr tut.
- *
- * ## Warum die drei Bereiche verschieden entstehen
- *
- * Die Menuebuchstaben stehen hier als Liste, weil sie hier entstehen: der Griff
- * am Fenster in App.tsx liest genau diese Liste, und was nicht darin steht,
- * wird nicht gehoert.
- *
- * Die Tasten des Walks und des Suchfensters stehen NICHT als Liste da. Sie
- * werden erfragt: `playerIntent` und `overlayIntent` sind die Funktionen, die
- * entscheiden, was eine Taste dort bedeutet, und dieses Modul probiert sie
- * gegen ein Alphabet moeglicher Tasten durch. Damit ist die Hilfe kein zweiter
- * Katalog, sondern eine Ablesung: verschwindet ein `case` aus einer der beiden
- * Funktionen, verschwindet die Zeile aus der Hilfe, ohne dass jemand daran
- * denken muss.
- */
-
-import { overlayIntent } from '../search/overlay-model';
+/** Shared menu and workspace shortcut catalog used by keyboard handling and help. */
 import { playerIntent } from '../tours/tour-player';
-import { FOCUS_COMMAND_KEY, RESERVED_BARE_SHORTCUTS } from './keyboard';
+import { RESERVED_BARE_SHORTCUTS } from './keyboard';
 
 /**
  * Wo eine Taste gilt.
  *
- * Fuenf Bereiche, und der Unterschied zwischen den ersten beiden ist genau der,
+ * Vier Bereiche, und der Unterschied zwischen den ersten beiden ist genau der,
  * den ein Leser wissen muss: ein `mnemonic` traegt Alt/Option und gilt auch
  * waehrend des Tippens, eine `bare` Taste gilt nur, solange nirgends getippt
  * wird. Ein Bereich mehr ist billiger als eine Tabelle, die beides gleich
@@ -38,7 +13,7 @@ import { FOCUS_COMMAND_KEY, RESERVED_BARE_SHORTCUTS } from './keyboard';
  */
 import { experimentalAgentsEnabled } from './feature-flags';
 
-export type ShortcutScope = 'mnemonic' | 'bare' | 'line' | 'walk' | 'search';
+export type ShortcutScope = 'mnemonic' | 'bare' | 'walk' | 'galaxy';
 
 /** Eine Taste, die etwas tut, und der Bereich, in dem sie es tut. */
 export interface AtlasShortcut {
@@ -52,10 +27,10 @@ export interface AtlasShortcut {
  *
  * `a` klappt die Galaxie auf und zu; die Eintraege der Atlas-Zeile tragen seit
  * dem 2026-08-29 ihre eigenen: `w` die Frage nach dem Warum, `b` den
- * BUG-Assistenten, `c` die Aenderungsansicht, `l` den Schalter des lokalen
+ * BUG-Assistenten, `l` den Schalter des lokalen
  * Modells, `r` seit W8 den Weg zurueck zum Vorgabe-Layout, `s` seit W10 das
  * Einstellungen-Panel, `g` seit W11a den Live-Modus der Agenten, `p` das
- * Projekte-Panel (Index anlegen, entfernen, Entscheidungsakte, Serverzustand).
+ * Dialog zum Anlegen eines Projektindexes.
  * `?` schlaegt seit W7a die Hilfe auf und wieder zu.
  *
  * Warum das vorher nicht so war und warum es jetzt so ist: die Zeile war ein
@@ -70,7 +45,7 @@ export interface AtlasShortcut {
  * gepflegte Liste, denn eine gepflegte Liste ist genau die Stelle, an der ein
  * Punkt ohne Verdrahtung wieder hereinrutscht.
  */
-export const WIRED_MENU_SHORTCUTS: readonly string[] = ['a', 'w', 'b', 'c', 'l', 'r', 's', 'g', 'p', '?']
+export const WIRED_MENU_SHORTCUTS: readonly string[] = ['a', 'w', 'b', 'l', 'r', 's', 'g', 'p', '?']
     .filter(key => experimentalAgentsEnabled || key !== 'g');
 
 /**
@@ -102,8 +77,7 @@ export function needsAlt(shortcut: AtlasShortcut): boolean {
 
 /**
  * Jede Taste, die diese Oberflaeche hoert, in der Reihenfolge, in der die Hilfe
- * sie zeigt: erst die Menuekuerzel, dann die Kommandozeile, dann der Walk, dann
- * das Suchfenster.
+ * sie zeigt: Menuekuerzel, Galaxy-Suche, dann der Walk.
  *
  * Auch die Aufteilung in `mnemonic` und `bare` wird abgelesen und nicht
  * gepflegt: welche Taste ohne Alt/Option gilt, weiss keyboard.ts, und diese
@@ -114,9 +88,8 @@ export const ATLAS_SHORTCUTS: readonly AtlasShortcut[] = [
         scope: (RESERVED_BARE_SHORTCUTS.includes(key) ? 'bare' : 'mnemonic') as ShortcutScope,
         key,
     })),
-    { scope: 'line', key: FOCUS_COMMAND_KEY },
+    { scope: 'galaxy', key: 'Cmd/Ctrl+K' },
     ...probed('walk', playerIntent),
-    ...probed('search', overlayIntent),
 ];
 
 /** Der Schluessel, unter dem der Katalog den Satz zu dieser Taste fuehrt. */

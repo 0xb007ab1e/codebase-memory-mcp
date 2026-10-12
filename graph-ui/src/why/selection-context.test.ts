@@ -40,3 +40,28 @@ describe('selection relevance', () => {
         expect(selectionContext(graph, undefined, 'not-indexed.ts').incoming).toEqual([]);
     });
 });
+
+describe('hand test K13: relationships from the loaded Galaxy scope', () => {
+    // JSONBAgg in django-demo: 11 tests CALL and TEST it, its module DEFINES it, and it INHERITS twice.
+    const root = { ...node(1), name: 'JSONBAgg', qualified_name: 'p.JSONBAgg', file_path: 'general.py' };
+    const tests = Array.from({ length: 11 }, (_, at) => ({ ...node(10 + at), file_path: 'tests/test_aggregates.py' }));
+    const module = { ...node(30), label: 'Module', file_path: 'general.py' };
+    const bases = [node(40), node(41)];
+    const scope: GraphData = { total_nodes: 15, nodes: [root, ...tests, module, ...bases], edges: [
+        ...tests.flatMap(test => [{ source: test.id, target: 1, type: 'CALLS', line: 5 }, { source: test.id, target: 1, type: 'TESTS' }]),
+        { source: 30, target: 1, type: 'DEFINES' }, { source: 1, target: 40, type: 'INHERITS' }, { source: 1, target: 41, type: 'INHERITS' }] };
+
+    it('keeps every relationship type of the scope, not only the repository-map relations', () => {
+        const result = selectionContext(scope, root, 'general.py', undefined, { allRelations: true });
+        expect(result.incoming).toHaveLength(23);
+        expect(result.outgoing).toHaveLength(2);
+        expect(result.incomingByType).toEqual([['CALLS', 11], ['TESTS', 11], ['DEFINES', 1]]);
+        expect(result.outgoingByType).toEqual([['INHERITS', 2]]);
+    });
+
+    it('still limits the repository map snapshot to its map relations', () => {
+        const result = selectionContext(scope, root, 'general.py');
+        expect(result.incoming).toHaveLength(11);
+        expect(result.incomingByType).toEqual([['CALLS', 11]]);
+    });
+});

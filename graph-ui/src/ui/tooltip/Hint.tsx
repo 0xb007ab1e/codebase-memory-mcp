@@ -113,11 +113,29 @@ export interface HintProps {
     children: ReactElement | ((hold: HintHold) => ReactElement);
 }
 
+/*
+ * Ob ein Element ueberhaupt gezeichnet ist.
+ *
+ * Handtest 2026-10-04 (G3): der Inhalt eines zugeklappten `<details>` ist
+ * nicht zu sehen, behaelt im Browser aber einen Kasten (die Menues "Path to…"
+ * und "Edge types" der Galaxie mit ihren Feldern). Als geschuetzt gezaehlt,
+ * schoben sie den Kasten von "Expand +1" vom Platz unter dem Knopf in den Kopf
+ * der Seite. `checkVisibility` sagt es im Browser fuer jeden Grund; die Regel
+ * fuer `<details>` gilt auch dort, wo es die Methode nicht gibt.
+ */
+function rendered(node: Element): boolean {
+    const closed = node.closest('details:not([open])');
+    if (closed !== null && !(closed.querySelector(':scope > summary')?.contains(node) ?? false)) {
+        return false;
+    }
+    return typeof node.checkVisibility !== 'function' || node.checkVisibility();
+}
+
 /** Die Rechtecke, die an dieser Stelle nicht verdeckt werden duerfen. */
 function protectedRects(anchor: Element): HintRect[] {
     const out: HintRect[] = [];
     for (const node of document.querySelectorAll(HINT_PROTECTED_SELECTOR)) {
-        if (node === anchor) {
+        if (node === anchor || !rendered(node)) {
             continue;
         }
         const style = window.getComputedStyle(node);

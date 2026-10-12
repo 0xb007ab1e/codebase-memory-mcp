@@ -76,7 +76,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import { CHROME_FILES, SCAN_WHITELIST, scanChrome } from './lib/chrome-scan.mjs';
-import { DOWNLOADED_HOOK_ARTIFACT, operationalClientReference, OPERATIONAL_CLIENT_REASON } from './lib/operational-client-reference.mjs';
+import { operationalClientReference, OPERATIONAL_CLIENT_REASON } from './lib/operational-client-reference.mjs';
 import {
     ATTRIBUTION_PATTERNS,
     LONG_DASH,
@@ -165,10 +165,13 @@ async function main() {
      * einem Zitat. Das waere keine zweite Beobachtung, sondern dieselbe, und
      * eine Ausnahme fuer eine erzeugte Datei versteckt nichts: was in ihr steht,
      * steht auch in der Datei, aus der sie es abgeschrieben hat.
+     *
+     * Das gilt auch fuer den eingecheckten Bericht am Standardort, wenn --out
+     * woanders hin schreibt: er ist ein frueherer Lauf desselben Werkzeugs.
      */
     const selfReport = relative(ROOT, out);
-    const files = (await repositoryFiles()).filter((path) => path !== selfReport);
-    const canonicalHook = await readFile(join(ROOT, 'agents/hooks/atlas-trace.py')).catch(() => undefined);
+    const ownReports = new Set([selfReport, relative(ROOT, DEFAULT_OUT)]);
+    const files = (await repositoryFiles()).filter((path) => !ownReports.has(path));
     const dashHits = [];
     const dashExceptions = [];
     const attributionHits = [];
@@ -184,8 +187,6 @@ async function main() {
             continue;
         }
         textFiles += 1;
-        const artifact = path === DOWNLOADED_HOOK_ARTIFACT
-            ? await readFile(join(ROOT, path)).catch(() => undefined) : undefined;
         const lines = text.split('\n');
         for (let index = 0; index < lines.length; index += 1) {
             const line = lines[index];
@@ -215,7 +216,7 @@ async function main() {
                             'der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; '
                             + 'die Zeile traegt kein Urheberschafts-Muster',
                     });
-                } else if (operationalClientReference(path, line, { artifact, canonicalHook })) {
+                } else if (operationalClientReference(path, line)) {
                     attributionExceptions.push({ ...where, reason: OPERATIONAL_CLIENT_REASON });
                 } else {
                     attributionHits.push(where);

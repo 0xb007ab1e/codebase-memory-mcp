@@ -18,7 +18,7 @@ interface Props {
     project?: string; api?: Pick<AtlasApi, 'repoInfo'>;
     graph?: GraphData; onToggle: () => void; onOpenNode: (node: GraphNode) => void;
 }
-const emptyFilter: ActivityFilter = { agent: '', run: '', kind: '', query: '' };
+const emptyFilter: ActivityFilter = { agent: '', run: '', kind: '' };
 const rowKey = (row: AgentEvent): string => `${row.agent}:${eventKey(row)}`;
 
 export default function ActivityPanel(props: Props): JSX.Element {
@@ -50,7 +50,6 @@ export default function ActivityPanel(props: Props): JSX.Element {
         {props.status.error && <p role="status" className="cbm-activity-notice">{props.status.error}</p>}
         {props.state.unreadable > 0 && <p role="status" className="cbm-activity-notice">{s.unreadable}: {props.state.unreadable}</p>}
         <div className="cbm-activity-filters">
-            <input aria-label={s.search} placeholder={s.placeholder} value={filter.query} onChange={(event) => set({ query: event.target.value })} />
             <select aria-label={s.agent} value={filter.agent} onChange={(event) => set({ agent: event.target.value, run: '' })}>
                 <option value="">{s.allAgents}</option>{agents.map((value) => <option key={value}>{value}</option>)}
             </select>

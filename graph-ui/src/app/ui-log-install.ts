@@ -139,8 +139,10 @@ export function installUiLog(options: InstallUiLogOptions = {}): UiLogHandle {
     const page = `${target.location.pathname}${target.location.search}`;
     const getProject = options.getProject ?? (() => activeProject
         ?? new URLSearchParams(target.location.search).get('project') ?? '');
+    // A project switch changes the address and keeps the page (K24): each line names the address it was written on.
+    const getPage = (): string => `${target.location.pathname}${target.location.search}`;
     const buffer = options.buffer
-        ?? new UiLogBuffer({ page, session, getProject, transport: options.transport ?? httpUiLogTransport() });
+        ?? new UiLogBuffer({ page, getPage, session, getProject, transport: options.transport ?? httpUiLogTransport() });
 
     let recording = false;
     const guarded = (fn: () => void): void => {

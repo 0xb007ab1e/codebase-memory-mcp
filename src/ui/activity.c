@@ -1,5 +1,7 @@
 #include "ui/activity.h"
 #include <yyjson/yyjson.h>
+#include "foundation/mem_core.h"
+#include "foundation/json_writer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -282,7 +284,7 @@ int cbm_activity_ui_log(sqlite3 *db, const char *line, bool historical) {
 }
 
 static char *write_reply(yyjson_mut_doc *doc) {
-    char *reply = yyjson_mut_write(doc, 0, NULL);
+    char *reply = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return reply;
 }
@@ -432,7 +434,7 @@ int cbm_activity_ingest(sqlite3 *db, const char *body, char **reply) {
         }
         char *payload = write_reply(clean);
         if (!payload || strlen(payload) > EVENT_MAX) {
-            free(payload);
+            cbm_free(CBM_MEM_CLASS_OTHER, payload);
             ok = false;
             break;
         }
@@ -444,7 +446,7 @@ int cbm_activity_ingest(sqlite3 *db, const char *body, char **reply) {
         ok = sqlite3_step(st) == SQLITE_DONE;
         if (ok)
             accepted += sqlite3_changes(db);
-        free(payload);
+        cbm_free(CBM_MEM_CLASS_OTHER, payload);
     }
     sqlite3_finalize(st);
     if (ok)

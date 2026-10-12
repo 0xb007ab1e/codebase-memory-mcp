@@ -5,6 +5,7 @@ import type { ProjectsSource } from '../projects/ProjectsPanel';
 import type { AdrRecord } from '../projects/projects-model';
 import { ADR_CONTENT_LIMIT, adrSize, appendDecision, clearAdrDraft, readAdrDraft, sameAdr, storeAdrDraft } from './adr-model';
 import { adrStrings as s } from './adr-strings';
+import { RefreshControl, useRefreshFeedback } from '../ui/refresh/refresh-feedback';
 import './adr.css';
 
 export interface AdrWorkspaceProps {
@@ -27,13 +28,15 @@ interface EditorState {
     notice: string;
     conflict?: AdrRecord;
     reviewing: boolean;
+    /** How many readings of the record started; the Refresh status speaks about one of them (review of K42). */
+    reads: number;
 }
 
 function ProjectAdrWorkspace({ project, active, source }: AdrWorkspaceProps): JSX.Element {
     const [state, setState] = useState<EditorState>(() => {
         const draft = readAdrDraft(project);
         return { base: draft?.base, content: draft?.content ?? '', editing: !!draft, preview: false,
-            phase: 'idle', error: '', notice: draft ? s.restored : '', reviewing: false };
+            phase: 'idle', error: '', notice: draft ? s.restored : '', reviewing: false, reads: 0 };
     });
     const [saving, setSaving] = useState(false);
     const [storageAvailable, setStorageAvailable] = useState(true);
@@ -60,7 +63,7 @@ function ProjectAdrWorkspace({ project, active, source }: AdrWorkspaceProps): JS
         lastReload.current = reload;
         if (!active || savingRef.current || (hasLoaded.current && current.phase === 'ready' && current.base && current.content !== current.base.content && !forced)) return;
         const ticket = ++loadTicket.current;
-        setState(value => ({ ...value, phase: 'loading', error: '' }));
+        setState(value => ({ ...value, phase: 'loading', error: '', reads: value.reads + 1 }));
         void source.adr(project).then(record => {
             if (!mounted.current || ticket !== loadTicket.current) return;
             hasLoaded.current = true;
@@ -154,6 +157,14 @@ function ProjectAdrWorkspace({ project, active, source }: AdrWorkspaceProps): JS
         editing: !discard, conflict: undefined, reviewing: false, phase: 'ready', error: '', notice: discard ? '' : s.rebased }) : value);
     const ready = state.phase === 'ready';
     const documentVisible = !state.editing || state.preview;
+    /*
+     * Review of K42: Refresh read the record again and nothing on screen
+     * changed. Now it says that it runs, then when and whether the record
+     * changed; a failure only gets its time here, the alert below says what
+     * failed and offers Try again.
+     */
+    const refresh = useRefreshFeedback({ key: String(state.reads), settled: state.phase === 'ready' || state.phase === 'error',
+        value: state.base && { content: state.base.content, updatedAt: state.base.updatedAt, hasAdr: state.base.hasAdr }, error: state.phase === 'error' ? '' : undefined });
 
     return <section className="adr-workspace" aria-label={s.label} aria-busy={state.phase === 'loading' || saving}>
         <header className="adr-toolbar">
@@ -164,7 +175,7 @@ function ProjectAdrWorkspace({ project, active, source }: AdrWorkspaceProps): JS
                 <button type="button" disabled={saving} onClick={cancel}>{s.cancel}</button>
                 <button type="button" className="adr-primary" disabled={!ready || !dirty || !size.valid || saving || !!state.conflict} onClick={() => { void save(); }}>{saving ? s.saving : s.save}</button>
             </> : <>
-                <button type="button" disabled={state.phase === 'loading'} onClick={() => setReload(value => value + 1)}>{s.refresh}</button>
+                <RefreshControl labels={s.refreshFeedback} feedback={refresh.feedback} onRefresh={() => { refresh.begin(); setReload(value => value + 1); }} />
                 {ready && state.base?.hasAdr && <button type="button" onClick={() => startEditing()}>{s.edit}</button>}
                 {ready && state.base?.hasAdr && <button type="button" className="adr-primary" onClick={() => startEditing(true)}>{s.add}</button>}
             </>}</div>

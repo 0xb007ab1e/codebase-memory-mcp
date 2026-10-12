@@ -48,3 +48,21 @@ it('keeps definition cycles finite and preserves their recorded edges', () => {
     expect(projected.depth).toBe(1);
     expect(projectReaderHierarchy(layout, 'src/missing.ts')).toBeUndefined();
 });
+
+it('wraps a complete large file neighborhood without dropping edges or collapsing its width', () => {
+    const roots = Array.from({ length: 368 }, (_, index) => node(index + 8000, `root${index}`));
+    const neighbors = Array.from({ length: 1319 }, (_, index) => node(index + 10000, `neighbor${index}`, 'src/other.ts'));
+    const nodes = [...roots, ...neighbors];
+    const edges = neighbors.map(target => ({ source: roots[0]!.id, target: target.id, type: 'CALLS' }));
+    const result = projectReaderHierarchy({ nodes, edges, total_nodes: nodes.length }, 'src/service.ts', undefined, Number.MAX_SAFE_INTEGER)!;
+    expect(result.data.nodes).toHaveLength(nodes.length); expect(result.data.edges).toHaveLength(edges.length);
+    expect(new Set(result.data.nodes.map(node => `${node.x}:${node.y}`)).size).toBe(nodes.length);
+    const xs = result.data.nodes.map(node => node.x), ys = result.data.nodes.map(node => node.y);
+    const aspect = (Math.max(...xs) - Math.min(...xs)) / (Math.max(...ys) - Math.min(...ys));
+    expect(aspect).toBeGreaterThan(.5); expect(aspect).toBeLessThan(4);
+    const byId = new Map(result.data.nodes.map(node => [node.id, node]));
+    for (const edge of result.data.edges) {
+        expect(byId.get(edge.source)?.name).toBe('root0');
+        expect(byId.get(edge.target)?.name).toMatch(/^neighbor/);
+    }
+});

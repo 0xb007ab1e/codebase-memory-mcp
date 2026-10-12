@@ -27,6 +27,7 @@
 import { symbolKindOf } from '../provider/cbm-rpc-provider';
 import { twinTargetOf } from '../twin/twin-target';
 import type { SymbolRef } from '../core/focus-protocol';
+import { graphNodeName } from './node-names';
 import type { GraphData, GraphEdge, GraphNode } from './types';
 
 /**
@@ -132,7 +133,7 @@ export function missingNodeNote(name: string, budget: number = LAYOUT_NODE_BUDGE
 
 /** Was das Panel sagt, wenn ein angeklickter Knoten keine Datei hat. */
 export function unopenableNodeNote(node: GraphNode): string {
-    return `${node.name} is a ${node.label} node and carries no file in the index, so there is nothing to open`;
+    return `${graphNodeName(node)} is a ${node.label} node and carries no file in the index, so there is nothing to open`;
 }
 
 /** Was das Panel sagt, solange kein Symbol im Fokus steht. */

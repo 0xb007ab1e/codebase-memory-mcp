@@ -11,7 +11,7 @@
  *    Ein Fehler wird gezeigt, nicht verschluckt (src/galaxy/layout-source.ts).
  *    Was geladen wurde, meldet das Panel nach oben (`onLayout`), weil die
  *    Bedeutungssuche daraus ihre Fan-in-Zahlen nimmt und der Server sie in der
- *    flachen Suchform nicht mitschickt (UPSTREAM-ASKS.md, Ask 5).
+ *    flachen Suchform nicht mitschickt.
  * 2. **Einmal sichtbar heisst gemountet.** Wird das Panel zugeklappt, bleibt
  *    die Szene im Baum und nur der Renderloop steht still (`active`). Ein
  *    Aushaengen wuerde den WebGL-Kontext wegwerfen, und der naechste Aufklapper
@@ -128,14 +128,32 @@
 
 import type { JSX, ReactNode } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { GALAXY_NODE_LIMITS, GALAXY_EDGE_LIMITS, useViewPreferences } from '../settings/view-preferences';
 import { Html } from '@react-three/drei';
 
 import { GraphScene, computeCameraTarget, computeFitTarget, computeFrameTarget } from './GraphScene';
 import type { CameraTarget } from './GraphScene';
 import type { LabelBox } from './NodeLabels';
 import { NodeTooltipCard } from './NodeTooltipCard';
+import { HoverCardHtml } from './hover-layer';
 import GalaxyNavigator from './GalaxyNavigator';
+import { TraceEdgeFilter } from './TraceEdgeFilter';
+import { PathPicker, PathSteps } from './ScopePathControls';
+import { callOrder, pathNodes, shortestScopePath, type ScopePathStep } from './scope-path';
+import { galaxyHierarchyNoteText, galaxyHierarchyText, galaxyHistoryText, galaxyLayerText, galaxyPathText, galaxyToolbarText } from './galaxy-strings';
+import { graphNodeName, nodeFilePath, scopeDisplayName, scopeTitle } from './node-names';
+import { HierarchyBandLabel, HierarchyEdgeLabels } from './HierarchyEdgeLabels';
+import { FitLabel, useToolbarFit } from './toolbar-fit';
+import { emptyNavigationHistory, moveNavigation, peekNavigation, pushNavigation } from '../graph/navigation-history';
+import { useDismissibleMenu } from '../graph/use-dismissible-menu';
+import { galaxyHistoryOptions, historyEntryDetail, historyEntryLabel, scopeIdentity, type GalaxyHistoryEntry, type ScopeTrail } from './scope-history';
+import { useOrganicLayout } from './use-organic-layout';
+import RenderProgress from './RenderProgress';
+import { useGraphScope } from './use-graph-scope';
+import { SCOPED_HIERARCHY_LABEL_BUDGET, SCOPED_HIERARCHY_LABEL_MAX_TEXT_WIDTH, expandPastLimit, hierarchyLabelWidth, limitGraphRender, nextLayerEstimate, scenePictureFor, scopedHierarchy, type ExpandOutlook } from './graph-scope';
+import './graph-exploration.css';
 import { layoutNodeForSelection } from './selected-node';
+import { galaxyScopeEvidence, useSelectionEvidence, type SelectionEvidenceListener } from './selection-evidence';
 import { buildCoverageShadow } from './coverage-shadow';
 import type { CoverageShadowNode } from './coverage-shadow';
 import {
@@ -177,6 +195,7 @@ import { readerFocusFrame, readerGraphFocus, type SourceFocusRange } from './rea
 import { projectReaderHierarchy } from './reader-hierarchy';
 import Hint from '../ui/tooltip/Hint';
 import type { GraphData, GraphNode } from './types';
+import type { SelectionScope } from '../why/SelectionContext';
 import {
     AgentLayer,
     agentAngles,
@@ -204,6 +223,7 @@ import type { AgentsRuntime } from '../agents/agent-source';
 import { loadAgentsPreference, saveAgentsPreference } from '../agents/agent-preference';
 import type { AgentsPreference } from '../agents/agent-preference';
 import { fullscreenIsolationRequired, isolateFullscreenBackground } from './fullscreen-isolation';
+import { isTypingTarget } from '../app/keyboard';
 
 /**
  * Wie lange die Ereigniszeile des FOLLOW-Modus stehen bleibt.
@@ -219,20 +239,14 @@ export type GraphMode = 'galaxy' | 'hierarchy';
 /** Die beiden Chips, in der Reihenfolge, in der sie im Kopf stehen. */
 export const GRAPH_MODES: readonly GraphMode[] = ['galaxy', 'hierarchy'];
 
-/**
- * Was der `hierarchy`-Chip sagt, solange es weder Walk noch Fokus gibt.
- *
- * Seit W10b nennt er BEIDE Wege, weil es seitdem beide gibt (AC3): ein Symbol
- * im Fokus genuegt, ein Einstiegs-Spaziergang ist der andere Weg. Ein Knopf, der
- * nur den umstaendlicheren nennt, schickt den Leser auf den Umweg, den dieser
- * Zyklus gerade abgeschafft hat.
+/*
+ * Was der `hierarchy`-Chip sagt, solange es weder Walk noch Fokus gibt, und
+ * was das Panel sagt, wenn kein Knoten des Walks im Reader offen ist, stehen
+ * seit Runde 4 (N2) in galaxy-strings.ts (`galaxyHierarchyNoteText`). Seit
+ * W10b nennt der Chip BEIDE Wege (AC3): ein offenes Symbol genuegt, ein
+ * gewaehlter Start ist der andere Weg; im Galaxy-Tab ist es ein gewaehlter
+ * Knoten.
  */
-export const HIERARCHY_UNAVAILABLE_TITLE =
-    'hierarchy: open a symbol or pick a way in first, then this shows what it reaches';
-
-/** Was das Panel in der Hierarchie sagt, wenn der Leser ausserhalb des Walks steht. */
-export const HIERARCHY_NO_FOCUS_NOTE =
-    'nothing of this walk is in focus: the ring follows the symbol in front of the reader';
 
 /**
  * Wie die Szene im hierarchy-Modus eingestellt ist.
@@ -335,7 +349,10 @@ export interface AtlasHierarchySeam {
     cap: number;
     walkDepth: number;
     /** Je Knoten: Schluessel, Name, Datei, Hop und die gezeichnete Position. */
-    placements: { key: string; name: string; file: string; hop: number; x: number; y: number }[];
+    placements: { key: string; name: string; file: string; hop: number; x: number; y: number; side?: -1 | 0 | 1; mixed?: boolean }[];
+    /** Zweites Review zu K5: das Band der gemischt erreichten Knoten und wer Namen traegt. */
+    band?: { count: number; x: number; y: number; left: number; right: number; bottom: number };
+    names?: 'all' | 'neighbours' | 'none';
     /** Die gezeichneten Kanten, in den Schluesseln des Walks. */
     edges: { from: string; to: string }[];
     /** Wie viele Linien aus dem Walk stammen. */
@@ -416,6 +433,8 @@ export interface AtlasGalaxySeam {
         depth: number;
         normal: [number, number, number];
         up: [number, number, number];
+        /** Worauf die Kamera sieht: in einem Scope die Wurzel. */
+        center?: [number, number, number];
     } | undefined;
     /** Genau der Satz, der im Kopf steht. */
     headline: string;
@@ -437,6 +456,8 @@ export interface AtlasGalaxySeam {
     drawnEdges: number;
     /** Die zweite Kopfzeile: woraus die Linien bestehen und was fehlt. */
     edgeNote: string;
+    /** Der Verlauf aus Zurueck und Vor (K2): Eintraege als Tooltip-Text, der Zeiger, die letzten Wurzeln. */
+    history: { index: number; entries: string[]; recent: string[] };
 }
 
 /** Ein Akteur, so wie der Beweislauf ihn liest. */
@@ -593,6 +614,7 @@ export interface GalaxyPanelProps {
     onSelectShadowNode?: ((node: CoverageShadowNode) => void) | undefined;
     selectedNode?: GraphNode | undefined;
     onClearSelection?: () => void;
+    onSelectionEvidence?: SelectionEvidenceListener;
     /** Das Projekt, dessen Layout gezeigt wird. Leer heisst: nichts laden. */
     project: string;
     /** Ob das Panel im Layout sichtbar ist. */
@@ -722,8 +744,21 @@ export interface GalaxyPanelProps {
     fullscreenToggle?: number;
     /** Der Speicher fuer die Lage des Instruments. Ersetzbar fuer Tests. */
     agentStore?: Storage | undefined;
-    selectionPanel?: import('react').ReactNode;
+    /**
+     * "Selection details". As a function it receives the loaded scope (hand
+     * test K13): the relationships of the selection then come from what this
+     * panel loaded, not from the capped repository snapshot.
+     */
+    selectionPanel?: ReactNode | ((scope: SelectionScope | undefined) => ReactNode);
 }
+
+/**
+ * Bis zu wie vielen Knoten ein Ausschnitt auf dem Schirm auseinandergeschoben
+ * wird (Handtest K8). Die Trennung hebt Namen und Ringe kleiner Ausschnitte aus
+ * der Wolke; eine dichte Wolke aus tausenden Knoten (die dritte Ebene um
+ * JSONBAgg) schob sie dagegen zu einem Kreuz aus langen Linien auseinander.
+ */
+export const SCOPE_SEPARATION_LIMIT = 1500;
 
 /** Wie lange die Zeitangaben im Instrument stehen, bis sie neu gerechnet werden. */
 export const AGENT_TICK_MS = 1000;
@@ -740,8 +775,58 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
         stepQualifiedName,
     } = props;
 
-    const [data, setData] = useState<GraphData | undefined>(undefined);
+    const [layout, setData] = useState<GraphData | undefined>(undefined);
+    const [layoutLoading, setLayoutLoading] = useState(false);
+    const [spacingBusy, setSpacingBusy] = useState(false);
+    const { preferences: viewPreferences, setPreferences: setViewPreferences } = useViewPreferences(project);
+    const { galaxyNodes: nodeBudget, galaxyEdges: edgeBudget, coverageShadow: showCoverage } = viewPreferences;
+    const [traceFilter, setTraceFilter] = useState<{ project: string; types?: string[] }>({ project });
+    const traceTypes = props.workspaceExpanded && traceFilter.project === project ? traceFilter.types : undefined;
+    const changeTraceTypes = useCallback((types: string[] | undefined) => setTraceFilter({ project, types }), [project]);
+    const scope = useGraphScope({ project, layout,
+        filePath: props.workspaceExpanded ? undefined : props.focusFilePath,
+        range: props.focusSourceRange, fetch: props.fetch, edgeTypes: traceTypes,
+        // Handtest K8: eine Ebene ueber dem Render-Limit haelt dort an, statt minutenlang weiterzuladen.
+        ...(props.workspaceExpanded ? { limits: { nodes: nodeBudget, edges: edgeBudget } } : {}) });
+    const organicHistory = useRef<{ key: string; depth: number; data: GraphData } | undefined>(undefined);
+    const organicKey = JSON.stringify([project, scope.scope, scope.direction, traceTypes]);
+    const organicOptions = useMemo(() => {
+        const previous = organicHistory.current;
+        return { rootIds: scope.result?.roots,
+            previous: previous?.key === organicKey && previous.depth <= scope.depth ? previous.data : undefined };
+    }, [scope.result, scope.scope, organicKey, scope.depth]);
+    const organicTask = useOrganicLayout(scope.scope ? scope.result?.data : undefined, organicOptions);
+    const organic = organicTask.result;
+    useEffect(() => {
+        if (scope.complete && organic) organicHistory.current = { key: organicKey, depth: scope.depth, data: organic.data };
+        if (!scope.scope) organicHistory.current = undefined;
+    }, [scope.complete, scope.scope, organic, organicKey, scope.depth]);
+    const data = scope.scope ? organic?.data : layout;
+    /*
+     * Was die Szene zeigt, solange das naechste Bild noch angeordnet wird.
+     *
+     * Bis hierher war `data` waehrend jeder Anordnung leer, die Szene wurde
+     * ausgehaengt, und jeder Schritt (Auswahl, Expand, Vorschau zu Antwort)
+     * baute den Canvas neu auf (Review-Befund G1). Jetzt bleibt das letzte Bild
+     * stehen, bis das neue fertig ist; vor dem ersten Bild eines Scopes ist das
+     * der ganze Graph, der gerade noch zu sehen war. `data` bleibt dabei das
+     * AKTUELLE Bild: Einpassung, Legende und Zaehler rechnen nie mit dem alten.
+     */
+    const sceneData = scope.scope ? scenePictureFor(organic?.data, organicTask.stale?.data, layout) : layout;
+    const sceneScoped = Boolean(scope.scope) && sceneData !== layout;
+    const scopedRoot = scope.result?.roots.size === 1
+        ? scope.result.data.nodes.find(node => scope.result!.roots.has(node.id)) : undefined;
+    const notifiedScopedSymbol = useRef('');
+    useEffect(() => {
+        if (scope.scope?.kind !== 'symbol') { notifiedScopedSymbol.current = ''; return; }
+        if (!scope.complete || !scopedRoot) return;
+        const identity = `${project}:${scope.scope.qualifiedName}`;
+        if (notifiedScopedSymbol.current === identity) return;
+        notifiedScopedSymbol.current = identity;
+        props.onSelectNode?.(scopedRoot);
+    }, [scope.scope, scope.complete, scopedRoot, project, props.onSelectNode]);
     const [error, setError] = useState('');
+    useEffect(() => { if (organicTask.error) setError(organicTask.error); }, [organicTask.error]);
     const [note, setNote] = useState(GALAXY_NO_FOCUS_NOTE);
     const [highlighted, setHighlighted] = useState<Set<number> | null>(null);
     const [cameraTarget, setCameraTarget] = useState<CameraTarget | null>(null);
@@ -766,16 +851,6 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
      * etwas fehlt.
      */
     const [hiddenKinds, setHiddenKinds] = useState<ReadonlySet<string>>(() => new Set<string>());
-
-    const toggleKind = useCallback((type: string) => {
-        setHiddenKinds((hidden) => {
-            const next = new Set(hidden);
-            if (!next.delete(type)) {
-                next.add(type);
-            }
-            return next;
-        });
-    }, []);
 
     /*
      * Die Zeichenflaeche, gemessen statt geraten.
@@ -980,11 +1055,13 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
 
     useEffect(() => {
         if (project.length === 0) {
+            setLayoutLoading(false);
             return;
         }
         let cancelled = false;
         setError('');
-        loadLayout(project, fetchImpl === undefined ? {} : { fetch: fetchImpl })
+        setLayoutLoading(true);
+        loadLayout(project, { ...(fetchImpl === undefined ? {} : { fetch: fetchImpl }), maxNodes: props.workspaceExpanded ? nodeBudget : LAYOUT_NODE_BUDGET })
             .then((loaded) => {
                 if (cancelled) {
                     return;
@@ -1000,11 +1077,11 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                 }
                 setData(undefined);
                 setError(failure instanceof Error ? failure.message : String(failure));
-            });
+            }).finally(() => { if (!cancelled) setLayoutLoading(false); });
         return () => {
             cancelled = true;
         };
-    }, [project, fetchImpl, onLayout]);
+    }, [project, fetchImpl, onLayout, nodeBudget, props.workspaceExpanded]);
 
     /*
      * Der Walk als Bild.
@@ -1023,17 +1100,41 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
      * er gemeint, auch wenn der Leser darin gerade woanders hinsieht.
      */
     const activeWalk = walk ?? props.focusWalk;
-    const readerHierarchyActive = walk === undefined && Boolean(props.focusFilePath);
+    const readerHierarchyActive = !props.workspaceExpanded && walk === undefined && Boolean(props.focusFilePath);
     const readerProjection = useMemo(() => readerHierarchyActive && data
-        ? projectReaderHierarchy(data, props.focusFilePath!, props.focusSourceRange) : undefined,
-    [readerHierarchyActive, data, props.focusFilePath, props.focusSourceRange]);
+        ? projectReaderHierarchy(data, props.focusFilePath!, props.focusSourceRange, Number.MAX_SAFE_INTEGER, scope.depth > 1) : undefined,
+    [readerHierarchyActive, data, props.focusFilePath, props.focusSourceRange, scope.depth]);
     const hierarchyOrigin: HierarchyRootOrigin = walk !== undefined ? 'walk'
         : readerHierarchyActive ? 'file' : 'focus';
 
+    const scopedProjection = useMemo(() => props.workspaceExpanded && scope.scope && scope.result
+        ? scopedHierarchy(scope.result, scope.scope.name) : undefined, [props.workspaceExpanded, scope.scope, scope.result]);
+    /*
+     * Review zu K5: bis 150 Knoten stehen in der Hierarchie eines Ausschnitts
+     * alle Namen. Darueber behalten die Wurzel und ihre direkten Nachbarn ihre
+     * Namen und Kantenschilder (zweites Review), und erst eine Wurzel mit mehr
+     * Nachbarn als das hat keine; eine Notiz im Bild sagt es.
+     */
+    const scopedNames = scopedProjection?.names ?? 'all';
+    const scopedNeighbours = useMemo(() => scopedProjection?.placements.filter(placement => placement.hop === 1).length ?? 0, [scopedProjection]);
+    const scopedNamedIds = useMemo(() => scopedProjection?.namedIds ? new Set(scopedProjection.namedIds) : undefined, [scopedProjection]);
+    const scopedNamedSides = useMemo(() => {
+        const sides = { root: false, incoming: 0, outgoing: 0 };
+        for (const placement of scopedProjection?.placements ?? []) {
+            if (!scopedNamedIds?.has(placement.id)) continue;
+            if (placement.hop === 0) sides.root = true;
+            else if (placement.hop === 1 && placement.side === -1) sides.incoming += 1;
+            else if (placement.hop === 1 && placement.side === 1) sides.outgoing += 1;
+        }
+        return sides;
+    }, [scopedProjection, scopedNamedIds]);
+    const scopedSpots = useMemo(() => scopedProjection
+        ? new Map(scopedProjection.placements.map(placement => [placement.id, { hop: placement.hop, x: placement.x, y: placement.y }])) : undefined,
+    [scopedProjection]);
     const projection = useMemo(
-        () => readerHierarchyActive ? readerProjection
-            : activeWalk === undefined ? undefined : projectHierarchy(activeWalk, { layout: data }),
-        [readerHierarchyActive, readerProjection, activeWalk, data],
+        () => scopedProjection ?? (readerHierarchyActive ? readerProjection
+            : activeWalk === undefined ? undefined : projectHierarchy(activeWalk, { layout: data })),
+        [scopedProjection, readerHierarchyActive, readerProjection, activeWalk, data],
     );
 
     /*
@@ -1056,8 +1157,8 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
      * sie vor W9 gezeigt hat.
      */
     const indexEdges = useMemo(
-        () => (readerHierarchyActive || projection === undefined ? [] : hierarchyIndexEdges(projection, data)),
-        [readerHierarchyActive, projection, data],
+        () => (readerHierarchyActive || scopedProjection || projection === undefined ? [] : hierarchyIndexEdges(projection, data)),
+        [readerHierarchyActive, scopedProjection, projection, data],
     );
 
     /*
@@ -1082,10 +1183,144 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
     const hiddenHere = kinds.filter((kind) => hiddenKinds.has(kind.type)).length;
     const kindNote = edgeKindNote(kinds.length, hiddenHere);
 
-    const shown = useMemo(
-        () => (picture === undefined ? undefined : withoutEdgeKinds(picture, hiddenKinds)),
-        [picture, hiddenKinds],
+    /*
+     * Die Szene bekommt in der Galaxie das stehende Bild (siehe `sceneData`).
+     * Steht dort noch der ganze Graph, gelten auch seine ausgeblendeten
+     * Kantenarten weiter; erst ein Scope-Bild filtert ueber `traceTypes`.
+     * `shown` ist nur das AKTUELLE Bild: Kantenfilter, Zaehler und Auskunft an
+     * den Chat rechnen nie mit dem Platzhalter.
+     */
+    const scenePicture = mode === 'hierarchy' ? picture : sceneData;
+    const sceneShown = useMemo(
+        () => {
+            if (!scenePicture) return undefined;
+            const traced = props.workspaceExpanded && scope.scope && (mode === 'hierarchy' || sceneScoped);
+            const filtered = traced ? scenePicture : withoutEdgeKinds(scenePicture, hiddenKinds);
+            const requiredNames = new Set(data?.nodes.filter(node => scope.result?.roots.has(node.id)).map(node => node.qualified_name));
+            return props.workspaceExpanded ? limitGraphRender(filtered, nodeBudget, edgeBudget, mode === 'hierarchy'
+                ? new Set(filtered.nodes.filter(node => requiredNames.has(node.qualified_name)).map(node => node.id))
+                : scope.result?.roots) : filtered;
+        },
+        [scenePicture, hiddenKinds, props.workspaceExpanded, nodeBudget, edgeBudget, scope.result?.roots, scope.scope, mode, data, sceneScoped],
     );
+    const shown = mode === 'hierarchy' || sceneData === data ? sceneShown : undefined;
+
+    const traceKinds = useMemo(() => edgeKinds(shown), [shown]);
+    const agentEvidence = useMemo(() => scope.scope ? galaxyScopeEvidence({ project, identity: scope.scope,
+        nodes: scope.result?.data.nodes ?? [], edges: scope.result?.data.edges ?? [], roots: scope.result?.roots ?? new Set<number>(),
+        depth: scope.depth, direction: props.workspaceExpanded ? scope.direction : 'both', edgeTypes: traceTypes ?? 'all',
+        // A layer that stopped at the render limit is loaded, not complete: the chat says so (C1).
+        state: scope.complete ? scope.result?.partial ? 'render-limit-partial' : 'complete-indexed-scope' : scope.loading ? 'loading-partial-preview' : 'partial',
+        error: scope.error, exhausted: scope.result?.exhausted,
+        ...scope.complete && scope.result?.partial ? { renderLimit: { layer: scope.result.partial.layer, kind: scope.result.partial.limit,
+            limit: scope.result.partial.limit === 'nodes' ? nodeBudget : edgeBudget } } : {},
+        // Which picture is shown, so the chat can say how to read it (H1).
+        display: mode }) : undefined,
+    [project, scope.scope, scope.result, scope.depth, scope.direction, scope.complete, scope.loading, scope.error, traceTypes, props.workspaceExpanded, nodeBudget, edgeBudget, mode]);
+    useSelectionEvidence(props.onSelectionEvidence, agentEvidence, visible && props.workspaceExpanded === true);
+    const toggleKind = useCallback((type: string) => {
+        if (props.workspaceExpanded && scope.scope) {
+            const next = new Set(traceTypes ?? kinds.map(kind => kind.type));
+            if (!next.delete(type)) next.add(type);
+            changeTraceTypes([...next].sort());
+            return;
+        }
+        setHiddenKinds((hidden) => {
+            const next = new Set(hidden);
+            if (!next.delete(type)) next.add(type);
+            return next;
+        });
+    }, [props.workspaceExpanded, scope.scope, traceTypes, kinds, changeTraceTypes]);
+
+    const renderLimits = <>
+        <label>Nodes <select aria-label="Rendered node limit" value={nodeBudget} onChange={event => setViewPreferences({ galaxyNodes: Number(event.target.value) })}>
+            {GALAXY_NODE_LIMITS.map(value => <option key={value} value={value}>{value.toLocaleString()}</option>)}
+        </select></label>
+        <label>Edges <select aria-label="Rendered edge limit" value={edgeBudget} onChange={event => setViewPreferences({ galaxyEdges: Number(event.target.value) })}>
+            {GALAXY_EDGE_LIMITS.map(value => <option key={value} value={value}>{value.toLocaleString()}</option>)}
+        </select></label>
+    </>;
+
+    /*
+     * Der Pfad und die Aufrufreihe (Review-Befund G5, nach dem Vorbild von
+     * Graphify).
+     *
+     * Beide rechnen nur auf dem, was dieser Scope schon geladen hat, und in der
+     * Richtung, in der er verfolgt wird: der Server wird nicht gefragt, und ein
+     * fehlender Pfad heisst "nicht in diesen Beziehungen", nicht "gibt es
+     * nicht". Der Abstand ist hier die Zahl der Hops und nur hier (G6); die
+     * Wolke selbst behauptet keinen. Die Wahl haengt am Scope (`organicKey`):
+     * eine neue Wurzel, Richtung oder Kantenart verwirft sie, ein Expand
+     * rechnet sie auf dem groesseren Bild neu. Verworfen heisst verworfen: wer
+     * die Richtung zurueckstellt oder dieselbe Wurzel neu waehlt, bekommt den
+     * alten Pfad nicht ungefragt wieder. Das Ziel behaelt seinen Namen, auch
+     * wenn ein entfernter Layer es aus dem Bild nimmt.
+     */
+    const [trail, setTrail] = useState<{ key: string; kind: 'path'; target: number; name: string } | { key: string; kind: 'calls' }>();
+    const [trailStep, setTrailStep] = useState(0);
+    useEffect(() => {
+        setTrail(current => (current && current.key !== organicKey ? undefined : current));
+        setTrailStep(0);
+    }, [organicKey]);
+    const trailRoot = scope.result?.roots.size === 1 ? [...scope.result.roots][0] : undefined;
+    const rootCalls = useMemo(() => (data && trailRoot !== undefined ? callOrder(data.edges, trailRoot) : []), [data, trailRoot]);
+    const pathCandidates = useMemo(() => data?.nodes.filter(node => !scope.result?.roots.has(node.id)) ?? [], [data, scope.result]);
+    const trailView = useMemo(() => {
+        // Handtest K5: Pfad und Aufrufreihe auch in der Hierarchie eines Ausschnitts.
+        if (!props.workspaceExpanded || (mode !== 'galaxy' && !scopedProjection) || trail?.key !== organicKey || !data || !scope.result) return undefined;
+        const names = new Map(data.nodes.map(node => [node.id, graphNodeName(node)]));
+        const nameOf = (id: number) => names.get(id) ?? `#${id}`;
+        if (trail.kind === 'calls') {
+            return { nameOf, lines: true, labels: 'active' as const, steps: rootCalls,
+                heading: galaxyPathText.callsHeading(trailRoot === undefined ? '' : nameOf(trailRoot), rootCalls.length) };
+        }
+        const steps: ScopePathStep[] | undefined = shortestScopePath(data.edges, scope.result.roots, trail.target, scope.direction);
+        const target = names.get(trail.target) ?? trail.name;
+        return { nameOf, lines: false, labels: 'all' as const, steps: steps ?? [],
+            heading: galaxyPathText.pathHeading(target, steps?.length ?? 0),
+            note: steps === undefined ? galaxyPathText.noPath(target) : steps.length === 0 ? galaxyPathText.isRoot(target) : undefined };
+    }, [props.workspaceExpanded, mode, trail, organicKey, data, scope.result, scope.direction, rootCalls, trailRoot]);
+    const trailActive = trailView ? Math.min(trailStep, Math.max(0, trailView.steps.length - 1)) : 0;
+    const trailIds = useMemo(() => trailView?.steps.length && scope.result ? pathNodes(trailView.steps, scope.result.roots) : undefined,
+        [trailView, scope.result]);
+    /*
+     * Die Hierarchie zeichnet mit eigenen IDs (K5). Der Pfad rechnet im Scope und
+     * wird fuer ihr Bild umgeschrieben, damit Linien, Ring und Abdunkeln an den
+     * Knoten liegen, die dort zu sehen sind.
+     */
+    const hierarchyIds = useMemo(() => mode === 'hierarchy' && scopedProjection?.sourceIds
+        ? new Map(scopedProjection.sourceIds.map((source, id) => [source, id])) : undefined, [mode, scopedProjection]);
+    const sceneTrailIds = useMemo(() => !trailIds || !hierarchyIds ? trailIds
+        : new Set([...trailIds].flatMap(id => hierarchyIds.get(id) ?? [])), [trailIds, hierarchyIds]);
+    const scenePathSteps = useMemo(() => {
+        if (!trailView) return undefined;
+        if (!hierarchyIds) return trailView.steps;
+        return trailView.steps.flatMap(step => {
+            const from = hierarchyIds.get(step.from), to = hierarchyIds.get(step.to);
+            const source = hierarchyIds.get(step.edge.source), target = hierarchyIds.get(step.edge.target);
+            return from === undefined || to === undefined || source === undefined || target === undefined ? []
+                : [{ edge: { ...step.edge, source, target }, from, to }];
+        });
+    }, [trailView, hierarchyIds]);
+    const clearTrail = useCallback(() => { setTrail(undefined); setTrailStep(0); }, []);
+    /*
+     * Escape gibt den Pfad frei, aber erst nach allen, die vorgehen: liegt eine
+     * Flaeche darueber (`escapeTaken`, dieselbe Reihenfolge wie beim
+     * Vollbild), gehoert die Taste ihr, und wer in einem Feld oder im Editor
+     * tippt, verlaesst mit Escape das Feld und nicht den Pfad.
+     */
+    const escapeTaken = props.escapeTaken === true;
+    useEffect(() => {
+        if (!trailView || escapeTaken) return;
+        const onKey = (event: globalThis.KeyboardEvent): void => {
+            if (event.key !== 'Escape' || event.defaultPrevented) return;
+            if (isTypingTarget(event.target instanceof Element ? event.target : null)) return;
+            event.preventDefault();
+            clearTrail();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [trailView, escapeTaken, clearTrail]);
 
     const index = useMemo(
         () => (picture === undefined ? new Map<string, GraphNode>() : nodesByQualifiedName(picture.nodes)),
@@ -1096,9 +1331,9 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
     // Graphen und nicht alle, die die Tabelle kennt.
     const legend = useMemo(
         () => (mode === 'hierarchy'
-            ? hierarchyLegendEntries(picture, readerHierarchyActive)
+            ? hierarchyLegendEntries(picture, readerHierarchyActive, Boolean(scopedProjection))
             : galaxyLegendEntries(picture)),
-        [mode, picture, readerHierarchyActive],
+        [mode, picture, readerHierarchyActive, scopedProjection],
     );
 
     // Der Inhalt hat sich geaendert (aufgeklappt, Ansicht gewechselt, eine Art
@@ -1355,10 +1590,25 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
     const requestedFit = props.refit ?? 0;
     const [ownFit, setOwnFit] = useState(0);
     const refitNow = useCallback(() => setOwnFit((count) => count + 1), []);
-    const coverageShadow = useMemo(() => props.workspaceExpanded && mode === 'galaxy' && data
-        ? buildCoverageShadow(data) : null, [data, props.workspaceExpanded, mode]);
-    const fitRequest = useMemo(() => ({ picture, mode, projection, requestedFit, ownFit, coverageShadow }),
-        [picture, mode, projection, requestedFit, ownFit, coverageShadow]);
+    const coverageShadow = useMemo(() => showCoverage && props.workspaceExpanded && mode === 'galaxy' && data
+        ? buildCoverageShadow(data) : null, [data, props.workspaceExpanded, mode, showCoverage]);
+    /*
+     * Was eine neue Einpassung verlangt.
+     *
+     * In der gewaehlten Galaxie ist das der Scope selbst (Wurzel, Richtung,
+     * Kantenarten) und nicht sein Bild: ein Expand, eine Vorschau und die
+     * vollstaendige Antwort danach sind derselbe Ausschnitt, und eine Kamera,
+     * die bei jedem davon neu einpasst, stellt den Leser jedes Mal anders hin
+     * (Review-Befund G1). Wie weit die Kamera fuer das neue Bild stehen muss,
+     * stellt die Szene selbst nach, entlang derselben Blickrichtung und nur,
+     * solange der Leser die Kamera nicht bewegt hat (GraphScene,
+     * `FitContainment`).
+     */
+    const fitScope = mode === 'galaxy' && props.workspaceExpanded && scope.scope ? organicKey : undefined;
+    const fitPicture = fitScope === undefined ? picture : undefined;
+    const fitProjection = fitScope === undefined ? projection : undefined;
+    const fitRequest = useMemo(() => ({ scope: fitScope, picture: fitPicture, projection: fitProjection, mode, requestedFit, ownFit, coverageShadow }),
+        [fitScope, fitPicture, fitProjection, mode, requestedFit, ownFit, coverageShadow]);
     const lastFitRequest = useRef<typeof fitRequest | undefined>(undefined);
 
     useEffect(() => {
@@ -1372,10 +1622,16 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
             skipNextFit.current = false;
             return;
         }
-        lastFitRequest.current = fitRequest;
         if (mode === 'hierarchy' && projection !== undefined) {
-            const box = hierarchyFrame(projection);
+            // In der Hierarchie eines Ausschnitts rahmt die Kamera die Namen in ihrer Breite (Runde 4, N1); ohne Namen zaehlt der Punkt.
+            const box = hierarchyFrame(projection, projection === scopedProjection ? (placement) => {
+                const node = projection.data.nodes[placement.id];
+                return node === undefined || (scopedNamedIds !== undefined && !scopedNamedIds.has(placement.id)) ? 0 : hierarchyLabelWidth(graphNodeName(node));
+            } : undefined);
             const target = computeFrameTarget(box, aspect);
+            // Erst eine Einpassung, die wirklich lief, verbraucht die Anfrage:
+            // ein Scope, dessen Bild noch angeordnet wird, passt danach ein.
+            lastFitRequest.current = fitRequest;
             setCameraTarget(target);
             targetChanges.current += 1;
             fitCount.current += 1;
@@ -1398,10 +1654,22 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
         if (nodes.length === 0) {
             return;
         }
-        const target = computeFitTarget(nodes, aspect);
+        /*
+         * Die Wurzel steht in der Mitte (Review-Befund G4). Gerahmt wird um sie
+         * herum, weit genug, dass auch der fernste Knoten passt; ohne das stand
+         * die Mitte der Wolke im Bild und die Wurzel irgendwo darin.
+         */
+        const roots = fitScope === undefined ? [] : nodes.filter((node) => scope.result?.roots.has(node.id));
+        const center = roots.length === 0 ? undefined : {
+            x: roots.reduce((sum, node) => sum + node.x, 0) / roots.length,
+            y: roots.reduce((sum, node) => sum + node.y, 0) / roots.length,
+            z: roots.reduce((sum, node) => sum + node.z, 0) / roots.length,
+        };
+        const target = computeFitTarget(nodes, aspect, center);
         if (target === null) {
             return;
         }
+        lastFitRequest.current = fitRequest;
         setCameraTarget(target);
         targetChanges.current += 1;
         fitCount.current += 1;
@@ -1417,8 +1685,11 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
             depth: fit.depth,
             normal: [fit.normal.x, fit.normal.y, fit.normal.z],
             up: [fit.up.x, fit.up.y, fit.up.z],
+            center: [fit.center.x, fit.center.y, fit.center.z],
         };
-    }, [visible, mode, projection, picture, aspect, requestedFit, ownFit, coverageShadow, fitRequest, props.workspaceExpanded]);
+        // `scope.result` folgt dem Bild und loest selbst keine Einpassung aus.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [visible, mode, projection, picture, aspect, requestedFit, ownFit, coverageShadow, fitRequest, props.workspaceExpanded, fitScope, scopedProjection, scopedNamedIds]);
 
     const [backgroundCleared, setBackgroundCleared] = useState(false);
     useEffect(() => {
@@ -1429,6 +1700,9 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
     useEffect(() => {
         if (backgroundCleared || mode !== 'galaxy' || data === undefined) {
             return;
+        }
+        if (props.workspaceExpanded && scope.scope) {
+            setHighlighted(new Set(data.nodes.map(node => node.id))); setNote(''); return;
         }
         const node = focusQualifiedName ? index.get(focusQualifiedName) : undefined;
         if (props.focusFilePath === '') {
@@ -1456,7 +1730,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
         // `focusName` steht bewusst nicht in der Liste: er begleitet den
         // qualifizierten Namen und darf keine zweite Kamerafahrt ausloesen.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [backgroundCleared, mode, data, index, focusQualifiedName, flyTo, props.focusFilePath, props.focusSourceRange, aspect, visible]);
+    }, [backgroundCleared, mode, data, index, focusQualifiedName, flyTo, props.focusFilePath, props.focusSourceRange, aspect, visible, props.workspaceExpanded, scope.scope]);
 
     /*
      * FOLLOW: die Kamera geht dorthin, wo sich zuletzt etwas bewegt hat.
@@ -1536,9 +1810,8 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
      * die Oberflaeche legt, und zwar ZULETZT: liegt eine andere Flaeche darueber
      * (Hilfe, Einstiegsdialog, Suchfenster, Einstellungen), gehoert die Taste
      * ihr. Der Vollbildmodus reiht sich in die bestehende Reihenfolge ein, er
-     * draengt sich nicht vor.
+     * draengt sich nicht vor (`escapeTaken` steht beim Pfad weiter oben).
      */
-    const escapeTaken = props.escapeTaken === true;
     useEffect(() => {
         const node = panel.current;
         if (node === null || !fullscreenIsolationRequired(fullscreen, escapeTaken)) {
@@ -1585,6 +1858,18 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
     }, [backgroundCleared, mode, readerHierarchyActive, focusQualifiedName, stepQualifiedName, index]);
 
     /*
+     * Ob die Notiz zum Ring gilt (Runde 4, N2). Der Ring folgt dem Symbol, das
+     * im Reader von Explore offen ist; die Notiz sagt, dass keiner der Knoten
+     * dieses ist. Das gilt nur neben dem Reader: im Galaxy-Tab steht die
+     * Wurzel eines Ausschnitts markiert in der Mitte, und Explore ist dort
+     * nicht zu sehen. Ein Klick ins Leere blendet den Ring aus, macht die
+     * Notiz aber nicht wahr; darum zaehlt hier das Bild und nicht der Ring.
+     */
+    const hierarchyNoFocusNote = useMemo(() => !props.workspaceExpanded
+        && ![focusQualifiedName, stepQualifiedName].some((candidate) => candidate !== undefined && candidate.length > 0 && index.has(candidate))
+        ? galaxyHierarchyNoteText.noFocus : '', [props.workspaceExpanded, focusQualifiedName, stepQualifiedName, index]);
+
+    /*
      * In der Hierarchie bleibt alles hell.
      *
      * In der Galaxie dunkelt die Szene alles ausser der Nachbarschaft ab, und
@@ -1600,8 +1885,8 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
             return;
         }
         setHighlighted(new Set(projection.data.nodes.map((node) => node.id)));
-        setNote(readerProjection ? readerProjection.message : pulsedNode === undefined ? HIERARCHY_NO_FOCUS_NOTE : '');
-    }, [mode, projection, pulsedNode, readerProjection]);
+        setNote(readerProjection ? readerProjection.message : hierarchyNoFocusNote);
+    }, [mode, projection, pulsedNode, readerProjection, hierarchyNoFocusNote]);
 
     // Rueck-Richtung: ein Klick in die Szene oeffnet die Datei.
     const handleNodeClick = useCallback(
@@ -1616,29 +1901,240 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                 setHighlighted(ids);
                 flyTo(picture.nodes, ids, node.qualified_name ?? node.name);
             }
-            const selected = layoutNodeForSelection(data, node) ?? node;
+            const selected = layoutNodeForSelection(layout, node) ?? layoutNodeForSelection(data, node) ?? node;
             props.onSelectNode?.(selected);
             if (props.workspaceExpanded) {
-                setNote('Graph selection attached to the next chat message.');
+                clearTrail();
+                scope.select({ kind: 'node', id: selected.id, name: selected.name, qualifiedName: selected.qualified_name });
+                setNote('');
                 return;
             }
-            if (node.file_path === undefined || node.file_path.length === 0) {
+            const file = nodeFilePath(node);
+            if (file === undefined || file.length === 0) {
                 setNote(unopenableNodeNote(node));
                 return;
             }
             setNote('');
             onOpenNode(selected);
         },
-        [data, picture, mode, flyTo, onOpenNode, props.onSelectNode, props.workspaceExpanded],
+        [layout, data, picture, mode, flyTo, onOpenNode, props.onSelectNode, props.workspaceExpanded, scope.select, clearTrail],
     );
 
-    const handleBackgroundClick = useCallback(() => {
+    /* "All graph" und Escape: der Ausschnitt wird verlassen, und das ist selbst ein Schritt im Verlauf (K2). */
+    const leaveScope = useCallback(() => {
         setBackgroundCleared(true);
+        if (props.workspaceExpanded) setChosenMode('galaxy');
+        clearTrail();
+        scope.reset();
+        changeTraceTypes(undefined);
         setHighlighted(null);
-        setNote(mode === 'hierarchy' ? readerProjection?.message ?? HIERARCHY_NO_FOCUS_NOTE : GALAXY_NO_FOCUS_NOTE);
+        setNote(props.workspaceExpanded ? '' : mode === 'hierarchy' ? readerProjection?.message ?? hierarchyNoFocusNote : GALAXY_NO_FOCUS_NOTE);
         refitNow();
         props.onClearSelection?.();
-    }, [mode, refitNow, props.onClearSelection, readerProjection]);
+    }, [mode, refitNow, props.onClearSelection, readerProjection, scope.reset, props.workspaceExpanded, changeTraceTypes, clearTrail, hierarchyNoFocusNote]);
+    /*
+     * Ein Klick ins Leere hebt im Ausschnitt nur die Markierung auf (Handtest
+     * K9). Bis dahin verliess er den Ausschnitt samt Ebenen und Pfad, ohne
+     * Rueckfrage, und ein Klick knapp neben einen Knoten genuegte. Aus dem
+     * Ausschnitt fuehren jetzt nur "All graph", Escape und Zurueck; der
+     * aufgehobene Pfad ist ein Schritt im Verlauf und kommt mit Zurueck wieder.
+     */
+    const handleBackgroundClick = useCallback(() => {
+        if (props.workspaceExpanded && scope.scope) { clearTrail(); return; }
+        leaveScope();
+    }, [props.workspaceExpanded, scope.scope, clearTrail, leaveScope]);
+
+    /*
+     * Zurueck und Vor (Handtest K2), wie beim Blaettern.
+     *
+     * Der Eintrag ist die ganze Frage dieses Augenblicks: Wurzel, Tiefe,
+     * Richtung, Kantenarten, offener Pfad und Ansicht, und nichts von der
+     * Antwort. Er wird aus dem Zustand ABGELEITET und nicht an jeder Stelle
+     * abgelegt, die ihn aendert; so kann kein Weg in einen neuen Ausschnitt den
+     * Verlauf vergessen. Was ein Zurueck selbst herstellt, legt keinen neuen
+     * Eintrag ab (`restoringKey`). Regeln und Grenzen: src/graph/navigation-history.ts.
+     */
+    const historyTrail: ScopeTrail | undefined = trail?.key !== organicKey ? undefined
+        : trail.kind === 'calls' ? { kind: 'calls' } : { kind: 'path', target: trail.target, name: trail.name };
+    const historyEntry: GalaxyHistoryEntry | undefined = props.workspaceExpanded ? {
+        ...(scope.scope ? { scope: scope.scope } : {}), depth: scope.depth, direction: scope.direction,
+        ...(traceTypes ? { edgeTypes: traceTypes } : {}), ...(historyTrail ? { trail: historyTrail } : {}), mode,
+    } : undefined;
+    const historyKey = historyEntry ? galaxyHistoryOptions.key(historyEntry) : '';
+    const latestEntry = useRef(historyEntry);
+    latestEntry.current = historyEntry;
+    const [history, setHistory] = useState(() => emptyNavigationHistory<GalaxyHistoryEntry>());
+    const restoringKey = useRef<string | undefined>(undefined);
+    const selectOnComplete = useRef<string | undefined>(undefined);
+    const historyProject = useRef(project);
+    useEffect(() => {
+        const entry = latestEntry.current;
+        /*
+         * Ein Projektwechsel beginnt einen neuen Verlauf. Das Projekt kommt oft
+         * erst nach dem ersten Bild aus der Adresszeile; der ganze Graph steht
+         * dann schon da und muss der erste Eintrag bleiben. Ein offener
+         * Ausschnitt gehoert noch zum alten Projekt und wird nicht uebernommen.
+         */
+        if (historyProject.current !== project) {
+            historyProject.current = project;
+            restoringKey.current = undefined;
+            const fresh = emptyNavigationHistory<GalaxyHistoryEntry>();
+            setHistory(entry !== undefined && !entry.scope ? pushNavigation(fresh, entry, galaxyHistoryOptions) : fresh);
+            return;
+        }
+        if (entry === undefined) return;
+        const expected = restoringKey.current;
+        restoringKey.current = undefined;
+        if (expected === historyKey) return;
+        setHistory((current) => pushNavigation(current, entry, galaxyHistoryOptions));
+    }, [historyKey, project]);
+    const applyEntry = useCallback((entry: GalaxyHistoryEntry) => {
+        scope.restore({ ...(entry.scope ? { scope: entry.scope } : {}), depth: entry.depth, direction: entry.direction });
+        const types = entry.edgeTypes ? [...entry.edgeTypes] : undefined;
+        changeTraceTypes(types);
+        setChosenMode(entry.mode);
+        const nextKey = JSON.stringify([project, entry.scope, entry.scope ? entry.direction : 'both', types]);
+        setTrail(entry.trail ? { key: nextKey, ...entry.trail } : undefined);
+        setTrailStep(0);
+        setBackgroundCleared(false);
+        setNote('');
+        /*
+         * Die Auswahl folgt der Wurzel: der ganze Graph hat keine, eine andere
+         * Wurzel waehlt sich, sobald sie geladen ist (ein Symbol meldet sich
+         * selbst, siehe `notifiedScopedSymbol`), und dieselbe Wurzel auf einer
+         * anderen Tiefe oder nach einem Abbruch bleibt ausgewaehlt, mit ihren
+         * "Selection details" und dem Kontext des Chats.
+         */
+        if (!entry.scope) { setHighlighted(null); props.onClearSelection?.(); }
+        else if (!scope.scope || scopeIdentity(entry.scope) !== scopeIdentity(scope.scope))
+            selectOnComplete.current = entry.scope.kind === 'symbol' ? undefined : scopeIdentity(entry.scope);
+    }, [scope.restore, scope.scope, changeTraceTypes, project, props.onClearSelection]);
+    const historyBack = peekNavigation(history, -1);
+    const historyForward = peekNavigation(history, 1);
+    const goHistory = useCallback((step: -1 | 1) => {
+        const entry = peekNavigation(history, step);
+        if (entry === undefined) return;
+        restoringKey.current = galaxyHistoryOptions.key(entry);
+        setHistory((current) => moveNavigation(current, step, galaxyHistoryOptions));
+        applyEntry(entry);
+    }, [history, applyEntry]);
+    // A recent root is a new navigation: it is pushed and drops the forward branch.
+    const jumpToRecent = useCallback((entry: GalaxyHistoryEntry) => applyEntry(entry), [applyEntry]);
+    useEffect(() => {
+        if (!scope.complete || !scopedRoot || !scope.scope || selectOnComplete.current !== scopeIdentity(scope.scope)) return;
+        selectOnComplete.current = undefined;
+        props.onSelectNode?.(layoutNodeForSelection(layout, scopedRoot) ?? scopedRoot);
+    }, [scope.complete, scopedRoot, scope.scope, layout, props.onSelectNode]);
+    useEffect(() => {
+        if (!props.workspaceExpanded || escapeTaken) return;
+        const onKey = (event: globalThis.KeyboardEvent): void => {
+            if (event.defaultPrevented || !event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+            if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+            if (isTypingTarget(event.target instanceof Element ? event.target : null)) return;
+            const step = event.key === 'ArrowLeft' ? -1 : 1;
+            if (peekNavigation(history, step) === undefined) return;
+            event.preventDefault();
+            goHistory(step);
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [props.workspaceExpanded, escapeTaken, history, goHistory]);
+    /* Escape ohne offenen Pfad verlaesst den Ausschnitt (K9); den Pfad gibt der Griff weiter oben frei. */
+    useEffect(() => {
+        if (!props.workspaceExpanded || !scope.scope || trailView || escapeTaken) return;
+        const onKey = (event: globalThis.KeyboardEvent): void => {
+            if (event.key !== 'Escape' || event.defaultPrevented) return;
+            if (isTypingTarget(event.target instanceof Element ? event.target : null)) return;
+            event.preventDefault();
+            leaveScope();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [props.workspaceExpanded, scope.scope, trailView, escapeTaken, leaveScope]);
+    /* Handtest 2026-10-04 (A2): die Liste schliesst bei einem Klick daneben, mit Escape und mit jedem neuen Ort. */
+    const recentMenu = useDismissibleMenu(historyKey);
+    const historyControls = props.workspaceExpanded ? <span className="atlas-graph-history" role="group" aria-label={galaxyHistoryText.group}>
+        <button type="button" aria-label={galaxyHistoryText.back} disabled={!historyBack} onClick={() => goHistory(-1)}
+            title={historyBack ? galaxyHistoryText.backTo(historyEntryLabel(historyBack)) : galaxyHistoryText.noBack}>
+            <FitLabel wide={galaxyHistoryText.backWide} narrow={galaxyHistoryText.backGlyph} /></button>
+        <button type="button" aria-label={galaxyHistoryText.forward} disabled={!historyForward} onClick={() => goHistory(1)}
+            title={historyForward ? galaxyHistoryText.forwardTo(historyEntryLabel(historyForward)) : galaxyHistoryText.noForward}>
+            <FitLabel wide={galaxyHistoryText.forwardWide} narrow={galaxyHistoryText.forwardGlyph} /></button>
+        {history.recent.length > 1 && <details className="atlas-graph-recent" ref={recentMenu.ref}>
+            <summary title={galaxyHistoryText.recentTitle} aria-label={galaxyHistoryText.recent}>{galaxyHistoryText.recentGlyph}</summary>
+            <ul className="atlas-graph-recent-menu" aria-label={galaxyHistoryText.recentList}>{history.recent.map((entry) => {
+                const current = galaxyHistoryOptions.recentKey?.(entry) === (scope.scope ? scopeIdentity(scope.scope) : undefined);
+                return <li key={galaxyHistoryOptions.recentKey?.(entry)}>
+                    <button type="button" disabled={current} aria-current={current ? 'true' : undefined} onClick={() => {
+                        recentMenu.close();
+                        jumpToRecent(entry);
+                    }}><strong>{entry.scope && scopeDisplayName(entry.scope)}</strong><span>{historyEntryDetail(entry)}</span></button>
+                </li>;
+            })}</ul>
+        </details>}
+    </span> : null;
+
+    /* Der geladene Ausschnitt fuer "Selection details" (K13). */
+    const selectionScope = useMemo<SelectionScope | undefined>(() => props.workspaceExpanded && scope.scope && scope.result ? {
+        graph: scope.result.data, complete: scope.complete, direction: scope.direction, depth: scope.result.depth,
+        ...(traceTypes ? { edgeTypes: traceTypes } : {}), ...(scope.result.partial ? { partial: scope.result.partial } : {}),
+    } : undefined, [props.workspaceExpanded, scope.scope, scope.result, scope.complete, scope.direction, traceTypes]);
+    const selectionContent = typeof props.selectionPanel === 'function' ? props.selectionPanel(selectionScope) : props.selectionPanel;
+
+    /* K3 und Review: die Leiste misst, ob sie voll, knapp oder umgebrochen passt (toolbar-fit.tsx). */
+    const explorationBar = useRef<HTMLDivElement>(null);
+    useToolbarFit(explorationBar, Boolean(props.workspaceExpanded && scope.scope));
+
+    /* Was die Leiste sonst noch braucht (K3): Quelle der Wurzel, Gruppen und was ausserhalb der Limits liegt. */
+    const openRoot = props.workspaceExpanded && scopedRoot && nodeFilePath(scopedRoot)
+        ? () => props.onOpenNode(layoutNodeForSelection(layout, scopedRoot) ?? scopedRoot) : undefined;
+    /* Runde 4 (N1): die Wurzel heisst, wie die Galaxie sie zeigt; ein Branch-Knoten "django-demo · detached HEAD". */
+    // Ordner und Dateien behalten ihren Pfad; ein Knoten nimmt seine Art von der geladenen Wurzel, wo es sie gibt.
+    const rootShown = !scope.scope ? ''
+        : (scope.scope.kind === 'node' || scope.scope.kind === 'symbol') && scopedRoot && scopedRoot.qualified_name === scope.scope.qualifiedName
+            ? graphNodeName(scopedRoot) : scopeDisplayName(scope.scope);
+    const groupCount = mode === 'galaxy' && organic ? organic.groups.length : 0;
+    const groupsText = groupCount > 1 ? galaxyToolbarText.groupsTitle(groupCount) : undefined;
+    const outsideLimits = props.workspaceExpanded && data && shown && (shown.nodes.length < data.nodes.length || shown.edges.length < data.edges.length)
+        ? galaxyToolbarText.outsideLimits(data.nodes.length - shown.nodes.length, data.edges.length - shown.edges.length) : undefined;
+
+    /*
+     * "−" waehrend des Ladens ist ein Abbruch (K8), und ein Abbruch ist ein
+     * Schritt zurueck und kein neuer: steht die vorige Ebene direkt davor im
+     * Verlauf, geht es dorthin, und Vor laedt die abgebrochene Ebene wieder.
+     */
+    const cancelOrRemoveLayer = () => {
+        const previous = historyEntry && { ...historyEntry, depth: scope.depth - 1 };
+        if (scope.loading && previous && historyBack && galaxyHistoryOptions.key(historyBack) === galaxyHistoryOptions.key(previous)) goHistory(-1);
+        else scope.setDepth(scope.depth - 1);
+    };
+
+    /* Was die Leiste ueber das Laden der Ebenen sagt (Handtest K8). */
+    const partial = scope.complete ? scope.result?.partial : undefined;
+    const scopeState = scope.validating ? 'checking' : scope.loading ? 'loading' : organicTask.loading ? 'arranging'
+        : partial ? 'partial' : scope.complete ? 'complete' : 'preview';
+    const scopeStatus = scope.validating ? galaxyLayerText.checking
+        : scope.loading ? scope.progress ? galaxyLayerText.loadingProgress(scope.progress.layer, scope.progress.nodes, scope.progress.edges) : galaxyLayerText.loading(scope.depth)
+            : organicTask.loading ? galaxyLayerText.arranging
+                : scope.complete ? partial ? galaxyLayerText.partial(galaxyLayerText.counts(data?.nodes.length ?? 0, data?.edges.length ?? 0))
+                    : `${galaxyLayerText.counts(data?.nodes.length ?? 0, data?.edges.length ?? 0)}${scope.result?.exhausted ? galaxyLayerText.endOfTrace : ''}`
+                    : galaxyLayerText.partialPreview;
+    const estimate = scope.complete ? nextLayerEstimate(scope.result) : undefined;
+    // Die gezaehlten Aufrufe am Rand sind eine Untergrenze; das Wachstum allein uebersah die Knoten mit tausend Aufrufern (Review zu K8).
+    const edgeCalls = estimate ? scope.edgeCalls : undefined;
+    // G3: die Render-Limits gelten nur in der Werkzeugleiste des Galaxy-Arbeitsbereichs; das Mini-Galaxy laedt ohne sie.
+    const expandOutlook: ExpandOutlook | undefined = estimate && {
+        layer: estimate.layer, frontier: estimate.frontier, estimate: estimate.estimate, calls: edgeCalls,
+        loaded: { nodes: data?.nodes.length ?? 0, edges: data?.edges.length ?? 0 },
+        limits: props.workspaceExpanded ? { nodes: nodeBudget, edges: edgeBudget } : undefined,
+    };
+    const expandPast = expandOutlook && expandPastLimit(expandOutlook);
+    const expandWarning = Boolean(expandPast);
+    const expandBlocked = Boolean(scope.loading || scope.result?.exhausted || scope.result?.partial);
+    // Review zu K31: gesperrt heisst immer mit Grund, auch waehrend eine Ebene laedt.
+    const expandTitle = scope.loading ? galaxyLayerText.expandLoading(scope.depth)
+        : partial ? galaxyLayerText.expandPartial : scope.result?.exhausted ? galaxyLayerText.expandEnd
+        : expandOutlook ? galaxyLayerText.expandHint(expandOutlook, expandPast) : undefined;
 
     /*
      * Die Vorgabe der Ansicht, mit der Wahl des Lesers darauf.
@@ -1653,7 +2149,8 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
         mode === 'hierarchy' ? HIERARCHY_DISPLAY : DEFAULT_DISPLAY_SETTINGS,
         choice,
     );
-    const layoutState = error.length > 0 ? 'failed' : data === undefined ? 'loading' : 'ready';
+    // Ein stehendes Bild ist kein Ladezustand: die Werkzeugleiste sagt, dass angeordnet wird.
+    const layoutState = error.length > 0 ? 'failed' : sceneData === undefined ? 'loading' : 'ready';
     // Die Hierarchie braucht das Layout nicht: sie faerbt sich damit, sie lebt
     // nicht davon. Ein Walk, dessen Bild dasteht, ist fertig.
     const state = mode === 'hierarchy' ? projection ? 'ready'
@@ -1670,7 +2167,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                 ? `layout unavailable: ${error}`
                 : layoutState === 'loading'
                     ? `loading the layout of ${project.length > 0 ? project : 'no project'} ...`
-                    : layoutSummary(data as GraphData, LAYOUT_NODE_BUDGET);
+                    : layoutSummary((data ?? sceneData) as GraphData, LAYOUT_NODE_BUDGET);
 
     /*
      * Die zweite Zeile des Kopfes: woraus die Linien bestehen (W9).
@@ -1844,7 +2341,8 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
             legendOpen,
             legendEntries: legend.length,
             bloom: display.bloom,
-            labelBoxes: labelBoxes.current,
+            // Live: the scene publishes new name boxes from its frame loop, without a render of this panel.
+            get labelBoxes() { return labelBoxes.current; },
             mode,
             open: visible,
             hierarchyAvailable: projection !== undefined,
@@ -1855,8 +2353,9 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
             pulsedQn: pulsedNode?.qualified_name ?? pulsedNode?.name ?? '',
             edgeKinds: kinds.map((kind) => ({ ...kind, hidden: hiddenKinds.has(kind.type) })),
             hiddenKinds: [...hiddenKinds].sort(),
-            drawnEdges: shown?.edges.length ?? 0,
+            drawnEdges: sceneShown?.edges.length ?? 0,
             edgeNote,
+            history: { index: history.index, entries: history.entries.map(historyEntryLabel), recent: history.recent.map(historyEntryLabel) },
             hierarchy:
                 projection === undefined
                     ? undefined
@@ -1875,7 +2374,11 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                             hop: placement.hop,
                             x: placement.x,
                             y: placement.y,
+                            ...(placement.side !== undefined ? { side: placement.side } : {}),
+                            ...(placement.mixed ? { mixed: true } : {}),
                         })),
+                        ...(projection.band ? { band: projection.band } : {}),
+                        ...(projection.names ? { names: projection.names } : {}),
                         edges: projection.data.edges.map((edge) => ({
                             from: projection.data.nodes[edge.source]?.qualified_name
                                 ?? projection.data.nodes[edge.source]?.name ?? '',
@@ -1925,9 +2428,19 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
      * GraphScene.tsx), und sie muss zwischen einem Ring und einer Ebene aus
      * Koerpern nicht unterscheiden: was hier steht, ist ein Kind ihres Baums.
      */
-    const overlay: ReactNode = (pulseRing === undefined && !liveOn) ? undefined : (
+    /* K5: die Kantenarten an den Linien der Hierarchie eines Ausschnitts, solange kein Pfad seine eigenen zeigt. */
+    // Review zu K5: Kantenschilder nur neben Namen; ohne Namen waeren sie Schilder an Punkten, die niemand zuordnen kann.
+    const labelledEdges = useMemo(() => !sceneShown || !scopedNamedIds ? sceneShown?.edges
+        : sceneShown.edges.filter(edge => scopedNamedIds.has(edge.source) && scopedNamedIds.has(edge.target)), [sceneShown, scopedNamedIds]);
+    const hierarchyEdgeLabels = mode === 'hierarchy' && scopedProjection && !sceneTrailIds && sceneShown && labelledEdges?.length
+        ? <HierarchyEdgeLabels nodes={sceneShown.nodes} edges={labelledEdges} layout={scopedSpots} nameBoxes={labelBoxes} /> : undefined;
+    // Zweites Review zu K5: die Ueberschrift des Bandes der gemischt erreichten Knoten.
+    const hierarchyBand = mode === 'hierarchy' && scopedProjection?.band ? <HierarchyBandLabel band={scopedProjection.band} /> : undefined;
+    const overlay: ReactNode = (pulseRing === undefined && !liveOn && hierarchyEdgeLabels === undefined && hierarchyBand === undefined) ? undefined : (
         <>
             {pulseRing}
+            {hierarchyEdgeLabels}
+            {hierarchyBand}
             {liveOn && agentLayerOn && agentsView !== undefined && (
                 <AgentLayer
                     actors={agentsView.actors}
@@ -1998,7 +2511,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                                     name={`graph-mode-${candidate}`}
                                     text={
                                         candidate === 'hierarchy' && projection === undefined
-                                            ? HIERARCHY_UNAVAILABLE_TITLE
+                                            ? props.workspaceExpanded ? galaxyHierarchyNoteText.unavailableWorkspace : galaxyHierarchyNoteText.unavailable
                                             : !visible
                                                 ? graphModeCollapsedTitle(candidate)
                                                 : mode === candidate && candidate === 'galaxy' && !props.workspaceExpanded
@@ -2006,6 +2519,8 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                                                     : candidate === 'galaxy'
                                                         ? 'galaxy: the whole project, laid out by the server'
                                                         : readerHierarchyActive ? 'hierarchy: incoming relationships, file definitions, and outgoing relationships'
+                                                        : scopedProjection ? galaxyHierarchyText.hint(scope.direction, { mixed: scopedProjection.band?.count ?? 0, names: scopedNames,
+                                                            budget: SCOPED_HIERARCHY_LABEL_BUDGET, neighbours: scopedNeighbours, sides: scopedNamedSides })
                                                         : 'hierarchy: what the chosen symbol reaches, one column per call depth'
                                     }
                                 >
@@ -2026,6 +2541,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                                                 return;
                                             }
                                             setChosenMode(candidate);
+                                            if (props.workspaceExpanded && !scope.scope && !activeWalk) setNote('');
                                             if (!visible) {
                                                 props.onToggleVisible?.();
                                             }
@@ -2088,26 +2604,22 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                         </Hint>
                     )}
                 </div>
-                {props.workspaceExpanded && <GalaxyNavigator nodes={data?.nodes ?? []} onSelect={handleNodeClick} />}
-                {props.workspaceExpanded && props.selectedNode && <div className="atlas-galaxy-selected">
-                    <span>{props.selectedNode.name}</span>
-                    {props.selectedNode.file_path && <button type="button" onClick={() => props.onOpenNode(props.selectedNode!)}>Open source</button>}
-                </div>}
-                {props.workspaceExpanded && <span className="atlas-galaxy-coverage-key">
+                {showCoverage && props.workspaceExpanded && !scope.scope && <span className="atlas-galaxy-coverage-key">
                     <i aria-hidden="true" />{mode === 'hierarchy' ? 'Coverage shadow is shown in galaxy view' : coverageShadow
                         ? `Coverage shadow: ${coverageShadow.counts.files} files, ${coverageShadow.counts.folders} folders with index gaps`
                         : data?.missed_graph ? 'No coverage-shadow nodes reported' : 'Coverage shadow unavailable in this layout'}
                 </span>}
                 <span
                     className="atlas-galaxy-headline"
+                    hidden={Boolean(scope.scope)}
                     data-testid="atlas-galaxy-headline"
                     data-state={state}
                 >
                     {props.workspaceExpanded && mode === 'galaxy' && state === 'ready' && data
-                        ? `${data.nodes.length.toLocaleString()} of ${data.total_nodes.toLocaleString()} nodes · ${data.edges.length.toLocaleString()} relationships loaded`
+                        ? `${shown?.nodes.length.toLocaleString() ?? 0} of ${data.total_nodes.toLocaleString()} nodes · ${shown?.edges.length.toLocaleString() ?? 0} relationships`
                         : headline}
                 </span>
-                {edgeNote.length > 0 && (
+                {edgeNote.length > 0 && !scope.scope && (
                     <span
                         className="atlas-galaxy-edgenote"
                         data-testid="atlas-galaxy-edgenote"
@@ -2118,6 +2630,96 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                     </span>
                 )}
             </header>
+            {(props.workspaceExpanded || scope.scope) && <div className="atlas-graph-exploration" aria-label="Graph scope" ref={explorationBar}
+                data-scoped={props.workspaceExpanded && scope.scope ? 'true' : undefined}>
+                {historyControls}
+                {props.workspaceExpanded && <GalaxyNavigator embedded nodes={layout?.nodes ?? []} project={project} fetch={fetchImpl} onSelect={handleNodeClick} onSelectScope={next => { props.onClearSelection?.(); setBackgroundCleared(false); clearTrail(); scope.select(next); }} />}
+                {scope.scope ? <>
+                    {props.workspaceExpanded && <button type="button" onClick={leaveScope} aria-label={galaxyHistoryText.allGraph} title={galaxyHistoryText.allGraphTitle}>
+                        <FitLabel wide={galaxyHistoryText.allGraph} narrow={galaxyHistoryText.allGraphNarrow} /></button>}
+                    {/*
+                      * Handtest K3: die Wurzel ist zugleich der Weg zu ihrer
+                      * Quelle. Ein eigener Knopf "Open source" daneben kostete die
+                      * Zeile bei offenem Chat rund hundert Pixel; er steht fuer
+                      * die Tastatur weiter im Menue "⋯".
+                      */}
+                    {props.workspaceExpanded && openRoot
+                        ? <button type="button" className="atlas-graph-scope-name" data-fit-whole="" onClick={openRoot} aria-label={galaxyToolbarText.openRootLabel(rootShown)}
+                            title={galaxyToolbarText.openRootTitle(rootShown, scopedRoot?.file_path ?? '', scopedRoot?.start_line)}>{rootShown}</button>
+                        : <strong className="atlas-graph-scope-name" data-fit-whole="" title={scopeTitle(scope.scope)}>{rootShown}</strong>}
+                    {props.workspaceExpanded && <select aria-label="Trace direction" title={galaxyToolbarText.traceTitle} value={scope.direction}
+                        onChange={event => scope.setDirection(event.target.value as 'both' | 'inbound' | 'outbound')}>
+                        <option value="both">Both directions</option><option value="inbound">Incoming</option><option value="outbound">Outgoing</option>
+                    </select>}
+                    {props.workspaceExpanded && <TraceEdgeFilter kinds={traceKinds} availableTypes={kinds.map(kind => kind.type)} selected={traceTypes} onChange={changeTraceTypes} />}
+                    {/*
+                      * Handtest K8: waehrend eine Ebene laedt, ist "−" der Weg
+                      * hinaus. Es bricht das Laden ab und steht sofort wieder auf
+                      * der vorigen, schon vollstaendigen Ebene.
+                      */}
+                    <button type="button" disabled={scope.depth <= scope.minDepth}
+                        title={scope.loading ? galaxyLayerText.cancelLoading(scope.depth) : galaxyLayerText.removeLayer}
+                        onClick={cancelOrRemoveLayer} aria-label="Remove graph layer">−</button>
+                    <span>{scope.depth} {scope.depth === 1 ? 'layer' : 'layers'}</span>
+                    {/*
+                      * G3: die Erklaerung zu Expand ist lang, und als natives
+                      * `title` kam sie erst nach der Verzoegerung des Browsers.
+                      * Der eigene Tooltip steht sofort bei Hover und Fokus unter
+                      * dem Knopf, auch in der knappen Form "+1", ueber der Szene.
+                      * Gesperrt heisst `aria-disabled` und nicht `disabled`: ein
+                      * abgeschalteter Knopf nimmt weder Zeiger noch Fokus, und
+                      * gerade dann (Ebene unvollstaendig, Ende des Traces) ist der
+                      * Grund das, was der Leser wissen will.
+                      */}
+                    <Hint name="galaxy-expand" text={expandTitle}>
+                        <button type="button" aria-disabled={expandBlocked || undefined}
+                            data-warning={expandWarning || undefined}
+                            onClick={() => { if (!expandBlocked) scope.setDepth(scope.depth + 1); }} aria-label={galaxyToolbarText.expand}>
+                            <FitLabel wide={galaxyToolbarText.expand} narrow={galaxyToolbarText.expandNarrow} /></button>
+                    </Hint>
+                    {props.workspaceExpanded && (mode === 'galaxy' || scopedProjection) && <>
+                        <PathPicker nodes={pathCandidates} onPick={node => { setTrail({ key: organicKey, kind: 'path', target: node.id, name: graphNodeName(node) }); setTrailStep(0); }} />
+                        <button type="button" disabled={rootCalls.length === 0} aria-pressed={trail?.key === organicKey && trail.kind === 'calls'}
+                            title={rootCalls.length ? galaxyPathText.callOrderTitle : galaxyPathText.callOrderUnavailable}
+                            onClick={() => { if (trail?.key === organicKey && trail.kind === 'calls') clearTrail(); else { setTrail({ key: organicKey, kind: 'calls' }); setTrailStep(0); } }}>
+                            <FitLabel wide={galaxyPathText.callOrder} narrow={galaxyPathText.callOrderNarrow} /></button>
+                    </>}
+                    <span className="atlas-graph-scope-count" role="status" data-state={scopeState}
+                        title={partial ? galaxyLayerText.partialTitle(partial.layer, partial.limit === 'nodes' ? nodeBudget : edgeBudget, partial.limit)
+                            : [scopeStatus, scope.loading && scope.progress ? galaxyLayerText.loadingRequest(scope.progress.requests) : groupsText]
+                                .filter(Boolean).join('. ')}>{scopeStatus}</span>
+                    {scope.error && <span className="atlas-graph-scope-warning" title={scope.error}>Some relationships could not be loaded. <button type="button" onClick={scope.retry}>Retry</button></span>}
+                    {!props.workspaceExpanded && scope.complete && <small>All indexed direct dependencies included.</small>}
+                    {!props.workspaceExpanded && groupCount > 1 && <small className="atlas-graph-scope-groups" title={groupsText}>{galaxyToolbarText.groups(groupCount)}</small>}
+                </> : null}
+                {props.workspaceExpanded && <>
+                    {/*
+                      * Im Scope tritt der Deckel in ein Aufklappfeld zurueck
+                      * (Review-Befund G7): die Leiste traegt dort Pfad,
+                      * Aufrufreihe und Zaehler, und bei 1600 Pixeln brach die
+                      * Zeile sonst um. Ein Scope liegt fast immer unter dem
+                      * Deckel; im ganzen Graphen bleibt er in der Zeile.
+                      */}
+                    {/* K3: im Ausschnitt stehen Quelle, Limits, Gruppen und abgeschnittene Knoten im Menue "⋯". */}
+                    {scope.scope ? <details className="atlas-graph-limits atlas-graph-more" title={galaxyToolbarText.moreTitle}
+                        data-attention={outsideLimits ? 'true' : undefined} onKeyDown={event => {
+                            if (event.key === 'Escape') { event.stopPropagation(); event.currentTarget.open = false; }
+                        }}>
+                        <summary aria-label={galaxyToolbarText.more}>{galaxyToolbarText.moreGlyph}</summary>
+                        <div className="atlas-graph-limits-menu">
+                            {openRoot && <button type="button" onClick={openRoot}>{galaxyToolbarText.openSource}</button>}
+                            {renderLimits}
+                            {groupCount > 1 && <small className="atlas-graph-scope-groups" title={groupsText}>{galaxyToolbarText.groups(groupCount)}</small>}
+                            {outsideLimits && <small>{outsideLimits}</small>}
+                        </div>
+                    </details> : renderLimits}
+                    {mode === 'galaxy' && !scope.scope && <label className="atlas-graph-coverage-filter" title="Show files and folders with indexing gaps">
+                        <input type="checkbox" aria-label="Show coverage graph" checked={showCoverage} onChange={event => setViewPreferences({ coverageShadow: event.target.checked })} />
+                        Coverage
+                    </label>}
+                    {!scope.scope && outsideLimits && <small>{outsideLimits}</small>}
+                </>}
+            </div>}
             {legendOpen && (
                 /*
                  * Der Rahmen um die Legende traegt ihre Kante.
@@ -2151,7 +2753,9 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                                 {entry.swatches.length > 0 && (
                                     <span className="atlas-galaxy-legend-swatches">
                                         {entry.swatches.map((swatch) => {
-                                            const hidden = hiddenKinds.has(swatch.label);
+                                            const hidden = props.workspaceExpanded && scope.scope
+                                                ? traceTypes !== undefined && !traceTypes.includes(swatch.label)
+                                                : hiddenKinds.has(swatch.label);
                                             const dot = (
                                                 <span
                                                     className="atlas-galaxy-legend-dot"
@@ -2229,7 +2833,12 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                     )}
                 </div>
             )}
-            <div className="atlas-galaxy-scene" data-testid="atlas-galaxy-scene" ref={scene}>
+            <div className="atlas-galaxy-scene" data-testid="atlas-galaxy-scene" ref={scene}
+                aria-busy={layoutLoading || scope.loading || organicTask.loading || spacingBusy}>
+                <RenderProgress busy={visible && (layoutLoading || scope.loading || organicTask.loading || spacingBusy)}
+                    {...(scope.scope && scope.loading ? { label: galaxyLayerText.previewLoading(scope.depth) } : {})} />
+                {trailView && <PathSteps heading={trailView.heading} note={trailView.note} steps={trailView.steps} active={trailActive}
+                    nameOf={trailView.nameOf} lines={trailView.lines} onStep={setTrailStep} onClear={clearTrail} />}
                 {/*
                   * Der Weg zurueck zur eingepassten Ansicht (AC5).
                   *
@@ -2254,12 +2863,17 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                         </button>
                     </Hint>
                 )}
-                {shown !== undefined && everVisible.current && (
+                {sceneShown !== undefined && everVisible.current && (
                     <GraphScene
                         active={visible}
-                        data={shown}
+                        separateNodes={mode === 'galaxy' && sceneScoped && sceneShown.nodes.length <= SCOPE_SEPARATION_LIMIT}
+                        onRenderBusyChange={setSpacingBusy}
+                        idleRotation={mode === 'galaxy' && !sceneScoped}
+                        rootIds={mode === 'galaxy' && sceneScoped ? scope.result?.roots : undefined}
+                        data={sceneShown}
                         display={display}
-                        highlightedIds={highlighted}
+                        highlightedIds={sceneTrailIds ?? (scope.scope && scope.depth > 1 && mode === 'galaxy' ? null : highlighted)}
+                        path={sceneTrailIds && trailView && scenePathSteps ? { steps: scenePathSteps, active: trailActive, labels: trailView.labels } : undefined}
                         emphasizeIncidentEdges={mode === 'galaxy' && Boolean(props.focusFilePath)}
                         cameraTarget={cameraTarget}
                         /*
@@ -2273,7 +2887,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                             mode === 'hierarchy' ? HIERARCHY_LABEL_FONT_SIZE : undefined
                         }
                         labelMaxTextWidth={
-                            mode === 'hierarchy' ? HIERARCHY_LABEL_MAX_TEXT_WIDTH : undefined
+                            mode === 'hierarchy' ? scopedProjection ? SCOPED_HIERARCHY_LABEL_MAX_TEXT_WIDTH : HIERARCHY_LABEL_MAX_TEXT_WIDTH : undefined
                         }
                         onLabelLayout={onLabelLayout}
                         /*
@@ -2290,14 +2904,17 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                          * gestellt wurde.
                          *
                          * In der Hierarchie sind die Namen immer an: dort
-                         * stehen hoechstens sechzig Punkte, und eine
-                         * Aufrufkette ohne Namen waere eine Reihe Punkte.
+                         * stehen hoechstens sechzig Punkte (im Ausschnitt
+                         * 150, Review zu K5), und eine Aufrufkette ohne
+                         * Namen waere eine Reihe Punkte.
                          */
                         showLabels={
                             mode === 'hierarchy'
-                                ? shown.nodes.length <= HIERARCHY_LABEL_BUDGET
-                                : highlighted !== null && highlighted.size > 0
+                                ? scopedProjection ? scopedNames === 'all' || Boolean(scopedNamedIds?.size) : sceneShown.nodes.length <= HIERARCHY_LABEL_BUDGET
+                                : trailIds !== undefined || (highlighted !== null && highlighted.size > 0)
                         }
+                        labelBudget={mode === 'hierarchy' && scopedProjection ? SCOPED_HIERARCHY_LABEL_BUDGET : undefined}
+                        labelIds={mode === 'hierarchy' ? scopedNamedIds : undefined}
                         /*
                          * Landmarken nur in der Galaxie: der Halo sitzt auf den
                          * groessten Knoten, und "gross" heisst in der Projektion
@@ -2323,13 +2940,19 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                             props.onSelectShadowNode?.(node);
                             setNote(`${node.file_path ?? node.name}: coverage shadow. Detailed indexing reasons are not included in this layout.`);
                         }}
-                        renderShadowTooltip={(node) => <Html position={[node.x, node.y, node.z]} center style={{ pointerEvents: 'none' }}>
+                        renderShadowTooltip={(node) => <HoverCardHtml position={[node.x, node.y, node.z]}>
                             <div className="atlas-coverage-tooltip"><b>{node.file_path ?? node.name}</b><p>Coverage shadow: not fully indexed.</p></div>
-                        </Html>}
+                        </HoverCardHtml>}
                         onBackgroundClick={handleBackgroundClick}
                         renderTooltip={(node) => <NodeTooltipCard node={node} />}
                         overlay={overlay}
                     />
+                )}
+                {/* Zweites Review zu K5: fehlen Namen, sagt das Bild es selbst, und wie man sie bekommt. */}
+                {mode === 'hierarchy' && scopedProjection && scopedNames !== 'all' && (
+                    <p className="atlas-hierarchy-key" data-testid="atlas-hierarchy-key">
+                        {galaxyHierarchyText.namesNote(scope.direction, scopedProjection.data.nodes.length, scopedNames, scopedNeighbours, SCOPED_HIERARCHY_LABEL_BUDGET, scopedNamedSides)}
+                    </p>
                 )}
                 {state !== 'ready' && (
                     <p className="atlas-galaxy-placeholder" data-state={state}>
@@ -2341,9 +2964,9 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                   * Das Instrument liegt IM Kasten der Szene und nicht darunter:
                   * es erklaert, was auf dem Graphen zu sehen ist, und ein Kasten
                   * daneben waere eine zweite Flaeche, die man zwischen Bild und
-                  * Text hin und her lesen muesste. Es ist halbtransparent und
-                  * faengt seine eigenen Klicks ab; der Rest der Flaeche bleibt
-                  * die Szene.
+                  * Text hin und her lesen muesste. Es ist deckend (Review zu
+                  * K29) und faengt seine eigenen Klicks ab; der Rest der Flaeche
+                  * bleibt die Szene.
                   */}
                 {liveOn && agentsView !== undefined && props.agents !== undefined && (
                     <AgentsHud
@@ -2428,8 +3051,11 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                     </div>
                 )}
             </div>
-            {props.selectionPanel && <aside className="galaxy-selection-evidence" aria-label="Selection evidence">{props.selectionPanel}</aside>}
-            {note.length > 0 && (
+            {selectionContent && <details className="galaxy-selection-evidence atlas-galaxy-selection-details" aria-label="Selection evidence">
+                <summary>Selection details</summary>
+                <div className="atlas-galaxy-selection-details-body">{selectionContent}</div>
+            </details>}
+            {note.length > 0 && !scope.loading && (
                 <p className="atlas-galaxy-note" data-testid="atlas-galaxy-note">
                     {props.workspaceExpanded && note === GALAXY_NO_FOCUS_NOTE
                         ? 'Select a node or entry point to attach graph context to chat.' : note}

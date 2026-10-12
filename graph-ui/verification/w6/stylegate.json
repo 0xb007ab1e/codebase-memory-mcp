@@ -184,37 +184,37 @@
     },
     {
       "file": "README.md",
-      "line": 46,
+      "line": 82,
       "text": "Projektregeln in `CLAUDE.md`, der aufgenommene Fremdcode in `THIRD_PARTY.md`.",
       "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
     },
     {
       "file": "README.md",
-      "line": 118,
+      "line": 184,
       "text": "python3 ~/Downloads/cbm-atlas-trace.py --install-claude --root /absolute/repository --project INDEXED_NAME --daemon-url http://127.0.0.1:9749",
       "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
     },
     {
       "file": "README.md",
-      "line": 121,
+      "line": 187,
       "text": "Installation is explicit and local: it preserves unrelated Claude settings,",
       "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
     },
     {
       "file": "README.md",
-      "line": 122,
+      "line": 188,
       "text": "adds a PostToolUse entry to `.claude/settings.local.json`, and copies the hook",
       "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
     },
     {
       "file": "README.md",
-      "line": 123,
+      "line": 189,
       "text": "into `.claude/hooks/`. It refuses conflicting hooks, symlinks and malformed",
       "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
     },
     {
       "file": "README.md",
-      "line": 124,
+      "line": 190,
       "text": "configuration. It makes no network request or account change. Start a new Claude",
       "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
     },
@@ -408,6 +408,12 @@
       "file": "src/agents/AgentSetup.tsx",
       "line": 43,
       "text": "<li>Start a new Claude Code session in that repository and perform a tool call. Then choose <strong>Load recorded activity</strong> here. A new recorded event i",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "src/settings/ConfigReference.tsx",
+      "line": 21,
+      "text": "['CLAUDE_CONFIG_DIR · CODEX_HOME · KIRO_HOME · HERMES_HOME · QWEN_HOME · CLINE_DATA_DIR', 'Agent integration locations.'],",
       "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
     },
     {
@@ -613,8 +619,8 @@
       "reason": "Docblocks und Zeilenkommentare sind kein Bildschirmtext. Der Parser sieht den Unterschied, ein regulaerer Ausdruck koennte ihn nicht sehen."
     }
   ],
-  "filesConsidered": 1028,
-  "textFiles": 704,
+  "filesConsidered": 1176,
+  "textFiles": 852,
   "binaryFiles": 324,
-  "generatedAt": "2026-09-09T22:07:16.679Z"
+  "generatedAt": "2026-10-02T18:51:09.032Z"
 }

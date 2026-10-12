@@ -2,7 +2,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import SystemArchitecture, { suggestedBehaviorEntry, type SystemArchitectureProps } from './SystemArchitecture';
+import SystemArchitecture, { flowEntries, suggestedBehaviorEntry, type FlowsLoader, type SystemArchitectureProps } from './SystemArchitecture';
 import { isContiguousPath, systemBehaviorGraph, systemComponentGraph, systemComponents, type SystemSceneModel } from './system-architecture-model';
 import { loadSystemArchitecture, readSystemArchitecture, type SystemArchitectureLoader, type SystemArchitectureResponse, type SystemProjection, type SystemSymbol } from './system-architecture-source';
 import { callToolJson } from '../provider/rpc-transport';
@@ -52,6 +52,22 @@ function corridorFixture(): SystemProjection {
     const data = overviewFixture();
     data.behavior = { ...data.behavior!, mode: 'corridor', target_id: 3, nodes: data.paths[0].nodes, edges: data.paths[0].edges };
     return data;
+}
+/** The response the server returns when the projection exceeds its JSON memory budget (Django 5.2.7). */
+function limitedEmptyFixture(): SystemProjection {
+    return {
+        schema_version: 1, status: 'limited', kind: 'static_projection', complete: false,
+        components: [], dependencies: [], cycles: [], entrypoints: [], paths: [],
+        warnings: ['Component candidates are inferred from indexed declarations and interactions; they do not establish intended responsibilities or deployment boundaries.',
+            'Paths are bounded static witnesses, not observed executions. Callback references are not invocation evidence. Index coverage gaps remain possible.',
+            'The architecture response exceeded its memory budget; narrow the requested projection.'],
+        totals: { nodes: 52402, files: 4654, edges: 274549, accounted_nodes: 0, structural_nodes: 0, components: 0, dependencies: 0, entrypoints: 0, cycles: 0, relationship_edges: 0, unmodeled_edges: 0 },
+        limits: { node_budget: 100000, edge_budget: 500000, omitted_components: 0, omitted_dependencies: 0, omitted_entrypoints: 0, omitted_cycles: 0, paths_truncated: false, path_depth: 10 },
+        overview: { complete: false, grouping_basis: 'common_source_directory_aggregate', groups: [], components: [], connections: [],
+            totals: { groups: 0, components: 0, accounted_nodes: 0, connections: 0 }, limits: { omitted_connections: 0 } },
+        behavior: { mode: 'targets', source_id: 0, complete: false, corridor_complete: false, max_hops: 10, limits_hit: ['analysis_budget'],
+            reachable_targets: [], nodes: [], edges: [], cycles: [], totals: { reachable_nodes: 0, corridor_nodes: 0, corridor_edges: 0 } },
+    };
 }
 function addOverviewContext(data: SystemProjection) {
     const extra = { id: 'context', label: 'context', basis: 'declared_module', member_count: 1, file_count: 1, representatives: [], group_id: 'g:context' };
@@ -158,6 +174,11 @@ describe('system architecture evidence', () => {
         const data = fixture(); data.status = 'limited'; data.complete = false; data.warnings = ['Node budget reached.'];
         expect(readSystemArchitecture(response(data)).result?.complete).toBe(false);
     });
+    it('accepts the empty limited projection exactly as the server sends it', () => {
+        const wire = { status: 'ready', generation: 'g1', result: { ...limitedEmptyFixture(), project: 'django-demo', elapsed_ms: 310,
+            overview: { ...limitedEmptyFixture().overview, grouping_depth: 1 } } };
+        expect(readSystemArchitecture(wire).result?.status).toBe('limited');
+    });
     it('rejects projected paths whose underlying symbols do not join', () => {
         const data = fixture(); data.paths[0].edges[1].source_id = 99;
         expect(isContiguousPath(data.paths[0])).toBe(false);
@@ -227,7 +248,7 @@ describe('system architecture workspace', () => {
         expect(container.querySelector('[data-node="g:store"]')).toBeNull();
         expect(container.querySelector('[data-node="g:context"]')).toBeNull();
     });
-    it('returns to immediate calls and restores the selected destination with Back', async () => {
+    it('returns to immediate calls, and leaves Back to the Architecture workspace (K27)', async () => {
         const loader = vi.fn<SystemArchitectureLoader>().mockImplementation(request => Promise.resolve(response(request.targetNodeId === 3 ? corridorFixture() : overviewFixture())));
         await render(loader, { view: 'behavior' });
         await choose('Behavior entry point', '1'); await choose('Behavior destination', '3');
@@ -235,10 +256,11 @@ describe('system architecture workspace', () => {
         expect(container.querySelector<HTMLSelectElement>('[aria-label="Behavior destination"]')?.value).toBe('');
         expect(container.querySelectorAll('[data-node]')).toHaveLength(2);
         expect(container.textContent).toContain('DIRECT CALLS · UNORDERED');
-        await clickText('← Back');
-        expect(container.querySelector<HTMLSelectElement>('[aria-label="Behavior destination"]')?.value).toBe('3');
-        expect(container.querySelectorAll('[data-node]')).toHaveLength(3);
-        expect(container.querySelector('[data-testid="system-scene"]')?.getAttribute('data-focus')).toBe('');
+        // The old "← Back" buttons are absorbed into the one Back beside the Architecture subtabs.
+        expect([...container.querySelectorAll('button')].some(item => item.textContent === '← Back')).toBe(false);
+        await render(loader, { view: 'structure' });
+        expect([...container.querySelectorAll('button')].some(item => item.textContent === '← Back')).toBe(false);
+        expect([...container.querySelectorAll('.system-scope-actions button')].map(item => item.textContent)).toEqual(['Whole system']);
     });
     it('filters whole paths without drawing disconnected remnants and restores the path without refetching', async () => {
         const loader = vi.fn<SystemArchitectureLoader>().mockImplementation(request => Promise.resolve(response(request.targetNodeId === 3 ? corridorFixture() : overviewFixture())));
@@ -327,6 +349,22 @@ describe('system architecture workspace', () => {
         ];
         expect(suggestedBehaviorEntry(entries)?.id).toBe(4);
         expect(suggestedBehaviorEntry([symbol(5, 'helper', 'format')])).toBeUndefined();
+        const handlers = [{ ...symbol(6, 'commands', 'handle'), file_path: 'django/core/management/commands/runserver.py' },
+            { ...symbol(7, 'tests', 'handle'), file_path: 'tests/admin_scripts/management/commands/base_command.py' },
+            { ...symbol(8, 'app', 'render'), file_path: 'django/shortcuts.py' }];
+        expect(suggestedBehaviorEntry(handlers)).toBeUndefined();
+        expect(suggestedBehaviorEntry(handlers, true)?.id).toBe(6);
+        // Ranked flows keep their order: a shallower but lower-ranked handler does not win.
+        expect(suggestedBehaviorEntry([handlers[0], { ...symbol(9, 'docs', 'run'), file_path: 'docs/_ext/djangodocs.py' }], true)?.id).toBe(6);
+        expect(suggestedBehaviorEntry([...handlers, ...entries], true)?.id).toBe(4);
+    });
+    it('reads flow entries once each and never invents an identity', () => {
+        const node = (id: number | undefined, name: string, filePath?: string) => ({ ...(id === undefined ? {} : { id }), name, ...(filePath ? { filePath } : {}) });
+        expect(flowEntries([
+            { id: 0, label: 'handle → tick', entry: node(36163, 'handle', 'django/core/management/commands/runserver.py'), terminal: node(44340, 'tick'), steps: 40 },
+            { id: 1, label: 'handle → len', entry: node(36163, 'handle', 'django/core/management/commands/runserver.py'), terminal: node(8040, 'len'), steps: 3 },
+            { id: 2, label: 'unknown', entry: node(undefined, 'anonymous'), terminal: node(1, 'x'), steps: 1 },
+        ])).toEqual([{ id: 36163, name: 'handle', qualified_name: '', label: '', file_path: 'django/core/management/commands/runserver.py', component_id: '' }]);
     });
     it('automatically requests the executable entry once and leaves manual selection authoritative', async () => {
         const data = fixture(); data.entrypoints[0] = { ...data.entrypoints[0], name: 'main', file_path: 'src/main.c' };
@@ -453,7 +491,9 @@ describe('system architecture workspace', () => {
         expect(loader.mock.calls[1][0]).toEqual({ project: 'sample', entryNodeId: 2, expectedGeneration: 'analysis-g1', includeBehaviorEvidence: true });
         expect(loader.mock.calls[2][0]).toEqual({ project: 'sample', entryNodeId: undefined, includeBehaviorEvidence: true });
         expect(loader).toHaveBeenCalledTimes(3);
-        expect(container.querySelector<HTMLSelectElement>('[aria-label="Behavior entry point"]')?.value).toBe('');
+        // The stale choice is dropped; the Start field names the operation the reopened journey shows.
+        expect(container.querySelector('.behavior-heading h2')?.textContent).toBe('What can start call?');
+        expect(container.querySelector<HTMLSelectElement>('[aria-label="Behavior entry point"]')?.value).toBe('1');
         expect(container.textContent).not.toContain('Entry snapshot changed.');
     });
     it('opens exact source witnesses and synchronizes selection by qualified name', async () => {
@@ -492,9 +532,154 @@ describe('system architecture workspace', () => {
         expect(container.querySelector('[data-node="store"]')).not.toBeNull();
         expect(container.textContent).toContain('Test code'); expect(container.textContent).toContain('3 components returned');
     });
+    it('explains an empty limited projection with its own warning before any filter message', async () => {
+        await render(vi.fn<SystemArchitectureLoader>().mockResolvedValue(response(limitedEmptyFixture())));
+        const reason = () => container.querySelector('.system-scene-empty[role="status"]')?.textContent ?? '';
+        expect(reason()).toContain('The analysis returned no system structure for this project.');
+        expect(reason()).toContain('The architecture response exceeded its memory budget; narrow the requested projection.');
+        expect(reason()).not.toContain('Component candidates are inferred');
+        const cycles = [...container.querySelectorAll('label')].find(label => label.textContent?.includes('Group cycles'))!.querySelector('input')!;
+        await act(async () => cycles.click());
+        expect(container.textContent).not.toContain('No component cycles match');
+        expect(reason()).toContain('exceeded its memory budget');
+    });
+    it('keeps the budget message for an empty projection that names no limit', async () => {
+        const data = limitedEmptyFixture(); data.status = 'ready'; data.warnings = data.warnings.slice(0, 2);
+        await render(vi.fn<SystemArchitectureLoader>().mockResolvedValue(response(data)));
+        expect(container.querySelector('.system-scene-empty[role="status"]')?.textContent).toBe('No component projection is available within this analysis budget.');
+    });
+    it('fills an empty behavior start list from ranked flows and requests a conventional handler', async () => {
+        const flowsLoader = vi.fn<FlowsLoader>().mockResolvedValue([
+            { id: 0, label: 'run_tests → setup', entry: { id: 9, name: 'run_tests', filePath: 'tests/runtests.py' }, terminal: { id: 10, name: 'setup' }, steps: 12 },
+            { id: 1, label: 'handle → tick', entry: { id: 36163, name: 'handle', filePath: 'django/core/management/commands/runserver.py' }, terminal: { id: 44340, name: 'tick' }, steps: 40 },
+        ]);
+        const chosen = limitedEmptyFixture();
+        chosen.behavior = { ...chosen.behavior!, source_id: 36163 };
+        chosen.warnings = [...chosen.warnings, 'Optional behavior evidence was omitted entirely to keep the base graph within the response memory budget.'];
+        const loader = vi.fn<SystemArchitectureLoader>().mockResolvedValueOnce(response(limitedEmptyFixture())).mockResolvedValue(response(chosen));
+        await render(loader, { view: 'behavior', flowsLoader });
+        expect(flowsLoader).toHaveBeenCalledExactlyOnceWith('sample');
+        expect(loader.mock.calls.at(-1)?.[0]).toEqual({ project: 'sample', entryNodeId: 36163, expectedGeneration: 'g1', includeBehaviorEvidence: true });
+        const start = container.querySelector<HTMLSelectElement>('[aria-label="Behavior entry point"]')!;
+        // Alphabetical (hand test 2026-10-04, A4); with every operation suggested a Suggested group would only repeat the list.
+        expect([...start.options].map(option => option.textContent)).toEqual(['Choose an operation…',
+            'handle · django/core/management/commands/runserver.py', 'run_tests · tests/runtests.py']);
+        expect(start.querySelectorAll('optgroup')).toHaveLength(1);
+        expect(start.value).toBe('36163');
+        const state = container.querySelector('.behavior-loading[role="status"]')!;
+        expect(state.textContent).toContain('The analysis returned no call evidence.');
+        expect(state.textContent).toContain('exceeded its memory budget');
+        expect(state.textContent).toContain('Optional behavior evidence was omitted entirely');
+        await choose('Behavior entry point', '9');
+        expect(loader.mock.calls.at(-1)?.[0].entryNodeId).toBe(9);
+        // The chosen start keeps its place in the alphabetical list.
+        expect([...start.options].map(option => option.value)).toEqual(['', '36163', '9']);
+        expect(start.value).toBe('9');
+    });
+    it('does not ask for flows once the projection classifies enough entry points', async () => {
+        const flowsLoader = vi.fn<FlowsLoader>().mockResolvedValue([]);
+        const many = fixture(); many.entrypoints = [1, 2, 3, 4, 5, 6, 7, 8].map(id => symbol(id, 'api', `entry${id}`));
+        await render(vi.fn<SystemArchitectureLoader>().mockResolvedValue(response(many)), { view: 'behavior', flowsLoader });
+        expect(flowsLoader).not.toHaveBeenCalled();
+    });
+    it('adds ranked flows after a handful of classified entry points, once each', async () => {
+        const flowsLoader = vi.fn<FlowsLoader>().mockResolvedValue([
+            { id: 0, label: 'handle → tick', entry: { id: 36163, name: 'handle', filePath: 'django/core/management/commands/runserver.py' }, terminal: { id: 44340, name: 'tick' }, steps: 40 },
+            { id: 1, label: 'handle → save', entry: { id: 2, name: 'handle', filePath: 'src/service.ts' }, terminal: { id: 3, name: 'save' }, steps: 2 },
+        ]);
+        await render(vi.fn<SystemArchitectureLoader>().mockResolvedValue(response()), { view: 'behavior', flowsLoader });
+        expect(flowsLoader).toHaveBeenCalledExactlyOnceWith('sample');
+        const start = container.querySelector<HTMLSelectElement>('[aria-label="Behavior entry point"]')!;
+        // Every operation alphabetically (hand test 2026-10-04, A4), the flow that repeats a classified entry point once.
+        // The journey's start and the two ranked flows would suggest all three, so no Suggested group repeats them.
+        expect([...start.querySelectorAll('optgroup')].map(group => [group.label, [...group.querySelectorAll('option')].map(option => option.value)]))
+            .toEqual([['All operations · 3', ['36163', '2', '1']]]);
+    });
+    it('A4: suggests the automatic start and the top ranked flows, and names look-alike flow starts by their class', async () => {
+        const MODELS = 'django/db/migrations/operations/models.py';
+        const flow = (id: number, name: string, filePath: string) => ({ id, label: name, entry: { id, name, filePath }, terminal: { id: 1, name: 'x' }, steps: 3 });
+        const flowsLoader = vi.fn<FlowsLoader>().mockResolvedValue([flow(41, 'database_backwards', MODELS), flow(42, 'database_backwards', MODELS),
+            flow(43, 'handle', 'django/core/management/commands/loaddata.py'), flow(44, 'b4', 'b.py'), flow(45, 'b5', 'b.py'), flow(46, 'b6', 'b.py')]);
+        const operationNames = vi.fn(async (_project: string, entries: SystemSymbol[]) => entries.map(entry => entry.id === 41
+            ? { ...entry, qualified_name: 'p.ops.models.CreateModel.database_backwards' } : entry.id === 42 ? { ...entry, qualified_name: 'p.ops.models.DeleteModel.database_backwards' } : entry));
+        const data = overviewFixture();
+        data.entrypoints = [{ ...data.entrypoints[0], name: 'main' }, data.entrypoints[1]];
+        await render(vi.fn<SystemArchitectureLoader>().mockResolvedValue(response(data)), { view: 'behavior', flowsLoader, operationNames });
+        expect(operationNames).toHaveBeenCalledOnce();
+        expect(operationNames.mock.calls[0]?.[1].map(entry => entry.id)).toEqual([41, 42, 43, 44, 45, 46]);
+        const start = container.querySelector<HTMLSelectElement>('[aria-label="Behavior entry point"]')!;
+        const suggested = [...start.querySelectorAll('optgroup')[0]!.querySelectorAll('option')].map(option => option.textContent);
+        // The automatic start, then the first five ranked flows in their order.
+        expect(suggested).toEqual(['main · src/api.ts', `database_backwards (CreateModel) · ${MODELS}`, `database_backwards (DeleteModel) · ${MODELS}`,
+            'handle · django/core/management/commands/loaddata.py', 'b4 · b.py', 'b5 · b.py']);
+        expect(start.selectedOptions[0]?.textContent).toBe('main · src/api.ts');
+    });
+    it('A4: suggests the start the projection chose itself, and keeps suggesting it after another start is picked', async () => {
+        // django-demo: "main · …/manage.py-tpl" is no conventional entry for the page, the projection picks it on its own.
+        const flow = (id: number, name: string, filePath: string) => ({ id, label: name, entry: { id, name, filePath }, terminal: { id: 1, name: 'x' }, steps: 3 });
+        const flowsLoader = vi.fn<FlowsLoader>().mockResolvedValue([flow(43, 'handle', 'loaddata.py'), flow(44, 'b4', 'b.py')]);
+        const data = overviewFixture();
+        data.entrypoints = [{ ...data.entrypoints[0], name: 'main', file_path: 'conf/manage.py-tpl' }, data.entrypoints[1]];
+        // No operation requested: the server names none (0), and the journey starts at the first classified entry point.
+        data.behavior = { ...data.behavior!, source_id: 0 };
+        await render(vi.fn<SystemArchitectureLoader>().mockResolvedValue(response(data)), { view: 'behavior', flowsLoader });
+        const start = container.querySelector<HTMLSelectElement>('[aria-label="Behavior entry point"]')!;
+        const suggested = () => [...start.querySelectorAll('optgroup')[0]!.querySelectorAll('option')].map(option => option.value);
+        expect(start.value).toBe('1');
+        expect(suggested()).toEqual(['1', '43', '44']);
+        await choose('Behavior entry point', '43');
+        expect(start.value).toBe('43');
+        expect(suggested()).toEqual(['1', '43', '44']);
+    });
     it('shows failures without retrying continuously', async () => {
         vi.useFakeTimers(); const loader = vi.fn<SystemArchitectureLoader>().mockResolvedValue({ status: 'failed', generation: 'g1', error: 'Analysis budget exceeded.' });
         await render(loader); await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
         expect(container.querySelector('[role="alert"]')?.textContent).toContain('Analysis budget exceeded'); expect(loader).toHaveBeenCalledTimes(1);
+    });
+});
+
+/* Hand test 2026-10-04 (A3): "Refresh analysis" and the Behavior "Refresh" read again and said nothing. */
+describe('system architecture refresh feedback', () => {
+    const refresh = (pattern: RegExp) => [...container.querySelectorAll('button')].find(element => pattern.test(element.textContent ?? ''))!;
+    const status = () => container.querySelector('[role="status"].atlas-refresh-status')?.textContent;
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('A3: Refresh analysis is busy while it runs, then names the time and whether the index changed', async () => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(new Date(2026, 9, 4, 18, 0, 9));
+        const loader = vi.fn<SystemArchitectureLoader>().mockResolvedValue(response(overviewFixture()));
+        await render(loader);
+        let finish!: (value: SystemArchitectureResponse) => void;
+        loader.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+        await act(async () => refresh(/^Refresh(ing)? analysis/).click());
+        expect(refresh(/^Refresh(ing)? analysis/).textContent).toBe('Refreshing analysis…');
+        expect(refresh(/^Refresh(ing)? analysis/).getAttribute('aria-disabled')).toBe('true');
+        // The structure stays on screen meanwhile.
+        expect(container.querySelector('[data-testid="system-scene"]')).not.toBeNull();
+        await act(async () => finish(response(overviewFixture())));
+        expect(refresh(/^Refresh(ing)? analysis/).textContent).toBe('Refresh analysis');
+        expect(status()).toBe('Up to date at 18:00:09: no changes since the last load');
+        loader.mockResolvedValueOnce({ ...response(overviewFixture()), generation: 'g2' });
+        await act(async () => refresh(/^Refresh(ing)? analysis/).click());
+        expect(status()).toBe('Analysis refreshed at 18:00:09');
+        loader.mockRejectedValueOnce(new Error('Daemon stopped.'));
+        await act(async () => refresh(/^Refresh(ing)? analysis/).click());
+        expect(status()).toBe('Refresh failed at 18:00:09: Daemon stopped.');
+    });
+
+    it('A3: the Behavior Refresh says the same beside its button', async () => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(new Date(2026, 9, 4, 18, 1, 0));
+        const loader = vi.fn<SystemArchitectureLoader>().mockResolvedValue(response(overviewFixture()));
+        await render(loader, { view: 'behavior' });
+        const button = () => container.querySelector<HTMLButtonElement>('.behavior-heading .atlas-refresh button')!;
+        expect(button()?.textContent).toBe('Refresh');
+        let finish!: (value: SystemArchitectureResponse) => void;
+        loader.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+        await act(async () => button().click());
+        expect(button().textContent).toBe('Refreshing…');
+        await act(async () => finish(response(overviewFixture())));
+        expect(button().textContent).toBe('Refresh');
+        expect(container.querySelector('.behavior-heading [role="status"]')?.textContent).toBe('Up to date at 18:01:00: no changes since the last load');
     });
 });

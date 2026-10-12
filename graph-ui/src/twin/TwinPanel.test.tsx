@@ -277,8 +277,8 @@ describe('die Sektionen der technischen Tiefe', () => {
         await render();
         // Der Effekt-Block sagt, was in ihm staende, statt sich als "keine
         // Effekte" zu lesen; die Fehler-Sektion sagt, was der Index nicht sieht.
-        expect(text()).toContain('records no routes, no outbound calls and no writes');
-        expect(text()).toContain('Ask 2 in UPSTREAM-ASKS.md');
+        expect(text()).toContain('No evidence for routes, outbound calls or writes is available');
+        expect(text()).toContain('Missing evidence does not establish that the symbol has no effects');
         expect(text()).toContain('Where these are handled is not visible to the index');
     });
 
@@ -433,7 +433,7 @@ describe('wenn es nichts zu zeigen gibt', () => {
             ir: undefined,
             symbolName: 'nothing',
             message: 'This file is not indexed yet.',
-            hint: 'CodeAtlas is still reading this workspace.',
+            hint: 'CBM Lens is still reading this workspace.',
         });
         const empty = q('[data-testid="atlas-twin-empty"]');
         expect(empty?.textContent).toContain('not indexed yet');
@@ -627,7 +627,7 @@ describe('die Pseudocode-Ansicht', () => {
         expect(q('[data-testid="atlas-pseudocode-group"]')?.textContent)
             .toContain('not used anywhere in this file as far as the index shows');
         expect(q('[data-testid="atlas-pseudocode-tally"]')?.textContent)
-            .toContain('that CodeAtlas cannot check');
+            .toContain('that CBM Lens cannot check');
     });
 
     it('nennt an jeder Schrittzeile Datei und Zeile des aufgerufenen Symbols', async () => {

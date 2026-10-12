@@ -4,6 +4,7 @@
  * http_server.c; tests call these directly).
  */
 #include "foundation/constants.h"
+#include "foundation/json_writer.h"
 #include "ui/atlas.h"
 #include "foundation/hash_table.h"
 
@@ -22,7 +23,7 @@ static char *aa_strdup(const char *s) {
     if (!s)
         return NULL;
     size_t len = strlen(s) + 1;
-    char *copy = malloc(len);
+    char *copy = cbm_alloc(CBM_MEM_CLASS_OTHER, len);
     if (copy)
         memcpy(copy, s, len);
     return copy;
@@ -99,7 +100,8 @@ static aa_tree_child_t *aa_child(aa_children_t *set, const char *name, bool is_f
     }
     if (set->count >= set->cap) {
         int nc = set->cap ? set->cap * 2 : 64;
-        aa_tree_child_t *grown = realloc(set->items, (size_t)nc * sizeof(aa_tree_child_t));
+        aa_tree_child_t *grown =
+            cbm_realloc(CBM_MEM_CLASS_OTHER, set->items, (size_t)nc * sizeof(aa_tree_child_t));
         if (!grown)
             return NULL;
         /* The by_name table stores indices, so growth is safe. */
@@ -140,17 +142,17 @@ static void aa_children_free(aa_children_t *set) {
         int cap;
     } box;
     box.cap = set->count * 2 + 8;
-    box.keys = malloc((size_t)box.cap * sizeof(char *));
+    box.keys = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)box.cap * sizeof(char *));
     box.count = 0;
     if (set->by_name && box.keys)
         cbm_ht_foreach(set->by_name, aa_collect_keys, &box);
     for (int i = 0; i < box.count; i++)
-        free(box.keys[i]);
-    free(box.keys);
+        cbm_free(CBM_MEM_CLASS_OTHER, box.keys[i]);
+    cbm_free(CBM_MEM_CLASS_OTHER, box.keys);
     cbm_ht_free(set->by_name);
     for (int i = 0; i < set->count; i++)
-        free(set->items[i].name);
-    free(set->items);
+        cbm_free(CBM_MEM_CLASS_OTHER, set->items[i].name);
+    cbm_free(CBM_MEM_CLASS_OTHER, set->items);
     memset(set, 0, sizeof(*set));
 }
 
@@ -278,7 +280,7 @@ char *cbm_atlas_tree_json(cbm_store_t *store, const char *project, const char *p
         yyjson_mut_arr_append(arr, obj);
     }
     yyjson_mut_obj_add_val(doc, root, "children", arr);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     aa_children_free(&set);
     return json;
@@ -490,7 +492,7 @@ char *cbm_atlas_symbol_json(cbm_store_t *store, const char *project, int64_t nod
                 yyjson_mut_obj_add_strcpy(doc, robj, "name", region_name);
             yyjson_mut_obj_add_val(doc, root, "region", robj);
         }
-        free(region_name);
+        cbm_free(CBM_MEM_CLASS_OTHER, region_name);
     }
 
     aa_add_connections(doc, root, db, store, project, id, true, limit, offset);
@@ -616,7 +618,7 @@ char *cbm_atlas_symbol_json(cbm_store_t *store, const char *project, int64_t nod
                     yyjson_mut_obj_add_val(doc, root, "file_history", copy);
                 yyjson_doc_free(hdoc);
             }
-            free(history);
+            cbm_free(CBM_MEM_CLASS_OTHER, history);
         }
     }
 
@@ -648,8 +650,8 @@ char *cbm_atlas_symbol_json(cbm_store_t *store, const char *project, int64_t nod
         yyjson_mut_obj_add_val(doc, root, "similar", similar);
     }
 
-    free(file_copy);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    cbm_free(CBM_MEM_CLASS_OTHER, file_copy);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -668,7 +670,7 @@ char *cbm_atlas_scent_json(cbm_store_t *store, const char *project, const char *
         return NULL;
 
     enum { SCENT_MAX_MATCHES = 50000, SCENT_MAX_REGIONS = 4096 };
-    long long *counts = calloc(SCENT_MAX_REGIONS, sizeof(long long));
+    long long *counts = cbm_atlas_calloc_array(SCENT_MAX_REGIONS, sizeof(long long));
     if (!counts)
         return NULL;
     long long total = 0, unmapped = 0;
@@ -694,7 +696,7 @@ char *cbm_atlas_scent_json(cbm_store_t *store, const char *project, const char *
                            "ESCAPE '\\' COLLATE NOCASE AND file_path IS NOT NULL "
                            "AND label NOT IN ('File','Folder')",
                            -1, &st, NULL) != SQLITE_OK) {
-        free(counts);
+        cbm_free(CBM_MEM_CLASS_OTHER, counts);
         return NULL;
     }
     sqlite3_bind_text(st, 1, project, -1, SQLITE_STATIC);
@@ -731,8 +733,8 @@ char *cbm_atlas_scent_json(cbm_store_t *store, const char *project, const char *
         yyjson_mut_arr_append(arr, row);
     }
     yyjson_mut_obj_add_val(doc, root, "regions", arr);
-    free(counts);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    cbm_free(CBM_MEM_CLASS_OTHER, counts);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -806,13 +808,14 @@ char *cbm_atlas_bridges_json(cbm_store_t *store, const char *project) {
                 if (!node) {
                     if (all_count >= all_cap) {
                         int nc = all_cap ? all_cap * 2 : 256;
-                        br_node_t **grown = realloc(all, (size_t)nc * sizeof(br_node_t *));
+                        br_node_t **grown =
+                            cbm_realloc(CBM_MEM_CLASS_OTHER, all, (size_t)nc * sizeof(br_node_t *));
                         if (!grown)
                             continue;
                         all = grown;
                         all_cap = nc;
                     }
-                    node = calloc(1, sizeof(br_node_t));
+                    node = cbm_atlas_calloc_array(1, sizeof(br_node_t));
                     if (!node)
                         continue;
                     node->id = ids[k];
@@ -872,14 +875,14 @@ char *cbm_atlas_bridges_json(cbm_store_t *store, const char *project) {
             }
             sqlite3_finalize(nst);
         }
-        free(node);
+        cbm_free(CBM_MEM_CLASS_OTHER, node);
     }
     yyjson_mut_obj_add_val(doc, root, "bridges", arr);
     for (int i = 0; i < all_count; i++)
-        free(all[i]);
-    free(all);
+        cbm_free(CBM_MEM_CLASS_OTHER, all[i]);
+    cbm_free(CBM_MEM_CLASS_OTHER, all);
     cbm_ht_free(ht);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -893,20 +896,20 @@ char *cbm_atlas_blast_json(cbm_store_t *store, const char *project, const char *
         return NULL;
 
     enum { BL_MAX_REGIONS = 4096, BL_MAX_FILES = 200 };
-    long long *counts = calloc(BL_MAX_REGIONS, sizeof(long long));
-    char **names = calloc(BL_MAX_REGIONS, sizeof(char *));
+    long long *counts = cbm_atlas_calloc_array(BL_MAX_REGIONS, sizeof(long long));
+    char **names = cbm_atlas_calloc_array(BL_MAX_REGIONS, sizeof(char *));
     if (!counts || !names) {
-        free(counts);
-        free(names);
+        cbm_free(CBM_MEM_CLASS_OTHER, counts);
+        cbm_free(CBM_MEM_CLASS_OTHER, names);
         return NULL;
     }
     int files = 0, unmapped = 0;
     bool truncated = false;
 
-    char *copy = strdup(files_csv);
+    char *copy = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, files_csv);
     if (!copy) {
-        free(counts);
-        free(names);
+        cbm_free(CBM_MEM_CLASS_OTHER, counts);
+        cbm_free(CBM_MEM_CLASS_OTHER, names);
         return NULL;
     }
     char *cursor = copy;
@@ -920,7 +923,7 @@ char *cbm_atlas_blast_json(cbm_store_t *store, const char *project, const char *
                 break;
             }
             files++;
-            char *region_name = NULL; /* strdup'd by the lookup — we own it */
+            char *region_name = NULL; /* OTHER copy from the lookup; owned here. */
             int region = cbm_layout_region_for_file(store, project, cursor, &region_name);
             if (region >= 0 && region < BL_MAX_REGIONS) {
                 counts[region]++;
@@ -931,11 +934,11 @@ char *cbm_atlas_blast_json(cbm_store_t *store, const char *project, const char *
             } else {
                 unmapped++;
             }
-            free(region_name);
+            cbm_free(CBM_MEM_CLASS_OTHER, region_name);
         }
         cursor = comma ? comma + 1 : NULL;
     }
-    free(copy);
+    cbm_free(CBM_MEM_CLASS_OTHER, copy);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -953,12 +956,12 @@ char *cbm_atlas_blast_json(cbm_store_t *store, const char *project, const char *
             yyjson_mut_obj_add_strcpy(doc, row, "name", names[i]);
         yyjson_mut_obj_add_int(doc, row, "count", counts[i]);
         yyjson_mut_arr_append(arr, row);
-        free(names[i]);
+        cbm_free(CBM_MEM_CLASS_OTHER, names[i]);
     }
     yyjson_mut_obj_add_val(doc, root, "regions", arr);
-    free(counts);
-    free(names);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    cbm_free(CBM_MEM_CLASS_OTHER, counts);
+    cbm_free(CBM_MEM_CLASS_OTHER, names);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }

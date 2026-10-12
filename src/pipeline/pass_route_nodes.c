@@ -38,95 +38,6 @@ enum {
 #include <stdio.h>
 #include <string.h>
 
-/* True for characters that may appear in a ":name" route parameter. */
-static inline bool is_route_ident_char(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
-}
-
-/* Canonicalize route-path parameter placeholders to a single "{}" token so that
- * client call sites and server handlers rendezvous on the same Route QN
- * regardless of framework syntax. Each parameter token collapses to "{}":
- *
- *   :name    Express / React-Router / Rails / typical JS API clients
- *   {name}   Axum / Spring / OpenAPI / ASP.NET
- *   <name>   Flask / Rocket (incl. typed "<int:id>")
- *   ${...}   JS template interpolation captured into the path
- *
- * Parameter names are intentionally discarded so the same logical endpoint
- * matches across services that name the path variable differently. Static path
- * text is copied verbatim; the result never exceeds the input length. */
-const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz) {
-    if (out == NULL || out_sz == 0) {
-        /* WHY: cppcheck value-flow follows a caller that passes an as-yet
-         * uninitialized output buffer (e.g. `char cpath[256];`) and flags this
-         * `return out` as uninitvar. False positive: we only return the pointer
-         * here and never read the buffer; returning it (NULL, or a buffer too
-         * small to write into) is the intended early-out contract. */
-        // cppcheck-suppress uninitvar
-        return out;
-    }
-    if (in == NULL) {
-        out[0] = '\0';
-        return out;
-    }
-    const size_t last = out_sz - 1;
-    size_t oi = 0;
-    size_t i = 0;
-    while (in[i] != '\0' && oi < last) {
-        char c = in[i];
-        bool at_seg_start = (oi == 0) || (out[oi - 1] == '/');
-        bool is_param = false;
-
-        if (c == ':' && at_seg_start && is_route_ident_char(in[i + 1])) {
-            i++;
-            while (in[i] != '\0' && is_route_ident_char(in[i])) {
-                i++;
-            }
-            is_param = true;
-        } else if (c == '{') {
-            i++;
-            while (in[i] != '\0' && in[i] != '}' && in[i] != '/') {
-                i++;
-            }
-            if (in[i] == '}') {
-                i++;
-            }
-            is_param = true;
-        } else if (c == '<') {
-            i++;
-            while (in[i] != '\0' && in[i] != '>' && in[i] != '/') {
-                i++;
-            }
-            if (in[i] == '>') {
-                i++;
-            }
-            is_param = true;
-        } else if (c == '$' && in[i + 1] == '{') {
-            i += 2;
-            while (in[i] != '\0' && in[i] != '}' && in[i] != '/') {
-                i++;
-            }
-            if (in[i] == '}') {
-                i++;
-            }
-            is_param = true;
-        }
-
-        if (is_param) {
-            if (oi + 2 > last) {
-                break;
-            }
-            out[oi++] = '{';
-            out[oi++] = '}';
-            continue;
-        }
-        out[oi++] = c;
-        i++;
-    }
-    out[oi] = '\0';
-    return out;
-}
-
 /* Extract a JSON string value by key from properties.
  * Returns pointer into buf (caller provides buffer). NULL if not found. */
 static const char *json_extract(const char *json, const char *key, char *buf, int bufsz) {
@@ -322,9 +233,34 @@ static bool is_broker_route(const char *qn) {
 
 /* Try to match a single infra Route to a handler Route and create HANDLES bridge.
  * Returns 1 if matched, 0 otherwise. */
+/* Total order over candidates, so "which handler" never depends on the order
+ * nodes happened to land in the graph buffer. Qualified names are unique per
+ * node, so this is a tie-break that always decides; a NULL name sorts last and
+ * therefore only wins when nothing else matched. */
+static bool infra_candidate_is_better(const cbm_gbuf_node_t *candidate,
+                                      const cbm_gbuf_node_t *best) {
+    if (!best) {
+        return true;
+    }
+    if (!candidate->qualified_name) {
+        return false;
+    }
+    if (!best->qualified_name) {
+        return true;
+    }
+    return strcmp(candidate->qualified_name, best->qualified_name) < 0;
+}
+
 static int match_one_infra_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
                                  const char *infra_path, const char *svc_name,
                                  const cbm_gbuf_node_t **all_routes, int route_count) {
+    /* The FIRST match in array order used to win, and that array is in graph
+     * buffer insertion order — parallel worker interleaving. Two runs of the
+     * same corpus linked the same infra route to different handlers, so the
+     * HANDLES edge set moved between runs (kubernetes, 2026-09-18: 229 vs 242
+     * HANDLES with an identical node set). Collect the best candidate under a
+     * total order instead, and match on it. */
+    const cbm_gbuf_node_t *best = NULL;
     for (int j = 0; j < route_count; j++) {
         const cbm_gbuf_node_t *handler_route = all_routes[j];
         if (is_broker_route(handler_route->qualified_name)) {
@@ -352,18 +288,22 @@ static int match_one_infra_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
                                                  strstr(handler_path, infra_path) != NULL));
         int root_svc_match = (strcmp(handler_path, "/") == 0);
         if (path_match || root_svc_match) {
-            const cbm_gbuf_edge_t **fn_handles = NULL;
-            int fn_hcount = 0;
-            cbm_gbuf_find_edges_by_target_type(gb, handler_route->id, "HANDLES", &fn_handles,
-                                               &fn_hcount);
-            for (int fh = 0; fh < fn_hcount; fh++) {
-                cbm_gbuf_insert_edge(gb, fn_handles[fh]->source_id, infra->id, "HANDLES",
-                                     "{\"source\":\"infra_match\"}");
+            if (infra_candidate_is_better(handler_route, best)) {
+                best = handler_route;
             }
-            return SKIP_ONE;
         }
     }
-    return 0;
+    if (!best) {
+        return 0;
+    }
+    const cbm_gbuf_edge_t **fn_handles = NULL;
+    int fn_hcount = 0;
+    cbm_gbuf_find_edges_by_target_type(gb, best->id, "HANDLES", &fn_handles, &fn_hcount);
+    for (int fh = 0; fh < fn_hcount; fh++) {
+        cbm_gbuf_insert_edge(gb, fn_handles[fh]->source_id, infra->id, "HANDLES",
+                             "{\"source\":\"infra_match\"}");
+    }
+    return SKIP_ONE;
 }
 
 /* Phase 2: Match infra Route URLs to handler Route nodes by URL path + service name. */
@@ -850,20 +790,41 @@ static void create_grpc_routes(cbm_gbuf_t *gb) {
         return;
     }
 
-    const cbm_gbuf_node_t *services[CBM_SZ_64];
+    /* EVERY proto service, not a fixed-size prefix of them.
+     *
+     * This array held 64 and the loop stopped at that many, so WHICH services
+     * were considered depended on the order Class nodes happened to land in the
+     * graph buffer — i.e. on parallel worker interleaving. Two indexes of the
+     * same corpus with the same binary produced different __grpc__ Routes
+     * (kubernetes, 2026-09-18: 5 Routes present in one run and absent from the
+     * other, 4 the other way, plus their HANDLES edges). It was a silent
+     * quality cut as well: every service past the 64th got no Routes at all,
+     * and a repository with more than 64 services is not unusual. */
+    int svc_total = 0;
+    for (int i = 0; i < class_count; i++) {
+        if (classes[i]->file_path && strstr(classes[i]->file_path, ".proto")) {
+            svc_total++;
+        }
+    }
+    if (svc_total == 0) {
+        return;
+    }
+    const cbm_gbuf_node_t **services =
+        cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)svc_total * sizeof(*services));
+    if (!services) {
+        return; /* the borrowed `classes` array belongs to the graph buffer */
+    }
     int svc_count = 0;
-    for (int i = 0; i < class_count && svc_count < CBM_SZ_64; i++) {
+    for (int i = 0; i < class_count && svc_count < svc_total; i++) {
         if (classes[i]->file_path && strstr(classes[i]->file_path, ".proto")) {
             services[svc_count++] = classes[i];
         }
-    }
-    if (svc_count == 0) {
-        return;
     }
 
     const cbm_gbuf_node_t **funcs = NULL;
     int func_count = 0;
     if (cbm_gbuf_find_by_label(gb, "Function", &funcs, &func_count) != 0 || func_count == 0) {
+        cbm_free(CBM_MEM_CLASS_OTHER, services);
         return;
     }
 
@@ -888,10 +849,13 @@ static void create_grpc_routes(cbm_gbuf_t *gb) {
         cbm_gbuf_insert_edge(gb, fn->id, route_id, "HANDLES", "{\"via\":\"proto_rpc\"}");
         grpc_routes++;
     }
+    cbm_free(CBM_MEM_CLASS_OTHER, services);
     if (grpc_routes > 0) {
         char buf[CBM_SZ_16];
+        char svc_buf[CBM_SZ_16];
         snprintf(buf, sizeof(buf), "%d", grpc_routes);
-        cbm_log_info("pass.route_nodes.grpc", "routes", buf);
+        snprintf(svc_buf, sizeof(svc_buf), "%d", svc_count);
+        cbm_log_info("pass.route_nodes.grpc", "routes", buf, "services", svc_buf);
     }
 }
 

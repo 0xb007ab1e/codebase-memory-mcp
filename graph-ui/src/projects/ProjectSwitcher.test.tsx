@@ -38,16 +38,8 @@ function button(label: string): HTMLButtonElement | null {
     return [...container.querySelectorAll('button')].find(node => node.textContent?.includes(label)) ?? null;
 }
 
-async function filter(value: string): Promise<void> {
-    const input = container.querySelector('input')!;
-    await act(async () => {
-        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value);
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-    });
-}
-
 describe('ProjectSwitcher', () => {
-    it('opens a searchable server list and selects the exact project name only on activation', async () => {
+    it('opens the complete project list without search and selects the exact project name only on activation', async () => {
         const list = vi.fn().mockResolvedValue([
             { name: 'beta & tools/日本', root_path: '/repos/backend' },
             { name: currentProject, root_path: '/repos/frontend' },
@@ -56,10 +48,9 @@ describe('ProjectSwitcher', () => {
         expect(container.querySelector('summary')?.textContent).toContain(currentProject);
         expect(list).not.toHaveBeenCalled();
         await click(container.querySelector('summary'));
-        expect(document.activeElement).toBe(container.querySelector('input'));
+        expect(container.querySelector('input')).toBeNull();
         expect(button(currentProject)?.getAttribute('aria-current')).toBe('true');
-        await filter('BACKEND');
-        expect(button(currentProject)).toBeNull();
+        expect(container.querySelectorAll('.atlas-project-results li')).toHaveLength(2);
         expect(onSelectProject).not.toHaveBeenCalled();
         expect(list).toHaveBeenCalledTimes(1);
         await click(button('beta & tools/日本'));
@@ -82,7 +73,7 @@ describe('ProjectSwitcher', () => {
     it('closes on Escape with trigger focus, and on an outside pointer', async () => {
         await render(async () => [{ name: currentProject }]);
         await click(container.querySelector('summary'));
-        await act(async () => container.querySelector('input')!.dispatchEvent(
+        await act(async () => container.querySelector('summary')!.dispatchEvent(
             new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
         ));
         expect(container.querySelector('details')?.open).toBe(false);
@@ -109,15 +100,16 @@ describe('ProjectSwitcher', () => {
         expect(document.activeElement).toBe(container.querySelector('summary'));
     });
 
-    it('distinguishes an empty index from a search with no matches', async () => {
+    it('distinguishes an empty index from a refreshed list and retains Add project', async () => {
         const list = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([{ name: 'indexed' }]);
         await render(list);
         await click(container.querySelector('summary'));
         expect(container.textContent).toContain('No indexed projects yet.');
         expect(button('Add project index')).not.toBeNull();
         await click(button('Refresh projects'));
-        await filter('missing');
-        expect(container.textContent).toContain('No matching projects.');
+        expect(button('indexed')).not.toBeNull();
+        expect(button('Add project index')).not.toBeNull();
+        expect(container.querySelector('input')).toBeNull();
         expect(container.textContent).not.toContain('No indexed projects yet.');
     });
 

@@ -14,6 +14,8 @@
 #include "ui/layout3d.h"
 #include "ui/layout_internal.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
+#include "foundation/platform.h"
 
 #include <yyjson/yyjson.h>
 
@@ -178,7 +180,7 @@ float cbm_layout_rand_float(uint32_t *seed) {
  * (or raises, up to HARD_MAX_NODES) the ceiling for constrained deployments;
  * without it the full hard ceiling is available to explicit requests. */
 static int render_node_limit(void) {
-    const char *raw = getenv("CBM_UI_MAX_RENDER_NODES");
+    const char *raw = cbm_runtime_getenv("CBM_UI_MAX_RENDER_NODES");
     if (!raw || !raw[0]) {
         return HARD_MAX_NODES;
     }
@@ -522,15 +524,15 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     cbm_search_output_t search_out;
     memset(&search_out, 0, sizeof(search_out));
     if (cbm_store_search(store, &params, &search_out) != CBM_STORE_OK)
-        return calloc(CBM_ALLOC_ONE, sizeof(cbm_layout_result_t));
+        return cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(cbm_layout_result_t));
 
     int n = search_out.count, total_count = search_out.total;
     cbm_node_t *node_arr = NULL;
     if (n > 0) {
-        node_arr = malloc((size_t)n * sizeof(cbm_node_t));
+        node_arr = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)n * sizeof(cbm_node_t));
         if (!node_arr) {
             cbm_store_search_free(&search_out);
-            cbm_layout_result_t *r = calloc(CBM_ALLOC_ONE, sizeof(*r));
+            cbm_layout_result_t *r = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*r));
             if (r)
                 r->total_nodes = total_count;
             return r;
@@ -539,7 +541,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
             node_arr[i] = search_out.results[i].node;
     }
     cbm_layout_result_t *result = cbm_layout_from_nodes(store, project, node_arr, n, total_count);
-    free(node_arr);
+    cbm_free(CBM_MEM_CLASS_OTHER, node_arr);
     cbm_store_search_free(&search_out);
     return result;
 }
@@ -547,10 +549,10 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
 cbm_layout_result_t *cbm_layout_from_nodes(cbm_store_t *store, const char *project,
                                            const cbm_node_t *nodes, int n, int total_nodes) {
     int total_count = total_nodes;
-    if (!store || !project || n < 0)
+    if (!store || !project || n < 0 || (size_t)n > SIZE_MAX / sizeof(int))
         return NULL;
     if (n == 0 || !nodes) {
-        cbm_layout_result_t *r = calloc(CBM_ALLOC_ONE, sizeof(*r));
+        cbm_layout_result_t *r = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*r));
         if (r)
             r->total_nodes = total_count;
         return r;
@@ -559,7 +561,7 @@ cbm_layout_result_t *cbm_layout_from_nodes(cbm_store_t *store, const char *proje
     /* 2. Build sorted node-ID → index map for O(log n) edge filtering */
     node_id_entry_t *id_map = malloc((size_t)n * sizeof(node_id_entry_t));
     if (!id_map) {
-        cbm_layout_result_t *r = calloc(CBM_ALLOC_ONE, sizeof(*r));
+        cbm_layout_result_t *r = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*r));
         if (r) {
             r->total_nodes = total_count;
         }
@@ -645,7 +647,7 @@ cbm_layout_result_t *cbm_layout_from_nodes(cbm_store_t *store, const char *proje
 
     /* 5. Seed positions: ring by directory cluster key + z from call depth */
     cbm_layout_body_t *bodies = calloc((size_t)n, sizeof(cbm_layout_body_t));
-    cbm_layout_result_t *result = calloc(CBM_ALLOC_ONE, sizeof(*result));
+    cbm_layout_result_t *result = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*result));
     if (!result || !bodies) {
         free(bodies);
         free(deg);
@@ -667,7 +669,7 @@ cbm_layout_result_t *cbm_layout_from_nodes(cbm_store_t *store, const char *proje
      * having zero callers. */
     int64_t *node_ids = malloc((size_t)n * sizeof(int64_t));
     int *in_calls = calloc((size_t)n, sizeof(int));
-    int *out_calls = calloc((size_t)n, sizeof(int));
+    int *out_calls = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)n * sizeof(int));
     int *in_usage = calloc((size_t)n, sizeof(int));
     int *in_call_reference = calloc((size_t)n, sizeof(int));
     int *deg_dummy = calloc((size_t)n, sizeof(int));
@@ -798,7 +800,7 @@ cbm_layout_result_t *cbm_layout_from_nodes(cbm_store_t *store, const char *proje
     free(cdepth);
     free(node_ids);
     free(in_calls);
-    free(out_calls);
+    cbm_free(CBM_MEM_CLASS_OTHER, out_calls);
     free(in_usage);
     free(in_call_reference);
     free(deg_dummy);
@@ -819,7 +821,7 @@ void cbm_layout_free(cbm_layout_result_t *r) {
     for (int i = 0; i < r->edge_count; i++)
         free((void *)r->edges[i].type);
     free(r->edges);
-    free(r);
+    cbm_free(CBM_MEM_CLASS_OTHER, r);
 }
 
 char *cbm_layout_to_json(const cbm_layout_result_t *r) {

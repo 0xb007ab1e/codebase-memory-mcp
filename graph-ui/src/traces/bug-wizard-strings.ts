@@ -80,7 +80,7 @@ export const BUG_WIZARD_ENTRY_TOOLTIP =
  * the first would be honest and useless.
  */
 export const BUG_WIZARD_NO_TRACES =
-    'No observed call came back for this symbol. CodeAtlas does not watch code while it runs; '
+    'No observed call came back for this symbol. CBM Lens does not watch code while it runs; '
     + 'it reads back what somebody handed the analysis backend.';
 
 export const BUG_WIZARD_NO_TRACES_HOW =
@@ -114,7 +114,7 @@ export const BUG_WIZARD_NO_TRACES_WHERE =
 
 /** Said above the observed chains, so nobody reads them as a reading of the index. */
 export const BUG_WIZARD_OBSERVED_NOTE =
-    'Read back from the analysis backend, along the calls the index connects. CodeAtlas did not '
+    'Read back from the analysis backend, along the calls the index connects. CBM Lens did not '
     + 'observe any of this itself.';
 
 /** How many times an observed call was seen, and under which run. */

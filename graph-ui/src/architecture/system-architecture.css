@@ -1,11 +1,9 @@
 .system-architecture { min-width: 0; }
-.atlas-architecture[data-system-view] { padding: 16px; }
+/* Review of K40: the view's frame and the row with Back, Forward and the subtabs are those of the other subtabs; with values of their own the row jumped by 16 px. */
 .atlas-architecture[data-system-view] .atlas-arch-heading { align-items: center; margin-bottom: 12px; }
 .atlas-architecture[data-system-view] .atlas-arch-heading h1 { font-size: 24px; line-height: 1.2; margin: 0 0 5px; }
 .atlas-architecture[data-system-view] .atlas-arch-heading p { margin: 0; font-size: 12px; }
 .atlas-architecture[data-system-view] .atlas-arch-project { display: none; }
-.atlas-architecture[data-system-view] .atlas-arch-tabs { margin-bottom: 10px; gap: 5px; }
-.atlas-architecture[data-system-view] .atlas-arch-tab { padding: 7px 10px; }
 .atlas-architecture[data-system-view] .atlas-arch-toolbar { margin-bottom: 12px; gap: 8px; }
 .system-toolbar, .system-reading-status, .system-map-caption { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; justify-content: space-between; }
 .system-toolbar { margin-bottom: 10px; gap: 8px; }
@@ -25,7 +23,7 @@
 .system-architecture .system-map { height: clamp(320px, calc(100dvh - 540px), 620px); min-width: 0; position: relative; overflow: hidden; }
 .system-map-caption { position: absolute; bottom: 0; left: 0; right: 0; padding: 11px 16px; font-size: 11px; color: var(--atlas-dim); background: linear-gradient(transparent, var(--atlas-panel)); pointer-events: none; }
 .system-map-caption button { pointer-events: auto; }
-.system-architecture .system-inspector { border-left: 1px solid var(--atlas-line); padding: 16px; min-height: 0; box-sizing: border-box; max-height: clamp(320px, calc(100dvh - 540px), 620px); overflow: auto; }
+.system-architecture .system-inspector { border-left: 1px solid var(--atlas-line); background: var(--arch-panel-raised); padding: 16px; min-height: 0; box-sizing: border-box; max-height: clamp(320px, calc(100dvh - 540px), 620px); overflow: auto; }
 .system-inspector h3 { font-size: 17px; margin: 8px 0 14px; overflow-wrap: anywhere; }
 .system-inspector h4 { margin: 18px 0 8px; font-size: 12px; font-weight: 500; }
 .system-inspector h4 span { float: right; color: var(--atlas-dim); }
@@ -73,10 +71,11 @@
 .system-path-list li > span { color: var(--atlas-dim); font-size: 10px; }
 .system-scene-empty, .system-analysis-state { display: flex; align-items: center; justify-content: center; text-align: center; flex-direction: column; gap: 12px; height: 100%; min-height: 260px; padding: 30px; color: var(--atlas-dim); }
 .system-analysis-state { border: 1px solid var(--atlas-line); border-radius: 12px; }
-.system-analysis-state strong { color: var(--atlas-fg); font-weight: 500; }
+.system-analysis-state strong, .system-scene-empty[data-limited] strong { color: var(--atlas-fg); font-weight: 500; }
+.system-scene-empty[data-limited="true"] p { color: var(--atlas-fg); max-width: 560px; }
 .system-progress { width: 26px; height: 26px; border: 1px solid #869f9638; border-top-color: #a0b6aa; border-radius: 50%; animation: system-progress-turn 1.3s linear infinite; }
 @keyframes system-progress-turn { to { transform: rotate(360deg); } }
-.system-architecture .system-scene-node-label { display: grid; align-content: center; gap: 0; width: 96px; height: 28px; min-height: 0; box-sizing: border-box; margin: 0; background: #101816ec; color: #c0cec7; border: 1px solid #78928638; border-radius: 6px; padding: 6px 7px; text-align: center; line-height: 14px; font-family: var(--atlas-ui-font, system-ui, sans-serif); box-shadow: 0 2px 8px #0002; }
+.system-architecture .system-scene-node-label { display: grid; align-content: center; gap: 0; width: 96px; height: 28px; min-height: 0; box-sizing: border-box; margin: 0; background: var(--arch-label); color: #c0cec7; border: 1px solid #78928638; border-radius: 6px; padding: 6px 7px; text-align: center; line-height: 14px; font-family: var(--atlas-ui-font, system-ui, sans-serif); box-shadow: 0 2px 8px #0002; }
 .system-architecture .system-scene-node-label strong { margin: 0; font-size: 11px; line-height: 14px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .system-architecture .system-scene-node-label small { margin: 0; font-size: 9px; line-height: 11px; color: #94a79c; white-space: nowrap; }
 .system-architecture .system-scene-node-label[data-selected=true] { border-color: #9db5a7; color: #edf2ef; }
@@ -89,7 +88,7 @@
 .system-architecture .system-scene-node-label[data-kind=remainder] { color: #b6b3a6; border-style: dashed; }
 .system-scene-lane-label { color: #92a89c; font: 10px var(--atlas-ui-font, system-ui, sans-serif); white-space: nowrap; background: #0d1512bb; padding: 3px 7px; border-radius: 4px; }
 .system-scene-lane-label[data-component=true] { font-size: 11px; color: #a7b9af; display: inline-block; max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
-.system-scene-edge-label { display: inline-block; max-width: 230px; color: #c2c6cf; font-size: 10px; background: #111716f2; border: 1px solid #91a59a38; padding: 5px 8px; border-radius: 6px; }
+.system-scene-edge-label { display: inline-block; max-width: 230px; color: var(--arch-label-text); font-size: 10px; background: #111716f2; border: 1px solid #91a59a38; padding: 5px 8px; border-radius: 6px; }
 .system-scope-actions, .system-selection-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 8px 0 12px; }
 .system-scope-actions button, .system-selection-actions button { border: 1px solid var(--atlas-line); border-radius: 5px; background: #82998f0c; color: var(--atlas-fg); font: inherit; font-size: 11px; padding: 5px 8px; }
 .system-selection-actions button:disabled, .system-scope-actions button:disabled { opacity: .4; }
@@ -104,24 +103,27 @@
 @media (prefers-reduced-motion: reduce) { .system-progress { animation: none; } }
 
 /* System maps share the Overview ground-plane canvas and restrained source tint. */
-.system-architecture .system-scene { position: relative; isolation: isolate; width: 100%; height: 100%; min-width: 0; background: #0b1118; cursor: grab; }
+.system-architecture .system-scene { position: relative; isolation: isolate; width: 100%; height: 100%; min-width: 0; background: var(--arch-background); cursor: grab; }
 .system-architecture .system-scene:active { cursor: grabbing; }
 .system-architecture .system-scene canvas { display: block; outline: none; touch-action: none; }
-.system-architecture .system-scene .system-scene-node-label { color: #c4ced9; background: #111923ed; border-color: color-mix(in srgb, var(--system-node-tint, #91a6b4) 34%, transparent); box-shadow: 0 2px 8px #0003; cursor: pointer; }
+.system-architecture .system-scene .system-scene-node-label { color: var(--arch-label-text); background: var(--arch-label); border-color: color-mix(in srgb, var(--system-node-tint, var(--arch-node)) 34%, transparent); box-shadow: 0 2px 8px #0003; cursor: pointer; }
 .system-architecture .system-scene .system-scene-node-label[data-kind=group]:not([data-expanded=true]) { width: 76px; height: 24px; gap: 0; padding: 4px 5px; }
-.system-architecture .system-scene .system-scene-node-label small { color: #99a8b8; }
-.system-architecture .system-scene .system-scene-node-label[data-focus=true] { border-color: #ced9e080; background: #1a2530ee; color: #e1e9ef; }
-.system-architecture .system-scene .system-scene-node-label[data-selected=true] { border-color: #eff5fa; color: #f1f6fa; background: #1c2732f2; }
-.system-architecture .system-scene .system-scene-node-label:focus-visible { outline: 2px solid #e5eef8; outline-offset: 2px; }
-.system-architecture .system-scene .system-scene-lane-label { display: inline-block; max-width: 180px; overflow: hidden; text-overflow: ellipsis; color: #9aaaba; background: #101923c9; font-size: 10px; }
-.system-architecture .system-scene .system-scene-edge-label { background: #111923f2; border-color: #91a6b440; }
+.system-architecture .system-scene .system-scene-node-label small { color: var(--arch-label-muted); }
+.system-architecture .system-scene .system-scene-node-label[data-focus=true] { border-color: color-mix(in srgb, var(--arch-label-focus) 50%, transparent); background: var(--arch-label-selected); color: var(--arch-label-text); }
+.system-architecture .system-scene .system-scene-node-label[data-selected=true] { border-color: var(--arch-label-focus); color: var(--arch-selected); background: var(--arch-label-selected); }
+.system-architecture .system-scene .system-scene-node-label:focus-visible { outline: 2px solid var(--arch-label-focus); outline-offset: 2px; }
+/* A lane name on a right-hand corner ends at it; one without a free corner waits hidden. */
+.system-scene-lane-label[data-align=end] { transform: translateX(-100%); }
+.system-scene-lane-label.is-hidden { visibility: hidden; }
+.system-architecture .system-scene .system-scene-lane-label { display: inline-block; max-width: 180px; overflow: hidden; text-overflow: ellipsis; color: var(--arch-folder-label); background: color-mix(in srgb, var(--arch-background) 80%, transparent); font-size: 10px; }
+.system-architecture .system-scene .system-scene-edge-label { background: var(--arch-edge-label); border-color: color-mix(in srgb, var(--arch-node) 25%, transparent); }
 
 .system-display-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; margin: 0 0 10px; color: var(--atlas-dim); font-size: 11px; }
 .system-layout-hint { margin-right: auto; }
 .system-display-controls label { display: flex; align-items: center; gap: 8px; }
 .system-view-switch { display: flex; border: 1px solid var(--atlas-line); border-radius: 7px; padding: 2px; }
 .system-view-switch button { background: transparent; color: var(--atlas-dim); border: 0; border-radius: 4px; padding: 5px 12px; font: inherit; }
-.system-view-switch button[aria-pressed=true] { background: #b6c7d51a; color: var(--atlas-fg); }
+.system-view-switch button[aria-pressed=true] { background: color-mix(in srgb, var(--arch-accent) 12%, transparent); color: var(--atlas-fg); }
 .system-color-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 10px 2px; color: var(--atlas-dim); font-size: 10px; }
 .system-color-legend span { display: inline-flex; align-items: center; gap: 6px; }
 .system-color-legend i { display: inline-block; width: 7px; height: 7px; border-radius: 2px; opacity: .7; }

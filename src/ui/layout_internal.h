@@ -34,7 +34,8 @@ uint32_t cbm_layout_fnv1a(const char *s);
 float cbm_layout_rand_float(uint32_t *seed);
 
 /* Layout core: seed + optimize + classify an explicit node array. Borrowed
- * `nodes` structs (strings are copied into the result). `total_nodes` is the
+ * `nodes` structs and strings remain owned by the caller; the result copies
+ * them and is released with cbm_layout_free. `total_nodes` is the
  * project-wide count the caller knows (may exceed n). */
 cbm_layout_result_t *cbm_layout_from_nodes(cbm_store_t *store, const char *project,
                                            const cbm_node_t *nodes, int n, int total_nodes);

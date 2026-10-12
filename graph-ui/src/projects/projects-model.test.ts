@@ -104,6 +104,9 @@ describe('readHealth', () => {
             nodes: 76,
             edges: 178,
             sizeBytes: 1048576,
+            indexedAt: null,
+            watchRegistered: null,
+            watcherRunning: null,
             reason: '',
         });
         expect(readHealth({ status: 'missing' }).status).toBe('missing');
@@ -114,6 +117,15 @@ describe('readHealth', () => {
         const health = readHealth({ status: 'healthy' });
         expect(health.nodes).toBeUndefined();
         expect(health.sizeBytes).toBeUndefined();
+    });
+
+    it('reads the recorded indexing time and actual watcher signals independently', () => {
+        expect(readHealth({ status: 'healthy', indexed_at: '2026-10-01T12:00:00Z', watch_registered: true, watcher_running: false })).toMatchObject({
+            indexedAt: '2026-10-01T12:00:00Z', watchRegistered: true, watcherRunning: false,
+        });
+        expect(readHealth({ indexed_at: 'not a time', watch_registered: 'true', watcher_running: 1 })).toMatchObject({
+            indexedAt: null, watchRegistered: null, watcherRunning: null,
+        });
     });
 
     it('names an unknown verdict as unknown', () => {

@@ -534,14 +534,14 @@ async function main() {
     const ok =
         failure === null &&
         missingTestids.length === 0 &&
-        /CODEATLAS/.test(report.brandText) &&
+        /CBM LENS/.test(report.brandText) &&
         /^v\d+\.\d+\.\d+/.test(report.versionChip) &&
         // Nachgezogen am 2026-08-29 (W7a, Nutzerauftrag): der Lauf nagelte
         // [f]ile fest, also ausgerechnet einen der vier Menuepunkte ohne
         // Verdrahtung. Eine Attrappe darf keine Zusicherung sein. Verlangt
         // bleibt das Buchstaben-Menue als Form, belegt am verdrahteten [a]tlas.
         /\[a\]tlas/.test(report.menuText) &&
-        /type a command or ask the atlas/.test(report.commandPlaceholder) &&
+        /type a command or ask CBM Lens/.test(report.commandPlaceholder) &&
         report.treeEntries >= 10 &&
         report.treeSource === '/api/tree' &&
         report.openedFile === OPEN_FILE &&

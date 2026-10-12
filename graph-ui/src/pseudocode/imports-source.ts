@@ -6,8 +6,7 @@
  * `provider.fileImports(root, relativePath)`, und ein Theia-Backend setzt die
  * Antwort aus zwei Lesungen zusammen. Dieses Projekt hat kein solches Backend.
  * Der C-Server bietet auf /rpc kein Werkzeug an, das die Importe einer Datei mit
- * Namen und Zeilen zurueckgibt (INVENTAR.md Abschnitt 3, Ask 2 auf der
- * Upstream-Liste). Also wird derselbe DTO hier aus den zwei Lesungen gebaut,
+ * Namen und Zeilen gemeinsam zurueckgibt. Derselbe DTO wird aus zwei Lesungen gebaut,
  * die es schon gibt, und diese Datei ist genau diese duenne Beschaffung.
  *
  * **Die beiden Lesungen, und warum es zwei sein muessen.**

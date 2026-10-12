@@ -19,6 +19,7 @@
  */
 
 import { layoutUrl, LAYOUT_NODE_BUDGET, LAYOUT_ROUTE } from './galaxy-model';
+import { nodeFilePath } from './node-names';
 import type { GraphData, GraphEdge, GraphNode, MissedGraph, NodeStatus } from './types';
 
 export interface LayoutSourceOptions {
@@ -89,15 +90,18 @@ export function readGraphData(value: unknown): GraphData {
         if (id === undefined || x === undefined || y === undefined || z === undefined) {
             continue;
         }
+        const label = text(entry['label']) ?? '';
+        const qualifiedName = text(entry['qualified_name']);
         nodes.push({
             id,
             x,
             y,
             z,
-            label: text(entry['label']) ?? '',
+            label,
             name: name ?? String(id),
-            file_path: text(entry['file_path']),
-            qualified_name: text(entry['qualified_name']),
+            // Der Branch-Knoten traegt im Layout die Datei "{}"; das ist keine Datei (Runde 4, N1).
+            file_path: nodeFilePath({ name: name ?? String(id), label, qualified_name: qualifiedName, file_path: text(entry['file_path']) }),
+            qualified_name: qualifiedName,
             start_line: num(entry['start_line']),
             end_line: num(entry['end_line']),
             size: size !== undefined && size > 0 ? size : 1,

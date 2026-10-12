@@ -10,13 +10,13 @@ const event = (patch: Partial<AgentEvent>): AgentEvent => ({
 const state = [event({}), event({ seq: 2, ts: 2000, tool: 'Edit', path: 'missing.ts' }),
     event({ agent: 'Ben', run: 'two', ts: 3000, path: '' })]
     .reduce(withEvent, emptyAgentsState());
-const all = { agent: '', run: '', kind: '' as const, query: '' };
+const all = { agent: '', run: '', kind: '' as const };
 
 it('keeps unmapped events and orders recorded activity newest first', () => {
     expect(activityRows(state, all).map((row) => row.path)).toEqual(['', 'missing.ts', 'src/main.ts']);
 });
-it('intersects agent, run, work kind and text filters', () => {
-    expect(activityRows(state, { agent: 'Ada', run: 'one', kind: 'write', query: 'MISSING' }))
+it('intersects agent, run and work kind filters', () => {
+    expect(activityRows(state, { agent: 'Ada', run: 'one', kind: 'write' }))
         .toEqual([event({ seq: 2, ts: 2000, tool: 'Edit', path: 'missing.ts' })]);
     expect(activityRows(state, { ...all, agent: 'Ben', run: 'one' })).toEqual([]);
 });

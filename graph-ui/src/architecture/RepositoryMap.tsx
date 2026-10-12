@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { ArchitectureOverviewDto } from '../core/intelligence-provider';
+import { graphNodeName } from '../galaxy/node-names';
 import type { GraphData, GraphNode } from '../galaxy/types';
 import { areaConnections, areaOf, repositoryMap, type MapEvidence } from './repository-map';
 import { entryCandidates, entryRole, entryRoutes, sourceCandidates, type SourceReader, type SourceQuote } from './repository-guide';
@@ -21,7 +22,8 @@ function Nodes({ nodes, onSelect, onNavigate }: Pick<RepositoryMapProps, 'onSele
     const [limit, setLimit] = useState(24);
     return <><ul className="repo-map-nodes">{nodes.slice(0, limit).map(node => <li key={node.id}>
         <button onClick={() => onSelect ? onSelect(node) : onNavigate(node.file_path!, node.start_line, node.name)}>
-            <strong>{node.name}</strong><span>{node.label} · {node.file_path}{node.start_line ? `:${node.start_line}` : ''}</span>
+            {/* Round 4 (N1): a Branch node reads "django-demo · detached HEAD", not "DETACHED". */}
+            <strong>{graphNodeName(node)}</strong><span>{node.label} · {node.file_path}{node.start_line ? `:${node.start_line}` : ''}</span>
         </button>
     </li>)}</ul>{nodes.length > limit && <button className="atlas-arch-action" onClick={() => setLimit(limit + 24)}>More symbols ({limit} of {nodes.length})</button>}</>;
 }

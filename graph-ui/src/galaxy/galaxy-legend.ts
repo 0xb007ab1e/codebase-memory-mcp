@@ -295,7 +295,9 @@ export function galaxyLegendEntries(data: GraphData | undefined): LegendEntry[] 
  * Die Schluessel sind dieselben wie in {@link galaxyLegendEntries}, damit ein
  * Leser die Zeile, die er sucht, an derselben Stelle findet.
  */
-export function hierarchyLegendEntries(data: GraphData | undefined, fileRelationships = false): LegendEntry[] {
+export function hierarchyLegendEntries(data: GraphData | undefined, fileRelationships = false,
+    /* Die Hierarchie eines Galaxy-Ausschnitts (Handtest K5): keine Walk-Spalten, sondern Ebenen links und rechts der Wurzel. */
+    scoped = false): LegendEntry[] {
     const swatches = edgeSwatches(data);
     return [
         {
@@ -311,7 +313,9 @@ export function hierarchyLegendEntries(data: GraphData | undefined, fileRelation
              * Beziehungen auch, und der Griff zum Ausblenden steht am
              * Punkt selbst (`title`).
              */
-            detail: fileRelationships
+            detail: scoped
+                ? 'Every relationship of this scope, its type and an arrow from source to target written at the line. Edge colours keep their types; this is not a runtime trace.'
+                : fileRelationships
                 ? 'Recorded relationships touching the selected file or marked code. Edge colours retain their original types; this is not a complete call trace.'
                 : 'one line per call on this walk, cycles included rather than hidden. '
                 + 'What else the index records between these symbols is drawn in its own colour: '
@@ -322,7 +326,11 @@ export function hierarchyLegendEntries(data: GraphData | undefined, fileRelation
         {
             key: 'positions',
             title: 'positions',
-            detail: fileRelationships
+            detail: scoped
+                ? 'Incoming relationships on the left, the root in the middle, outgoing relationships on the right; each column is one layer further in the same direction. '
+                + 'Nodes reached through both directions, such as a callee of a caller, stand in the band below. '
+                + 'Inside a column: by the neighbour that leads there, calls before other types, calls by call-site line.'
+                : fileRelationships
                 ? 'Incoming relationships on the left, selected definitions in the middle, outgoing relationships on the right. Recorded containment orders the definition columns; source paths and lines order each column.'
                 : 'columns are the call depth from the entry point, and inside a column the symbols '
                 + 'are ordered by name. A deterministic projection of the walk, not the server layout: '

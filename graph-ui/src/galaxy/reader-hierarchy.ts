@@ -1,3 +1,4 @@
+import { hierarchyBlockPositions } from './hierarchy-blocks';
 import {
     HIERARCHY_COLUMN_WIDTH, HIERARCHY_LABEL_BUDGET, HIERARCHY_LANE_SPACING,
     HIERARCHY_MAX_SIZE, HIERARCHY_MIN_SIZE, HIERARCHY_ROW_HEIGHT, HIERARCHY_SIZE_SCALE,
@@ -24,18 +25,20 @@ export function projectReaderHierarchy(
     filePath: string,
     range?: SourceFocusRange,
     cap = HIERARCHY_LABEL_BUDGET,
+    includeExpanded = false,
 ): ReaderHierarchyProjection | undefined {
     const focus = readerGraphFocus(layout.nodes, filePath, range);
     if (focus.ids.size === 0) return undefined;
     const nodeById = new Map(layout.nodes.map(node => [node.id, node]));
     const roots = layout.nodes.filter(node => focus.ids.has(node.id)).sort(compareNodes);
-    const incident = layout.edges.filter(edge => (focus.ids.has(edge.source) || focus.ids.has(edge.target))
+    const incident = layout.edges.filter(edge => (includeExpanded || focus.ids.has(edge.source) || focus.ids.has(edge.target))
         && nodeById.has(edge.source) && nodeById.has(edge.target));
     const contextIds = new Set<number>();
     for (const edge of incident) {
         if (!focus.ids.has(edge.source)) contextIds.add(edge.source);
         if (!focus.ids.has(edge.target)) contextIds.add(edge.target);
     }
+    if (includeExpanded) for (const node of layout.nodes) if (!focus.ids.has(node.id)) contextIds.add(node.id);
     const context = [...contextIds].map(id => nodeById.get(id)!).sort(compareNodes);
     const limit = Number.isFinite(cap) ? Math.max(1, Math.floor(cap)) : HIERARCHY_LABEL_BUDGET;
     // Selected nodes, including isolated definitions, take priority over context.
@@ -83,16 +86,14 @@ export function projectReaderHierarchy(
     const nodes: GraphNode[] = [];
     const placements: HierarchyProjection['placements'] = [];
     const renderId = new Map<number, number>();
-    for (const [level, entries] of [...columns].sort(([a], [b]) => a - b)) {
-        for (const [row, node] of entries.sort(compareNodes).entries()) {
-            const id = nodes.length;
-            const x = level * HIERARCHY_COLUMN_WIDTH;
-            const y = ((entries.length - 1) / 2 - row) * HIERARCHY_ROW_HEIGHT;
-            const size = Number.isFinite(node.size) ? node.size * HIERARCHY_SIZE_SCALE : HIERARCHY_MIN_SIZE;
-            nodes.push({ ...node, id, x, y, z: 0, size: Math.max(HIERARCHY_MIN_SIZE, Math.min(HIERARCHY_MAX_SIZE, size)) });
-            renderId.set(node.id, id);
-            placements.push({ id, key: node.qualified_name ?? `node:${node.id}`, name: node.name, hop: level, x, y });
-        }
+    const blocks = [...columns].map(([level, entries]) => ({ level, entries: entries.sort(compareNodes) }));
+    for (const { node, level, x, y } of hierarchyBlockPositions(blocks,
+        { levelGap: HIERARCHY_COLUMN_WIDTH, rowGap: HIERARCHY_ROW_HEIGHT })) {
+        const id = nodes.length;
+        const size = Number.isFinite(node.size) ? node.size * HIERARCHY_SIZE_SCALE : HIERARCHY_MIN_SIZE;
+        nodes.push({ ...node, id, x, y, z: 0, size: Math.max(HIERARCHY_MIN_SIZE, Math.min(HIERARCHY_MAX_SIZE, size)) });
+        renderId.set(node.id, id);
+        placements.push({ id, key: node.qualified_name ?? `node:${node.id}`, name: node.name, hop: level, x, y });
     }
     const lanes = new Map<string, number>();
     const projectedEdges = edges.map(edge => ({ ...edge, source: renderId.get(edge.source)!, target: renderId.get(edge.target)! }))

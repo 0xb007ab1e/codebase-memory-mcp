@@ -84,12 +84,43 @@
  *     ihre Geschwindigkeit ueber das neue Ziel hinweg; ihr Daempfungsgrad ist
  *     genau 1, sie kann also nicht ueberschwingen. Ohne das Feld ist jeder
  *     bestehende Anflug Zeichen fuer Zeichen der von vorher.
+ * 14. Neu (Review-Call 2026-10-02): CameraAnimator spielt einen Anflug, der
+ *     schon vor dem Aufsetzen der Szene gesetzt war, nicht nach. Er gehoert
+ *     zum Bild davor; eine Einpassung gilt weiter.
+ * 15. Neu (Review-Call 2026-10-02): `FitContainment` rahmt das naechste Bild
+ *     eines Scopes, ohne neu einzupassen: die Kamera tritt entlang ihrer
+ *     Blickrichtung zurueck oder vor, solange der Leser sie nicht bewegt hat.
+ * 16. Neu (Review-Call 2026-10-02): die OrbitControls zoomen zum Mauszeiger
+ *     (`zoomToCursor`), nicht mehr in die Bildmitte.
+ * 17. Neu (Review-Call 2026-10-02): die Prop `rootIds`. Die Wurzeln eines
+ *     Scopes bekommen einen Ring und einen Namen, der immer zu sehen ist, und
+ *     die Trennung auf dem Schirm schiebt sie nie weg. Ohne die Prop zeichnet
+ *     die Szene wie vorher.
+ * 18. Neu (Review-Call 2026-10-02): die Prop `path`. Ein Pfad oder eine
+ *     Aufrufreihe liegt mit beschrifteten Kanten ueber der Szene
+ *     (src/galaxy/PathLayer.tsx). Ohne die Prop zeichnet die Szene wie vorher.
+ * 19. Neu (Handtest K6): ein neu gezeigter Pfad rahmt die Kamera auf seine
+ *     Knoten (`PathFrame`, Rechnung in src/galaxy/path-frame.ts), mit Rand und
+ *     neben der Schrittliste. Die Knoten des Pfades bekommen ihren Namen von der
+ *     Pfadebene; die Namensebene der Szene zeichnet fuer sie keinen zweiten.
+ * 20. Neu (Handtest K12): die Namen der Wurzelmarken suchen sich freie Plaetze
+ *     um ihre Ringe (src/galaxy/marker-names.ts), statt bei mehreren Wurzeln
+ *     aufeinander zu liegen; ein Name ohne freien Platz wird ausgeblendet. Eine
+ *     einzelne Wurzel behaelt ihren Namen unter dem Ring.
+ * 21. Neu (Review zu K5): die Prop `labelIds`. Mit ihr bekommen nur diese
+ *     Knoten einen Namen (die Hierarchie eines grossen Ausschnitts benennt die
+ *     Wurzel und ihre direkten Nachbarn). Ohne die Prop wie vorher.
+ * 22. Neu (Handtest 2026-10-04, G1): die Huelle des Canvas bildet ihren
+ *     eigenen Stapelkontext (`isolation: isolate`). Siehe `CANVAS_STYLE`.
+ * 23. Neu (Review zu K29): neben der Huelle steht die Ebene der Hover-Karten,
+ *     damit eine Karte ueber den Flaechen der Galaxie steht und nicht wie die
+ *     Namen darunter. Siehe hover-layer.tsx.
  */
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import type { JSX, ReactNode, RefObject } from 'react';
 import { Canvas, useThree, useFrame } from '@react-three/fiber';
-import { OrbitControls, OrthographicCamera } from '@react-three/drei';
+import { Html, OrbitControls, OrthographicCamera } from '@react-three/drei';
 import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib';
 import { EffectComposer, Bloom } from '@react-three/postprocessing';
 import * as THREE from 'three';
@@ -97,13 +128,19 @@ import { NodeCloud } from './NodeCloud';
 import { HaloLayer } from './HaloLayer';
 import { EdgeLines } from './EdgeLines';
 import { NodeLabels } from './NodeLabels';
+import { ScreenNodeSeparation } from './ScreenNodeSeparation';
+import { PathLayer, pathNodeIds, type ScenePath } from './PathLayer';
+import { pathFrame } from './path-frame';
+import { markerNameRect, placeMarkerNames, type MarkerName } from './marker-names';
+import { graphNodeName } from './node-names';
 import type { LabelBox } from './NodeLabels';
-import { fitCamera, flatBounds, frameDistance, orthographicZoom } from './camera-frame';
+import { FRAME_MIN_DISTANCE, containShift, fitCamera, flatBounds, frameDistance, orthographicZoom } from './camera-frame';
 import type { CameraFit, FrameBox } from './camera-frame';
 import { FRAME_WINDOW_MS, recordFrameWindow, recordSceneFacts } from './frame-rate';
 import { springStep } from '../agents/agent-motion';
 import type { GraphData, GraphNode } from './types';
 import { COVERAGE_SHADOW_COLOR, coverageShadowPositions, resolveCoverageShadowNode } from './coverage-shadow';
+import { HOVER_LAYER_STYLE, HoverLayerContext } from './hover-layer';
 import type { CoverageShadow, CoverageShadowNode } from './coverage-shadow';
 import {
     DEFAULT_DISPLAY_SETTINGS,
@@ -114,6 +151,23 @@ import {
 } from './density';
 
 const BASE_BLOOM_INTENSITY = 1.45;
+
+/*
+ * Aenderung 22 (Handtest 2026-10-04, G1): die Namen der Szene bleiben unter
+ * den Bedienflaechen.
+ *
+ * drei haengt jedes <Html> (Wurzelmarken, Pfad, Kantenschilder, Band, die
+ * Agentenebene, die Hover-Karte) in die Huelle des Canvas und rechnet ihm einen
+ * z-index aus seinem `zIndexRange`, bis 10 und in der Agentenebene bis 80.
+ * Ohne eigenen Stapelkontext der Huelle galten diese Zahlen im Stapel der
+ * ganzen Galaxie, und der Name des Pfadziels (10) lag ueber "Selection details"
+ * (4). Mit ihm ordnen sie nur noch die Namen untereinander; nach aussen steht
+ * die Huelle samt allen Namen auf der Ebene 0, also unter jeder Bedienflaeche
+ * mit z-index ab 1 (Pfadliste, Menues, Tooltips, Legende, Selection details)
+ * und ueber dem Canvas, der in ihr liegt. Dasselbe gilt im Mini-Galaxy von
+ * Explore, das dieselbe Szene ist.
+ */
+const CANVAS_STYLE = { background: '#0D0F12', isolation: 'isolate' } as const;
 
 /* Camera fly-to animation */
 
@@ -161,7 +215,7 @@ const FLY_LERP_PER_FRAME = 0.08;
  * einen ganzen Anflug in einem Sprung erledigen. */
 const FLY_MAX_DELTA = 0.1;
 
-function CameraAnimator({
+export function CameraAnimator({
     target,
     controlsRef,
     flat = false,
@@ -179,9 +233,21 @@ function CameraAnimator({
         position: [0, 0, 0] as [number, number, number],
         lookAt: [0, 0, 0] as [number, number, number],
     });
+    /* Das Ziel, das beim Aufsetzen schon dastand. Siehe Aenderung 14. */
+    const mountedWith = useRef(target);
 
     useEffect(() => {
         if (!target) {
+            return;
+        }
+        /*
+         * Aenderung 14: ein Anflug, der schon vor dem Aufsetzen dieser Szene
+         * gesetzt war, gehoert zum Bild davor. Ihn jetzt abzuspielen hiesse,
+         * die Kamera zu einem Ziel zu fahren, das niemand mehr meint
+         * (Review-Befund G1). Eine Einpassung (`immediate`) gilt weiter: sie ist
+         * die Lage, in der das Bild anfaengt.
+         */
+        if (target === mountedWith.current && target.immediate !== true) {
             return;
         }
         targetRef.current = target;
@@ -315,6 +381,179 @@ function CameraAnimator({
         }
     });
 
+    return null;
+}
+
+/*
+ * Aenderung 15: das naechste Bild eines Scopes wird gerahmt, nicht eingepasst.
+ *
+ * Ein Expand und die vollstaendige Antwort nach einer Vorschau passen nicht
+ * neu ein (Review-Befund G1): eine neue Einpassung stellte die Kamera jedes
+ * Mal anders hin. Das neue Bild ist aber groesser oder kleiner als das alte,
+ * und die Trennung auf dem Schirm schiebt Knoten nach aussen. Also tritt die
+ * Kamera entlang ihrer Blickrichtung so weit zurueck oder vor, dass der
+ * aeusserste gezeichnete Knoten mit Rand am Bildrand steht (`containShift`).
+ * Richtung, Oben und Drehpunkt bleiben, und naeher als jede Einpassung
+ * (`FRAME_MIN_DISTANCE`) kommt sie dem Drehpunkt nicht. Das gilt nur, solange
+ * die letzte Lage eine Einpassung war und der Leser die Kamera seitdem nicht
+ * bewegt hat: wer gezoomt hat, wollte genau diesen Ausschnitt.
+ */
+export function FitContainment({
+    nodes,
+    target,
+    controlsRef,
+    moved,
+    enabled,
+}: {
+    nodes: readonly GraphNode[];
+    target: CameraTarget | null;
+    controlsRef: RefObject<OrbitControlsImpl | null>;
+    /** Wird von der Steuerung gesetzt, sobald der Leser zieht, dreht oder zoomt. */
+    moved: RefObject<boolean>;
+    enabled: boolean;
+}): null {
+    const camera = useThree((state) => state.camera);
+    const size = useThree((state) => state.size);
+    const armed = useRef<CameraTarget | null>(null);
+
+    useEffect(() => {
+        if (target === null) {
+            return;
+        }
+        armed.current = target.immediate === true ? target : null;
+        moved.current = false;
+    }, [target, moved]);
+
+    useEffect(() => {
+        const fit = armed.current;
+        if (!enabled || fit === null || moved.current || nodes.length === 0 || size.height <= 0
+            || !(camera instanceof THREE.PerspectiveCamera)) {
+            return;
+        }
+        camera.updateMatrixWorld();
+        const view = nodes.map((node) =>
+            new THREE.Vector3(node.x, node.y, node.z).applyMatrix4(camera.matrixWorldInverse));
+        const shift = Math.max(containShift(view, camera.fov, size.width / size.height),
+            FRAME_MIN_DISTANCE - camera.position.distanceTo(fit.lookAt));
+        if (!(Math.abs(shift) > 0.5)) {
+            return;
+        }
+        const direction = camera.getWorldDirection(new THREE.Vector3());
+        camera.position.addScaledVector(direction, -shift);
+        camera.updateMatrixWorld();
+        controlsRef.current?.update();
+    }, [nodes, enabled, camera, size, controlsRef, moved]);
+
+    return null;
+}
+
+/*
+ * Aenderung 17: die Wurzel ist zu finden.
+ *
+ * Nach einem Expand stand die Wurzel als ein Punkt unter neunzig, ohne Namen,
+ * und die Trennung auf dem Schirm hatte sie aus der Mitte geschoben
+ * (Review-Befund G4). Der Ring ist DOM wie der Ring der Hierarchie (Html aus
+ * drei), also kein Neubau der Puffer, und sein Name steht immer da, nicht erst
+ * bei Fokus. Ein Ordner mit hundert Wurzeln bekommt keine hundert Ringe: ueber
+ * der Grenze markiert die Szene nichts und schiebt wie vorher.
+ */
+export const ROOT_MARKER_LIMIT = 12;
+
+const PLACE_NAMES_EVERY_FRAMES = 3;
+
+/*
+ * Handtest K12: mehrere Wurzeln nah beieinander (die Definitionen einer Datei
+ * im Mini-Galaxy von Explore) legten ihre Namen aufeinander. Alle paar Bilder
+ * bekommt jeder Name einen freien Platz um seinen Ring (marker-names.ts); der
+ * Platz steht als `data-name-slot` an der Marke, ein Name ohne Platz ist
+ * `hidden`. Gemessen wird jeder Name einmal, wie die Schilder der Hierarchie.
+ */
+export function RootMarkers({ nodes }: { nodes: readonly GraphNode[] }): JSX.Element {
+    const markers = useRef(new Map<number, HTMLSpanElement>());
+    const sizes = useRef(new Map<string, { width: number; height: number }>());
+    const placedNames = useRef(new Map<number, string>());
+    const camera = useThree((state) => state.camera);
+    const gl = useThree((state) => state.gl);
+    const tick = useRef(0);
+    const point = useMemo(() => new THREE.Vector3(), []);
+    useFrame(() => {
+        tick.current = (tick.current + 1) % PLACE_NAMES_EVERY_FRAMES;
+        if (tick.current !== 0) return;
+        const box = gl.domElement.getBoundingClientRect();
+        const wanted: MarkerName[] = [];
+        for (const node of nodes) {
+            const name = markers.current.get(node.id)?.querySelector('b');
+            if (!name) continue;
+            const shown = graphNodeName(node);
+            let size = sizes.current.get(shown);
+            if (!size && name.offsetWidth > 0) { size = { width: name.offsetWidth, height: name.offsetHeight }; sizes.current.set(shown, size); }
+            if (!size) continue;
+            point.set(node.x, node.y, node.z).project(camera);
+            if (!(point.z >= -1 && point.z <= 1)) continue;
+            wanted.push({ id: node.id, x: box.left + ((point.x + 1) / 2) * box.width, y: box.top + ((1 - point.y) / 2) * box.height, ...size });
+        }
+        for (const { id, slot, rect } of placeMarkerNames(wanted, { left: box.left, top: box.top, right: box.right, bottom: box.bottom })) {
+            const marker = markers.current.get(id), name = marker?.querySelector('b');
+            if (!marker || !name) continue;
+            const anchor = wanted.find((entry) => entry.id === id)!;
+            // The name sits at its place relative to the ring centre, which is where drei puts the marker.
+            const offset = rect ? { left: Math.round(rect.left - anchor.x), top: Math.round(rect.top - anchor.y) } : undefined;
+            const standard = rect ? markerNameRect(anchor, 'below') : undefined;
+            const plain = slot === 'below' && rect && standard && Math.abs(rect.left - standard.left) < 0.5;
+            const place = `${slot}:${offset?.left ?? ''}:${offset?.top ?? ''}`;
+            if (placedNames.current.get(id) === place) continue;
+            placedNames.current.set(id, place);
+            marker.dataset.nameSlot = slot;
+            name.style.visibility = slot === 'hidden' ? 'hidden' : '';
+            if (!offset || plain) { name.style.left = ''; name.style.top = ''; name.style.transform = ''; continue; }
+            name.style.left = `${offset.left}px`; name.style.top = `${offset.top}px`; name.style.transform = 'none';
+        }
+    });
+    return (
+        <>
+            {nodes.map((node) => (
+                <Html key={node.id} position={[node.x, node.y, node.z]} zIndexRange={[10, 0]} style={{ pointerEvents: 'none' }}>
+                    <span className="atlas-galaxy-root-marker" data-testid="atlas-galaxy-root-marker" data-qn={node.qualified_name ?? node.name}
+                        ref={(element) => { if (element) markers.current.set(node.id, element); else markers.current.delete(node.id); }}>
+                        <i aria-hidden="true" />
+                        <b>{graphNodeName(node)}</b>
+                    </span>
+                </Html>
+            ))}
+        </>
+    );
+}
+
+/*
+ * Aenderung 19: ein neuer Pfad bekommt eine Kamerafahrt auf seine Knoten.
+ *
+ * Nur wenn sich der Pfad selbst aendert (anderes Ziel, Aufrufreihe statt Pfad),
+ * nicht beim Durchschalten der Schritte: das ist ein Lesen im selben Bild. Die
+ * Blickrichtung bleibt, die Kamera tritt nur vor oder zurueck und rueckt den
+ * Pfad aus der Schrittliste links oben heraus.
+ */
+const PATH_PANEL_INSET = 440;
+
+function PathFrame({ nodes, path, onTarget }: { nodes: readonly GraphNode[]; path: ScenePath; onTarget: (target: CameraTarget) => void }): null {
+    const camera = useThree((state) => state.camera);
+    const size = useThree((state) => state.size);
+    const key = `${path.labels}:${path.steps.map((step) => `${step.from}>${step.to}`).join(',')}`;
+    const latest = useRef({ nodes, size, onTarget });
+    latest.current = { nodes, size, onTarget };
+    useEffect(() => {
+        const { nodes: drawn, size: viewport, onTarget: report } = latest.current;
+        if (!(camera instanceof THREE.PerspectiveCamera) || viewport.height <= 0) return;
+        const ids = new Set(pathNodeIds(path));
+        const points = drawn.filter((node) => ids.has(node.id)).map((node) => ({ x: node.x, y: node.y, z: node.z }));
+        if (points.length === 0) return;
+        const direction = camera.getWorldDirection(new THREE.Vector3());
+        const frame = pathFrame(points, { direction, up: camera.up }, viewport, camera.fov,
+            { left: Math.min(PATH_PANEL_INSET, viewport.width * 0.4), top: 0 });
+        report({ position: new THREE.Vector3(frame.position.x, frame.position.y, frame.position.z),
+            lookAt: new THREE.Vector3(frame.lookAt.x, frame.lookAt.y, frame.lookAt.z) });
+        // Nur ein neuer Pfad rahmt neu, siehe oben.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [key, camera]);
     return null;
 }
 
@@ -492,7 +731,11 @@ export interface FitMeasurement {
 
 declare global {
     // eslint-disable-next-line no-var
-    var __atlasGalaxyFit: { measure: () => FitMeasurement } | undefined;
+    var __atlasGalaxyFit: {
+        measure: () => FitMeasurement;
+        /** Weltpunkte in Pixel der Zeichenflaeche, mit genau der Kamera, die zeichnet (Beweislauf K5). */
+        project: (points: readonly { x: number; y: number; z: number }[]) => { x: number; y: number }[];
+    } | undefined;
 }
 
 /**
@@ -583,7 +826,15 @@ function FitProbe({ nodes }: { nodes: GraphNode[] }): null {
                 worst: seen.slice(0, 5),
             };
         };
-        globalThis.__atlasGalaxyFit = { measure };
+        const project = (points: readonly { x: number; y: number; z: number }[]) => {
+            camera.updateMatrixWorld();
+            const point = new THREE.Vector3();
+            return points.map((entry) => {
+                point.set(entry.x, entry.y, entry.z).project(camera);
+                return { x: ((point.x + 1) / 2) * size.width, y: ((1 - point.y) / 2) * size.height };
+            });
+        };
+        globalThis.__atlasGalaxyFit = { measure, project };
         return () => {
             globalThis.__atlasGalaxyFit = undefined;
         };
@@ -655,6 +906,10 @@ import { useGraphBackgroundReset } from '../graph/useGraphBackgroundReset';
 interface GraphSceneProps {
     /* False pauses the render loop (hidden-but-mounted panel). */
     active?: boolean;
+    /* Keep a framed hierarchy still; manual orbit remains available. */
+    idleRotation?: boolean;
+    separateNodes?: boolean;
+    onRenderBusyChange?: (busy: boolean) => void;
     data: GraphData;
     coverageShadow?: CoverageShadow | null;
     onShadowNodeClick?: (node: CoverageShadowNode) => void;
@@ -676,6 +931,10 @@ interface GraphSceneProps {
     /* Label geometry, passed straight through to NodeLabels (Aenderung 9). */
     labelWorldFontSize?: number | undefined;
     labelMaxTextWidth?: number | undefined;
+    /* Wie viele Namen hoechstens; ohne Angabe die achtzig von NodeLabels (Review zu K5: die Hierarchie eines Ausschnitts traegt mehr). */
+    labelBudget?: number | undefined;
+    /* Nur diese Knoten tragen einen Namen (Aenderung 21); ohne Angabe jeder, den die Namensebene waehlt. */
+    labelIds?: ReadonlySet<number> | undefined;
     onLabelLayout?: ((boxes: LabelBox[]) => void) | undefined;
     /* Aenderung 10 (W10): was Rechenzeit kostet. Ohne diese vier zeichnet die
      * Szene wie vorher. */
@@ -692,6 +951,10 @@ interface GraphSceneProps {
     labelDistanceFactor?: number;
     /* Bilder je Sekunde, hoechstens. 0 heisst: kein Deckel. */
     frameCap?: number;
+    /* Die Wurzeln des gewaehlten Scopes (Aenderung 17). */
+    rootIds?: ReadonlySet<number>;
+    /* Ein Pfad oder eine Aufrufreihe ueber der Szene (Aenderung 18). */
+    path?: ScenePath;
 }
 
 export type { CameraTarget };
@@ -706,6 +969,9 @@ function CoverageShadowEdges({ shadow, brightness }: { shadow: CoverageShadow; b
 
 export function GraphScene({
     active = true,
+    idleRotation = true,
+    separateNodes = true,
+    onRenderBusyChange,
     data,
     coverageShadow = null,
     onShadowNodeClick,
@@ -722,31 +988,58 @@ export function GraphScene({
     overlay,
     labelWorldFontSize,
     labelMaxTextWidth,
+    labelBudget,
+    labelIds,
     onLabelLayout,
     projection = 'spatial',
     drawEdges = true,
     labelDistanceFactor = 0,
     frameCap = 0,
+    rootIds,
+    path,
 }: GraphSceneProps) {
     const [hovered, setHovered] = useState<GraphNode | null>(null);
     const [hoveredShadow, setHoveredShadow] = useState<CoverageShadowNode | null>(null);
     const controlsRef = useRef<OrbitControlsImpl | null>(null);
+    /* Ob der Leser die Kamera seit der letzten Einpassung bewegt hat (Aenderung 15). */
+    const moved = useRef(false);
     const background = useGraphBackgroundReset(() => { setHovered(null); setHoveredShadow(null); onBackgroundClick?.(); });
     const flat = projection === 'flat';
     const sceneNodes = useMemo(() => coverageShadow ? [...data.nodes, ...coverageShadow.nodes] : data.nodes, [data.nodes, coverageShadow]);
+    const [separated, setSeparated] = useState<{ source: GraphNode[]; nodes: GraphNode[] }>();
+    const receiveSeparation = useCallback((source: GraphNode[], nodes: GraphNode[]) => setSeparated({ source, nodes }), []);
+    const renderedNodes = separateNodes && separated?.source === sceneNodes ? separated.nodes : sceneNodes;
+    const renderedCode = useMemo(() => renderedNodes === sceneNodes ? data.nodes : renderedNodes.slice(0, data.nodes.length),
+        [renderedNodes, sceneNodes, data.nodes]);
+    const renderedShadow = useMemo(() => {
+        if (!coverageShadow || renderedNodes === sceneNodes) return coverageShadow;
+        const nodes = renderedNodes.slice(data.nodes.length) as CoverageShadowNode[];
+        return { ...coverageShadow, nodes, nodeById: new Map(nodes.map(node => [node.id, node])) };
+    }, [coverageShadow, renderedNodes, sceneNodes, data.nodes.length]);
+    const markedRoots = rootIds !== undefined && rootIds.size > 0 && rootIds.size <= ROOT_MARKER_LIMIT ? rootIds : undefined;
+    const rootNodes = useMemo(() => markedRoots ? renderedCode.filter((node) => markedRoots.has(node.id)) : [],
+        [markedRoots, renderedCode]);
+    // Der Ring traegt den Namen der Wurzel, die Pfadebene die Namen ihrer Knoten (K6); ein zweiter Name waere doppelt.
+    const pathIds = useMemo(() => (path ? new Set(pathNodeIds(path)) : undefined), [path]);
+    const labelNodes = useMemo(() => markedRoots || pathIds || labelIds
+        ? renderedCode.filter((node) => !markedRoots?.has(node.id) && !pathIds?.has(node.id) && (!labelIds || labelIds.has(node.id))) : renderedCode,
+    [markedRoots, pathIds, labelIds, renderedCode]);
+    /* Das Kameraziel: das des Panels, oder die Fahrt auf einen neuen Pfad, je nachdem, was zuletzt kam. */
+    const [sceneTarget, setSceneTarget] = useState<CameraTarget | null>(cameraTarget);
+    useEffect(() => { setSceneTarget(cameraTarget); }, [cameraTarget]);
     const onCodeHover = useCallback((node: GraphNode | null) => {
         setHovered(node);
         if (node) setHoveredShadow(null);
     }, []);
     const onShadowHover = useCallback((node: GraphNode | null) => {
-        const selected = resolveCoverageShadowNode(coverageShadow, node);
+        const selected = resolveCoverageShadowNode(renderedShadow, node);
         setHoveredShadow(selected);
         if (selected) setHovered(null);
-    }, [coverageShadow]);
+    }, [renderedShadow]);
     const onShadowClick = useCallback((node: GraphNode) => {
-        const selected = resolveCoverageShadowNode(coverageShadow, node);
+        const selected = resolveCoverageShadowNode(renderedShadow, node);
         if (selected) onShadowNodeClick?.(selected);
-    }, [coverageShadow, onShadowNodeClick]);
+    }, [renderedShadow, onShadowNodeClick]);
 
     /* Adaptive density defaults x user multipliers. The automatic scale keeps
      * contrast roughly constant as the graph grows; the sliders nudge it.
@@ -819,13 +1112,15 @@ export function GraphScene({
      * Beweislaeufe von W3 bis W9 gemessen haben.
      */
     const frameloop = !active ? 'never' : frameCap > 0 ? 'never' : 'always';
+    /* Aenderung 23: die Hover-Karten zeichnen ausserhalb der Huelle in diese Ebene. */
+    const [hoverLayer, setHoverLayer] = useState<HTMLDivElement | null>(null);
 
-    return (
+    return (<>
         <Canvas
             {...background}
             frameloop={frameloop}
             camera={{ position: [0, 0, 800], fov: GRAPH_CAMERA_FOV, near: 0.1, far: 100000 }}
-            style={{ background: '#0D0F12' }}
+            style={CANVAS_STYLE}
             dpr={GRAPH_CANVAS_DPR}
             gl={{
                 antialias: false,
@@ -847,7 +1142,7 @@ export function GraphScene({
             {drawEdges && (
                 <EdgeLines
                     active={active}
-                    nodes={data.nodes}
+                    nodes={renderedCode}
                     edges={data.edges}
                     highlightedIds={highlightedIds}
                     emphasizeIncidentEdges={emphasizeIncidentEdges}
@@ -855,7 +1150,7 @@ export function GraphScene({
                 />
             )}
             <NodeCloud
-                nodes={data.nodes}
+                nodes={renderedCode}
                 highlightedIds={highlightedIds}
                 onHover={onCodeHover}
                 onClick={onNodeClick}
@@ -863,29 +1158,39 @@ export function GraphScene({
             />
             {showLabels && (
                 <NodeLabels
-                    nodes={data.nodes}
+                    nodes={labelNodes}
                     highlightedIds={highlightedIds}
+                    {...(labelBudget !== undefined ? { maxLabels: labelBudget } : {})}
                     worldFontSize={labelWorldFontSize}
                     maxTextWidth={labelMaxTextWidth}
                     maxDistance={labelMaxDistance}
                     onLayout={onLabelLayout}
                 />
             )}
-            {landmarks && <HaloLayer nodes={data.nodes} />}
+            {landmarks && <HaloLayer nodes={renderedCode} />}
+            {rootNodes.length > 0 && <RootMarkers nodes={rootNodes} />}
+            {path !== undefined && <PathLayer nodes={renderedCode} path={path} namedRoots={markedRoots} />}
+            {path !== undefined && !flat && <PathFrame nodes={renderedCode} path={path} onTarget={setSceneTarget} />}
 
-            {coverageShadow && coverageShadow.nodes.length > 0 && <group>
-                {drawEdges && <CoverageShadowEdges shadow={coverageShadow} brightness={display.edgeBrightness} />}
-                <NodeCloud nodes={coverageShadow.nodes} highlightedIds={null} onHover={onShadowHover} onClick={onShadowClick} opacity={0.6} boost={nodeBoost * 0.75} />
-                {showLabels && <NodeLabels nodes={coverageShadow.nodes} highlightedIds={null} worldFontSize={labelWorldFontSize} maxTextWidth={labelMaxTextWidth} maxDistance={labelMaxDistance} />}
+            {renderedShadow && renderedShadow.nodes.length > 0 && <group>
+                {drawEdges && <CoverageShadowEdges shadow={renderedShadow} brightness={display.edgeBrightness} />}
+                <NodeCloud nodes={renderedShadow.nodes} highlightedIds={null} onHover={onShadowHover} onClick={onShadowClick} opacity={0.6} boost={nodeBoost * 0.75} />
+                {showLabels && <NodeLabels nodes={renderedShadow.nodes} highlightedIds={null} worldFontSize={labelWorldFontSize} maxTextWidth={labelMaxTextWidth} maxDistance={labelMaxDistance} />}
             </group>}
 
             {overlay}
-            {hovered && renderTooltip !== undefined && renderTooltip(hovered)}
-            {resolveCoverageShadowNode(coverageShadow, hoveredShadow) && hoveredShadow && renderShadowTooltip?.(hoveredShadow)}
+            <HoverLayerContext.Provider value={hoverLayer}>
+                {hovered && renderTooltip !== undefined && renderTooltip(hovered)}
+                {resolveCoverageShadowNode(renderedShadow, hoveredShadow) && hoveredShadow && renderShadowTooltip?.(hoveredShadow)}
+            </HoverLayerContext.Provider>
 
-            <CameraAnimator target={cameraTarget} controlsRef={controlsRef} flat={flat} />
-            <FitProbe nodes={sceneNodes} />
-            <IdleAutoRotate controlsRef={controlsRef} enabled={!flat} />
+            <CameraAnimator target={sceneTarget} controlsRef={controlsRef} flat={flat} />
+            <FitContainment nodes={renderedNodes} target={sceneTarget} controlsRef={controlsRef} moved={moved}
+                enabled={separateNodes && !flat} />
+            {separateNodes && <ScreenNodeSeparation nodes={sceneNodes} active={active} onChange={receiveSeparation} onBusyChange={onRenderBusyChange}
+                pinned={markedRoots} />}
+            <FitProbe nodes={renderedNodes} />
+            <IdleAutoRotate controlsRef={controlsRef} enabled={!flat && idleRotation && !separateNodes} />
             <FrameRateMeter nodes={sceneNodes.length} edges={data.edges.length + (coverageShadow?.edges.length ?? 0)} cap={frameCap} />
             <FrameCapDriver cap={frameCap} active={active} />
 
@@ -919,13 +1224,23 @@ export function GraphScene({
                 dampingFactor={0.08}
                 rotateSpeed={0.5}
                 zoomSpeed={1.5}
+                /*
+                 * Aenderung 16: das Mausrad zoomt dorthin, wo der Zeiger steht,
+                 * und nicht in die Bildmitte (Review-Befund G3). three-stdlib
+                 * versetzt dabei auch den Drehpunkt; die Einpassung und jeder
+                 * Anflug setzen ihn ohnehin selbst, und die Grenzen der
+                 * Entfernung gelten fuer den neuen Abstand genauso.
+                 */
+                zoomToCursor
                 minDistance={Math.max(5, sceneRadius * 0.02)}
                 maxDistance={Math.max(sceneRadius, orbitReach) * 4}
                 autoRotateSpeed={0.4}
+                onStart={() => { moved.current = true; }}
             />
             {flat && <FlatTarget box={flatBox} controlsRef={controlsRef} />}
         </Canvas>
-    );
+        <div ref={setHoverLayer} data-testid="atlas-galaxy-hover-layer" style={HOVER_LAYER_STYLE} />
+    </>);
 }
 
 /*
@@ -960,8 +1275,10 @@ export function computeFrameTarget(box: FrameBox, aspect: number): CameraTarget 
 export function computeFitTarget(
     nodes: readonly { x: number; y: number; z: number }[],
     aspect: number,
+    /* Der Punkt in der Bildmitte, etwa die Wurzel eines Scopes (Review-Befund G4). */
+    center?: { x: number; y: number; z: number },
 ): (CameraTarget & { fit: CameraFit }) | null {
-    const fit = fitCamera(nodes, GRAPH_CAMERA_FOV, aspect);
+    const fit = fitCamera(nodes, GRAPH_CAMERA_FOV, aspect, undefined, center);
     if (fit === null) {
         return null;
     }

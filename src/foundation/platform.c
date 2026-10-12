@@ -370,7 +370,37 @@ static const char *platform_copy_environment_value(char *buf, size_t buf_sz, con
     return buf;
 }
 
+static cbm_environment_resolver_t environment_resolver;
+
+void cbm_set_environment_resolver(cbm_environment_resolver_t resolver) {
+    environment_resolver = resolver;
+}
+
+const char *cbm_runtime_getenv(const char *name) {
+    /* A small per-thread ring supports callers that inspect several inherited
+     * values together without exposing libc's mutable environment storage. */
+    static CBM_TLS char inherited[4][CBM_SZ_4K];
+    static CBM_TLS unsigned slot;
+    const char *value = NULL;
+    if (environment_resolver && environment_resolver(name, &value)) {
+        return value;
+    }
+    char *buffer = inherited[slot++ % 4U];
+    return cbm_native_getenv(name, buffer, CBM_SZ_4K, NULL);
+}
+
 const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
+    const char *value = NULL;
+    if (environment_resolver && environment_resolver(name, &value)) {
+        if (buf && buf_sz) {
+            buf[0] = '\0';
+        }
+        return platform_copy_environment_value(buf, buf_sz, value ? value : fallback);
+    }
+    return cbm_native_getenv(name, buf, buf_sz, fallback);
+}
+
+const char *cbm_native_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
     if (!name || !name[0] || !buf || buf_sz == 0) {
         return NULL;
     }
@@ -542,6 +572,60 @@ const char *cbm_app_local_dir(void) {
 }
 
 /* ── Cache directory ────────────────────────── */
+
+const char *cbm_errno_name(int error) {
+    static const struct {
+        int value;
+        const char *name;
+    } names[] = {
+        {EACCES, "EACCES"},
+        {EAGAIN, "EAGAIN"},
+        {EBUSY, "EBUSY"},
+        {EEXIST, "EEXIST"},
+        {EFBIG, "EFBIG"},
+        {EINTR, "EINTR"},
+        {EINVAL, "EINVAL"},
+        {EIO, "EIO"},
+        {EISDIR, "EISDIR"},
+        {ELOOP, "ELOOP"},
+        {EMFILE, "EMFILE"},
+        {EMLINK, "EMLINK"},
+        {ENAMETOOLONG, "ENAMETOOLONG"},
+        {ENFILE, "ENFILE"},
+        {ENOENT, "ENOENT"},
+        {ENOMEM, "ENOMEM"},
+        {ENOSPC, "ENOSPC"},
+        {ENOTDIR, "ENOTDIR"},
+        {ENOTEMPTY, "ENOTEMPTY"},
+        {ENXIO, "ENXIO"},
+        {EPERM, "EPERM"},
+        {EROFS, "EROFS"},
+        {ETXTBSY, "ETXTBSY"},
+        {EXDEV, "EXDEV"},
+        {ETIMEDOUT, "ETIMEDOUT"},
+        {ECONNREFUSED, "ECONNREFUSED"},
+        {EADDRINUSE, "EADDRINUSE"},
+        {ENOTSOCK, "ENOTSOCK"},
+        {EPIPE, "EPIPE"},
+#ifdef EDQUOT
+        {EDQUOT, "EDQUOT"},
+#endif
+#ifdef EOVERFLOW
+        {EOVERFLOW, "EOVERFLOW"},
+#endif
+#ifdef ENOTSUP
+        {ENOTSUP, "ENOTSUP"},
+#endif
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (names[i].value == error) {
+            return names[i].name;
+        }
+    }
+    static CBM_TLS char fallback[16];
+    (void)snprintf(fallback, sizeof(fallback), "%d", error);
+    return fallback;
+}
 
 const char *cbm_resolve_cache_dir(void) {
     static CBM_TLS char buf[CBM_SZ_4K];

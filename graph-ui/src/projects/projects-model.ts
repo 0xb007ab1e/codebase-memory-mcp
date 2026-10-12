@@ -134,6 +134,9 @@ export interface ProjectHealth {
     nodes?: number;
     edges?: number;
     sizeBytes?: number;
+    indexedAt?: string | null;
+    watchRegistered?: boolean | null;
+    watcherRunning?: boolean | null;
     reason: string;
 }
 
@@ -145,6 +148,9 @@ export function readHealth(raw: unknown): ProjectHealth {
         nodes: optionalNumber(record['nodes']),
         edges: optionalNumber(record['edges']),
         sizeBytes: optionalNumber(record['size_bytes']),
+        indexedAt: typeof record['indexed_at'] === 'string' && Number.isFinite(Date.parse(record['indexed_at'])) ? record['indexed_at'] : null,
+        watchRegistered: typeof record['watch_registered'] === 'boolean' ? record['watch_registered'] : null,
+        watcherRunning: typeof record['watcher_running'] === 'boolean' ? record['watcher_running'] : null,
         reason: text(record['reason']),
     };
 }

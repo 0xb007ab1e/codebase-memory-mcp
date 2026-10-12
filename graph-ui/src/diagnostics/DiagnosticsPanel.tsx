@@ -24,16 +24,15 @@ export default function DiagnosticsPanel({ project, client, coverage, coverageEr
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [status, setStatus] = useState('');
-    const [query, setQuery] = useState('');
+    const [recordLimit, setRecordLimit] = useState(100);
     const request = useRef(0);
     useEffect(() => {
         request.current += 1;
-        setDiagnosis(null); setReport(''); setBusy(false); setError(null); setStatus(''); setQuery('');
+        setDiagnosis(null); setReport(''); setBusy(false); setError(null); setStatus(''); setRecordLimit(100);
         return () => { request.current += 1; };
     }, [project, path, active]);
     const index = diagnosis?.reading.index ?? coverage;
     const records = useMemo(() => diagnosticRecords(index), [index]);
-    const filtered = useMemo(() => records.filter((record) => `${record.path} ${record.reason}`.toLowerCase().includes(query.toLowerCase())), [records, query]);
     const run = async () => {
         const ticket = ++request.current;
         setBusy(true); setError(null); setStatus('');
@@ -82,13 +81,14 @@ export default function DiagnosticsPanel({ project, client, coverage, coverageEr
             {diagnosis.pathAnswer?.coverage.map((row, i) => <p key={`${row.path}:${i}`}><code>{row.path}</code> · {row.kind} · {row.detail || 'No detail recorded'}</p>)}
             {diagnosis.reading.answer.caveat && <p className="diagnostics-caveat">{diagnosis.reading.answer.caveat}</p>}
         </div>}
-        {records.length > 0 && <><label className="diagnostics-filter">Filter recorded paths or reasons<input type="search" value={query} onChange={(event) => setQuery(event.currentTarget.value)} /></label>
-            <ol className="diagnostics-records">{filtered.slice(0, 100).map((record) => <li key={record.path} className={`diagnostics-record-${diagnosticCategory(record)}`}>
+        {records.length > 0 && <details><summary>Recorded paths · {records.length}</summary>
+            <ol className="diagnostics-records">{records.slice(0, recordLimit).map((record) => <li key={record.path} className={`diagnostics-record-${diagnosticCategory(record)}`}>
                 <div><strong>{DIAGNOSTIC_LABELS[diagnosticCategory(record)]}</strong> · {record.kind} <button type="button" onClick={() => onNavigate(record.path)}><code>{record.path}</code></button></div>
                 <p><strong>Recorded reason:</strong> {record.reason || 'No reason recorded'}</p>
                 <p><strong>Evidence:</strong> {record.sources.join(', ') || 'Source not reported'}</p>
                 <p>{diagnosticAction(record)}</p>
-            </li>)}</ol><p className="diagnostics-caveat">Showing {Math.min(100, filtered.length)} of {filtered.length} matching records. Filter to locate another path.</p></>}
+            </li>)}</ol><p className="diagnostics-caveat">Showing {Math.min(recordLimit, records.length)} of {records.length} records.</p>
+            {recordLimit < records.length && <button type="button" onClick={() => setRecordLimit(limit => limit + 100)}>Show more paths</button>}</details>}
         {index && records.length === 0 && <p>No gap records returned. This does not prove complete indexing; undiscovered or unsupported files may be unrecorded.</p>}
         {diagnosis && <section aria-label="Local diagnostic report"><h3>Review the local report</h3><p>This draft contains paths and recorded reasons. Edit it before sharing. Copy and download stay local; publication would require a separate, explicit action outside this panel.</p>
             <textarea aria-label="Editable local diagnostic report" value={report} onChange={(event) => setReport(event.currentTarget.value)} spellCheck={false} />

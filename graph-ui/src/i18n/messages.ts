@@ -1,7 +1,7 @@
 /**
  * Der typisierte Katalog der sichtbaren Chrome-Strings.
  *
- * Die Mechanik ist die des PR-Frontends (INVENTAR.md Abschnitt 1): EIN Objekt,
+ * Die Mechanik ist die des PR-Frontends: EIN Objekt,
  * `as const`, nach Bereichen geordnet, und alles, was eine Zahl oder einen Namen
  * einsetzen muss, ist eine Funktion statt einer Zeichenkette mit Platzhaltern.
  * Eine Funktion kann der Uebersetzer nicht falsch zusammensetzen, und der
@@ -68,7 +68,8 @@ export const messages = {
     },
     /** Die Kopfzeile und die Flaechen, die zu keinem Panel gehoeren. */
     app: {
-        brand: 'CODEATLAS',
+        brand: 'CBM LENS',
+        releaseLabel: 'Beta',
         /** Steht in der Tab-Leiste und im Breadcrumb, wenn nichts offen ist. */
         noFileOpen: 'no file open',
         /** Der Name, den eine Oberflaeche ohne Projekt traegt. */
@@ -147,14 +148,14 @@ export const messages = {
      *    Repository.
      */
     help: {
-        title: 'CODEATLAS HELP',
+        title: 'CBM LENS HELP',
         subtitle: 'a reading surface over an indexed repository',
         close: '[esc] close',
         closeLabel: CLOSE,
 
         whatTitle: 'What this is',
         what: [
-            'CodeAtlasWeb reads a repository that the analysis server has indexed and explains it: '
+            'CBM Lens reads a repository that the analysis server has indexed and explains it: '
             + 'the tree and the source, a twin of the symbol under the caret, a walk along the calls, '
             + 'the scope of a change, and the answers of a local model.',
             'Everything on this screen comes from that index or from a file the server handed over, '
@@ -211,13 +212,9 @@ export const messages = {
 
         shortcutsTitle: 'Every key this window listens to',
         shortcutsNote:
-            'This table is derived from the wiring itself, not written beside it: the menu keys come from '
-            + 'the list the window handler reads, the walk and search keys from the functions that decide '
-            + 'what a key means. A key that stopped working could not stay in this table.',
+            'Menu shortcuts work across the workspace. Cmd/Ctrl+K opens the dedicated node and cluster search in Galaxy.',
         typingNote:
-            'Everything else you type goes into the command line, even when nothing has the cursor: the '
-            + 'line takes the focus and the character lands in it, where you can see it. That is why the '
-            + 'menu keys carry alt (option on an Apple keyboard): a bare letter is text, not a command.',
+            'Typing stays in the field you focused. Menu shortcuts use Alt (Option on an Apple keyboard).',
         columnKey: 'key',
         columnWhere: 'where it counts',
         columnDoes: 'what it does',
@@ -267,10 +264,9 @@ export const messages = {
         altPrefix: 'alt+',
         scopes: {
             mnemonic: 'anywhere, also while you type',
-            bare: 'while the command line does not have the cursor',
-            line: 'while the command line does not have the cursor',
+            bare: 'outside text fields',
+            galaxy: 'anywhere',
             walk: 'during a walk',
-            search: 'while the search window is open',
         },
         keyNames: {
             Enter: 'enter',
@@ -291,22 +287,17 @@ export const messages = {
             'mnemonic:a': 'show or hide the galaxy',
             'mnemonic:w': 'ask again where to start, and walk from there',
             'mnemonic:b': 'open the BUG hunt on the symbol in the twin',
-            'mnemonic:c': 'open change impact',
             'mnemonic:l': 'turn the local model on or off',
             'mnemonic:r': 'put every zone back to the width and height it starts with',
             'mnemonic:s': 'open or close the settings: the model, and what the drawing costs',
             'mnemonic:g': 'turn the live agent mode on or off. Off asks the bridge nothing at all',
-            'mnemonic:p': 'open or close the projects: what is indexed, index more, and what the server is doing',
+            'mnemonic:p': 'add a project index or return to its indexing progress',
             'bare:?': 'open or close this page',
-            'line:/': 'put the cursor in the command line, without typing the slash itself',
+            'galaxy:Cmd/Ctrl+K': 'open Galaxy and focus node or cluster search',
             'walk:Enter': 'go to the next step of the walk, and finish it on the last one',
             'walk:ArrowLeft': 'go back one step',
             'walk:q': 'leave the walk',
             'walk:d': 'draw the flow of this step, when the step has a symbol',
-            'search:ArrowUp': 'move the selection up',
-            'search:ArrowDown': 'move the selection down',
-            'search:Enter': 'open the selected hit, or ask the atlas when nothing matched',
-            'search:Escape': 'close the search window',
         } as Readonly<Record<string, string>>,
 
         operationsTitle: 'Running it',
@@ -330,11 +321,10 @@ export const messages = {
 
         referencesTitle: 'Where to read further, in this repository',
         references: [
-            { path: 'PLAN.md', about: 'the plan this surface was built against, and its honesty rules' },
-            { path: 'INVENTAR.md', about: 'what the analysis server delivers, and what it does not' },
-            { path: 'UPSTREAM-ASKS.md', about: 'the gaps that were handed back to the server' },
-            { path: 'docs/adr/0001-modellwahl.md', about: 'why this local model and no other' },
-            { path: 'verification/', about: 'the proof runs: screenshots, measurements, gate reports' },
+            { path: 'README.md', about: 'exploration, local inference and development setup' },
+            { path: 'CONFIGURATION.md', about: 'settings, precedence and the local configuration API' },
+            { path: 'THIRD_PARTY.md', about: 'source provenance, dependencies and model licenses' },
+            { path: 'docs/adr/0001-modellwahl.md', about: 'local inference choices and model evidence' },
         ],
         referencesNote:
             'Paths in this repository, not links. This window is offline by design, so a link into the '
@@ -410,7 +400,7 @@ export const messages = {
          * Beispiele, wie man den Chat nutzt, sonst weiss niemand, wie man es
          * nutzt."
          */
-        placeholder: 'type a command or ask the atlas...',
+        placeholder: 'type a command or ask CBM Lens...',
         examplesLabel: 'what you can type here',
         hintIdle: 'type 2 letters to search by meaning',
         hintOpen: 'up/down picks, enter opens, esc closes',
@@ -432,7 +422,7 @@ export const messages = {
          * Schweigen. Jetzt steht der Satz an der Stelle, an der die Antwort
          * erwartet wird.
          */
-        oneMoreLetter: 'one more letter, then the atlas searches by meaning',
+        oneMoreLetter: 'one more letter, then CBM Lens searches by meaning',
         /*
          * Die Sofort-Vorschlaege, und dass sie vorlaeufig sind.
          *
@@ -658,7 +648,7 @@ export const messages = {
 
     /** Der Rahmen des Antwort-Panels. Seine Saetze stehen in chat-strings.ts. */
     chat: {
-        panelLabel: 'atlas chat',
+        panelLabel: 'CBM Lens chat',
         depthGroupLabel: 'neighbourhood depth',
         /*
          * `clear` bleibt der einzige Knopf, der loescht, und sagt es.
@@ -688,6 +678,8 @@ export const messages = {
     /** Was die Statusleiste ueber das Graph-Panel sagt. */
     galaxy: {
         noLayout: 'no layout',
+        /** The label of a coverage-only selection: a file the graph knows about, not a symbol. */
+        coverageSelection: (name: string): string => `Coverage · ${name}`,
         nodeCount: (nodes: number, hidden: boolean): string =>
             `${nodes} nodes${hidden ? ' (hidden)' : ''}`,
     },
@@ -714,7 +706,7 @@ export const messages = {
      *    das wurde am 2026-08-29 gemessen, und der Satz sagt es so.
      */
     settings: {
-        title: 'CODEATLAS SETTINGS',
+        title: 'CBM LENS SETTINGS',
         subtitle: 'which model answers, and everything that costs computing time',
         panelLabel: 'settings',
         close: '[esc] close',
@@ -982,13 +974,16 @@ export const messages = {
      * not about one subject area.
      */
     projects: {
-        title: 'CODEATLAS PROJECTS',
+        title: 'CBM LENS PROJECTS',
         subtitle: 'what this server has indexed, and how to give it more',
         panelLabel: 'projects',
         close: '[esc] close',
         closeLabel: CLOSE,
         /** The entry in the atlas row. The letter sits in brackets. */
         menuLabel: '[p]rojects',
+        /** The atlas row entry that opens this panel to index a repository; alt+p opens it as well. */
+        addIndexLabel: 'Add project index',
+        addIndexTitle: 'Choose a repository folder to index',
 
         /* ------------------------------------------------------- the list */
 
@@ -1059,6 +1054,7 @@ export const messages = {
         /* -------------------------------------------------------- the adr */
 
         adrTitle: 'Decision record',
+        adrOpen: 'Open ADR',
         adrIntro: (project: string): string =>
             `The architecture decision record the server keeps for ${project}, as markdown. Saving `
             + 'stores it in the project index; a reindex keeps it.',
@@ -1104,7 +1100,7 @@ export const messages = {
     /** Der Rahmen des Twins. Seine Fakten-Saetze stehen in twin/strings.ts. */
     twin: {
         /** Das Etikett des Leseprofils, mit dem dieses Produkt startet. */
-        profileLabel: 'CodeAtlasWeb Twin',
+        profileLabel: 'CBM Lens Twin',
         /** Der Kopf des Panels, solange kein Symbol vor dem Leser steht. */
         noSymbol: 'no symbol',
     },

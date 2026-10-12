@@ -36,6 +36,23 @@ function clientFixture() {
 }
 
 describe('Local diagnosis user boundary', () => {
+    it('keeps recorded paths collapsed, pages all records and preserves source navigation without search', async () => {
+        const fixture = clientFixture(); const onNavigate = vi.fn();
+        const entries = Array.from({ length: 101 }, (_, index) => ({ path: `src/file-${String(index).padStart(3, '0')}.ts`, kind: 'parse_partial', detail: '3-5' }));
+        const coverage = buildCoverageIndex({ scopes: [{ scope: '.', requestedScope: '.', status: 'complete', total: entries.length, hasMore: false, entries }] });
+        await act(async () => root.render(<DiagnosticsPanel project="fixture" client={fixture.client} coverage={coverage} active onNavigate={onNavigate} />));
+        expect(container.querySelector('input')).toBeNull();
+        const disclosure = [...container.querySelectorAll('details')].find(item => item.querySelector('summary')?.textContent === 'Recorded paths · 101')!;
+        expect(disclosure.open).toBe(false);
+        await act(async () => disclosure.querySelector('summary')!.click());
+        expect(disclosure.open).toBe(true);
+        expect(container.querySelectorAll('.diagnostics-records li')).toHaveLength(100);
+        await click('Show more paths');
+        expect(container.querySelectorAll('.diagnostics-records li')).toHaveLength(101);
+        await click('src/file-100.ts');
+        expect(onNavigate).toHaveBeenCalledExactlyOnceWith('src/file-100.ts');
+        expect(fixture.calls).toHaveLength(0);
+    });
     it('does no read until requested, uses existing tools, and only copies the edited report', async () => {
         const fixture = clientFixture(); const outside = vi.fn(); vi.stubGlobal('fetch', outside);
         const writeText = vi.fn().mockResolvedValue(undefined);

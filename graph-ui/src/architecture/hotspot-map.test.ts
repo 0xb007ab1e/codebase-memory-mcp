@@ -21,6 +21,13 @@ describe('hotspot overlays and gravity', () => {
         expect(hotspotsForNode(area, catalog)?.findings).toHaveLength(2);
         expect(catalog.byFile.get('src/api/complex.ts')?.maxFanIn).toBeUndefined();
     });
+    it('collects the findings of a sub-area inside an opened area', () => {
+        const nested: GraphData = { total_nodes: 2, edges: [], nodes: [node(1, 'busy', 'django/db/models/query.py'), node(2, 'complex', 'django/db/backends/base.py')] };
+        const catalog = collectHotspots(findings, nested);
+        const models = buildSemanticGraph(nested, { view: 'overview', areaPath: 'django/db' }).nodes.find(item => item.id === 'area:django/db/models')!;
+        expect(hotspotsForNode(models, catalog)).toMatchObject({ maxFanIn: 100, findings: [expect.objectContaining({ name: 'busy' })] });
+        expect(hotspotsForNode({ ...models, areaPath: 'django/views' }, catalog)).toBeUndefined();
+    });
     it('does not turn complexity or missing fan-in into a gravity measurement', () => {
         const catalog = collectHotspots(findings, graph);
         expect(gravityStrength(catalog.byFile.get('src/api/complex.ts')!.maxFanIn, catalog.maxFanIn)).toBe(0);

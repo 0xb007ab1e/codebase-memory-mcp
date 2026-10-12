@@ -1,8 +1,8 @@
 export const activityStrings = {
     title: 'Agent activity', subtitle: 'Follow recorded work and inspect the code it touches.',
     connect: 'Load recorded activity', disconnect: 'Disconnect', agent: 'Agent', run: 'Run', kind: 'Activity',
-    allAgents: 'All agents', allRuns: 'All runs', allKinds: 'All activity', search: 'Filter activity',
-    placeholder: 'Search tools, paths, or details…', events: 'Recorded events', actors: 'Agents seen',
+    allAgents: 'All agents', allRuns: 'All runs', allKinds: 'All activity',
+    events: 'Recorded events', actors: 'Agents seen',
     gaps: 'Missing sequence numbers', dropped: 'Connection drops', unmapped: 'Unmapped',
     noSource: 'Load recorded activity from this daemon. Hooks send events to /api/agent-events on the same port.',
     noEvents: 'No recorded activity for this repository. Configure the tool hook with the indexed project name; tool calls are observed, never inferred.', noMatch: 'No activity matches these filters.',

@@ -2,17 +2,21 @@ import { useEffect, useState } from 'react';
 import { callToolJson } from '../provider/rpc-transport';
 import { readCodeSnippet, type CodeSnippetResult } from '../provider/rpc-schemas';
 import type { SystemPathEdge, SystemSymbol } from './system-architecture-source';
+export interface BehaviorSourceSnapshot { key: string; source?: CodeSnippetResult; error?: string }
 
 /** A small, current-source window. It never turns nearby syntax into an inferred guard. */
-export default function BehaviorSourceEvidence({ project, generation, symbol, call, active, onNavigate }: {
+export default function BehaviorSourceEvidence({ project, generation, symbol, call, active, onNavigate, onSourceEvidence }: {
     project: string; generation?: string; symbol: SystemSymbol; call?: SystemPathEdge; active: boolean;
     onNavigate: (path: string, line?: number, name?: string) => void;
+    onSourceEvidence?: (snapshot: BehaviorSourceSnapshot) => void;
 }) {
     const line = call?.callsite?.line ?? symbol.start_line;
     const file = call?.callsite?.file_path ?? symbol.file_path;
     const key = JSON.stringify([project, generation, symbol.qualified_name, file, line]);
     const [reading, setReading] = useState<{ key: string; source?: CodeSnippetResult; error?: string }>();
     const current = reading?.key === key ? reading : undefined;
+    useEffect(() => { if (active) onSourceEvidence?.({ key, source: current?.source, error: current?.error }); },
+        [active, key, current?.source, current?.error, onSourceEvidence]);
     useEffect(() => {
         if (!active || !file || !symbol.qualified_name) return;
         const controller = new AbortController();

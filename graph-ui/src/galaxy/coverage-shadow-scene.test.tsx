@@ -23,6 +23,14 @@ const node = (id: number): GraphNode => ({ id, x: 0, y: 0, z: 0, label: 'File', 
 const data: GraphData = { nodes: [node(1)], edges: [], total_nodes: 1, missed_graph: { nodes: [node(1)], edges: [], offset: { x: 200, y: 0, z: 0 } } };
 
 describe('coverage shadow scene selection', () => {
+    it('keeps spatial hierarchies still after framing while preserving manual orbit', () => {
+        renderToStaticMarkup(<GraphScene data={data} idleRotation={false} highlightedIds={null} cameraTarget={null} showLabels={false} onNodeClick={vi.fn()} />);
+        const children = elements(canvas.children as ReactNode);
+        const idle = children.find(element => typeof element.type === 'function' && element.type.name === 'IdleAutoRotate');
+        expect(idle?.props['enabled']).toBe(false);
+        const orbit = children.find(element => 'autoRotateSpeed' in element.props);
+        expect(orbit?.props['enableRotate']).toBe(true);
+    });
     it('routes a shadow click only to the coverage callback despite duplicate source IDs', () => {
         const shadow = buildCoverageShadow(data)!;
         const onCode = vi.fn();

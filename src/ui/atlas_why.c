@@ -12,6 +12,7 @@
 
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
+#include "foundation/json_writer.h"
 #include "ui/atlas.h"
 
 #include "cbm.h"
@@ -59,7 +60,7 @@ static why_file_t *why_file_get(why_cache_t *cache, const char *file_path) {
     if (cache->count >= WHY_MAX_FILES)
         return NULL;
     why_file_t *slot = &cache->files[cache->count++];
-    slot->file_path = strdup(file_path);
+    slot->file_path = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, file_path);
     if (!slot->file_path)
         return NULL;
 
@@ -75,7 +76,7 @@ static why_file_t *why_file_get(why_cache_t *cache, const char *file_path) {
         fclose(fp);
         return NULL;
     }
-    char *source = malloc((size_t)size + 1);
+    char *source = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)size + 1);
     if (!source) {
         fclose(fp);
         return NULL;
@@ -87,7 +88,7 @@ static why_file_t *why_file_get(why_cache_t *cache, const char *file_path) {
     const char *dot = strrchr(file_path, '.');
     CBMLanguage lang = cbm_language_for_extension(dot ? dot : "");
     if (lang == CBM_LANG_COUNT) {
-        free(source);
+        cbm_free(CBM_MEM_CLASS_OTHER, source);
         return NULL;
     }
     CBMFileResult *result = cbm_extract_file(source, (int)got, lang, cache->project, file_path,
@@ -95,7 +96,7 @@ static why_file_t *why_file_get(why_cache_t *cache, const char *file_path) {
     if (!result || !result->cached_tree) {
         if (result)
             cbm_free_result(result);
-        free(source);
+        cbm_free(CBM_MEM_CLASS_OTHER, source);
         return NULL;
     }
     slot->source = source;
@@ -106,8 +107,8 @@ static why_file_t *why_file_get(why_cache_t *cache, const char *file_path) {
 
 static void why_cache_free(why_cache_t *cache) {
     for (int i = 0; i < cache->count; i++) {
-        free(cache->files[i].file_path);
-        free(cache->files[i].source);
+        cbm_free(CBM_MEM_CLASS_OTHER, cache->files[i].file_path);
+        cbm_free(CBM_MEM_CLASS_OTHER, cache->files[i].source);
         if (cache->files[i].result)
             cbm_free_result(cache->files[i].result);
     }
@@ -434,7 +435,7 @@ char *cbm_atlas_why_json(cbm_store_t *store, const char *project, int64_t node_i
     yyjson_mut_obj_add_bool(doc, jroot, "sources_readable", have_root);
 
     why_cache_free(&cache);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -464,7 +465,7 @@ char *cbm_atlas_callsite_guards_json(cbm_store_t *store, const char *project, co
         yyjson_mut_doc_free(doc);
         return NULL;
     }
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_mut_doc_free(doc);
     return json;
 }

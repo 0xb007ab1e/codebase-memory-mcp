@@ -7,6 +7,9 @@ import './source-evidence.css';
 
 export interface SourceEvidenceTarget { filePath: string; line?: number; name?: string; kind?: 'callsite' | 'declaration' | 'file' }
 const PAGE_LINES = 160;
+/* Hand test K13: a disabled "Next lines" at the last page read like a fault. The page says where the file ends. */
+const END_OF_FILE = ' · end of file';
+const endOfFileTitle = (line: number) => `Line ${line} is the last line of this file.`;
 const validLine = (value: number | undefined): value is number => value !== undefined && Number.isSafeInteger(value) && value > 0;
 
 export function fileQualifiedName(graph: GraphData | undefined, path: string): string | undefined {
@@ -100,6 +103,12 @@ export default function SourceEvidenceDrawer({ project, target, graph, client, o
     const more = source?.source_truncated === true || source?.source_clipped === true;
     const next = source?.next_start_line;
     const canNext = Boolean(more && validLine(next) && validLine(lastLine) && next === lastLine + 1 && rangeMatches);
+    const atEnd = Boolean(source && !more && rangeMatches && validLine(lastLine));
+    // The Module range counts the empty segment after the final line break; the file's last line is the one before it.
+    const endSegment = atEnd && lines.length > 1 && lines.at(-1) === '';
+    const lastFileLine = endSegment ? lastLine! - 1 : lastLine;
+    // Review of K13: range text, drawn lines and title all stop at that line, not at the empty segment after it.
+    const shownLines = endSegment ? lines.slice(0, -1) : lines;
     const locationVisible = requestedLine !== undefined && validLine(firstLine) && validLine(lastLine)
         && requestedLine >= firstLine && requestedLine <= lastLine && rangeMatches;
     useEffect(() => {
@@ -136,7 +145,7 @@ export default function SourceEvidenceDrawer({ project, target, graph, client, o
             {!rangeMatches && <p role="alert">Source text does not match the reported line range. Line numbers and highlighting are unavailable.</p>}
             {requestedLine && !locationVisible && rangeMatches && <p role="status" className="source-evidence-notice">Requested line {requestedLine} is outside this returned window.
                 {start === initialStart ? ' The index or requested source window may be stale.' : <button onClick={() => moveTo(initialStart)}>Return to requested location</button>}</p>}
-            <pre ref={sourceRef} tabIndex={0} aria-label="Source lines" className="source-evidence-lines"><code>{lines.map((line, index) => {
+            <pre ref={sourceRef} tabIndex={0} aria-label="Source lines" className="source-evidence-lines"><code>{shownLines.map((line, index) => {
                 const number = (firstLine ?? 1) + index;
                 const selected = rangeMatches && number === requestedLine;
                 return <span key={number} data-selected={selected} ref={selected ? selectedRef : undefined}>
@@ -145,8 +154,8 @@ export default function SourceEvidenceDrawer({ project, target, graph, client, o
             {lines.length === 0 && <p role="status">No source text was returned.</p>}
             {more && !canNext && <p role="status">The source is truncated, but no valid next page was supplied. Refresh or open Explore to inspect the available source.</p>}
             <nav aria-label="Source pages"><button disabled={!rangeMatches || !firstLine || firstLine <= 1} onClick={() => moveTo(Math.max(1, firstLine! - PAGE_LINES))}>Previous lines</button>
-                <span>{rangeMatches ? `Lines ${firstLine} to ${lastLine}` : 'Unverified line range'}{source.original_end_line ? ` · reported end ${source.original_end_line}` : ''}</span>
-                <button disabled={!canNext} onClick={() => moveTo(next!)}>Next lines</button></nav>
+                <span>{rangeMatches ? `Lines ${firstLine} to ${lastFileLine}` : 'Unverified line range'}{source.original_end_line ? ` · reported end ${source.original_end_line}` : ''}{atEnd ? END_OF_FILE : ''}</span>
+                <button disabled={!canNext} title={atEnd ? endOfFileTitle(lastFileLine!) : undefined} onClick={() => moveTo(next!)}>Next lines</button></nav>
         </>}
     </aside>;
 }

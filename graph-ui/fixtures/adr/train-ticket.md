@@ -2,7 +2,7 @@
 
 > Preview examples for the indexed Train Ticket repository. These are proposed review notes for exercising the ADR workspace, not decisions attributed to the upstream maintainers.
 
-## 001 — Review services as deployment boundaries
+## 001: Review services as deployment boundaries
 
 **Status:** Proposed · **Scope:** Routes review
 
@@ -20,7 +20,7 @@ Use detected service and container boundaries to organize the routes review. Kee
 - A declared dependency alone does not prove that a request is sent.
 - Services without discovered connections should remain visible.
 
-## 002 — Follow a request through its evidence
+## 002: Follow a request through its evidence
 
 **Status:** Proposed · **Scope:** Cross-service investigation
 

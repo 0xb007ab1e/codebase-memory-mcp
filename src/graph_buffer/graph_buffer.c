@@ -36,8 +36,10 @@ enum {
 #include "foundation/dyn_array.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
+#include "foundation/mem_core.h"
 #include <sqlite3.h>
 
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
@@ -60,6 +62,18 @@ static inline void *intptr_to_ptr(intptr_t v) {
 #define EDGE_KEY_BUF CBM_SZ_256
 
 /* Per-type or per-key edge list stored in hash tables as values */
+typedef struct {
+    uint64_t h0;
+    uint64_t h1;
+    cbm_gbuf_edge_t *edge; /* NULL = empty slot */
+} edge_key_slot_t;
+
+typedef struct {
+    edge_key_slot_t *slots;
+    size_t cap; /* power of two, 0 = not allocated */
+    size_t count;
+} edge_key_map_t;
+
 typedef CBM_DYN_ARRAY(const cbm_gbuf_edge_t *) edge_ptr_array_t;
 
 /* Per-label or per-name node list */
@@ -85,6 +99,10 @@ struct cbm_gbuf {
      * strings at kernel scale, plus a snprintf+strdup+hash on every one of
      * the ~18 hot find_by_id call sites. */
     cbm_gbuf_node_t **by_id;
+    /* Worker buffers (cbm_gbuf_new_worker) keep no by_id array: their ids
+     * come from the shared counter, so a dense array would span the whole
+     * global id space in every worker and double in lockstep. */
+    bool by_id_off;
     int64_t by_id_cap;
 
     /* Secondary node indexes */
@@ -95,7 +113,7 @@ struct cbm_gbuf {
     CBM_DYN_ARRAY(cbm_gbuf_edge_t *) edges;
 
     /* Edge dedup index: "srcID:tgtID:type" → cbm_gbuf_edge_t* */
-    CBMHashTable *edge_by_key;
+    edge_key_map_t edge_by_key; /* dedup: 128-bit key hash -> edge */
 
     /* Edge secondary indexes: composite keys → edge_ptr_array_t */
     CBMHashTable *edges_by_source_type; /* "srcID:type" → edge_ptr_array_t* */
@@ -124,7 +142,7 @@ struct cbm_gbuf {
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
 static char *heap_strdup(const char *s) {
-    return s ? strdup(s) : strdup("{}");
+    return cbm_mem_strdup(CBM_MEM_CLASS_GBUF_STRING, s ? s : "{}");
 }
 
 /* Intern a repetitive string into the buffer's pool: identical content collapses
@@ -137,7 +155,7 @@ static const char *gb_intern(cbm_gbuf_t *gb, const char *s) {
     if (found) {
         return found;
     }
-    char *copy = strdup(key);
+    char *copy = cbm_mem_strdup(CBM_MEM_CLASS_GBUF_STRING, key);
     if (copy) {
         cbm_ht_set(gb->intern_pool, copy, copy); /* key == value == owned copy */
     }
@@ -201,22 +219,142 @@ static void make_src_type_key(char *buf, size_t bufsz, int64_t src, const char *
     snprintf(buf, bufsz, "%lld:%s", (long long)src, type);
 }
 
+/* ── Edge dedup index: 128-bit key hash -> edge, open addressing ──────
+ *
+ * The dedup key is "src:tgt:type:props" (make_edge_key). Keeping it as a
+ * string per edge cost the kernel 15.8M heap strings (~1.2 GB live, and the
+ * same again transiently in worker buffers during merge). Two independent
+ * 64-bit FNV-1a hashes of the composed key take 16 bytes; a false match needs
+ * both to collide, ~n^2 / 2^129 for n edges -- below any other failure mode of
+ * the index. Linear probing, backward-shift deletion (no tombstones), load
+ * kept under 1/2. Values are the edge pointers (stable heap records). */
+
+static void edge_key_hash(const char *key, uint64_t *h0, uint64_t *h1) {
+    uint64_t a = 1469598103934665603ULL;
+    uint64_t b = 0x9E3779B97F4A7C15ULL;
+    for (const unsigned char *p = (const unsigned char *)key; *p; p++) {
+        a ^= *p;
+        a *= 1099511628211ULL;
+        b = (b ^ *p) * 0xFF51AFD7ED558CCDULL;
+        b ^= b >> 29;
+    }
+    *h0 = a;
+    *h1 = b ^ (a >> 17);
+}
+
+static void edge_key_map_free(edge_key_map_t *m) {
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, m->slots);
+    m->slots = NULL;
+    m->cap = 0;
+    m->count = 0;
+}
+
+static edge_key_slot_t *edge_key_map_find(const edge_key_map_t *m, uint64_t h0, uint64_t h1) {
+    if (!m->slots) {
+        return NULL;
+    }
+    size_t mask = m->cap - SKIP_ONE;
+    for (size_t i = (size_t)h0 & mask;; i = (i + SKIP_ONE) & mask) {
+        edge_key_slot_t *s = &m->slots[i];
+        if (!s->edge) {
+            return NULL;
+        }
+        if (s->h0 == h0 && s->h1 == h1) {
+            return s;
+        }
+    }
+}
+
+static bool edge_key_map_grow(edge_key_map_t *m) {
+    size_t new_cap = m->cap ? m->cap * PAIR_LEN : CBM_SZ_1K;
+    edge_key_slot_t *slots = cbm_calloc(CBM_MEM_CLASS_GBUF_INDEX, new_cap * sizeof(*slots));
+    if (!slots) {
+        return false;
+    }
+    size_t mask = new_cap - SKIP_ONE;
+    for (size_t i = 0; i < m->cap; i++) {
+        edge_key_slot_t *s = &m->slots[i];
+        if (!s->edge) {
+            continue;
+        }
+        size_t j = (size_t)s->h0 & mask;
+        while (slots[j].edge) {
+            j = (j + SKIP_ONE) & mask;
+        }
+        slots[j] = *s;
+    }
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, m->slots);
+    m->slots = slots;
+    m->cap = new_cap;
+    return true;
+}
+
+static bool edge_key_map_set(edge_key_map_t *m, uint64_t h0, uint64_t h1, cbm_gbuf_edge_t *edge) {
+    if ((m->count + SKIP_ONE) * PAIR_LEN > m->cap && !edge_key_map_grow(m)) {
+        return false;
+    }
+    size_t mask = m->cap - SKIP_ONE;
+    size_t i = (size_t)h0 & mask;
+    while (m->slots[i].edge) {
+        if (m->slots[i].h0 == h0 && m->slots[i].h1 == h1) {
+            m->slots[i].edge = edge;
+            return true;
+        }
+        i = (i + SKIP_ONE) & mask;
+    }
+    m->slots[i].h0 = h0;
+    m->slots[i].h1 = h1;
+    m->slots[i].edge = edge;
+    m->count++;
+    return true;
+}
+
+static void edge_key_map_delete(edge_key_map_t *m, uint64_t h0, uint64_t h1) {
+    edge_key_slot_t *s = edge_key_map_find(m, h0, h1);
+    if (!s) {
+        return;
+    }
+    size_t mask = m->cap - SKIP_ONE;
+    size_t i = (size_t)(s - m->slots);
+    m->slots[i].edge = NULL;
+    m->count--;
+    /* Backward shift: pull later entries of the same probe run into the hole. */
+    for (size_t j = (i + SKIP_ONE) & mask; m->slots[j].edge; j = (j + SKIP_ONE) & mask) {
+        size_t home = (size_t)m->slots[j].h0 & mask;
+        /* entry at j may move to i if its home is not in (i, j] cyclically */
+        bool movable = (i <= j) ? (home <= i || home > j) : (home <= i && home > j);
+        if (movable) {
+            m->slots[i] = m->slots[j];
+            m->slots[j].edge = NULL;
+            i = j;
+        }
+    }
+}
+
 /* Get or create a node_ptr_array_t in a hash table */
+static void node_array_push(node_ptr_array_t *arr, const cbm_gbuf_node_t *node);
+
 static node_ptr_array_t *get_or_create_node_array(CBMHashTable *ht, const char *key) {
+    if (!ht) {
+        return NULL; /* worker buffer: no secondary indexes (cbm_gbuf_new_worker) */
+    }
     node_ptr_array_t *arr = cbm_ht_get(ht, key);
     if (!arr) {
-        arr = calloc(CBM_ALLOC_ONE, sizeof(node_ptr_array_t));
-        cbm_ht_set(ht, strdup(key), arr);
+        arr = cbm_calloc(CBM_MEM_CLASS_GBUF_INDEX, sizeof(node_ptr_array_t));
+        cbm_ht_set(ht, cbm_mem_strdup(CBM_MEM_CLASS_GBUF_INDEX, key), arr);
     }
     return arr;
 }
 
 /* Get or create an edge_ptr_array_t in a hash table */
 static edge_ptr_array_t *get_or_create_edge_array(CBMHashTable *ht, const char *key) {
+    if (!ht) {
+        return NULL;
+    }
     edge_ptr_array_t *arr = cbm_ht_get(ht, key);
     if (!arr) {
-        arr = calloc(CBM_ALLOC_ONE, sizeof(edge_ptr_array_t));
-        cbm_ht_set(ht, strdup(key), arr);
+        arr = cbm_calloc(CBM_MEM_CLASS_GBUF_INDEX, sizeof(edge_ptr_array_t));
+        cbm_ht_set(ht, cbm_mem_strdup(CBM_MEM_CLASS_GBUF_INDEX, key), arr);
     }
     return arr;
 }
@@ -227,9 +365,9 @@ static void free_node_array(const char *key, void *value, void *ud) {
     node_ptr_array_t *arr = value;
     if (arr) {
         cbm_da_free(arr);
-        free(arr);
+        cbm_free(CBM_MEM_CLASS_GBUF_INDEX, arr);
     }
-    free((void *)key);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, (void *)key);
 }
 
 /* Free an edge_ptr_array_t (callback) */
@@ -238,30 +376,40 @@ static void free_edge_array(const char *key, void *value, void *ud) {
     edge_ptr_array_t *arr = value;
     if (arr) {
         cbm_da_free(arr);
-        free(arr);
+        cbm_free(CBM_MEM_CLASS_GBUF_INDEX, arr);
     }
-    free((void *)key);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, (void *)key);
 }
 
-/* Free keys only (for edge_by_key, deleted_set) */
-static void free_key_only(const char *key, void *value, void *ud) {
+/* Free index keys only (deleted_set id keys). */
+static void free_index_key(const char *key, void *value, void *ud) {
     (void)value;
     (void)ud;
-    free((void *)key);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, (void *)key);
+}
+
+/* Free one intern-pool entry: key == value == the single owned string copy
+ * that nodes/edges borrowed for label/file_path/type. */
+static void free_intern_entry(const char *key, void *value, void *ud) {
+    (void)value;
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, (void *)key);
 }
 
 /* Free a single node's owned strings. label and file_path are interned
  * (pool-owned) — NOT freed here; the pool frees them once in cbm_gbuf_free. */
 static void free_node_strings(cbm_gbuf_node_t *n) {
-    free(n->name);
-    free(n->qualified_name);
-    free(n->properties_json);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, n->name);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, n->qualified_name);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, n->properties_json);
 }
 
-/* Free a single edge's owned strings. type is interned (pool-owned) — NOT
- * freed here; the pool frees it once in cbm_gbuf_free. */
+/* An edge owns no strings: type AND properties_json are interned (pool-owned;
+ * the pool frees each once in cbm_gbuf_free). Edge properties repeat massively
+ * -- on the Go corpus 1.8M edges carry 343k distinct property strings and 854k
+ * are exactly "{}" -- and an edge's properties are never mutated in place. */
 static void free_edge_strings(cbm_gbuf_edge_t *e) {
-    free(e->properties_json);
+    (void)e;
 }
 
 /* Allocate the next buffer-local or shared-atomic ID. */
@@ -303,9 +451,10 @@ static void unindex_edge(cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e) {
     char key[EDGE_KEY_BUF];
 
     make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type, e->properties_json);
-    const char *ekey = cbm_ht_get_key(gb->edge_by_key, key);
-    cbm_ht_delete(gb->edge_by_key, key);
-    free((void *)ekey);
+    uint64_t h0;
+    uint64_t h1;
+    edge_key_hash(key, &h0, &h1);
+    edge_key_map_delete(&gb->edge_by_key, h0, h1);
 
     make_src_type_key(key, sizeof(key), e->source_id, e->type);
     remove_edge_from_ptr_array(cbm_ht_get(gb->edges_by_source_type, key), e->id);
@@ -329,7 +478,7 @@ static void cascade_delete_edges(cbm_gbuf_t *gb, CBMHashTable *deleted_set) {
         if (cbm_ht_get(deleted_set, src_id) || cbm_ht_get(deleted_set, tgt_id)) {
             unindex_edge(gb, e);
             free_edge_strings(e);
-            free(e);
+            cbm_free(CBM_MEM_CLASS_GBUF_EDGE, e);
         } else {
             gb->edges.items[write_idx++] = gb->edges.items[i];
         }
@@ -341,34 +490,50 @@ static void cascade_delete_edges(cbm_gbuf_t *gb, CBMHashTable *deleted_set) {
 static void register_node_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_node_t *node) {
     cbm_ht_set(gb->node_by_qn, node->qualified_name, node);
 
-    if (node->id >= gb->by_id_cap) {
-        int64_t nc = gb->by_id_cap > 0 ? gb->by_id_cap : CBM_SZ_1K;
-        while (nc <= node->id) {
-            nc *= 2;
+    if (!gb->by_id_off) {
+        if (node->id >= gb->by_id_cap) {
+            int64_t nc = gb->by_id_cap > 0 ? gb->by_id_cap : CBM_SZ_1K;
+            while (nc <= node->id) {
+                nc *= 2;
+            }
+            cbm_gbuf_node_t **grown =
+                cbm_realloc(CBM_MEM_CLASS_GBUF_INDEX, gb->by_id, (size_t)nc * sizeof(*grown));
+            if (grown) {
+                memset(grown + gb->by_id_cap, 0, (size_t)(nc - gb->by_id_cap) * sizeof(*grown));
+                gb->by_id = grown;
+                gb->by_id_cap = nc;
+            }
         }
-        cbm_gbuf_node_t **grown = realloc(gb->by_id, (size_t)nc * sizeof(*grown));
-        if (grown) {
-            memset(grown + gb->by_id_cap, 0, (size_t)(nc - gb->by_id_cap) * sizeof(*grown));
-            gb->by_id = grown;
-            gb->by_id_cap = nc;
+        if (node->id >= 0 && node->id < gb->by_id_cap) {
+            gb->by_id[node->id] = node;
         }
-    }
-    if (node->id >= 0 && node->id < gb->by_id_cap) {
-        gb->by_id[node->id] = node;
     }
 
     node_ptr_array_t *by_label =
         get_or_create_node_array(gb->nodes_by_label, node->label ? node->label : "");
-    cbm_da_push(by_label, (const cbm_gbuf_node_t *)node);
+    node_array_push(by_label, node);
 
     node_ptr_array_t *by_name =
         get_or_create_node_array(gb->nodes_by_name, node->name ? node->name : "");
-    cbm_da_push(by_name, (const cbm_gbuf_node_t *)node);
+    node_array_push(by_name, node);
 }
 
-/* Push an edge pointer into a dynamic array (wraps macro to reduce CC contribution). */
+/* Per-key index arrays start at two slots: on the kernel the secondary
+ * indexes hold ~18M of these arrays and most keys have one or two entries,
+ * so the default 8-slot start was 1 GB of empty headroom. NULL = the buffer
+ * has no secondary indexes (worker buffers). */
+enum { GB_INDEX_ARRAY_FIRST_CAP = 2 };
 static void edge_array_push(edge_ptr_array_t *arr, const cbm_gbuf_edge_t *edge) {
-    cbm_da_push(arr, edge);
+    if (!arr) {
+        return;
+    }
+    cbm_da_push_min(arr, edge, GB_INDEX_ARRAY_FIRST_CAP);
+}
+static void node_array_push(node_ptr_array_t *arr, const cbm_gbuf_node_t *node) {
+    if (!arr) {
+        return;
+    }
+    cbm_da_push_min(arr, node, GB_INDEX_ARRAY_FIRST_CAP);
 }
 
 /* Index an edge by one key into a hash table bucket. */
@@ -392,6 +557,9 @@ static void register_edge_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_edge_t *edge) {
 
 /* Rebuild edge secondary indexes from scratch (after bulk deletion). */
 static void rebuild_edge_secondary_indexes(cbm_gbuf_t *gb) {
+    if (!gb->edges_by_type) {
+        return; /* worker buffer: nothing to rebuild */
+    }
     cbm_ht_foreach(gb->edges_by_source_type, free_edge_array, NULL);
     cbm_ht_free(gb->edges_by_source_type);
     cbm_ht_foreach(gb->edges_by_target_type, free_edge_array, NULL);
@@ -399,9 +567,9 @@ static void rebuild_edge_secondary_indexes(cbm_gbuf_t *gb) {
     cbm_ht_foreach(gb->edges_by_type, free_edge_array, NULL);
     cbm_ht_free(gb->edges_by_type);
 
-    gb->edges_by_source_type = cbm_ht_create(CBM_SZ_256);
-    gb->edges_by_target_type = cbm_ht_create(CBM_SZ_256);
-    gb->edges_by_type = cbm_ht_create(CBM_SZ_32);
+    gb->edges_by_source_type = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, CBM_SZ_256);
+    gb->edges_by_target_type = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, CBM_SZ_256);
+    gb->edges_by_type = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, CBM_SZ_32);
 
     for (int i = 0; i < gb->edges.count; i++) {
         register_edge_in_indexes(gb, gb->edges.items[i]);
@@ -412,7 +580,7 @@ static void rebuild_edge_secondary_indexes(cbm_gbuf_t *gb) {
 static void release_gbuf_indexes(cbm_gbuf_t *gb) {
     cbm_ht_free(gb->node_by_qn);
     gb->node_by_qn = NULL;
-    free(gb->by_id);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, gb->by_id);
     gb->by_id = NULL;
     gb->by_id_cap = 0;
     cbm_ht_foreach(gb->nodes_by_label, free_node_array, NULL);
@@ -421,9 +589,7 @@ static void release_gbuf_indexes(cbm_gbuf_t *gb) {
     cbm_ht_foreach(gb->nodes_by_name, free_node_array, NULL);
     cbm_ht_free(gb->nodes_by_name);
     gb->nodes_by_name = NULL;
-    cbm_ht_foreach(gb->edge_by_key, free_key_only, NULL);
-    cbm_ht_free(gb->edge_by_key);
-    gb->edge_by_key = NULL;
+    edge_key_map_free(&gb->edge_by_key);
     cbm_ht_foreach(gb->edges_by_source_type, free_edge_array, NULL);
     cbm_ht_free(gb->edges_by_source_type);
     gb->edges_by_source_type = NULL;
@@ -438,28 +604,27 @@ static void release_gbuf_indexes(cbm_gbuf_t *gb) {
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
-    cbm_gbuf_t *gb = calloc(CBM_ALLOC_ONE, sizeof(cbm_gbuf_t));
+    cbm_gbuf_t *gb = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(cbm_gbuf_t));
     if (!gb) {
         return NULL;
     }
 
-    gb->project = strdup(project ? project : "");
-    gb->root_path = strdup(root_path ? root_path : "");
+    gb->project = cbm_mem_strdup(CBM_MEM_CLASS_GBUF_STRING, project ? project : "");
+    gb->root_path = cbm_mem_strdup(CBM_MEM_CLASS_GBUF_STRING, root_path ? root_path : "");
     gb->next_id = SKIP_ONE;
     gb->shared_ids = NULL;
 
-    gb->node_by_qn = cbm_ht_create(CBM_SZ_256);
+    gb->node_by_qn = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, CBM_SZ_256);
     gb->by_id = NULL;
     gb->by_id_cap = 0;
-    gb->nodes_by_label = cbm_ht_create(CBM_SZ_32);
-    gb->nodes_by_name = cbm_ht_create(CBM_SZ_256);
+    gb->nodes_by_label = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, CBM_SZ_32);
+    gb->nodes_by_name = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, CBM_SZ_256);
 
-    gb->edge_by_key = cbm_ht_create(CBM_SZ_512);
-    gb->edges_by_source_type = cbm_ht_create(CBM_SZ_256);
-    gb->edges_by_target_type = cbm_ht_create(CBM_SZ_256);
-    gb->edges_by_type = cbm_ht_create(CBM_SZ_32);
+    gb->edges_by_source_type = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, CBM_SZ_256);
+    gb->edges_by_target_type = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, CBM_SZ_256);
+    gb->edges_by_type = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, CBM_SZ_32);
 
-    gb->intern_pool = cbm_ht_create(CBM_SZ_1K);
+    gb->intern_pool = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_STRING, CBM_SZ_1K);
 
     return gb;
 }
@@ -473,6 +638,40 @@ cbm_gbuf_t *cbm_gbuf_new_shared_ids(const char *project, const char *root_path,
     return gb;
 }
 
+cbm_gbuf_t *cbm_gbuf_new_worker(const char *project, const char *root_path,
+                                _Atomic int64_t *id_source) {
+    cbm_gbuf_t *gb = cbm_gbuf_new_shared_ids(project, root_path, id_source);
+    if (!gb) {
+        return NULL;
+    }
+    /* A worker buffer is appended to and merged; it is never asked by label,
+     * name or edge type. Its secondary indexes were pure cost: on the kernel
+     * the index class peaked at 7.1 GB during resolve against 2.5 GB live in
+     * the main buffer, the difference being 18 workers' throwaway indexes.
+     * node_by_qn and edge_by_key stay: upsert and dedup need them. */
+    cbm_ht_free(gb->nodes_by_label);
+    cbm_ht_free(gb->nodes_by_name);
+    cbm_ht_free(gb->edges_by_source_type);
+    cbm_ht_free(gb->edges_by_target_type);
+    cbm_ht_free(gb->edges_by_type);
+    gb->nodes_by_label = NULL;
+    gb->nodes_by_name = NULL;
+    gb->edges_by_source_type = NULL;
+    gb->edges_by_target_type = NULL;
+    gb->edges_by_type = NULL;
+    /* Nor by id: with ids from the shared counter, a dense id -> node array
+     * in every worker spans the whole global id space (8.5M ids x 8 B x 18
+     * workers on the kernel) and all of them double in the same instant --
+     * a 1 GB step between two reads of the memory gate, which is where the
+     * 15 GB budget was missed (2026-09-14). Nothing asks a worker buffer by
+     * id before the merge; the main buffer answers after it. */
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, gb->by_id);
+    gb->by_id = NULL;
+    gb->by_id_cap = 0;
+    gb->by_id_off = true;
+    return gb;
+}
+
 void cbm_gbuf_free(cbm_gbuf_t *gb) {
     if (!gb) {
         return;
@@ -482,7 +681,7 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
         free_node_strings(n);
-        free(n);
+        cbm_free(CBM_MEM_CLASS_GBUF_NODE, n);
     }
     cbm_da_free(&gb->nodes);
 
@@ -490,7 +689,7 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
     for (int i = 0; i < gb->edges.count; i++) {
         cbm_gbuf_edge_t *e = gb->edges.items[i];
         free_edge_strings(e);
-        free(e);
+        cbm_free(CBM_MEM_CLASS_GBUF_EDGE, e);
     }
     cbm_da_free(&gb->edges);
 
@@ -498,7 +697,7 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
     if (gb->node_by_qn) {
         cbm_ht_free(gb->node_by_qn);
     }
-    free(gb->by_id);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, gb->by_id);
     if (gb->nodes_by_label) {
         cbm_ht_foreach(gb->nodes_by_label, free_node_array, NULL);
         cbm_ht_free(gb->nodes_by_label);
@@ -507,10 +706,7 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
         cbm_ht_foreach(gb->nodes_by_name, free_node_array, NULL);
         cbm_ht_free(gb->nodes_by_name);
     }
-    if (gb->edge_by_key) {
-        cbm_ht_foreach(gb->edge_by_key, free_key_only, NULL);
-        cbm_ht_free(gb->edge_by_key);
-    }
+    edge_key_map_free(&gb->edge_by_key);
     if (gb->edges_by_source_type) {
         cbm_ht_foreach(gb->edges_by_source_type, free_edge_array, NULL);
         cbm_ht_free(gb->edges_by_source_type);
@@ -526,28 +722,28 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
 
     /* Free vector storage */
     for (int i = 0; i < gb->dump_vector_count; i++) {
-        free((void *)gb->dump_vectors[i].vector);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)gb->dump_vectors[i].vector);
     }
-    free(gb->dump_vectors);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, gb->dump_vectors);
 
     /* Free token vector storage */
     for (int i = 0; i < gb->dump_token_vec_count; i++) {
-        free((void *)gb->dump_token_vecs[i].token);
-        free((void *)gb->dump_token_vecs[i].vector);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)gb->dump_token_vecs[i].token);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)gb->dump_token_vecs[i].vector);
     }
-    free(gb->dump_token_vecs);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, gb->dump_token_vecs);
 
     /* Free interned strings (node label/file_path, edge type) — pool owns one
-     * copy each (key == value), freed exactly once via free_key_only. Done after
-     * nodes/edges since they borrowed these pointers. */
+     * copy each (key == value), freed exactly once via free_intern_entry. Done
+     * after nodes/edges since they borrowed these pointers. */
     if (gb->intern_pool) {
-        cbm_ht_foreach(gb->intern_pool, free_key_only, NULL);
+        cbm_ht_foreach(gb->intern_pool, free_intern_entry, NULL);
         cbm_ht_free(gb->intern_pool);
     }
 
-    free(gb->project);
-    free(gb->root_path);
-    free(gb);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, gb->project);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, gb->root_path);
+    cbm_free(CBM_MEM_CLASS_OTHER, gb);
 }
 
 /* ── Vector storage ──────────────────────────────────────────────── */
@@ -560,7 +756,8 @@ int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector
     if (gb->dump_vector_count >= gb->dump_vector_cap) {
         int new_cap =
             gb->dump_vector_cap < VEC_INIT_CAP ? VEC_INIT_CAP : gb->dump_vector_cap * VEC_GROW;
-        CBMDumpVector *grown = realloc(gb->dump_vectors, (size_t)new_cap * sizeof(CBMDumpVector));
+        CBMDumpVector *grown = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, gb->dump_vectors,
+                                           (size_t)new_cap * sizeof(CBMDumpVector));
         if (!grown) {
             return GB_ERR;
         }
@@ -568,7 +765,7 @@ int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector
         gb->dump_vector_cap = new_cap;
     }
     /* Copy vector data */
-    uint8_t *vec_copy = malloc((size_t)vector_len);
+    uint8_t *vec_copy = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)vector_len);
     if (!vec_copy) {
         return GB_ERR;
     }
@@ -592,15 +789,15 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
     if (gb->dump_token_vec_count >= gb->dump_token_vec_cap) {
         int new_cap =
             gb->dump_token_vec_cap < TV_INIT_CAP ? TV_INIT_CAP : gb->dump_token_vec_cap * TV_GROW;
-        CBMDumpTokenVec *grown =
-            realloc(gb->dump_token_vecs, (size_t)new_cap * sizeof(CBMDumpTokenVec));
+        CBMDumpTokenVec *grown = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, gb->dump_token_vecs,
+                                             (size_t)new_cap * sizeof(CBMDumpTokenVec));
         if (!grown) {
             return GB_ERR;
         }
         gb->dump_token_vecs = grown;
         gb->dump_token_vec_cap = new_cap;
     }
-    uint8_t *vec_copy = malloc((size_t)vector_len);
+    uint8_t *vec_copy = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)vector_len);
     if (!vec_copy) {
         return GB_ERR;
     }
@@ -610,7 +807,7 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
     gb->dump_token_vecs[idx] = (CBMDumpTokenVec){
         .id = idx + SKIP_ONE, /* 1-based sequential ID */
         .project = gb->project,
-        .token = strdup(token),
+        .token = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, token),
         .vector = vec_copy,
         .vector_len = vector_len,
         .idf = idf,
@@ -638,7 +835,177 @@ void cbm_gbuf_set_next_id(cbm_gbuf_t *gb, int64_t next_id) {
     gb->next_id = next_id;
 }
 
+/* ── Definition variants ─────────────────────────────────────────────
+ * One name defined more than once under mutually exclusive conditions —
+ * C-family #if/#else, Rust #[cfg], build-tagged files, a definition under an
+ * `if` — is ONE identity: one QN, one node, whose edges are the union of
+ * every variant's body. The collision rule below keeps one canonical winner
+ * for name, file, lines and properties; every variant's span survives in the
+ * node's `variants` property ([{"file_path","start_line","end_line"}],
+ * sorted, unique), so a change in any variant maps to the node. Recorded only
+ * between definitions of the same label with real spans: a different kind
+ * sharing the QN (C: struct vs function) is no variant, a span on line 0 is
+ * no location (delta-route proxies), and a full tie is the same entity. */
+static void *gb_yy_malloc(void *ctx, size_t size) {
+    (void)ctx;
+    return cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, size);
+}
+
+static void *gb_yy_realloc(void *ctx, void *block, size_t old_size, size_t size) {
+    (void)ctx;
+    (void)old_size;
+    return cbm_realloc(CBM_MEM_CLASS_GBUF_STRING, block, size);
+}
+
+static void gb_yy_free(void *ctx, void *block) {
+    (void)ctx;
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, block);
+}
+
+static const yyjson_alc gb_yy_alc = {gb_yy_malloc, gb_yy_realloc, gb_yy_free, NULL};
+
+enum { GB_VARIANTS_MAX = 64 };
+
+typedef struct {
+    const char *file;
+    int start;
+    int end;
+} gb_span_t;
+
+static bool gb_variant_label(const char *label) {
+    static const char *const labels[] = {"Function", "Method", "Class", "Interface", "Enum",
+                                         "Struct",   "Trait",  "Type",  "Macro"};
+    for (size_t i = 0; label && i < sizeof(labels) / sizeof(labels[0]); i++) {
+        if (strcmp(label, labels[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int gb_span_cmp(const void *a, const void *b) {
+    const gb_span_t *x = a;
+    const gb_span_t *y = b;
+    int c = strcmp(x->file, y->file);
+    if (c == 0) {
+        c = (x->start > y->start) - (x->start < y->start);
+    }
+    if (c == 0) {
+        c = (x->end > y->end) - (x->end < y->end);
+    }
+    return c;
+}
+
+/* A definition's spans: its `variants` property, else its own span. */
+static int gb_spans_of(yyjson_doc *doc, const char *file, int start, int end, gb_span_t *out,
+                       int n) {
+    yyjson_val *list = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "variants") : NULL;
+    if (yyjson_is_arr(list) && yyjson_arr_size(list) > 0) {
+        size_t i;
+        size_t max;
+        yyjson_val *v;
+        yyjson_arr_foreach(list, i, max, v) {
+            const char *f = yyjson_get_str(yyjson_obj_get(v, "file_path"));
+            int s = (int)yyjson_get_int(yyjson_obj_get(v, "start_line"));
+            int e = (int)yyjson_get_int(yyjson_obj_get(v, "end_line"));
+            if (f && s > 0 && n < GB_VARIANTS_MAX) {
+                out[n++] = (gb_span_t){f, s, e};
+            }
+        }
+        return n;
+    }
+    if (start > 0 && n < GB_VARIANTS_MAX) {
+        out[n++] = (gb_span_t){file ? file : "", start, end};
+    }
+    return n;
+}
+
+/* The survivor's properties with the union of both definitions' variant
+ * spans. Returns a GBUF_STRING-owned JSON string, or NULL when there is
+ * nothing to record (fewer than two distinct spans) or on any failure — the
+ * survivor then keeps its own properties: a lost variants list costs
+ * precision, never data. */
+static char *gb_variants_props(const char *survivor_props, const char *a_props, const char *a_file,
+                               int a_start, int a_end, const char *b_props, const char *b_file,
+                               int b_start, int b_end) {
+    if (a_start <= 0 || b_start <= 0) {
+        return NULL;
+    }
+    yyjson_doc *a_doc =
+        a_props ? yyjson_read_opts((char *)a_props, strlen(a_props), 0, &gb_yy_alc, NULL) : NULL;
+    yyjson_doc *b_doc =
+        b_props ? yyjson_read_opts((char *)b_props, strlen(b_props), 0, &gb_yy_alc, NULL) : NULL;
+    gb_span_t spans[GB_VARIANTS_MAX * 2];
+    int n = gb_spans_of(a_doc, a_file, a_start, a_end, spans, 0);
+    n = gb_spans_of(b_doc, b_file, b_start, b_end, spans, n);
+    qsort(spans, (size_t)n, sizeof(spans[0]), gb_span_cmp);
+    int unique = 0;
+    for (int i = 0; i < n; i++) {
+        if (unique == 0 || gb_span_cmp(&spans[unique - 1], &spans[i]) != 0) {
+            spans[unique++] = spans[i];
+        }
+    }
+    char *out = NULL;
+    if (unique >= 2) {
+        yyjson_mut_doc *mut = yyjson_mut_doc_new(&gb_yy_alc);
+        yyjson_doc *s_doc = survivor_props
+                                ? yyjson_read_opts((char *)survivor_props, strlen(survivor_props),
+                                                   0, &gb_yy_alc, NULL)
+                                : NULL;
+        yyjson_mut_val *root = s_doc && yyjson_is_obj(yyjson_doc_get_root(s_doc))
+                                   ? yyjson_val_mut_copy(mut, yyjson_doc_get_root(s_doc))
+                                   : yyjson_mut_obj(mut);
+        yyjson_mut_val *list = yyjson_mut_arr(mut);
+        for (int i = 0; root && list && i < unique; i++) {
+            yyjson_mut_val *v = yyjson_mut_arr_add_obj(mut, list);
+            yyjson_mut_obj_add_strcpy(mut, v, "file_path", spans[i].file);
+            yyjson_mut_obj_add_int(mut, v, "start_line", spans[i].start);
+            yyjson_mut_obj_add_int(mut, v, "end_line", spans[i].end);
+        }
+        if (mut && root && list) {
+            yyjson_mut_obj_remove_key(root, "variants");
+            yyjson_mut_obj_add_val(mut, root, "variants", list);
+            yyjson_mut_doc_set_root(mut, root);
+            out = yyjson_mut_write_opts(mut, 0, &gb_yy_alc, NULL, NULL);
+        }
+        yyjson_doc_free(s_doc);
+        yyjson_mut_doc_free(mut);
+    }
+    yyjson_doc_free(a_doc);
+    yyjson_doc_free(b_doc);
+    return out;
+}
+
+/* Record the variant spans of a same-QN collision on the surviving node. */
+static void gb_record_variants(cbm_gbuf_node_t *survivor, const char *a_label, const char *a_props,
+                               const char *a_file, int a_start, int a_end, const char *b_label,
+                               const char *b_props, const char *b_file, int b_start, int b_end) {
+    if (!gb_variant_label(a_label) || !b_label || strcmp(a_label, b_label) != 0) {
+        return;
+    }
+    char *merged = gb_variants_props(survivor->properties_json, a_props, a_file, a_start, a_end,
+                                     b_props, b_file, b_start, b_end);
+    if (merged) {
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, survivor->properties_json);
+        survivor->properties_json = merged;
+    }
+}
+
 /* ── Node operations ─────────────────────────────────────────────── */
+
+/* First key of the canonical same-QN collision order: how strong a claim the
+ * entity has on a qualified name. A macro is the weakest: when a "Macro" and
+ * a definition share a QN, the definition, which carries the body, the
+ * signature and every edge, owns it whichever comes first.
+ *
+ * C-preprocessor macros no longer get here: their QN carries its own
+ * namespace (`...#macro`, CBM_MACRO_QN_SUFFIX) and cannot equal a definition's.
+ * The case left is Chialisp, whose `defmacro` / `defmac` defs are labelled
+ * "Macro" under a plain QN: a macro and a `defun` of one name in one file, or
+ * in a same-stem `.clsp` / `.clib` pair (one module QN). */
+static int gb_qn_claim_rank(const char *label) {
+    return (label && strcmp(label, "Macro") == 0) ? 0 : 1;
+}
 
 int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
                              const char *qualified_name, const char *file_path, int start_line,
@@ -683,8 +1050,13 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * of the same entity with new content) replaces the earlier one,
          * deterministically, because intra-file arrival order is fixed. A
          * full tie is the same entity re-upserted → refresh in place.
-         * Kind-disambiguated QNs (the real cure) remain a follow-up. */
-        int c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
+         * Ahead of all of these, a definition beats a macro
+         * (gb_qn_claim_rank). Kind-disambiguated QNs (the real cure) remain
+         * a follow-up. */
+        int c = gb_qn_claim_rank(existing->label) - gb_qn_claim_rank(label);
+        if (c == 0) {
+            c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
+        }
         if (c == 0) {
             c = existing->start_line - start_line;
         }
@@ -695,7 +1067,18 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
             c = strcmp(existing->label ? existing->label : "", label ? label : "");
         }
         if (c > 0) {
+            gb_record_variants(existing, existing->label, existing->properties_json,
+                               existing->file_path, existing->start_line, existing->end_line, label,
+                               properties_json, file_path, start_line, end_line);
             return existing->id; /* existing entity is the canonical winner */
+        }
+        /* The arrival wins: its properties, plus every variant span both carry. */
+        char *variant_props = NULL;
+        if (gb_variant_label(label) && existing->label && strcmp(existing->label, label) == 0) {
+            variant_props =
+                gb_variants_props(properties_json, existing->properties_json, existing->file_path,
+                                  existing->start_line, existing->end_line, properties_json,
+                                  file_path, start_line, end_line);
         }
         /* Update in-place. name/properties are strdup'd BEFORE freeing old ones
          * (callers may pass existing->name as an argument). label/file_path are
@@ -706,7 +1089,9 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * label/name — cbm_gbuf_find_by_label/name then missed or mis-listed it,
          * which is how the flickering Function set reached the semantic pass). */
         char *new_name = heap_strdup(name);
-        char *new_props = properties_json ? heap_strdup(properties_json) : NULL;
+        char *new_props = variant_props     ? variant_props
+                          : properties_json ? heap_strdup(properties_json)
+                                            : NULL;
         const char *new_label_interned = gb_intern(gb, label);
         bool label_changed = !existing->label || !new_label_interned ||
                              strcmp(existing->label, new_label_interned) != 0;
@@ -721,30 +1106,30 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
                 cbm_ht_get(gb->nodes_by_name, existing->name ? existing->name : ""), existing->id);
         }
         existing->label = (char *)new_label_interned;
-        free(existing->name);
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, existing->name);
         existing->name = new_name;
         existing->file_path = (char *)gb_intern(gb, file_path);
         existing->start_line = start_line;
         existing->end_line = end_line;
         if (new_props) {
-            free(existing->properties_json);
+            cbm_free(CBM_MEM_CLASS_GBUF_STRING, existing->properties_json);
             existing->properties_json = new_props;
         }
         if (label_changed) {
             node_ptr_array_t *by_label = get_or_create_node_array(
                 gb->nodes_by_label, existing->label ? existing->label : "");
-            cbm_da_push(by_label, (const cbm_gbuf_node_t *)existing);
+            node_array_push(by_label, existing);
         }
         if (name_changed) {
             node_ptr_array_t *by_name =
                 get_or_create_node_array(gb->nodes_by_name, existing->name ? existing->name : "");
-            cbm_da_push(by_name, (const cbm_gbuf_node_t *)existing);
+            node_array_push(by_name, existing);
         }
         return existing->id;
     }
 
     /* Heap-allocate a new node (pointer stays stable across array growth) */
-    cbm_gbuf_node_t *node = calloc(CBM_ALLOC_ONE, sizeof(cbm_gbuf_node_t));
+    cbm_gbuf_node_t *node = cbm_calloc(CBM_MEM_CLASS_GBUF_NODE, sizeof(cbm_gbuf_node_t));
     if (!node) {
         return 0;
     }
@@ -764,6 +1149,19 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
     register_node_in_indexes(gb, node);
 
     return id;
+}
+
+int cbm_gbuf_node_set_properties_json(cbm_gbuf_node_t *node, const char *json) {
+    if (!node) {
+        return GB_ERR;
+    }
+    char *copy = heap_strdup(json);
+    if (!copy) {
+        return GB_ERR;
+    }
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->properties_json);
+    node->properties_json = copy;
+    return 0;
 }
 
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn) {
@@ -834,7 +1232,8 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
 
         char id_buf[CBM_SZ_32];
         make_id_key(id_buf, sizeof(id_buf), n->id);
-        cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
+        cbm_ht_set(deleted_set, cbm_mem_strdup(CBM_MEM_CLASS_GBUF_INDEX, id_buf),
+                   intptr_to_ptr(SKIP_ONE));
 
         /* Remove from primary indexes */
         cbm_ht_delete(gb->node_by_qn, n->qualified_name);
@@ -849,7 +1248,7 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
     /* Cascade-delete edges referencing deleted nodes */
     cascade_delete_edges(gb, deleted_set);
 
-    cbm_ht_foreach(deleted_set, free_key_only, NULL);
+    cbm_ht_foreach(deleted_set, free_index_key, NULL);
     cbm_ht_free(deleted_set);
     return 0;
 }
@@ -876,7 +1275,8 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
 
         char id_buf[CBM_SZ_32];
         make_id_key(id_buf, sizeof(id_buf), n->id);
-        cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
+        cbm_ht_set(deleted_set, cbm_mem_strdup(CBM_MEM_CLASS_GBUF_INDEX, id_buf),
+                   intptr_to_ptr(SKIP_ONE));
 
         /* Remove from secondary indexes */
         remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, n->label), n->id);
@@ -890,7 +1290,7 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
 
         /* NULL out QN so dump's liveness check (cbm_ht_get by QN) fails
          * even if a new node with the same QN is inserted later via merge. */
-        free(n->qualified_name);
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, n->qualified_name);
         n->qualified_name = NULL;
         deleted_count++;
     }
@@ -903,7 +1303,7 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
     /* Cascade-delete edges referencing deleted nodes */
     cascade_delete_edges(gb, deleted_set);
 
-    cbm_ht_foreach(deleted_set, free_key_only, NULL);
+    cbm_ht_foreach(deleted_set, free_index_key, NULL);
     cbm_ht_free(deleted_set);
     {
         char s_buf[CBM_SZ_16];
@@ -945,7 +1345,8 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
     }
     sqlite3_finalize(stmt);
 
-    int64_t *old_to_new = calloc((size_t)(max_old_id + SKIP_ONE), sizeof(int64_t));
+    int64_t *old_to_new =
+        cbm_calloc(CBM_MEM_CLASS_GBUF_INDEX, (size_t)(max_old_id + SKIP_ONE) * sizeof(int64_t));
     if (!old_to_new) {
         cbm_store_close(store);
         return CBM_NOT_FOUND;
@@ -957,7 +1358,7 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
             "SELECT id, label, name, qualified_name, file_path, start_line, end_line, properties "
             "FROM nodes WHERE project = ? ORDER BY id",
             CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        free(old_to_new);
+        cbm_free(CBM_MEM_CLASS_GBUF_INDEX, old_to_new);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
     }
@@ -985,7 +1386,7 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
                            "SELECT source_id, target_id, type, properties "
                            "FROM edges WHERE project = ?",
                            CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        free(old_to_new);
+        cbm_free(CBM_MEM_CLASS_GBUF_INDEX, old_to_new);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
     }
@@ -1005,7 +1406,7 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
     }
     sqlite3_finalize(stmt);
 
-    free(old_to_new);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, old_to_new);
     cbm_store_close(store);
     return 0;
 }
@@ -1101,17 +1502,20 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
     char key[EDGE_KEY_BUF];
     make_edge_key(key, sizeof(key), source_id, target_id, type, properties_json);
 
-    cbm_gbuf_edge_t *existing = cbm_ht_get(gb->edge_by_key, key);
+    uint64_t h0;
+    uint64_t h1;
+    edge_key_hash(key, &h0, &h1);
+    edge_key_slot_t *hit = edge_key_map_find(&gb->edge_by_key, h0, h1);
+    cbm_gbuf_edge_t *existing = hit ? hit->edge : NULL;
     if (existing) {
         if (edge_props_should_replace(existing->properties_json, properties_json)) {
-            free(existing->properties_json);
-            existing->properties_json = heap_strdup(properties_json);
+            existing->properties_json = (char *)gb_intern(gb, properties_json);
         }
         return existing->id;
     }
 
     /* Heap-allocate a new edge (pointer stays stable) */
-    cbm_gbuf_edge_t *edge = calloc(CBM_ALLOC_ONE, sizeof(cbm_gbuf_edge_t));
+    cbm_gbuf_edge_t *edge = cbm_calloc(CBM_MEM_CLASS_GBUF_EDGE, sizeof(cbm_gbuf_edge_t));
     if (!edge) {
         return 0;
     }
@@ -1121,13 +1525,13 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
     edge->source_id = source_id;
     edge->target_id = target_id;
     edge->type = (char *)gb_intern(gb, type);
-    edge->properties_json = heap_strdup(properties_json);
+    edge->properties_json = (char *)gb_intern(gb, properties_json);
 
     /* Store pointer in array */
     cbm_da_push(&gb->edges, edge);
 
     /* Dedup index */
-    cbm_ht_set(gb->edge_by_key, strdup(key), edge);
+    (void)edge_key_map_set(&gb->edge_by_key, h0, h1, edge);
 
     /* Secondary indexes */
     register_edge_in_indexes(gb, edge);
@@ -1212,11 +1616,12 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
             char key[EDGE_KEY_BUF];
             make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type,
                           e->properties_json);
-            const char *ekey = cbm_ht_get_key(gb->edge_by_key, key);
-            cbm_ht_delete(gb->edge_by_key, key);
-            free((void *)ekey);
+            uint64_t h0;
+            uint64_t h1;
+            edge_key_hash(key, &h0, &h1);
+            edge_key_map_delete(&gb->edge_by_key, h0, h1);
             free_edge_strings(e);
-            free(e);
+            cbm_free(CBM_MEM_CLASS_GBUF_EDGE, e);
         } else {
             gb->edges.items[write_idx++] = gb->edges.items[i];
         }
@@ -1234,8 +1639,8 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
 /* Free remap hash table entries (key = heap string, value = heap int64_t*) */
 static void free_remap_entry(const char *key, void *val, void *ud) {
     (void)ud;
-    free((void *)key);
-    free(val);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, (void *)key);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, val);
 }
 
 /* Handle QN collision: update dst node fields (src wins), record remap if IDs differ.
@@ -1263,9 +1668,13 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
          * the node set (and every downstream consumer) run to run. Winner =
          * smallest file_path, then LARGEST start_line, then largest
          * name/label — one total order, commutative, scheduling-free; a full
-         * tie is the same entity → refresh from src. */
-        int c = strcmp(sn->file_path ? sn->file_path : "",
+         * tie is the same entity → refresh from src. A definition beats a
+         * macro ahead of all of these (gb_qn_claim_rank). */
+        int c = gb_qn_claim_rank(existing->label) - gb_qn_claim_rank(sn->label);
+        if (c == 0) {
+            c = strcmp(sn->file_path ? sn->file_path : "",
                        existing->file_path ? existing->file_path : "");
+        }
         if (c == 0) {
             c = existing->start_line - sn->start_line;
         }
@@ -1276,7 +1685,22 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
             c = strcmp(existing->label ? existing->label : "", sn->label ? sn->label : "");
         }
         bool sn_wins = c <= 0;
+        if (!sn_wins) {
+            gb_record_variants(existing, existing->label, existing->properties_json,
+                               existing->file_path, existing->start_line, existing->end_line,
+                               sn->label, sn->properties_json, sn->file_path, sn->start_line,
+                               sn->end_line);
+        }
         if (sn_wins) {
+            /* src's properties, plus every variant span both carry. */
+            char *variant_props = NULL;
+            if (gb_variant_label(sn->label) && existing->label &&
+                strcmp(existing->label, sn->label) == 0) {
+                variant_props = gb_variants_props(sn->properties_json, existing->properties_json,
+                                                  existing->file_path, existing->start_line,
+                                                  existing->end_line, sn->properties_json,
+                                                  sn->file_path, sn->start_line, sn->end_line);
+            }
             /* Keep the secondary indexes consistent when the surviving
              * label/name changes (the old code left the node listed under its
              * original label/name, so find_by_label/name mis-listed it). */
@@ -1296,24 +1720,25 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
                     existing->id);
             }
             existing->label = (char *)new_label;
-            free(existing->name);
+            cbm_free(CBM_MEM_CLASS_GBUF_STRING, existing->name);
             existing->name = heap_strdup(sn->name);
             existing->file_path = (char *)gb_intern(dst, sn->file_path);
             existing->start_line = sn->start_line;
             existing->end_line = sn->end_line;
-            if (sn->properties_json) {
-                free(existing->properties_json);
-                existing->properties_json = heap_strdup(sn->properties_json);
+            if (variant_props || sn->properties_json) {
+                cbm_free(CBM_MEM_CLASS_GBUF_STRING, existing->properties_json);
+                existing->properties_json =
+                    variant_props ? variant_props : heap_strdup(sn->properties_json);
             }
             if (label_changed) {
                 node_ptr_array_t *by_label = get_or_create_node_array(
                     dst->nodes_by_label, existing->label ? existing->label : "");
-                cbm_da_push(by_label, (const cbm_gbuf_node_t *)existing);
+                node_array_push(by_label, existing);
             }
             if (name_changed) {
                 node_ptr_array_t *by_name = get_or_create_node_array(
                     dst->nodes_by_name, existing->name ? existing->name : "");
-                cbm_da_push(by_name, (const cbm_gbuf_node_t *)existing);
+                node_array_push(by_name, existing);
             }
         }
     }
@@ -1324,15 +1749,15 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
         }
         char key[CBM_SZ_32];
         make_id_key(key, sizeof(key), sn->id);
-        int64_t *val = malloc(sizeof(int64_t));
+        int64_t *val = cbm_alloc(CBM_MEM_CLASS_GBUF_INDEX, sizeof(int64_t));
         *val = existing->id;
-        cbm_ht_set(*remap, strdup(key), val);
+        cbm_ht_set(*remap, cbm_mem_strdup(CBM_MEM_CLASS_GBUF_INDEX, key), val);
     }
 }
 
 /* Copy a non-colliding src node into dst with its original ID. */
 static void merge_copy_new_node(cbm_gbuf_t *dst, const cbm_gbuf_node_t *sn) {
-    cbm_gbuf_node_t *node = calloc(CBM_ALLOC_ONE, sizeof(cbm_gbuf_node_t));
+    cbm_gbuf_node_t *node = cbm_calloc(CBM_MEM_CLASS_GBUF_NODE, sizeof(cbm_gbuf_node_t));
     if (!node) {
         return;
     }
@@ -1445,7 +1870,7 @@ static char *extract_prop_string(const char *props, const char *key_quoted, cons
     yyjson_val *v = yyjson_obj_get(yyjson_doc_get_root(doc), key);
     if (v && yyjson_is_str(v)) {
         const char *sv = yyjson_get_str(v);
-        out = cbm_strndup(sv, strlen(sv));
+        out = cbm_mem_strdup(CBM_MEM_CLASS_DUMP, sv);
     }
     yyjson_doc_free(doc);
     return out;
@@ -1477,11 +1902,11 @@ static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *te
                                      int64_t max_temp_id, int *out_count,
                                      cbm_gbuf_node_t ***src_out) {
     size_t cap = (size_t)(live_count > 0 ? live_count : SKIP_ONE);
-    CBMDumpNode *dump_nodes = malloc(cap * sizeof(CBMDumpNode));
+    CBMDumpNode *dump_nodes = cbm_alloc(CBM_MEM_CLASS_DUMP, cap * sizeof(CBMDumpNode));
     /* Parallel gbuf-node pointers so a streamed partition can free its heavy
      * properties_json after the rows are persisted. NULL on OOM disables the
      * per-partition free (the dump still succeeds). */
-    cbm_gbuf_node_t **src = malloc(cap * sizeof(cbm_gbuf_node_t *));
+    cbm_gbuf_node_t **src = cbm_alloc(CBM_MEM_CLASS_DUMP, cap * sizeof(cbm_gbuf_node_t *));
     int idx = 0;
 
     for (int i = 0; i < gb->nodes.count; i++) {
@@ -1534,10 +1959,10 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
         }
     }
 
-    CBMDumpEdge *dump_edges =
-        malloc((size_t)(valid_edges > 0 ? valid_edges : SKIP_ONE) * sizeof(CBMDumpEdge));
-    char **url_paths = calloc((size_t)(valid_edges > 0 ? valid_edges : SKIP_ONE), sizeof(char *));
-    char **local_names = calloc((size_t)(valid_edges > 0 ? valid_edges : SKIP_ONE), sizeof(char *));
+    size_t edge_cap = (size_t)(valid_edges > 0 ? valid_edges : SKIP_ONE);
+    CBMDumpEdge *dump_edges = cbm_alloc(CBM_MEM_CLASS_DUMP, edge_cap * sizeof(CBMDumpEdge));
+    char **url_paths = cbm_calloc(CBM_MEM_CLASS_DUMP, edge_cap * sizeof(char *));
+    char **local_names = cbm_calloc(CBM_MEM_CLASS_DUMP, edge_cap * sizeof(char *));
     int idx = 0;
 
     for (int i = 0; i < gb->edges.count; i++) {
@@ -1625,18 +2050,44 @@ static void log_dump_summary(int node_count, int edge_count) {
     cbm_log_info("gbuf.dump", "nodes", b1, "edges", b2);
 }
 
+/* A dump that published nothing gets exactly one signature in the log.
+ * Without it the writer's return code is the only evidence, and it reaches
+ * the user as a generic pipeline failure that blames their repository
+ * (#1620, #2001).
+ *
+ * failure_errno is read by the caller at the point of failure: the value is
+ * only meaningful before the next library call. Zero means the failure did
+ * not originate at the publish boundary — an append that failed many calls
+ * earlier — and the field is omitted rather than claim a reason this record
+ * does not have. */
+static void log_dump_failed(int rc, int failure_errno, int node_count, int edge_count) {
+    char b1[CBM_SZ_16];
+    char b3[CBM_SZ_16];
+    char b4[CBM_SZ_16];
+    snprintf(b1, sizeof(b1), "%d", rc);
+    snprintf(b3, sizeof(b3), "%d", node_count);
+    snprintf(b4, sizeof(b4), "%d", edge_count);
+    if (failure_errno == 0) {
+        cbm_log_error("gbuf.dump_failed", "rc", b1, "nodes", b3, "edges", b4);
+        return;
+    }
+    char b2[CBM_SZ_16];
+    snprintf(b2, sizeof(b2), "%d", failure_errno);
+    cbm_log_error("gbuf.dump_failed", "rc", b1, "errno", b2, "nodes", b3, "edges", b4);
+}
+
 static void free_dump_resources(char **url_paths, char **local_names, int edge_count,
                                 CBMDumpEdge *dump_edges, CBMDumpNode *dump_nodes,
                                 int64_t *temp_to_final) {
     for (int i = 0; i < edge_count; i++) {
-        free(url_paths[i]);
-        free(local_names[i]);
+        cbm_free(CBM_MEM_CLASS_DUMP, url_paths[i]);
+        cbm_free(CBM_MEM_CLASS_DUMP, local_names[i]);
     }
-    free(url_paths);
-    free(local_names);
-    free(dump_edges);
-    free(dump_nodes);
-    free(temp_to_final);
+    cbm_free(CBM_MEM_CLASS_DUMP, url_paths);
+    cbm_free(CBM_MEM_CLASS_DUMP, local_names);
+    cbm_free(CBM_MEM_CLASS_DUMP, dump_edges);
+    cbm_free(CBM_MEM_CLASS_DUMP, dump_nodes);
+    cbm_free(CBM_MEM_CLASS_DUMP, temp_to_final);
 }
 
 static int count_live_nodes(cbm_gbuf_t *gb) {
@@ -1678,8 +2129,9 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
 
     CBM_PROF_START(t_build_nodes);
     int64_t max_temp_id = gb->next_id;
-    int64_t *temp_to_final = calloc((size_t)max_temp_id, sizeof(int64_t));
+    int64_t *temp_to_final = cbm_calloc(CBM_MEM_CLASS_DUMP, (size_t)max_temp_id * sizeof(int64_t));
     if (!temp_to_final) {
+        log_dump_failed(CBM_NOT_FOUND, errno, 0, 0);
         return CBM_NOT_FOUND;
     }
 
@@ -1710,9 +2162,10 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
      * uninitialized budget from ever triggering the free). */
     cbm_db_writer_t *w = cbm_writer_open(path);
     if (!w) {
-        free(src_nodes);
-        free(dump_nodes);
-        free(temp_to_final);
+        log_dump_failed(CBM_NOT_FOUND, errno, node_idx, 0);
+        cbm_free(CBM_MEM_CLASS_DUMP, src_nodes);
+        cbm_free(CBM_MEM_CLASS_DUMP, dump_nodes);
+        cbm_free(CBM_MEM_CLASS_DUMP, temp_to_final);
         return CBM_NOT_FOUND;
     }
 
@@ -1729,10 +2182,15 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         if (rc != 0) {
             break;
         }
-        free_heavy = free_heavy || (cbm_mem_budget() > 0 && cbm_mem_over_budget());
+        /* cbm_mem_should_relieve, not cbm_mem_over_budget: the dump is where
+         * the run died on 2026-09-18 with our charge UNDER budget and the host
+         * out of memory, so the only signal that would have fired here is the
+         * machine's. Dropping the property strings we have already written is
+         * pure relief — the rows are in the file by now. */
+        free_heavy = free_heavy || (cbm_mem_budget() > 0 && cbm_mem_should_relieve());
         if (free_heavy && src_nodes) {
             for (int j = off; j < off + chunk; j++) {
-                free(src_nodes[j]->properties_json);
+                cbm_free(CBM_MEM_CLASS_GBUF_STRING, src_nodes[j]->properties_json);
                 src_nodes[j]->properties_json = NULL;
                 dump_nodes[j].properties = NULL;
             }
@@ -1759,14 +2217,21 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     int frc = cbm_writer_finalize(w, gb->project, gb->root_path, indexed_at, dump_nodes, node_idx,
                                   dump_edges, edge_idx, gb->dump_vectors, gb->dump_vector_count,
                                   gb->dump_token_vecs, gb->dump_token_vec_count);
+    /* Read errno before anything else can touch it: the profiling macro
+     * below is already one library call away from losing the reason. */
+    int finalize_errno = errno;
     CBM_PROF_END_N("dump", "6_write_db_finalize", t_finalize, node_idx + edge_idx);
     if (rc == 0) {
         rc = frc;
     }
 
-    log_dump_summary(node_idx, edge_idx);
+    if (rc != 0) {
+        log_dump_failed(rc, finalize_errno, node_idx, edge_idx);
+    } else {
+        log_dump_summary(node_idx, edge_idx);
+    }
     free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, temp_to_final);
-    free(src_nodes);
+    cbm_free(CBM_MEM_CLASS_DUMP, src_nodes);
     return rc;
 }
 
@@ -1791,7 +2256,7 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
      * Temp IDs start at 1 and are sequential, but can have gaps from edge inserts.
      * Use max_id as size. */
     int64_t max_temp_id = gb->next_id;
-    int64_t *temp_to_real = calloc(max_temp_id, sizeof(int64_t));
+    int64_t *temp_to_real = cbm_calloc(CBM_MEM_CLASS_DUMP, (size_t)max_temp_id * sizeof(int64_t));
 
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
@@ -1840,7 +2305,7 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     cbm_store_create_indexes(store);
     cbm_store_end_bulk(store);
 
-    free(temp_to_real);
+    cbm_free(CBM_MEM_CLASS_DUMP, temp_to_real);
     return 0;
 }
 
@@ -1854,7 +2319,7 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
 
     /* Build temp_id → real_id map */
     int64_t max_temp_id = gb->next_id;
-    int64_t *temp_to_real = calloc(max_temp_id, sizeof(int64_t));
+    int64_t *temp_to_real = cbm_calloc(CBM_MEM_CLASS_DUMP, (size_t)max_temp_id * sizeof(int64_t));
 
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
@@ -1899,6 +2364,6 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
 
     cbm_store_commit(store);
 
-    free(temp_to_real);
+    cbm_free(CBM_MEM_CLASS_DUMP, temp_to_real);
     return 0;
 }

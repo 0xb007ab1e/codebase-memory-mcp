@@ -26,7 +26,8 @@ typedef struct {
  * Requires exclusive use of the store connection (prefer a dedicated worker
  * connection). Installs and removes its SQLite progress handler. No parsing,
  * indexing, database writes, or runtime execution observations are performed.
- * Returns malloc-owned JSON on OK, including explicit status="limited" when
+ * Returns CBM_MEM_CLASS_OTHER-owned JSON on OK; release it with
+ * cbm_free(CBM_MEM_CLASS_OTHER, json). Includes explicit status="limited" when
  * graph/resource limits prevent a complete projection. Cancel returns
  * CBM_STORE_CANCELLED, unknown projects return CBM_STORE_NOT_FOUND.
  * Component membership is inferred; every dependency witness is an indexed

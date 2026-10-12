@@ -1,20 +1,25 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import type { AtlasApi } from '../app/atlas-api';
-import { cpuText, logLevel, memoryLabel, memoryText } from './system-model';
+import type { ProjectEntry } from '../provider/rpc-schemas';
+import IndexesPanel, { type IndexesApi } from './IndexesPanel';
+import { collapseRepeats, cpuText, logLevel, memoryLabel, memoryText, repeatTitle } from './system-model';
 import { useSystemPoll, type SystemReading } from './useSystemPoll';
 import './system.css';
 
 export interface SystemWorkspaceProps {
-    api: Pick<AtlasApi, 'processes' | 'logs' | 'indexJobs'>;
+    api: Pick<AtlasApi, 'processes' | 'logs' | 'indexJobs'> & IndexesApi;
     onOpenProjects: () => void;
     active?: boolean;
     version?: string;
     pollMs?: number;
     project?: string;
+    configuration?: ReactNode | ((active: boolean) => ReactNode);
+    listProjects?: () => Promise<ProjectEntry[]>;
 }
 
-type SystemTab = 'overview' | 'indexes' | 'logs';
-const TABS: SystemTab[] = ['overview', 'indexes', 'logs'];
+type SystemTab = 'overview' | 'configuration' | 'indexes' | 'logs';
+const TABS: SystemTab[] = ['overview', 'configuration', 'indexes', 'logs'];
+const TAB_LABELS: Record<SystemTab, string> = { overview: 'Overview', configuration: 'Configuration', indexes: 'Indexes', logs: 'Logs' };
 
 function ReadStatus({ reading, paused }: { reading: SystemReading<unknown>; paused: boolean }) {
     return <div className="system-read-status">
@@ -26,17 +31,15 @@ function ReadStatus({ reading, paused }: { reading: SystemReading<unknown>; paus
     </div>;
 }
 
-/** Read-only daemon dashboard; project mutations stay in the existing dialog. */
-export default function SystemWorkspace({ api, onOpenProjects, active = true, version, pollMs = 3000, project }: SystemWorkspaceProps) {
+/** Daemon readings and configuration; project indexing uses the existing dialog. */
+export default function SystemWorkspace({ api, onOpenProjects, active = true, version, pollMs = 3000, project, configuration, listProjects }: SystemWorkspaceProps) {
     const [tab, setTab] = useState<SystemTab>('overview');
     const [paused, setPaused] = useState(false);
-    const [query, setQuery] = useState('');
     const [level, setLevel] = useState<'all' | 'error' | 'warn' | 'info'>('all');
     const [scope, setScope] = useState<'daemon' | 'project' | 'unattributed'>('daemon');
-    const [search, setSearch] = useState('');
-    useEffect(() => { const timer = setTimeout(() => setSearch(query.trim()), 250); return () => clearTimeout(timer); }, [query]);
     const [copyStatus, setCopyStatus] = useState('');
     const [followTail, setFollowTail] = useState(true);
+    const [indexesRefresh, setIndexesRefresh] = useState(0);
     const logRef = useRef<HTMLDivElement>(null);
     const readProcesses = useCallback(() => api.processes(), [api]);
     const selectedProject = scope === 'project' ? project : undefined;
@@ -44,14 +47,12 @@ export default function SystemWorkspace({ api, onOpenProjects, active = true, ve
         if (scope === 'project' && !selectedProject) throw new Error('Select a project to read its attributed events.');
         const data = await api.logs(200, level === 'all' ? undefined : level, selectedProject, {
             ...(scope === 'unattributed' ? { scope: 'unattributed' as const } : {}),
-            ...(search ? { query: search } : {}),
         });
-        if ((scope !== 'daemon' || level !== 'all' || search) && data.persistent !== true) throw new Error('Persistent history is unavailable. Filters require the daemon journal.');
+        if ((scope !== 'daemon' || level !== 'all') && data.persistent !== true) throw new Error('Persistent history is unavailable. Filters require the daemon journal.');
         if (scope === 'project' && (data.scope !== 'project' || data.project !== selectedProject)) throw new Error('The daemon did not confirm this project scope.');
         if (scope === 'unattributed' && data.scope !== 'unattributed') throw new Error('The daemon did not confirm unattributed scope.');
-        if (search && data.query !== search) throw new Error('This daemon does not confirm full-history search. Refresh the daemon before using this filter.');
         return data;
-    }, [api, level, selectedProject, scope, search]);
+    }, [api, level, selectedProject, scope]);
     const readJobs = useCallback(() => api.indexJobs(), [api]);
     const processes = useSystemPoll(readProcesses, active, paused, pollMs);
     const logs = useSystemPoll(readLogs, active && tab === 'logs', paused, pollMs);
@@ -60,17 +61,19 @@ export default function SystemWorkspace({ api, onOpenProjects, active = true, ve
     const self = report?.processes.find((process) => process.isSelf);
     const visibleLines = logs.data?.lines ?? [];
     const visibleRecords = logs.data?.records;
+    // Identical messages read as one line with a count; a repeated warning cannot push the rest out of view.
+    const logRows = useMemo(() => visibleRecords ? collapseRepeats(visibleRecords) : undefined, [visibleRecords]);
     const selectedReading = tab === 'logs' ? logs : tab === 'indexes' ? jobs : processes;
 
     useEffect(() => {
         if (followTail && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
     }, [logs.data, followTail, tab]);
-    useEffect(() => { setCopyStatus(''); }, [query, level, logs.data]);
+    useEffect(() => { setCopyStatus(''); }, [level, logs.data]);
 
     const copyLogs = async () => {
         try {
             if (!navigator.clipboard?.writeText) throw new Error('Clipboard access is unavailable. Select and copy the visible text.');
-            await navigator.clipboard.writeText(visibleRecords ? visibleRecords.map((record) => `${record.ts} ${record.level.toUpperCase()} ${record.source} #${record.id}\n${record.message}`).join('\n') : visibleLines.join('\n'));
+            await navigator.clipboard.writeText(logRows ? logRows.map(({ record, count }) => `${record.ts} ${record.level.toUpperCase()} ${record.source} #${record.id}${count > 1 ? ` ×${count}` : ''}\n${record.message}`).join('\n') : visibleLines.join('\n'));
             setCopyStatus('Visible lines copied');
         } catch (error) {
             setCopyStatus(error instanceof Error ? error.message : 'Could not copy the log.');
@@ -78,8 +81,8 @@ export default function SystemWorkspace({ api, onOpenProjects, active = true, ve
     };
     const moveTab = (event: KeyboardEvent<HTMLButtonElement>, current: SystemTab) => {
         const index = TABS.indexOf(current);
-        const target = event.key === 'ArrowRight' ? TABS[(index + 1) % TABS.length]
-            : event.key === 'ArrowLeft' ? TABS[(index + TABS.length - 1) % TABS.length]
+        const target = event.key === 'ArrowDown' ? TABS[(index + 1) % TABS.length]
+            : event.key === 'ArrowUp' ? TABS[(index + TABS.length - 1) % TABS.length]
             : event.key === 'Home' ? TABS[0] : event.key === 'End' ? TABS[TABS.length - 1] : undefined;
         if (!target) return;
         event.preventDefault();
@@ -89,17 +92,21 @@ export default function SystemWorkspace({ api, onOpenProjects, active = true, ve
 
     return <section className="system-workspace" aria-label="System" hidden={!active} data-testid="system-workspace">
         <header className="system-heading">
-            <div><p className="system-eyebrow">DAEMON</p><h1>System</h1><p>Processes, indexes, and frontend, API, and daemon events.</p></div>
+            <div><p className="system-eyebrow">DAEMON</p><h1>System</h1><p>Configuration, processes, indexes, and events.</p></div>
             <div className="system-heading-actions">
                 {version && <span className="system-version">{version}</span>}
-                <button type="button" onClick={() => selectedReading.refresh()} disabled={selectedReading.loading}>Refresh</button>
-                <button type="button" aria-label={paused ? 'Resume live updates' : 'Pause live updates'} aria-pressed={paused} onClick={() => setPaused(!paused)}>{paused ? 'Resume live' : 'Pause live'}</button>
+                {tab !== 'configuration' && <>
+                    <button type="button" onClick={() => { selectedReading.refresh(); if (tab === 'indexes') setIndexesRefresh(value => value + 1); }} disabled={selectedReading.loading}>Refresh</button>
+                    <button type="button" aria-label={paused ? 'Resume live updates' : 'Pause live updates'} aria-pressed={paused} onClick={() => setPaused(!paused)}>{paused ? 'Resume live' : 'Pause live'}</button>
+                </>}
             </div>
         </header>
-        <div className="system-tabs" role="tablist" aria-label="System views">
-            {TABS.map((name) => <button key={name} id={`system-tab-${name}`} type="button" role="tab" aria-selected={tab === name} aria-controls={`system-panel-${name}`} tabIndex={tab === name ? 0 : -1} onKeyDown={(event) => moveTab(event, name)} onClick={() => setTab(name)}>{name === 'overview' ? 'Overview' : name === 'indexes' ? 'Indexes' : 'Logs'}</button>)}
+        <div className="system-layout">
+        <div className="system-tabs" role="tablist" aria-label="System views" aria-orientation="vertical">
+            {TABS.map((name) => <button key={name} id={`system-tab-${name}`} type="button" role="tab" aria-selected={tab === name} aria-controls={`system-panel-${name}`} tabIndex={tab === name ? 0 : -1} onKeyDown={(event) => moveTab(event, name)} onClick={() => setTab(name)}>{TAB_LABELS[name]}</button>)}
         </div>
-        <ReadStatus reading={selectedReading} paused={paused} />
+        <div className="system-view">
+        {tab !== 'configuration' && tab !== 'indexes' && <ReadStatus reading={selectedReading} paused={paused} />}
 
         <div id="system-panel-overview" role="tabpanel" aria-labelledby="system-tab-overview" hidden={tab !== 'overview'}>
             <div className="system-metrics">
@@ -121,16 +128,21 @@ export default function SystemWorkspace({ api, onOpenProjects, active = true, ve
             </section>
         </div>
 
+        <div id="system-panel-configuration" role="tabpanel" aria-labelledby="system-tab-configuration" hidden={tab !== 'configuration'}>
+            {(typeof configuration === 'function' ? configuration(active && tab === 'configuration') : configuration) ?? <p className="system-empty">Configuration is unavailable.</p>}
+        </div>
+
         <div id="system-panel-indexes" role="tabpanel" aria-labelledby="system-tab-indexes" hidden={tab !== 'indexes'}>
-            <section className="system-section">
-                <div className="system-section-heading"><div><h2>Indexes</h2><p>Index activity from the local daemon.</p></div><button type="button" onClick={onOpenProjects}>Add project index</button></div>
-                <h3>Index activity</h3><p className="system-muted">Current daemon job slots. Slots may be reused; this is not a complete history.</p>
+            <IndexesPanel api={api} listProjects={listProjects} active={active && tab === 'indexes'} paused={paused} refreshToken={indexesRefresh} onOpenProjects={onOpenProjects} />
+            <details className="system-index-activity">
+                <summary>Recent indexing activity{jobs.data ? ` · ${jobs.data.length} job slots` : ''}</summary><p className="system-muted">Current daemon job slots. Slots may be reused; this is not a complete history.</p>
                 <div className="system-table-wrap"><table><thead><tr><th>Repository</th><th>State</th><th>Details</th></tr></thead><tbody>
                     {jobs.data?.map((job, index) => <tr key={`${job.slot}-${index}`}><th scope="row"><code>{job.path || 'Path unavailable'}</code></th><td><span className={`system-job-state system-job-${job.status}`}>{job.status === 'indexing' ? 'Indexing' : job.status === 'done' ? 'Complete' : job.status === 'error' ? 'Failed' : 'Unknown'}</span></td><td>{job.error || 'No details reported'}</td></tr>)}
                 </tbody></table></div>
                 {jobs.data?.length === 0 && <p className="system-empty">No index activity reported by this daemon.</p>}
                 {!jobs.data && <p className="system-empty">{jobs.loading ? 'Reading index activity…' : 'No index reading available.'}</p>}
-            </section>
+                {jobs.error && <p className="system-warning" role="alert">Could not update job activity: {jobs.error}</p>}
+            </details>
         </div>
 
         <div id="system-panel-logs" role="tabpanel" aria-labelledby="system-tab-logs" hidden={tab !== 'logs'}>
@@ -143,7 +155,6 @@ export default function SystemWorkspace({ api, onOpenProjects, active = true, ve
                         <option value="project" disabled={!project}>Current project{project ? ` · ${project}` : ' · none selected'}</option>
                         <option value="unattributed">Unattributed events</option>
                     </select></label>
-                    <label><span>Search retained history</span><input type="search" maxLength={256} value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="Find a source, path or message…" /></label>
                     <label><span>Severity</span><select aria-label="Log severity" value={level} onChange={(event) => setLevel(event.currentTarget.value as typeof level)}>
                         <option value="all">All levels</option><option value="info">Info and above</option>
                         <option value="warn">Warnings and errors</option><option value="error">Errors</option>
@@ -156,10 +167,12 @@ export default function SystemWorkspace({ api, onOpenProjects, active = true, ve
                     const element = logRef.current;
                     if (element && element.scrollHeight - element.scrollTop - element.clientHeight > 32) setFollowTail(false);
                 }}>
-                    {visibleRecords ? visibleRecords.map((record) => <div className={`system-log-line system-log-record system-log-${logLevel(`level=${record.level}`)}`} key={`${logs.data?.generation ?? ''}:${record.id}`}><strong>{record.level.toUpperCase() || 'UNCLASSIFIED'}</strong> · <time dateTime={record.ts}>{record.ts || 'Time unavailable'}</time> · {record.source || 'Source unavailable'} · Event #{record.id} · {record.project ? `Project: ${record.project}` : 'Project not recorded'}<pre>{record.message}</pre></div>) : visibleLines.map((line, index) => <div className={`system-log-line system-log-${logLevel(line)}`} key={index}>{line || '\u00a0'}</div>)}
+                    {logRows ? logRows.map((row) => { const { record } = row; return <div className={`system-log-line system-log-record system-log-${logLevel(`level=${record.level}`)}`} key={`${logs.data?.generation ?? ''}:${record.id}`}><strong>{record.level.toUpperCase() || 'UNCLASSIFIED'}</strong> · <time dateTime={record.ts}>{record.ts || 'Time unavailable'}</time> · {record.source || 'Source unavailable'} · Event #{record.id} · {record.project ? `Project: ${record.project}` : 'Project not recorded'}{row.count > 1 && <> · <span className="system-log-repeat" title={repeatTitle(row)}>×{row.count}</span></>}<pre>{record.message}</pre></div>; }) : visibleLines.map((line, index) => <div className={`system-log-line system-log-${logLevel(line)}`} key={index}>{line || '\u00a0'}</div>)}
                     {(visibleRecords?.length ?? visibleLines.length) === 0 && <p>{logs.loading ? 'Reading log…' : !logs.data ? 'No log reading available.' : 'No retained events match these filters.'}</p>}
                 </div>
             </section>
+        </div>
+        </div>
         </div>
     </section>;
 }

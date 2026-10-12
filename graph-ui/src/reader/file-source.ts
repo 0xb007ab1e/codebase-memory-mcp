@@ -2,7 +2,7 @@
  * Eine Datei fuer den Reader holen, und ehrlich sagen, was davon angekommen ist.
  *
  * Der Server hat keinen Endpunkt, der eine Datei ausliefert. Es gibt keinen
- * /api/file (INVENTAR.md Abschnitt 3), und das ist Ask 1 auf der Upstream-Liste.
+ * /api/file in diesem historischen Providerpfad.
  * Was es gibt, ist `get_code_snippet` auf einem indizierten Symbol. Der
  * Modul-Knoten ist das Symbol, das die ganze Datei umspannt, und ueber ihn
  * kommt der Reader an den Quelltext.

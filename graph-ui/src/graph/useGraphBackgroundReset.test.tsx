@@ -24,13 +24,13 @@ function pointer(target: Element, type: string, x = 10, y = 10, changes: { butto
     Object.defineProperties(event, { pointerId: { value: changes.pointerId ?? 1 }, isPrimary: { value: changes.isPrimary ?? true } });
     target.dispatchEvent(event);
 }
-it('resets only after a primary click on genuinely empty canvas', async () => {
+it('reports an empty-canvas click only after a primary click on genuinely empty canvas (the caller decides what it clears, K9)', async () => {
     const { reset, canvas } = await setup();
     pointer(canvas, 'pointerdown'); pointer(canvas, 'pointerup'); pointer(canvas, 'click');
     expect(reset).toHaveBeenCalledOnce();
     pointer(canvas, 'click'); expect(reset).toHaveBeenCalledOnce();
 });
-it('does not reset orbit/pan drags, including drags that return to their starting point', async () => {
+it('does not report orbit/pan drags, including drags that return to their starting point', async () => {
     const { reset, canvas } = await setup();
     pointer(canvas, 'pointerdown'); pointer(canvas, 'pointermove', 50); pointer(canvas, 'pointermove');
     pointer(canvas, 'pointerup'); pointer(canvas, 'click'); expect(reset).not.toHaveBeenCalled();

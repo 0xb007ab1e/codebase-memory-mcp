@@ -104,6 +104,14 @@ export function isPinnedModelRequest(value: string, modelId: string = BROWSER_MO
     } catch { return false; }
 }
 
+/** Whether every pinned file of the model is in its dedicated Cache Storage. Checking
+ * never creates the cache and never downloads (K10). */
+export async function isBrowserModelCached(model: BrowserModel): Promise<boolean> {
+    if (typeof caches === 'undefined' || !caches || !(await caches.has(model.cacheName))) return false;
+    const stored = new Set((await (await caches.open(model.cacheName)).keys()).map(request => request.url));
+    return model.files.every(file => stored.has(`${browserModelBaseUrl(model)}${file}`));
+}
+
 export async function removeBrowserModelCache(modelId: string = BROWSER_MODEL.id): Promise<void> {
     const model = getBrowserModel(modelId);
     if (typeof caches !== 'undefined') await caches.delete(model.cacheName);

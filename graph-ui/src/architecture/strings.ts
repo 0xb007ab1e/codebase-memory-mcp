@@ -75,4 +75,89 @@ export const architectureText = {
     focusGroup: (name: string) => `Show relationships for ${name}`,
     groupStats: (symbols: number) => `${symbols.toLocaleString()} symbols`,
     cohesion: (value: number) => `${Math.round(value * 100)}% cohesion`,
+    projectionLimited: 'The analysis returned no system structure for this project.',
+    projectionEmpty: 'No component projection is available within this analysis budget.',
+    behaviorLimited: 'The analysis returned no call evidence.',
+    includeTestRoutes: (hidden: number) => hidden ? `Include test routes (${hidden.toLocaleString()} hidden)` : 'Include test routes',
+    /** Until the route evidence arrives a count would be a guess that jumps later. */
+    includeTestRoutesChecking: 'Include test routes (checking…)',
+    showRoutes: (count: number) => `Show these ${count.toLocaleString()} routes →`,
+    /** Routes › Service map: what the deployment inventory read found. */
+    serviceMap: {
+        reading: 'Finding indexed Compose definitions…',
+        none: 'No Docker Compose deployment files were found in this index. Endpoints shows the routes.',
+        failed: 'Could not read the indexed deployment files. Refresh to try again.',
+        compareFailed: 'Could not read that project. Its index may be unavailable.',
+    },
+    showEndpoints: 'Show endpoints →',
+    /** Routes: the two perspectives, also the names a Back or Forward tooltip gives them. */
+    routesPerspective: { label: 'Routes perspective', services: 'Service map', endpoints: 'Endpoints', preparing: 'Preparing service map…' },
+    /** Behavior: the callees of the start operation; a call to itself is named, not counted. */
+    directCallees: (count: number, selfCalls: boolean) => `${count.toLocaleString()} direct callees with returned evidence${selfCalls ? ' · also calls itself' : ''}`,
+    /** Behavior: the page of direct calls, the same calls the "direct callees" count names. */
+    callPage: (from: number, to: number, drawn: number, beyond: number, filtered: boolean) => `Calls ${from} to ${to} of ${drawn.toLocaleString()}${filtered ? ' matching the filter' : ''}${beyond ? ` · ${beyond.toLocaleString()} more beyond the display limit` : ''}`,
+    openedArea: 'Opened area',
+    openedFile: 'Opened file',
+    scopeMeasure: (files: number, lines?: number) => `${files.toLocaleString()} files · ${lines === undefined ? 'unknown' : lines.toLocaleString()} indexed lines`,
+    openedScopeHint: 'Select a part or connection to inspect it. The location above leads back to the repository.',
+    /** Behavior "Start": suggestions first, then every operation alphabetically, with a filter (hand test 2026-10-04, A4). */
+    behaviorStart: {
+        label: 'Start',
+        field: 'Behavior entry point',
+        choose: 'Choose an operation…',
+        filter: 'Filter operations',
+        filterPlaceholder: 'Filter operations…',
+        suggested: 'Suggested',
+        /** The chosen start while the filter does not match it (review of K43): apart from the matches, so their count holds. */
+        current: 'Current start, not matching the filter',
+        all: (total: number) => `All operations · ${total.toLocaleString()}`,
+        matching: (shown: number, total: number) => `Matching operations · ${shown.toLocaleString()} of ${total.toLocaleString()}`,
+        none: (query: string) => `No operation matches "${query}"`,
+        option: (name: string, place: string) => `${name} · ${place}`,
+        /** The name stays first, so the list still reads alphabetically: "database_backwards (CreateModel)". */
+        qualified: (qualifier: string, name: string) => `${name} (${qualifier})`,
+        line: (place: string, line: number) => `${place}:${line}`,
+        ordinal: (index: number, count: number) => ` (${index} of ${count})`,
+    },
+    /** The camera button of the maps: back to the whole map. */
+    fitMap: 'Fit map',
+    /** Each Refresh button says what it did (hand test 2026-10-04, A3): busy while it runs, then when (shared words in ui/refresh/strings.ts). */
+    refreshFeedback: {
+        routes: { idle: 'Refresh connections', busy: 'Refreshing connections…', done: (time: string) => `Connections refreshed at ${time}` },
+        services: { idle: 'Refresh', busy: 'Refreshing…', done: (time: string) => `Service map refreshed at ${time}` },
+        structure: { idle: 'Refresh analysis', busy: 'Refreshing analysis…', done: (time: string) => `Analysis refreshed at ${time}` },
+        behavior: { idle: 'Refresh', busy: 'Refreshing…', done: (time: string) => `Journey refreshed at ${time}` },
+    },
+};
+
+/**
+ * Back and Forward for the whole Architecture workspace (hand test K27). The
+ * same rules and the same model as Galaxy (K2, src/graph/navigation-history.ts);
+ * a tooltip names the place a step leads to, for example "Back to Overview · django".
+ */
+export const architectureHistoryText = {
+    /** The accessible name of the Back, Forward and Recent group. */
+    group: 'Architecture history',
+    back: 'Back',
+    forward: 'Forward',
+    backGlyph: '←',
+    forwardGlyph: '→',
+    /** The words while the subtab row has room, as in Galaxy; the glyphs alone once the tabs would scroll. */
+    backWide: '← Back',
+    forwardWide: 'Forward →',
+    backTo: (label: string) => `Back to ${label} (Alt+Left)`,
+    forwardTo: (label: string) => `Forward to ${label} (Alt+Right)`,
+    noBack: 'Nothing to go back to yet',
+    noForward: 'Nothing to go forward to',
+    recent: 'Recent',
+    recentGlyph: '▾',
+    recentTitle: 'Jump straight to a recently visited place in Architecture, as it was last seen',
+    recentList: 'Recently visited places',
+    separator: ' · ',
+    plan: 'Plan',
+    groupsOpen: (count: number) => (count === 1 ? '1 group open' : `${count} groups open`),
+    reach: (start: string, target: string) => `${start} → ${target}`,
+    /** Another indexed path to a Behavior destination, named as its button: "Path 2". */
+    path: (number: number) => `Path ${number}`,
+    followedFrom: (name: string) => `followed from ${name}`,
 };

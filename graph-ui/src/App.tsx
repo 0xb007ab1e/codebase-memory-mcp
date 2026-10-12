@@ -121,9 +121,8 @@ import AtlasChrome, { CLOSE_COMMAND_SEARCH_EVENT, OPEN_COMMAND_SEARCH_EVENT } fr
 import { AtlasTreeIndexDetails } from './app/AtlasTree';
 import ArchitecturePanel from './architecture/ArchitecturePanel';
 import AdrWorkspace from './adr/AdrWorkspace';
-import SelectionContextPanel from './why/SelectionContext';
-import ChangeAnalysisWorkspace from './impact/ChangeAnalysisWorkspace';
-import type { SelectionImpactTarget } from './impact/selection-impact';
+import SelectionContextPanel, { type SelectionScope } from './why/SelectionContext';
+import FileImpactSummary from './impact/FileImpactSummary';
 import SourceEvidenceDrawer, { fileQualifiedName, type SourceEvidenceTarget } from './architecture/SourceEvidenceDrawer';
 import { setUiLogProject } from './app/ui-log-install';
 import DiagnosticsPanel from './diagnostics/DiagnosticsPanel';
@@ -131,11 +130,13 @@ import { resolveRepositorySelection, useRepositorySnapshot } from './architectur
 import ActivityPanel from './agents/ActivityPanel';
 import WelcomePanel from './app/WelcomePanel';
 import BrowserChatDock from './browser-ai/BrowserChatDock';
+import { switchKeepingAgent } from './browser-ai/agent-handover';
+import { browserChatHistoryProjectKey } from './browser-ai/chat-history-cache';
 import type { BrowserChatAttachment } from './browser-ai/BrowserChatDock';
 import { browserGraphContext } from './browser-ai/graph-context';
 import { readerChatContext, type ReaderSourceOrigin } from './browser-ai/reader-chat-context';
 import type { BrowserChatContext } from './browser-ai/chat-model';
-import { selectedGraphContext } from './galaxy/selected-node';
+import { selectionEvidenceContext } from './galaxy/selection-evidence';
 import SystemWorkspace from './system/SystemWorkspace';
 import type { Workspace, Guidance } from './app/workspace-strings';
 import { allowedWorkspace, initialWorkspace, workspaceStrings as workspaceText } from './app/workspace-strings';
@@ -145,7 +146,6 @@ import { AtlasApi, TREE_ROUTE } from './app/atlas-api';
 import { ATLAS_BUILD_SUFFIX, ATLAS_VERSION } from './app/build-info';
 import { messages } from './i18n/messages';
 import {
-    commandLineIntent,
     KEY_LISTENER_OPTIONS,
     menuShortcutFor,
     tourKeyForEvent,
@@ -269,7 +269,6 @@ import type { BugWizardStatus } from './traces/BugWizard';
 import { bugPaths, resolveHop } from './traces/bug-paths';
 import type { BugPathNode, BugPathsDto } from './traces/bug-paths';
 import { BUG_WIZARD_MENU_LABEL } from './traces/bug-wizard-strings';
-import { IMPACT_MENU_LABEL } from './impact/impact-strings';
 import { SIDECAR_ORIGIN } from './llm/sidecar';
 import type { CacheModel, SidecarReading, SidecarState } from './llm/sidecar';
 import AtlasChatPanel from './chat/AtlasChatPanel';
@@ -307,11 +306,12 @@ import type { PolicyReading } from './llm/policy';
 import { resolveLlmState } from './llm/llm-state';
 import { llmChipValue } from './llm/strings';
 import SettingsPanel from './settings/SettingsPanel';
+import ConfigPanel from './settings/ConfigPanel';
 import type { SettingsMeasurement } from './settings/SettingsPanel';
 import AddProjectIndexDialog from './projects/AddProjectIndexDialog';
 import ProjectSwitcher from './projects/ProjectSwitcher';
 import type { ProjectsSource } from './projects/ProjectsPanel';
-import { projectHref } from './projects/projects-model';
+import { ProjectWindows, useParamInAddress, type ProjectWindow } from './app/project-windows';
 import { MODEL_SUGGESTIONS, fetchCommand } from './settings/model-catalog';
 import { modelKey, readModelPreference, recordModelPreference } from './settings/model-preference';
 import {
@@ -345,17 +345,8 @@ export const EAGER_LEVEL_BUDGET = 40;
 export const TWIN_CARET_DEBOUNCE_MS = 250;
 
 /**
- * Womit das Panel startet.
- *
- * Kein eingebautes Profil, und das ist eine Aussage: die fuenf Presets des
- * Referenzprojekts hoeren zu einer Werkbank mit fuenf Panels, und jedes von
- * ihnen schaltet Linsen ab, die dort ein anderes Panel beantwortet. Hier gibt
- * es nur den Twin, also waere jedes der fuenf eine Startlage, in der eine
- * Sektion fehlt und niemand sagt, warum. Die Tiefe zwei zeigt die
- * aufgezeichneten Fakten, so wie design/design.png es zeigt; die Linsen sind
- * alle, die dieses Backend beantworten kann. Runtime und Changes sind aus, weil
- * sie hier nur ihre eigene Unfertigkeit melden koennten, und der Leser kann sie
- * mit einem Klick einschalten und genau das lesen.
+ * Start with the supported facts at depth two. Runtime and Changes remain
+ * opt-in because their unavailable states otherwise add noise to the panel.
  */
 export const TWIN_PROFILE: PresentationProfile = {
     id: 'custom:codeatlasweb-twin',
@@ -746,10 +737,34 @@ declare global {
     var __atlasLlm: AtlasLlmSeam | undefined;
 }
 
+/** Was ein Projektfenster dem naechsten mitgibt (K24): den Arbeitsbereich, die Kopfzeile des Agenten und ob der Chat offen ist. */
+interface WindowCarry {
+    workspace: Workspace;
+    chatOpen: boolean;
+    agentState: 'off' | 'loading' | 'active' | 'busy' | 'error';
+    agentModelName: string;
+    agentHasOpened: boolean;
+}
+
+/**
+ * Jedes Projekt bekommt ein frisches Fenster in derselben Seite (K24, Kopf von
+ * src/app/project-windows.tsx). Der Agent reicht beim Wechsel sein geladenes
+ * Modell an das Fenster des neuen Projekts weiter. Die Adresse behaelt dabei
+ * den Arbeitsbereich und die Grenzen des Walks, nichts vom alten Projekt (A5).
+ */
+const PAGE_PARAMS = ['workspace', CLOSURE_DEPTH_PARAM, CLOSURE_CAP_PARAM] as const;
 export default function App(): JSX.Element {
+    return <ProjectWindows<WindowCarry> around={switchKeepingAgent} keepParams={PAGE_PARAMS}>
+        {shown => <ProjectWindowView key={shown.key} projectWindow={shown} />}
+    </ProjectWindows>;
+}
+
+function ProjectWindowView({ projectWindow }: { projectWindow: ProjectWindow<WindowCarry> }): JSX.Element {
+    const carried = projectWindow.carried;
     const [workspace, setWorkspace] = useState<Workspace>(() => {
         try {
-            const requested = new URLSearchParams(window.location.search).get('workspace');
+            // A project switch keeps the workspace in view; Back and Forward restore the one of their entry (K24).
+            const requested = new URLSearchParams(window.location.search).get('workspace') ?? carried?.workspace ?? null;
             let saved: string | null = null;
             try { saved = localStorage.getItem('cbm.workspace'); } catch { /* URL navigation works without storage. */ }
             return initialWorkspace(requested, saved);
@@ -757,22 +772,40 @@ export default function App(): JSX.Element {
     });
     const changeWorkspace = (value: Workspace): void => {
         value = allowedWorkspace(value);
+        if (value !== workspace) {
+            setProactiveSelection(undefined); setChatGraphSelection(undefined); setChatAttachment(undefined);
+        }
         setWorkspace(value);
-        const url = new URL(window.location.href);
-        url.searchParams.set('workspace', value);
-        window.history.replaceState(window.history.state, '', url);
         try { localStorage.setItem('cbm.workspace', value); } catch { /* Session-only preference. */ }
     };
+    // The address always names the workspace in view, also one carried over a project switch, so a reload keeps it (A5).
+    useParamInAddress('workspace', workspace);
     const [welcomeOpen, setWelcomeOpen] = useState(() => {
         try { return localStorage.getItem('cbm.workspace.setup') !== 'done'; } catch { return false; }
     });
-    const [browserAiOpen, setBrowserAiOpen] = useState(false);
+    // The agent's lamp and the chat stay as they were across a project switch (K24).
+    const [browserAiOpen, setBrowserAiOpen] = useState(carried?.chatOpen ?? false);
+    const [localAgentState, setLocalAgentState] = useState<'off' | 'loading' | 'active' | 'busy' | 'error'>(carried?.agentState ?? 'off');
+    const [agentSettingsRequest, setAgentSettingsRequest] = useState(0);
+    const [agentModelName, setAgentModelName] = useState(carried?.agentModelName ?? '');
+    const agentHasOpened = useRef(carried?.agentHasOpened ?? false);
+    useEffect(() => {
+        projectWindow.report({ workspace, chatOpen: browserAiOpen, agentState: localAgentState, agentModelName, agentHasOpened: agentHasOpened.current });
+    });
+    const onAgentStateChange = useCallback((state: 'off' | 'loading' | 'active' | 'busy' | 'error') => {
+        setLocalAgentState(state);
+        if ((state === 'active' || state === 'busy') && !agentHasOpened.current) {
+            agentHasOpened.current = true; setBrowserAiOpen(true);
+        }
+    }, []);
+    const openAgentSettings = () => { setAgentSettingsRequest(value => value + 1); };
     const [codeDetailsOpen, setCodeDetailsOpen] = useState(false);
     const [readerSelection, setReaderSelection] = useState<ReaderSelection>();
     const [pinnedCode, setPinnedCode] = useState<SelectedCodeSnapshot>();
     const [fileSymbols, setFileSymbols] = useState<FileSymbolResult & { project: string; path: string; status: 'loading' | 'ready' | 'error' }>({ project: '', path: '', symbols: [], message: '', status: 'ready' });
     const [chatAttachment, setChatAttachment] = useState<BrowserChatAttachment>();
     const [chatGraphSelection, setChatGraphSelection] = useState<BrowserChatContext>();
+    const [proactiveSelection, setProactiveSelection] = useState<{ scope: string; context: BrowserChatContext }>();
     const [galaxySelection, setGalaxySelection] = useState<GraphNode>();
     const [galaxySelectionProject, setGalaxySelectionProject] = useState('');
     const finishSetup = (): void => {
@@ -781,16 +814,17 @@ export default function App(): JSX.Element {
         try { localStorage.setItem('cbm.workspace.setup', 'done'); } catch { /* Session-only preference. */ }
     };
     const guidance: Guidance = 'brief';
-    const client = useMemo(() => new RpcIntelligenceClient({}), []);
-    const api = useMemo(() => new AtlasApi({}), []);
+    // Requests of this window end with it: a switch to another project aborts them (K24).
+    const client = useMemo(() => new RpcIntelligenceClient({ signal: projectWindow.signal }), [projectWindow.signal]);
+    const api = useMemo(() => new AtlasApi({ signal: projectWindow.signal }), [projectWindow.signal]);
     const [diagnosticsPath, setDiagnosticsPath] = useState<string>();
 
     /*
      * What the projects panel asks the server. The list comes over /rpc like
      * every other read of this window; the rest are the /api routes the panel
-     * names in its own text. Opening a project reloads the page with the
-     * query the start-up code reads, because every panel of this window is
-     * keyed to the project it started with.
+     * names in its own text. Opening a project replaces this window with a
+     * fresh one for that project in the same page, because every panel of this
+     * window is keyed to the project it started with (K24).
      */
     const projectsSource = useMemo<ProjectsSource>(
         () => ({
@@ -808,11 +842,17 @@ export default function App(): JSX.Element {
         }),
         [client, api],
     );
-    const openProject = useCallback((name: string) => {
-        window.location.assign(projectHref(name));
-    }, []);
+    // Opening a project stays in this page and keeps a loaded agent (K24).
+    const openProject = projectWindow.open;
 
     const [project, setProject] = useState('');
+    const selectionScope = `${project}:${workspace}`;
+    const onSelectionEvidence = useCallback((context: BrowserChatContext | undefined) => {
+        setProactiveSelection(previous => context
+            ? previous?.scope === selectionScope && previous.context.text === context.text ? previous : { scope: selectionScope, context }
+            : undefined);
+    }, [selectionScope]);
+    useEffect(() => { setProactiveSelection(undefined); setChatGraphSelection(undefined); setChatAttachment(undefined); }, [project]);
     const [projectDetail, setProjectDetail] = useState('resolving project ...');
     const [serverOk, setServerOk] = useState<boolean | undefined>(undefined);
     const [counts, setCounts] = useState<{ nodes?: number; edges?: number }>({});
@@ -1109,7 +1149,6 @@ export default function App(): JSX.Element {
 
     const [galaxyOn, setGalaxyOn] = useState(true);
     const [layout, setLayout] = useState<GraphData | undefined>(undefined);
-    const [analysisSelection, setAnalysisSelection] = useState<{ project: string; target?: SelectionImpactTarget }>();
     const [sourceEvidence, setSourceEvidence] = useState<{ project: string; target: SourceEvidenceTarget }>();
     const [hits, setHits] = useState<RankedHit[]>(noHits);
     const [selectedHit, setSelectedHit] = useState(0);
@@ -1387,7 +1426,6 @@ export default function App(): JSX.Element {
     const [bugMessage, setBugMessage] = useState('');
     const bugTicket = useRef(0);
 
-    const impactOpen = explainOpen && explainTab === 'change';
     // ------------------------------------------ Das lokale Modell (W5a) ----
 
     /*
@@ -2327,7 +2365,7 @@ export default function App(): JSX.Element {
      * Wie oft der Index ein Symbol erreicht, aus dem geladenen Layout.
      *
      * Die flache Suchform des Servers traegt keine solche Spalte
-     * (UPSTREAM-ASKS.md, Ask 5), das Layout traegt sie an jedem Knoten. Solange
+     * des Fan-in; das Layout traegt sie an jedem Knoten. Solange
      * keines geladen ist, hat kein Kandidat eine Zahl, und das entscheidet nur
      * bei Gleichstand.
      */
@@ -2635,7 +2673,6 @@ export default function App(): JSX.Element {
         tour === undefined
         && !entryOpen
         && !bugOpen
-        && !impactOpen
         && project.length > 0
         && !whyDismissed
         && (whyReopened || (!whyAnswer.asked && activePath.length === 0));
@@ -2745,7 +2782,7 @@ export default function App(): JSX.Element {
             } else if (intent === 'bug') {
                 openExplain('bug');
             } else if (intent === 'change') {
-                openExplain('change');
+                changeWorkspace('explore');
             }
         },
         [openExplain, project, changeWorkspace, store],
@@ -3258,7 +3295,7 @@ export default function App(): JSX.Element {
                 context: {
                     focusName: twinSymbol?.name,
                     focusQualifiedName: twinSymbol?.qualifiedName,
-                    mode: bugOpen ? 'bug' : impactOpen ? 'change' : entryOpen ? 'entry'
+                    mode: bugOpen ? 'bug' : entryOpen ? 'entry'
                         : tour !== undefined ? 'tour' : 'none',
                 },
                 ...(twinSymbol === undefined ? {} : { focus: twinSymbol }),
@@ -3276,7 +3313,7 @@ export default function App(): JSX.Element {
             }, id).then(put);
         },
         [
-            bugOpen, chatDepth, entryOpen, impactOpen, llmFacts, llmMode, llmModel, llmState,
+            bugOpen, chatDepth, entryOpen, llmFacts, llmMode, llmModel, llmState,
             observedInto, project, provider, tour, twinSymbol,
         ],
     );
@@ -3667,17 +3704,6 @@ export default function App(): JSX.Element {
             }
             if (guard.walkRunning && playerIntent(event.key) !== 'none') {
                 return;
-            }
-            const intent = commandLineIntent(event, target);
-            if (intent === undefined) {
-                return;
-            }
-            // Abbestellt, damit das Zeichen nicht zweimal ankommt: einmal von
-            // hier und einmal von der Vorgabe, sobald das Feld den Fokus hat.
-            event.preventDefault();
-            window.dispatchEvent(new Event(OPEN_COMMAND_SEARCH_EVENT));
-            if (intent.kind === 'type') {
-                setCommand((current) => current + intent.text);
             }
         };
         window.addEventListener('keydown', onKeyDown, KEY_LISTENER_OPTIONS);
@@ -4256,17 +4282,6 @@ export default function App(): JSX.Element {
                 openExplain('bug');
             },
         },
-        {
-            key: 'impact',
-            shortcut: 'c',
-            label: IMPACT_MENU_LABEL,
-            title: messages.menu.impact,
-            onSelect: () => {
-                setEntryOpen(false);
-                setWhyReopened(false);
-                openExplain('change');
-            },
-        },
         /*
          * Der Weg zurueck aus AC3, als Menuepunkt.
          *
@@ -4318,8 +4333,8 @@ export default function App(): JSX.Element {
         {
             key: 'projects',
             shortcut: 'p',
-            label: 'Add project index',
-            title: 'Choose a repository folder to index',
+            label: messages.projects.addIndexLabel,
+            title: messages.projects.addIndexTitle,
             onSelect: () => setProjectsOpen((open) => !open),
         },
         /*
@@ -4489,8 +4504,6 @@ export default function App(): JSX.Element {
         : node.file_path === inspector.filePath && (node.label === 'File' || node.label === 'Module'));
     const exploreEvidence = ({ filePath, line, name }: SourceEvidenceTarget): void => {
         setSourceEvidence(undefined);
-        setAnalysisSelection(undefined);
-        if (impactOpen) collapseExplain();
         changeWorkspace('explore');
         setPinnedCode(undefined);
         const target = twinTargetOf({ filePath, startLine: line, name: name ?? filePath, kind: 'unknown' });
@@ -4508,24 +4521,33 @@ export default function App(): JSX.Element {
         setGalaxySelection(undefined);
         setGalaxySelectionProject('');
         setChatGraphSelection(undefined);
+        setProactiveSelection(undefined);
     };
-    const inspectorImpactTarget = inspector.filePath ? { filePath: inspector.filePath,
-        qualifiedName: inspector.symbol?.qualifiedName, id: inspector.symbol ? inspectorNode?.id : undefined,
-        name: inspector.symbol?.name, line: inspectorNode?.start_line } : undefined;
-    const mapImpactTarget = activeGalaxySelection?.file_path ? { filePath: activeGalaxySelection.file_path,
-        qualifiedName: ['File', 'Module'].includes(activeGalaxySelection.label) ? undefined : activeGalaxySelection.qualified_name,
-        id: ['File', 'Module'].includes(activeGalaxySelection.label) ? undefined : activeGalaxySelection.id,
-        name: activeGalaxySelection.name, line: activeGalaxySelection.start_line } : undefined;
-    const openSelectionImpact = (target?: SelectionImpactTarget) => setAnalysisSelection({ project, target });
+    const readerImpactTarget = activePath ? { filePath: activePath,
+        qualifiedName: markedGraphRange ? readerFocusSymbol?.qualifiedName : undefined,
+        name: markedGraphRange ? readerFocusSymbol?.name : undefined } : undefined;
     const selectMapNode = (node: GraphNode): void => {
         setGalaxySelection(node);
         setGalaxySelectionProject(project);
     };
     const mapSelectionPanel = selectionUnavailable ? <p role="status" className="repo-map-note">{selectionUnavailableText}</p> : activeGalaxySelection && (workspace === 'architecture' || workspace === 'galaxy') && <>
         <SelectionContextPanel graph={evidenceGraph} selected={activeGalaxySelection}
-            path={activeGalaxySelection.file_path ?? ''} agents={experimentalAgentsEnabled ? agents.state : undefined} onNavigate={navigateEvidence}
-            onImpact={() => openSelectionImpact(mapImpactTarget)} />
+            path={activeGalaxySelection.file_path ?? ''} agents={experimentalAgentsEnabled ? agents.state : undefined} onNavigate={navigateEvidence} />
     </>;
+    /*
+     * Galaxy reads its selection from the loaded scope (hand test K13). The
+     * repository snapshot is capped at 20,000 nodes by file path; a symbol in
+     * the scope but behind that cap is still a valid selection here.
+     */
+    const galaxySelectionPanel = (scope: SelectionScope | undefined) => {
+        const raw = galaxySelectionProject === project ? galaxySelection : undefined;
+        const inScope = raw && scope?.graph.nodes.some(node => raw.qualified_name
+            ? node.qualified_name === raw.qualified_name && node.file_path === raw.file_path : node.id === raw.id);
+        const selected = inScope ? raw : activeGalaxySelection;
+        if (!selected) return selectionUnavailable ? <p role="status" className="repo-map-note">{selectionUnavailableText}</p> : undefined;
+        return <SelectionContextPanel graph={evidenceGraph} selected={selected} scope={scope}
+            path={selected.file_path ?? ''} agents={experimentalAgentsEnabled ? agents.state : undefined} onNavigate={navigateEvidence} />;
+    };
     const followInspectorTarget = (target: SymbolRef): void => {
         setPinnedCode(undefined);
         followTarget(target);
@@ -4568,7 +4590,8 @@ export default function App(): JSX.Element {
         <GalaxyPanel
             project={project}
             onClearSelection={clearGraphSelection}
-            selectionPanel={workspace === 'galaxy' ? mapSelectionPanel : undefined}
+            onSelectionEvidence={workspace === 'galaxy' ? onSelectionEvidence : undefined}
+            selectionPanel={workspace === 'galaxy' ? galaxySelectionPanel : undefined}
             visible={workspace === 'galaxy' || (workspace === 'explore' && galaxyOn)}
             workspaceExpanded={workspace === 'galaxy'}
             focusQualifiedName={workspace === 'galaxy' ? activeGalaxySelection?.qualified_name : markedGraphRange ? readerFocusSymbol?.qualifiedName : undefined}
@@ -4580,16 +4603,12 @@ export default function App(): JSX.Element {
             onSelectNode={workspace === 'galaxy' ? (node) => {
                 setGalaxySelection(node);
                 setGalaxySelectionProject(project);
-                setChatGraphSelection(selectedGraphContext(layout, node, project, crypto.randomUUID()));
             } : undefined}
             onSelectShadowNode={(node) => {
                 setGalaxySelection(undefined);
-                setChatGraphSelection({ id: crypto.randomUUID(), label: workspaceText.coverageShadowSelection(node.name),
-                    text: JSON.stringify({ project, source: '/api/layout missed_graph', layer: 'coverage-shadow',
-                        selected: { id: node.sourceId, name: node.name, path: node.file_path, kind: node.label },
-                        coverage: 'Not fully indexed. Detailed reasons, source ranges, and freshness are unavailable in this layout.',
-                        limitation: 'This is coverage metadata, not a code symbol or proof that code is absent.' }, null, 2) });
-                setBrowserAiOpen(true);
+                onSelectionEvidence(selectionEvidenceContext({ project, view: 'galaxy-coverage', source: '/api/layout missed_graph',
+                    label: messages.galaxy.coverageSelection(node.name), selected: { id: node.sourceId, name: node.name, path: node.file_path, kind: node.label },
+                    limitations: 'Coverage metadata only, not a code symbol. Detailed reasons, source ranges, relationships and freshness are unavailable.' }));
             }}
             onLayout={onLayout}
             walk={workspace === 'galaxy' ? undefined : walk}
@@ -4635,7 +4654,7 @@ export default function App(): JSX.Element {
         walkStep: tourStep,
         walkSteps: tour?.document.steps.length ?? 0,
         chatTurns: chatTurns.length,
-    });
+    }).filter(tab => tab.id !== 'change');
     explainTabsRef.current = explainTabList;
 
     /*
@@ -4771,6 +4790,9 @@ export default function App(): JSX.Element {
             ir: matchingInspectorIr(liveCode.ir, symbol, project, activePath), selection }, crypto.randomUUID()));
         setBrowserAiOpen(true);
     };
+    // The chat grounds explanations in the selected symbol's source, read like "Read source evidence" (K14).
+    const readSymbolSource = useCallback((qualifiedName: string, window: { maxLines: number }) =>
+        client.getCodeSnippet(project, qualifiedName, window), [client, project]);
     const clearAttachment = (id: string): void => {
         setChatAttachment(current => current?.id === id ? undefined : current);
     };
@@ -4784,36 +4806,30 @@ export default function App(): JSX.Element {
             projectSwitcher={<ProjectSwitcher currentProject={project} listProjects={projectsSource.listProjects}
                 onSelectProject={openProject} onAddProject={() => setProjectsOpen(true)} indexActivity={indexActivity} />}
             onWorkspaceChange={value => { setDiagnosticsPath(undefined); changeWorkspace(value); }}
-            onOpenBrowserAi={() => setBrowserAiOpen(open => !open)}
+            onOpenBrowserAi={openAgentSettings}
+            onToggleBrowserAi={() => setBrowserAiOpen(open => !open)}
+            agentState={localAgentState} agentModelName={agentModelName}
             onOpenSystem={() => changeWorkspace('system')}
             daemonState={serverOk === undefined ? 'checking' : serverOk ? 'connected' : 'disconnected'}
             chatOpen={browserAiOpen}
             chatDock={<BrowserChatDock open={browserAiOpen} onClose={() => setBrowserAiOpen(false)}
-                showCollapsed={workspace === 'explore'} onOpen={() => setBrowserAiOpen(true)}
+                historyKey={project ? browserChatHistoryProjectKey(window.location.origin, project) : undefined}
+                proactiveSelection={proactiveSelection?.scope === selectionScope ? proactiveSelection.context : undefined}
+                selectionScope={selectionScope} onAgentStateChange={onAgentStateChange} onAgentModelChange={setAgentModelName} settingsRequest={agentSettingsRequest}
                 readerContext={workspace === 'explore' ? currentReaderContext : undefined}
                 pendingContext={chatGraphSelection} onContextConsumed={clearChatGraphSelection} onContextRemoved={clearChatGraphSelection}
                 context={browserGraphContext(inspector.ir, project, inspector.filePath, inspector.symbol ? workspacePathOf(inspector.symbol.uri) : '')}
-                attachment={chatAttachment} onAttachmentConsumed={clearAttachment} onAttachmentRemoved={clearAttachment} />}
+                attachment={chatAttachment} onAttachmentConsumed={clearAttachment} onAttachmentRemoved={clearAttachment} readSource={readSymbolSource} />}
             readerActions={<>
                 <button type="button" disabled={!liveSelection} aria-keyshortcuts="Control+Shift+L Meta+Shift+L"
                     onClick={() => { if (liveSelection) attachSelection(liveSelection); }}>{workspaceText.askSelection}</button>
-                <button type="button" disabled={!inspector.filePath} onClick={() => openSelectionImpact(inspectorImpactTarget)}>{workspaceText.assessImpact}</button>
                 <button type="button" aria-expanded={codeDetailsOpen} onClick={() => setCodeDetailsOpen(open => !open)}>{workspaceText.codeDetails}</button>
             </>}
+            readerSummary={workspace === 'explore' && activePath ? <FileImpactSummary
+                project={project} target={readerImpactTarget}
+                onOpen={target => exploreEvidence({ filePath: target.filePath, line: target.line, name: target.name })} /> : undefined}
             readerDetails={codeDetailsOpen ? selectedCode : undefined}
             globalOverlay={<>
-                {(impactOpen || analysisSelection?.project === project) && <div className="atlas-analysis-overlay" role="dialog" aria-label={workspaceText.changeAnalysis} onKeyDown={event => {
-                    event.stopPropagation();
-                    if (event.key === 'Escape') { setAnalysisSelection(undefined); if (impactOpen) collapseExplain(); }
-                }}><ChangeAnalysisWorkspace key={project} project={project} client={client}
-                    selectedTarget={analysisSelection?.project === project ? analysisSelection.target : (workspace === 'architecture' || workspace === 'galaxy') ? mapImpactTarget : inspectorImpactTarget}
-                    initialMode={analysisSelection?.project === project ? 'selection' : 'worktree'} expectedGeneration={repositoryReading.snapshot?.generation}
-                    onOpenSource={target => navigateEvidence(target.filePath, target.line, target.name)}
-                    onDiagnose={() => {
-                        setDiagnosticsPath((workspace === 'architecture' || workspace === 'galaxy') ? activeGalaxySelection?.file_path : activePath || undefined);
-                        setAnalysisSelection(undefined); if (impactOpen) collapseExplain();
-                        changeWorkspace('coverage');
-                    }} onClose={() => { setAnalysisSelection(undefined); if (impactOpen) collapseExplain(); }} /></div>}
                 {sourceEvidence?.project === project && <SourceEvidenceDrawer key={`${project}:${sourceEvidence.target.filePath}:${sourceEvidence.target.line ?? 1}`}
                     project={project} target={sourceEvidence.target} graph={evidenceGraph} client={client}
                     onClose={() => setSourceEvidence(undefined)} onExplore={exploreEvidence} />}
@@ -4824,7 +4840,7 @@ export default function App(): JSX.Element {
                     onOpenProject={openProject} onClose={() => setProjectsOpen(false)} />
                 {helpOpen && <HelpOverlay onClose={() => setHelpOpen(false)} />}
                 {settingsOpen && <SettingsPanel project={project} state={llmState} facts={llmFacts}
-                    onOpenBrowserModels={() => { setSettingsOpen(false); setBrowserAiOpen(true); }}
+                    onOpenBrowserModels={() => { setSettingsOpen(false); openAgentSettings(); }}
                     router={llmRouter} models={llmModels} selectedModel={selectedModel}
                     onSelectModel={chooseModel}
                     display={display} onDisplay={changeDisplay}
@@ -4837,7 +4853,9 @@ export default function App(): JSX.Element {
             workspacePanel={<>
                 <div hidden={workspace !== 'architecture'}>
                 <ArchitecturePanel projectName={project} overview={overview} active={workspace === 'architecture'}
+                    escapeTaken={helpOpen || entryOpen || overlayOpen || settingsOpen || projectsOpen}
                     onClearSelection={clearGraphSelection}
+                    onSelectionEvidence={onSelectionEvidence}
                     coverage={coverageAsked && coverageMeta.generation === repositoryReading.snapshot?.generation ? coverage : undefined}
                     readSource={readMapSource}
                     graph={repositoryReading.snapshot} graphGeneration={repositoryReading.snapshot?.generation} selection={activeGalaxySelection} selectionPanel={mapSelectionPanel}
@@ -4858,7 +4876,9 @@ export default function App(): JSX.Element {
                     <AdrWorkspace key={project} project={project} source={projectsSource} active={workspace === 'adr'} />
                 </div>
                 <div hidden={workspace !== 'system'}>
-                    <SystemWorkspace api={api} project={project} active={workspace === 'system'} version={ATLAS_VERSION}
+                    <SystemWorkspace api={api} listProjects={projectsSource.listProjects} project={project} active={workspace === 'system'} version={ATLAS_VERSION}
+                        configuration={active => <ConfigPanel embedded active={active} service={api} project={project} display={display} onDisplay={changeDisplay}
+                            onOpenBrowserModels={openAgentSettings} onOpenDisplay={() => setSettingsOpen(true)} onClose={() => {}} />}
                         onOpenProjects={() => setProjectsOpen(true)} />
                 </div>
                 <div hidden={workspace !== 'coverage'}>

@@ -18,6 +18,18 @@ it('reads cursor pages without losing the project, query or row order', async ()
     expect(rpc.calls[1].args).toEqual({ project: 'project-a', query: 'MATCH query', cursor: 'q1.next' });
 });
 
+it('sends a page budget as max_rows and max_output_tokens only when one is asked for (hand test K8)', async () => {
+    const { client: c, rpc } = client();
+    await c.queryGraph('p', 'q', undefined, { maxRows: 5000, maxOutputTokens: 600000 });
+    await c.queryGraph('p', 'q', 'q1.next', { maxRows: 5000, maxOutputTokens: 600000 });
+    await c.queryGraph('p', 'q');
+    expect(rpc.calls.map(call => call.args)).toEqual([
+        { project: 'p', query: 'q', max_rows: 5000, max_output_tokens: 600000 },
+        { project: 'p', query: 'q', cursor: 'q1.next', max_rows: 5000, max_output_tokens: 600000 },
+        { project: 'p', query: 'q' },
+    ]);
+});
+
 it('keeps truncation metadata on the single-page API', async () => {
     expect(await client().client.queryGraph('p', 'q')).toMatchObject({ total: 2, returned: 1, truncated: true, nextCursor: 'q1.next' });
 });

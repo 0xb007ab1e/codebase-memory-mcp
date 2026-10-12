@@ -1,14 +1,7 @@
 /*
- * Das Chrome der Lese-IDE: Kopfzeile, Tabs, Explorer, Reader, Kommandozeile,
- * Statusleiste. Die Farben kommen aus tokens.css, hier steht nur Anordnung.
- *
- * Der Aufbau folgt design/design.png: eine Spalte fuer den Baum, daneben der
- * Editor, rechts das SEMANTIC_TWIN-Panel, oben zwei Zeilen (Marke plus Menue,
- * dann Tabs), unten zwei Zeilen (Kommandozeile, Statusleiste).
- *
- * Die dritte Spalte gibt es nur, wenn ein Panel hereingereicht wurde
- * (`[data-twin='true']`). Eine leere Spalte zu reservieren waere die
- * Behauptung, es gaebe dort etwas, das gerade nichts sagt.
+ * Workspace layout; colors come from tokens.css. The explorer and reader
+ * share the main area. Reserve a third column only when a context panel is
+ * present (`[data-twin='true']`).
  */
 
 * {
@@ -85,6 +78,9 @@ body {
 }
 
 .atlas-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
     margin: 0;
     font-size: 15px;
     font-weight: 700;
@@ -92,22 +88,23 @@ body {
     color: var(--atlas-phosphor);
 }
 
-.atlas-version {
-    color: var(--atlas-dim);
+.atlas-brand-beta {
+    padding: 3px 6px;
+    border: 1px solid rgb(200 173 114 / 28%);
+    border-radius: 4px;
+    background: rgb(200 173 114 / 7%);
+    color: #c8ad72;
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1.2;
     letter-spacing: 0.06em;
+    text-shadow: none;
 }
 
-/*
- * Der Zustand des Arbeitsbaums, neben der Fassung und leiser als sie.
- *
- * Kleiner und gedimmt, weil er eine Randbemerkung ist: wer die Fassung sucht,
- * liest den Chip, und wer wissen will, ob ein Bild zu einem Commit gehoert,
- * findet daneben die Antwort.
- */
-.atlas-version-suffix {
+.atlas-version {
     color: var(--atlas-dim);
-    opacity: 0.7;
-    font-size: 10px;
+    opacity: 0.65;
+    font-size: 9px;
     letter-spacing: 0.06em;
 }
 
@@ -2369,8 +2366,8 @@ button.atlas-galaxy-legend-swatch:hover {
 /*
  * Der Weg zurueck zur eingepassten Ansicht (W10b, AC5).
  *
- * Oben rechts in der Szene, halbtransparent, in derselben Schrift wie alles
- * hier. Er liegt bewusst IM Bild und nicht im Kopf: die Kopfzeile ist bei 440
+ * Oben rechts in der Szene, deckend (Review zu K29: durch 82 % schien ein
+ * Name der Szene hindurch), in derselben Schrift wie alles hier. Er liegt bewusst IM Bild und nicht im Kopf: die Kopfzeile ist bei 440
  * Pixeln Breite voll (siehe .atlas-galaxy-head-row), und ein Wort mehr darin
  * haette den Zuklapper abgeschnitten. Die andere Ecke gehoert dem Instrument
  * der Agentenebene, also stehen sich die beiden nie im Weg.
@@ -2382,7 +2379,7 @@ button.atlas-galaxy-legend-swatch:hover {
     z-index: 3;
     padding: 1px 6px;
     border: 1px solid var(--atlas-line);
-    background: rgb(10 14 13 / 82%);
+    background: rgb(10 14 13);
     color: var(--atlas-dim);
     font: inherit;
     font-size: 11px;
@@ -2940,11 +2937,7 @@ button.atlas-galaxy-legend-swatch:hover {
 
 /* ---------------------------------------------------------- Schrittkarte - */
 
-/*
- * Die Karte sitzt in der Editorspalte unter dem Reader und schiebt ihn hoch,
- * statt ihn zu verdecken: sie erklaert den Schritt, und der Quelltext daneben
- * ist das, was sie erklaert. Vorlage ist design/design.png.
- */
+/* Keep the step card below the reader so its source remains visible. */
 .atlas-tour {
     flex: 0 0 auto;
     padding: 10px 16px 12px;
@@ -5881,8 +5874,9 @@ button.atlas-settings-model-pick:focus-visible {
 /*
  * Das Instrument unten rechts.
  *
- * Halbtransparent ueber dem Graphen, in derselben Schrift und mit denselben
- * duennen Raendern wie der Rest der Oberflaeche. Kein Glassmorphism: keine
+ * Deckend ueber dem Graphen (Review zu K29: durch eine halbtransparente
+ * Flaeche schienen die Namen der Szene hindurch), in derselben Schrift und mit
+ * denselben duennen Raendern wie der Rest der Oberflaeche. Kein Glassmorphism: keine
  * Weichzeichnung, kein Verlauf, kein runder Kasten. Was hier "fancy" ist, kommt
  * aus dem Licht der Koerper daneben und nicht aus der Flaeche.
  */
@@ -5897,7 +5891,7 @@ button.atlas-settings-model-pick:focus-visible {
     max-width: calc(100% - 16px);
     max-height: calc(100% - 16px);
     border: 1px solid var(--atlas-line);
-    background: rgb(10 14 13 / 88%);
+    background: rgb(10 14 13);
     color: var(--atlas-fg);
     font-family: var(--atlas-font);
     font-size: 11px;
@@ -6342,7 +6336,7 @@ button.atlas-settings-model-pick:focus-visible {
     margin: 0 0 2px;
     padding: 2px 8px;
     border: 1px solid var(--atlas-line);
-    background: rgb(10 14 13 / 88%);
+    background: rgb(10 14 13);
     color: var(--atlas-agent-color, var(--atlas-fg));
     font-size: 11px;
     white-space: nowrap;
@@ -6366,7 +6360,7 @@ button.atlas-settings-model-pick:focus-visible {
     gap: 2px;
     padding: 3px 8px 4px;
     border-top: 1px solid var(--atlas-line);
-    background: rgb(10 14 13 / 92%);
+    background: rgb(10 14 13);
     font-family: var(--atlas-font);
     font-size: 10px;
 }

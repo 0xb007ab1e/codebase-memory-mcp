@@ -1,6 +1,6 @@
 /**
- * Das Chrome: Kopfzeile, Menue, Tabs, Explorer, Breadcrumb, Reader-Flaeche,
- * Kommandozeile, Statusleiste. Vorlage ist design/design.png.
+ * Workspace chrome: header, menu, tabs, explorer, breadcrumbs, reader,
+ * command line, and status bar.
  *
  * Rein darstellend, und das ist der Punkt: der Reader kommt als `children`
  * herein, nicht als Import. So laesst sich das ganze Chrome in jsdom pruefen,
@@ -15,7 +15,7 @@
  * Verdrahtung wird NICHT gezeichnet. Ein Tooltip macht aus einer Attrappe keine
  * Auskunft, sondern eine Attrappe mit Fussnote, und ein Menue, das sich
  * anklicken laesst und schweigt, ist die Sorte stille Luege, gegen die dieses
- * Produkt gebaut ist (PLAN.md Abschnitt 6, Ehrlichkeitsregeln).
+ * Produkt gebaut ist.
  *
  * Das ist hier die Notbremse und nicht der Normalfall: welche Punkte es gibt,
  * entscheidet `messages.menu.items`, und dass jeder davon einen Buchstaben in
@@ -37,6 +37,7 @@ import { LAYOUT_DEFAULT } from '../layout/layout-model';
 import Splitter from '../layout/Splitter';
 import { availableWorkspaces, workspaceStrings } from './workspace-strings';
 import type { Workspace, Guidance } from './workspace-strings';
+import './agent-status.css';
 
 /** Ein Menuepunkt: sein Buchstaben-Kuerzel und der Rest des Wortes. */
 export interface MenuItem {
@@ -139,13 +140,19 @@ export interface TabDescriptor {
 
 export interface AtlasChromeProps {
     projectSwitcher?: ReactNode;
+    onOpenConfig?: () => void;
+    configOpen?: boolean;
     onOpenBrowserAi?: () => void;
+    agentState?: 'off' | 'loading' | 'active' | 'busy' | 'error';
+    agentModelName?: string;
+    onToggleBrowserAi?: () => void;
     chatOpen?: boolean;
     chatDock?: ReactNode;
     /** Persistent code context, shared by the Explore sidebar and chat column. */
     selectionInspector?: ReactNode;
     readerActions?: ReactNode;
     readerDetails?: ReactNode;
+    readerSummary?: ReactNode;
     onOpenSystem?: () => void;
     daemonState?: 'connected' | 'disconnected' | 'checking';
     globalOverlay?: ReactNode;
@@ -157,16 +164,7 @@ export interface AtlasChromeProps {
     guidance?: Guidance;
     /** Versions-Chip, zur Buildzeit injiziert. Nur die Fassung, ohne Zusatz. */
     version: string;
-    /**
-     * Der Zusatz neben dem Chip: `dirty`, wenn beim Bauen etwas uncommitted war.
-     *
-     * Ein eigenes Element und nicht ein Anhaengsel im Chip, weil es eine andere
-     * Aussage ist: der Chip nennt die Fassung, der Zusatz den Zustand des
-     * Baums, aus dem sie gebaut wurde. Zusammengeschrieben liest sich das wie
-     * eine Fassung namens "1.0.0-dirty", die es als Release nie gibt. Fehlt der
-     * Zusatz, steht dort nichts: ein leeres Element waere ein Platz, an dem
-     * jemand eine Angabe vermutet.
-     */
+    /** Build diagnostics are accepted for compatibility but not shown in the header. */
     buildSuffix?: string;
     chips: Chip[];
     tabs: TabDescriptor[];
@@ -533,16 +531,12 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
      * taete dasselbe fuer das Auge, aber nicht fuer den Beweislauf, der lesen
      * koennen soll, was die Oberflaeche ueber sich behauptet.
      */
-    const [commandFocused, setCommandFocused] = useState(false);
     const [chatWidth, setChatWidth] = useState(420);
     const [graphShare, setGraphShare] = useState(1 / 3);
     const [chatColumnHeight, setChatColumnHeight] = useState(600);
     const chatColumn = useRef<HTMLDivElement>(null);
     const graphSpace = Math.max(1, chatColumnHeight - 8);
     const graphHeight = graphSpace * graphShare;
-    const [searchOpen, setSearchOpen] = useState(false);
-    const searchDialog = useRef<HTMLDialogElement>(null);
-    const searchOpener = useRef<HTMLElement | null>(null);
     const inlineGalaxyHost = useRef<HTMLDivElement>(null);
     const chatGalaxyHost = useRef<HTMLDivElement>(null);
     const inlineInspectorHost = useRef<HTMLDivElement>(null);
@@ -588,52 +582,24 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
         return () => { galaxyMount?.remove(); };
     }, [galaxyMount, graphBelowChat]);
 
-    const openSearch = useCallback(() => {
-        if (!searchDialog.current?.open) {
-            searchOpener.current = document.activeElement instanceof HTMLElement
-                ? document.activeElement : null;
-        }
-        setSearchOpen(true);
-        if (searchDialog.current?.open) searchDialog.current.querySelector<HTMLInputElement>('.atlas-command-input')?.focus();
-    }, []);
-    const closeSearch = useCallback(() => setSearchOpen(false), []);
     useEffect(() => {
-        const onKey = (event: globalThis.KeyboardEvent): void => {
+        const focusGalaxySearch = () => {
+            props.onWorkspaceChange?.('galaxy');
+            requestAnimationFrame(() => window.dispatchEvent(new Event('cbm:focus-galaxy-search')));
+        };
+        const onKey = (event: globalThis.KeyboardEvent) => {
             if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
                 event.preventDefault();
-                event.stopPropagation();
-                openSearch();
+                focusGalaxySearch();
             }
         };
-        window.addEventListener(OPEN_COMMAND_SEARCH_EVENT, openSearch);
-        window.addEventListener(CLOSE_COMMAND_SEARCH_EVENT, closeSearch);
-        window.addEventListener('keydown', onKey, true);
+        window.addEventListener(OPEN_COMMAND_SEARCH_EVENT, focusGalaxySearch);
+        window.addEventListener('keydown', onKey);
         return () => {
-            window.removeEventListener(OPEN_COMMAND_SEARCH_EVENT, openSearch);
-            window.removeEventListener(CLOSE_COMMAND_SEARCH_EVENT, closeSearch);
-            window.removeEventListener('keydown', onKey, true);
+            window.removeEventListener(OPEN_COMMAND_SEARCH_EVENT, focusGalaxySearch);
+            window.removeEventListener('keydown', onKey);
         };
-    }, [openSearch, closeSearch]);
-    useLayoutEffect(() => {
-        const dialog = searchDialog.current;
-        if (dialog === null) return;
-        if (searchOpen) {
-            if (!dialog.open) {
-                if (typeof dialog.showModal === 'function') dialog.showModal();
-                else dialog.setAttribute('open', '');
-            }
-            dialog.querySelector<HTMLInputElement>('.atlas-command-input')?.focus();
-        } else if (dialog.open) {
-            if (typeof dialog.close === 'function') dialog.close();
-            else dialog.removeAttribute('open');
-            const opener = searchOpener.current;
-            if (opener?.isConnected && !dialog.contains(opener)) opener.focus();
-            else dialog.closest('.atlas-shell')?.querySelector<HTMLButtonElement>('[data-workspace-tab][aria-selected="true"]')?.focus();
-        }
-    }, [searchOpen]);
-    const examples = props.commandExamples ?? [];
-    const showExamples =
-        commandFocused && examples.length > 0 && props.commandValue.trim().length === 0;
+    }, [props.onWorkspaceChange]);
 
     /*
      * Die Masse mit ihrer Vorgabe, an einer Stelle.
@@ -647,28 +613,13 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
     const hasSide =
         hasInspector || props.twin !== undefined || (props.galaxy !== undefined && !graphBelowChat) || props.llm !== undefined;
 
-    const stopTabKeys = (event: KeyboardEvent<HTMLInputElement>): void => {
-        if (event.key === 'Escape') {
-            event.preventDefault();
-            event.stopPropagation();
-            closeSearch();
-            return;
-        }
-        props.onCommandKeyDown?.(event);
-    };
-
     return (
         <div className="atlas-shell" data-workspace={props.workspace ?? 'explore'} data-guidance={props.guidance ?? 'brief'} data-chat-open={showChatColumn} data-has-status={props.workspaceStatus !== undefined}>
             <header className="atlas-header" data-testid="atlas-header">
-                <h1 className="atlas-brand">{messages.app.brand}</h1>
+                <h1 className="atlas-brand">{messages.app.brand}{' '}<span className="atlas-brand-beta">{messages.app.releaseLabel}</span></h1>
                 <span className="atlas-version" data-testid="atlas-version">
-                    {props.version}
+                    {props.version.replace(/-dirty$/, '')}
                 </span>
-                {(props.buildSuffix ?? '').length > 0 && (
-                    <span className="atlas-version-suffix" data-testid="atlas-version-suffix">
-                        {props.buildSuffix}
-                    </span>
-                )}
                 {/*
                   * Sechs Eintraege, EINE Gestalt.
                   *
@@ -712,7 +663,18 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
                     ))}
                 </div>
                 {props.projectSwitcher}
-                {props.onOpenBrowserAi !== undefined && <button type="button" className="atlas-browser-ai-action" aria-expanded={props.chatOpen === true} onClick={props.onOpenBrowserAi}>{workspaceStrings.browserAi}</button>}
+                {(props.onOpenBrowserAi !== undefined || props.onToggleBrowserAi !== undefined) && <div className="atlas-agent-controls" role="group" aria-label={workspaceStrings.agentControls}>
+                    {props.onOpenBrowserAi !== undefined && <button type="button" className="atlas-browser-ai-action" data-state={props.agentState ?? 'off'}
+                        aria-label={workspaceStrings.agentSettings(workspaceStrings.agentStatus[props.agentState ?? 'off'], props.agentModelName || undefined)}
+                        title={workspaceStrings.agentSettingsTitle(workspaceStrings.agentStatus[props.agentState ?? 'off'], props.agentModelName || undefined)} onClick={props.onOpenBrowserAi}>
+                        {/* Derselbe Strich und dasselbe Raster wie der Chat-Schalter daneben; den Zustand traegt die Lampe. */}
+                        <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M10 3v3" /><circle cx="10" cy="2.5" r="1" fill="currentColor" stroke="none" /><rect x="3.5" y="6" width="13" height="10" rx="2.5" /><path d="M1.5 10v3M18.5 10v3" /><circle cx="7.5" cy="10.5" r="1.2" fill="currentColor" stroke="none" /><circle cx="12.5" cy="10.5" r="1.2" fill="currentColor" stroke="none" /><path d="M8 13.5h4" /></svg>
+                        <span aria-hidden="true" />
+                    </button>}
+                    {props.onToggleBrowserAi !== undefined && <button type="button" className="atlas-agent-chat-toggle" aria-expanded={props.chatOpen === true} aria-label={props.chatOpen ? workspaceStrings.hideChat : workspaceStrings.openChat} title={props.chatOpen ? workspaceStrings.hideChat : workspaceStrings.openChat} onClick={props.onToggleBrowserAi}>
+                        <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="2" y="3" width="16" height="14" rx="2" /><path d="M12 3v14" /><path className="atlas-agent-chat-toggle-pane" d="M12 3h4a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-4z" stroke="none" /></svg>
+                    </button>}
+                </div>}
             </header>
 
             {props.workspaceStatus}
@@ -767,6 +729,7 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
                         )}
                         {props.readerActions !== undefined && <div className="atlas-reader-actions">{props.readerActions}</div>}
                     </div>
+                    {props.readerSummary}
                     {props.readerDetails && <section className="atlas-reader-details" aria-label={workspaceStrings.codeDetails}>{props.readerDetails}</section>}
                     {props.coverageNote !== undefined && (
                         <p
@@ -839,154 +802,7 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
               * Zeigen ueber den Anfang der Zeile. Was er sagte, steht in der
               * Hilfe ([?]help).
               */}
-            <dialog ref={searchDialog} className="atlas-command-palette" aria-labelledby="atlas-search-title"
-                onCancel={(event) => { event.preventDefault(); closeSearch(); }}
-                onClose={closeSearch}
-                onClick={(event) => {
-                    if (event.target !== event.currentTarget) return;
-                    const bounds = event.currentTarget.getBoundingClientRect();
-                    if (event.clientX < bounds.left || event.clientX > bounds.right ||
-                        event.clientY < bounds.top || event.clientY > bounds.bottom) closeSearch();
-                }}>
-            <header className="atlas-search-heading">
-                <h2 id="atlas-search-title">{workspaceStrings.searchTitle}</h2>
-                <button type="button" onClick={closeSearch} aria-label={workspaceStrings.searchClose}>×</button>
-            </header>
-            <div
-                className="atlas-command"
-                data-testid="atlas-command"
-                data-hint-keep="command line"
-                data-focused={commandFocused}
-                data-examples={showExamples}
-                onFocus={() => setCommandFocused(true)}
-                onBlur={(event) => {
-                    if (!event.currentTarget.contains(event.relatedTarget)) {
-                        setCommandFocused(false);
-                    }
-                }}
-            >
-                <div className="atlas-search-options">{props.commandOverlay}</div>
-                {showExamples && (
-                    <div
-                        className="atlas-command-examples"
-                        data-testid="atlas-command-examples"
-                        role="group"
-                        aria-label={messages.command.examplesLabel}
-                    >
-                        <span className="atlas-command-examples-label">
-                            {workspaceStrings.searchExamples}
-                        </span>
-                        {examples.map((example) => (
-                            <button
-                                key={example.id}
-                                type="button"
-                                className="atlas-command-example"
-                                data-testid="atlas-command-example"
-                                data-example={example.id}
-                                data-symbol={example.symbol}
-                                onMouseDown={(event) => {
-                                    // Vor dem Blur des Feldes: ein Klick, der
-                                    // erst nach dem Fokusverlust wirkt, traefe
-                                    // eine Liste, die dann schon zu waere.
-                                    event.preventDefault();
-                                    props.onCommandExample?.(example.text);
-                                }}
-                                onClick={() => props.onCommandExample?.(example.text)}
-                            >
-                                <span className="atlas-command-example-text">{example.text}</span>
-                                <span className="atlas-command-example-note">{example.note}</span>
-                            </button>
-                        ))}
-                    </div>
-                )}
-                <span className="atlas-command-prompt" data-testid="atlas-command-prompt">
-                    {'>'}
-                </span>
-                <input
-                    ref={props.commandInputRef}
-                    className="atlas-command-input"
-                    data-testid="atlas-command-input"
-                    aria-label={messages.command.ariaLabel}
-                    placeholder={props.commandPlaceholder ?? COMMAND_PLACEHOLDER}
-                    value={props.commandValue}
-                    onChange={(event) => props.onCommandChange(event.target.value)}
-                    onKeyDown={stopTabKeys}
-                    autoComplete="off"
-                />
-                <span className="atlas-command-hint">{props.commandHint}</span>
-            </div>
 
-                <nav className="atlas-menu" data-testid="atlas-menu" onClick={event => { if ((event.target as HTMLElement).closest('button')) closeSearch(); }} aria-label={messages.menu.ariaLabel}>
-                    {MENU_ITEMS.map((item) => {
-                        const wiring = props.menus?.[item.key];
-                        return wiring === undefined ? null : (
-                            <span className="atlas-menu-group" key={item.key}>
-                                <Hint name={`menu-${item.key}`} text={wiring.title}>
-                                    <button
-                                        type="button"
-                                        className="atlas-menu-item"
-                                        data-state={wiring.state}
-                                        data-menu={item.key}
-                                        data-testid="atlas-menu-item"
-                                        aria-pressed={wiring.state === 'on'}
-                                        onClick={wiring.onSelect}
-                                    >
-                                        <span className="atlas-menu-key">[{item.key}]</span>
-                                        {item.rest}
-                                    </button>
-                                </Hint>
-                                {(wiring.extras ?? [])
-                                    .filter((extra) => extra.key !== 'bug' && extra.key !== 'impact')
-                                    .map((extra) => {
-                                    const parts = splitMenuLabel(extra.label);
-                                    return (
-                                        <Hint
-                                            key={extra.key}
-                                            name={`menu-${item.key}-${extra.key}`}
-                                            text={extra.title}
-                                        >
-                                            <button
-                                                type="button"
-                                                className="atlas-menu-item"
-                                                /*
-                                                 * `off` und nicht ein dritter
-                                                 * Wert: ein Eintrag der
-                                                 * Atlas-Zeile schaltet eine
-                                                 * Flaeche auf, die beim Zeichnen
-                                                 * der Zeile noch zu ist. `on`
-                                                 * waere die Behauptung, sie
-                                                 * stuende schon da.
-                                                 */
-                                                data-state="off"
-                                                data-menu={`${item.key}-${extra.key}`}
-                                                data-testid="atlas-menu-item"
-                                                onClick={extra.onSelect}
-                                            >
-                                                {parts.key.length > 0 && (
-                                                    <span className="atlas-menu-key">[{parts.key}]</span>
-                                                )}
-                                                {parts.rest}
-                                            </button>
-                                        </Hint>
-                                    );
-                                })}
-                            </span>
-                        );
-                    })}
-                    {/*
-                      * Was die Klammer bedeutet, in der Zeile selbst.
-                      *
-                      * Seit dem 2026-08-29 gilt ein Menuebuchstabe nur mit
-                      * Alt/Option (src/app/keyboard.ts nennt den Grund: blanke
-                      * Buchstaben gehoeren dem Tippen). Ein `[a]` ohne diese
-                      * Angabe waere genau die Sorte Versprechen, die dieser
-                      * Zyklus aus der Zeile entfernt hat.
-                      */}
-                    <span className="atlas-menu-legend" data-testid="atlas-menu-legend">
-                        {messages.menu.legend}
-                    </span>
-                </nav>
-            </dialog>
 
             <div className="atlas-statusbar" data-testid="atlas-statusbar">
                 {props.status.filter((chip) => chip.label === messages.statusbar.chipServer).map((chip) => (

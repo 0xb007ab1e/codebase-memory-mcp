@@ -2,7 +2,7 @@
 .atlas-shell[data-has-status=true] { grid-template-rows: auto auto minmax(0, 1fr) auto; }
 .atlas-header { gap: 12px; padding: 12px 18px; overflow: visible; position: relative; z-index: 20; border-bottom-color: var(--atlas-phosphor-mute); box-shadow: 0 2px 18px var(--atlas-glow); }
 .atlas-brand { font-size: 15px; font-weight: 700; letter-spacing: .22em; color: var(--atlas-phosphor); text-shadow: 0 0 16px var(--atlas-glow); }
-.atlas-version, .atlas-version-suffix { font-size: 10px; color: var(--atlas-dim); }
+.atlas-version { font-size: 9px; color: var(--atlas-dim); }
 .atlas-workspace-tabs { display: flex; gap: 4px; margin-left: 16px; }
 .atlas-workspace-tabs button, .atlas-guidance, .atlas-tools-menu > summary { border: 1px solid transparent; border-radius: 2px; background: transparent; color: var(--atlas-dim); padding: 7px 12px; font: inherit; cursor: pointer; }
 .atlas-workspace-tabs button[aria-selected=true] { background: var(--atlas-select); color: var(--atlas-phosphor); border-color: var(--atlas-phosphor-mute); box-shadow: inset 0 1px 0 var(--atlas-phosphor); }
@@ -10,6 +10,12 @@
 .atlas-tools-menu { position: relative; margin-left: auto; }
 .atlas-browser-ai-action { margin-left: 0; flex-shrink: 0; border: 1px solid var(--atlas-line); background: transparent; border-radius: 2px; color: var(--atlas-cyan); padding: 7px 10px; font: inherit; cursor: pointer; }
 .atlas-browser-ai-action + .atlas-tools-menu { margin-left: 0; }
+.atlas-browser-ai-action { display: inline-flex; align-items: center; gap: 7px; color: var(--atlas-dim); }
+.atlas-browser-ai-action > span { width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: var(--atlas-dim); }
+.atlas-browser-ai-action[data-state=active] > span { background: var(--atlas-phosphor); }
+.atlas-browser-ai-action:is([data-state=loading], [data-state=busy]) > span { background: var(--atlas-cyan); }
+.atlas-browser-ai-action[data-state=error] > span { background: var(--atlas-alarm); }
+.atlas-workspace-content { position: relative; }
 .atlas-tools-menu > summary { list-style: none; }
 .atlas-tools-menu > summary::after { content: ' ▾'; }
 .atlas-tools-menu .atlas-menu { position: absolute; right: 0; top: calc(100% + 8px); width: 310px; padding: 12px; background: var(--atlas-panel-raised); border: 1px solid var(--atlas-phosphor-mute); border-radius: 2px; box-shadow: 0 16px 48px #0008; }
@@ -49,6 +55,8 @@
 .atlas-shell[data-workspace=galaxy] .atlas-body { grid-template-columns: minmax(0, 1fr); }
 .atlas-shell[data-workspace=galaxy] .atlas-side { display: flex; border-left: none; }
 .atlas-shell[data-workspace=galaxy] .atlas-galaxy { min-height: 0; height: 100%; border-top: none; }
+/* Selection details are placed against the galaxy stage, never against the grid that also holds the chat column. Fullscreen keeps its own fixed box. */
+.atlas-shell[data-workspace=galaxy] .atlas-galaxy:not([data-fullscreen='true']) { position: relative; }
 .atlas-shell[data-workspace=galaxy] .atlas-galaxy-head { padding: 12px 18px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 12px; }
 .atlas-shell[data-workspace=galaxy] .atlas-galaxy-head-row { grid-column: 2; grid-row: 1; }
 .atlas-shell[data-workspace=galaxy] .atlas-galaxy-title { display: none; }
@@ -240,7 +248,7 @@
 
 /* Explorer keeps chat and graph in one column, with a proportional split. */
 .atlas-chat-column[data-graph=true][data-selection-inspector=false] { display: grid; overflow: hidden; grid-template-rows: minmax(0, var(--atlas-chat-fraction)) 8px minmax(0, var(--atlas-graph-fraction)); }
-.atlas-chat-column[data-graph=true][data-selection-inspector=false][data-chat-expanded=false] { grid-template-rows: auto minmax(0, 1fr); }
+.atlas-chat-column[data-graph=true][data-selection-inspector=false][data-chat-expanded=false] { grid-template-rows: minmax(0, 1fr); }
 .atlas-chat-column[data-graph=true][data-selection-inspector=false] > .cbm-chat-dock { min-height: 0; height: 100%; flex: initial; overflow: auto; }
 .atlas-chat-column[data-graph=true][data-selection-inspector=false][data-chat-expanded=false] > .cbm-chat-dock { height: auto; }
 .atlas-shell[data-workspace=explore] .atlas-chat-column[data-graph=true][data-selection-inspector=false] > .atlas-galaxy-host { min-height: 0; height: 100%; flex: initial; }
@@ -248,3 +256,7 @@
 .atlas-command-palette > .atlas-menu { padding: 12px 18px; margin: 0; border-top: 1px solid var(--atlas-line); }
 .diagnostics-inventory { margin: 18px 0; }
 .diagnostics-inventory > summary { cursor: pointer; color: var(--atlas-cyan); }
+
+.atlas-flow-direction-pulse { fill: #9cafbe; opacity: .32; pointer-events: none; }
+.atlas-flow-error-pulse { fill: #b095a4; }
+@media (prefers-reduced-motion: reduce) { .atlas-flow-direction-pulse { display: none; } }

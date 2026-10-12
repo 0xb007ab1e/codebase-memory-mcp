@@ -14,9 +14,8 @@ import { describe, expect, it } from 'vitest';
 
 import { messages } from '../i18n/messages';
 import { experimentalAgentsEnabled } from './feature-flags';
-import { overlayIntent } from '../search/overlay-model';
 import { playerIntent } from '../tours/tour-player';
-import { FOCUS_COMMAND_KEY, RESERVED_BARE_SHORTCUTS, menuShortcutFor } from './keyboard';
+import { RESERVED_BARE_SHORTCUTS, menuShortcutFor } from './keyboard';
 import { ATLAS_SHORTCUTS, PROBED_KEYS, WIRED_MENU_SHORTCUTS, needsAlt, shortcutId } from './shortcuts';
 
 describe('die Menuezeile traegt nur, was etwas tut', () => {
@@ -90,13 +89,10 @@ describe('die Tastenliste der Hilfe ist die Verdrahtung selbst', () => {
         }
     });
 
-    it('liest die Tasten des Suchfensters aus overlayIntent', () => {
-        const search = ATLAS_SHORTCUTS.filter((entry) => entry.scope === 'search').map((entry) => entry.key);
-        for (const key of PROBED_KEYS) {
-            const wired = overlayIntent(key) !== 'none';
-            expect(search.includes(key), `${key}: Verdrahtung ${wired}, Hilfe ${search.includes(key)}`)
-                .toBe(wired);
-        }
+    it('documents only the dedicated Galaxy search shortcut', () => {
+        expect(ATLAS_SHORTCUTS.filter(entry => entry.scope === 'galaxy')).toEqual([{ scope: 'galaxy', key: 'Cmd/Ctrl+K' }]);
+        expect(ATLAS_SHORTCUTS.some(entry => entry.key === '/')).toBe(false);
+        expect(WIRED_MENU_SHORTCUTS).not.toContain('c');
     });
 
     it('nimmt die Menuetasten aus genau der Liste, die das Fenster hoert', () => {
@@ -112,11 +108,6 @@ describe('die Tastenliste der Hilfe ist die Verdrahtung selbst', () => {
         for (const entry of ATLAS_SHORTCUTS.filter((item) => item.scope === 'mnemonic')) {
             expect(needsAlt(entry)).toBe(true);
         }
-    });
-
-    it('nennt die Taste, die die Kommandozeile holt', () => {
-        const line = ATLAS_SHORTCUTS.filter((entry) => entry.scope === 'line').map((entry) => entry.key);
-        expect(line).toEqual([FOCUS_COMMAND_KEY]);
     });
 
     it('sagt zu jeder Taste, was sie tut, und zu keiner anderen', () => {

@@ -12,9 +12,11 @@
 .system-heading p, .system-section-heading p { margin: 6px 0 0; color: #a0b8ae; font-size: 14px; }
 .system-heading .system-eyebrow { color: #57e8a8; letter-spacing: .18em; font: 11px ui-monospace, monospace; }
 .system-version { color: #9bb4a9; font: 12px ui-monospace, monospace; }
-.system-tabs { display: flex; border-bottom: 1px solid #274237; gap: 5px; }
-.system-tabs button { background: transparent; border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 12px 20px; color: #a1b9ae; }
-.system-tabs button[aria-selected='true'] { color: #65edb0; border-bottom-color: #65edb0; }
+.system-layout { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 26px; align-items: start; }
+.system-tabs { display: flex; flex-direction: column; gap: 5px; position: sticky; top: 0; padding: 8px 14px 8px 0; border-right: 1px solid #274237; }
+.system-tabs button { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 12px 15px; color: #a1b9ae; text-align: left; }
+.system-tabs button[aria-selected='true'] { color: #65edb0; border-color: #65edb02e; background: #65edb00c; }
+.system-view { min-width: 0; }
 .system-read-status { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; min-height: 47px; color: #9fb5ab; font-size: 12px; padding: 12px 0; }
 .system-read-status p { width: 100%; color: #f0b9bd; margin: 0; overflow-wrap: anywhere; }
 .system-warning { color: #edc288; }
@@ -37,6 +39,20 @@
 .system-tag { display: inline-block; margin-left: 8px; font-size: 10px; color: #68e7b7; background: #1a3629; border-radius: 4px; padding: 3px 5px; }
 .system-empty { color: #a4baae; padding: 28px 12px; font-size: 14px; }
 .system-job-indexing { color: #69dcea; }.system-job-error { color: #f09eac; }.system-job-done { color: #76e7ae; }
+.system-watcher-setting { padding: 14px 16px; margin: 0 0 20px; border: 1px solid #335648; border-radius: 7px; background: #12231c66; }
+.system-watcher-toggle { display: inline-flex; align-items: center; gap: 12px; font-size: 14px; cursor: pointer; }
+.system-watcher-toggle input { width: 17px; height: 17px; accent-color: #65edb0; }
+.system-watcher-toggle small, .system-index-table small { display: block; margin-top: 5px; color: #9fb5ab; font-size: 11px; font-weight: 400; }
+.system-watcher-details { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 13px; color: #abc3b6; font-size: 12px; }
+.system-watcher-details strong { color: #edc288; font-weight: 500; }
+.system-watcher-setting > p { margin-bottom: 0; }
+.system-index-reading { display: flex; justify-content: space-between; gap: 10px; color: #9fb5ab; font-size: 11px; margin-bottom: 10px; }
+.system-index-table tbody th { min-width: 170px; }
+.system-index-table tbody th small { max-width: 34ch; white-space: normal; overflow-wrap: anywhere; }
+.system-index-table tbody th .system-index-path { max-width: 24ch; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.system-index-table td:last-child { white-space: normal; min-width: 150px; }
+.system-index-activity { border: 1px solid #294237; border-radius: 8px; padding: 15px 20px; margin-top: 16px; }
+.system-index-activity summary { cursor: pointer; color: #adc5b8; font-size: 13px; }
 .system-log-controls { display: flex; align-items: end; gap: 14px; flex-wrap: wrap; }
 .system-log-controls label { display: grid; gap: 6px; font-size: 12px; color: #acc0b6; }
 .system-log-controls label:has(input[type='search']) { flex: 1; min-width: 220px; }
@@ -49,3 +65,7 @@
 .system-log-record { padding: 8px 10px; border-left: 3px solid transparent; margin: 5px 0; }.system-log-record pre { font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0; }.system-log-record.system-log-error { border-color: #ff637f; background: #35151e; color: #ffc0cb; }.system-log-record.system-log-warn { border-color: #dfa745; background: #2e2616; }
 @media (max-width: 1000px) { .system-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 550px) { .system-metrics { grid-template-columns: 1fr; }.system-section { padding: 14px; }.system-heading-actions { gap: 8px; } }
+@media (max-width: 800px) { .system-layout { grid-template-columns: 134px minmax(0, 1fr); gap: 14px; }.system-tabs { padding-right: 9px; }.system-tabs button { padding: 11px 9px; font-size: 12px; }.system-metrics { grid-template-columns: 1fr; } }
+@media (max-width: 550px) { .system-workspace { padding: 14px 9px; }.system-layout { grid-template-columns: 112px minmax(0, 1fr); gap: 9px; }.system-tabs button { padding: 10px 5px; }.system-metrics article { padding: 13px; } }
+/* How often a combined message occurred; the tooltip names the time span. */
+.system-log-repeat { display: inline-block; padding: 0 6px; border: 1px solid currentColor; border-radius: 9px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.5; }

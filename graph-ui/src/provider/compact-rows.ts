@@ -63,7 +63,22 @@ export interface SearchResults {
     returned?: number;
     totalRelation?: string;
     truncated?: boolean;
+    /** Was bm25_emit_metadata_tree (src/mcp/mcp.c) ausserdem schreibt: die naechste Seite,
+     * warum gekappt wurde, ein gesaettigtes Kandidatenfenster und ein zu kleines Budget. */
+    nextOffset?: number;
+    truncationReason?: string;
+    candidateWindowSaturated?: boolean;
+    continuationRequiresHigherBudget?: boolean;
+    maxOutputBytes?: number;
+    outputBudgetFloorExceeded?: boolean;
+    hint?: string;
 }
+
+/** Fusszeilen der Suchantwort mit Zahl, Wahrheitswert oder Text (Handtest 04.10.: jede
+ * unbekannte liess die Suche mit "Index search unavailable" scheitern). */
+const SEARCH_NUMBER_LINE = /^(next_offset|max_output_bytes):\s*(\d+)\s*$/;
+const SEARCH_FLAG_LINE = /^(candidate_window_saturated|continuation_requires_higher_budget|output_budget_floor_exceeded):\s*(true|false)\s*$/;
+const SEARCH_TEXT_LINE = /^(truncation_reason|hint):\s*(.*)$/;
 
 const ROWS_HEAD = /^rows:\s*(\d+)\s*\(cols:\s*([^)]*)\)\s*$/;
 const RESULTS_HEAD = /^results:\s*(\d+)\s*\(cols:\s*([^)]*)\)\s*$/;
@@ -341,6 +356,7 @@ export function parseSearchResults(text: string): SearchResults {
     let totalRelation: string | undefined;
     let truncated: boolean | undefined;
     let refs: ReadonlyMap<number, string> | undefined;
+    const footers: Pick<SearchResults, 'nextOffset' | 'truncationReason' | 'candidateWindowSaturated' | 'continuationRequiresHigherBudget' | 'maxOutputBytes' | 'outputBudgetFloorExceeded' | 'hint'> = {};
 
     let i = 0;
     while (i < lines.length) {
@@ -394,6 +410,26 @@ export function parseSearchResults(text: string): SearchResults {
             i += 1;
             continue;
         }
+        const numberMatch = SEARCH_NUMBER_LINE.exec(line);
+        if (numberMatch !== null) {
+            footers[numberMatch[1] === 'next_offset' ? 'nextOffset' : 'maxOutputBytes'] = Number.parseInt(numberMatch[2], 10);
+            i += 1;
+            continue;
+        }
+        const flagMatch = SEARCH_FLAG_LINE.exec(line);
+        if (flagMatch !== null) {
+            const key = flagMatch[1] === 'candidate_window_saturated' ? 'candidateWindowSaturated'
+                : flagMatch[1] === 'continuation_requires_higher_budget' ? 'continuationRequiresHigherBudget' : 'outputBudgetFloorExceeded';
+            footers[key] = flagMatch[2] === 'true';
+            i += 1;
+            continue;
+        }
+        const textMatch = SEARCH_TEXT_LINE.exec(line);
+        if (textMatch !== null) {
+            footers[textMatch[1] === 'truncation_reason' ? 'truncationReason' : 'hint'] = unquote(textMatch[2].trim());
+            i += 1;
+            continue;
+        }
         const head = RESULTS_HEAD.exec(line);
         if (head !== null) {
             declared = Number.parseInt(head[1], 10);
@@ -426,7 +462,7 @@ export function parseSearchResults(text: string): SearchResults {
         throw new Error('Suchantwort ohne has_more-Zeile');
     }
 
-    const out: SearchResults = { total, mode, columns, rows, hasMore };
+    const out: SearchResults = { total, mode, columns, rows, hasMore, ...footers };
     if (returned !== undefined) {
         out.returned = returned;
     }

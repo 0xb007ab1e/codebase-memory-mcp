@@ -18,6 +18,8 @@ it('keeps unmapped evidence visible and only opens recorded graph locations', as
         onToggle: vi.fn(), onOpenNode };
     try {
         await act(async () => root.render(<ActivityPanel {...props} graph={{ nodes: [], edges: [], total_nodes: 100 }} />));
+        expect(host.querySelector('.cbm-activity-filters input')).toBeNull();
+        expect(host.querySelectorAll('.cbm-activity-filters select')).toHaveLength(3);
         await act(async () => host.querySelector<HTMLButtonElement>('.cbm-activity-row')!.click());
         expect(host.querySelector('.cbm-activity-inspector')?.textContent).toContain('Unmapped');
         expect(host.querySelector('.cbm-activity-inspector')?.textContent).toContain('loaded graph');

@@ -732,7 +732,7 @@ export default function ProjectsPanel(props: ProjectsPanelProps): JSX.Element {
                     <p className="atlas-projects-text" data-testid="atlas-projects-adr-none">{text.adrNoProject}</p>
                 )}
                 {project.length > 0 && props.onOpenAdr && <button type="button" className="atlas-projects-action"
-                    onClick={props.onOpenAdr}>Open ADR</button>}
+                    onClick={props.onOpenAdr}>{text.adrOpen}</button>}
                 {project.length > 0 && !props.onOpenAdr && (
                     <>
                         <p className="atlas-projects-text">{text.adrIntro(project)}</p>

@@ -5,7 +5,7 @@
  * `loader.js` aus `/node_modules/monaco-editor/min/vs`. Das war fuer einen
  * Wegwerf-Beweis richtig und fuer das Produkt falsch: der ausgelieferte Ordner
  * ist `dist/`, und der Server bettet genau das ein, was dort liegt
- * (scripts/embed-frontend.sh sammelt dist/ per find, INVENTAR.md Abschnitt 8).
+ * (scripts/embed-frontend.sh sammelt dist/ per find).
  * Ein AMD-Loader haette verlangt, `min/vs` daneben zu kopieren und den Pfad zur
  * Laufzeit zu raten. Als ESM-Import ist Monaco Teil des Bundles, und was Vite
  * gebaut hat, liegt vollstaendig in dist/.

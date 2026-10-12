@@ -1,4 +1,8 @@
 #include "test_framework.h"
+#include "test_helpers.h"
+#include "foundation/compat.h"
+#include "foundation/mem_core.h"
+#include "mcp/architecture_jobs.h"
 #include <store/architecture_projection.h>
 #include <foundation/platform.h>
 #include <yyjson/yyjson.h>
@@ -57,7 +61,7 @@ TEST(projection_accounts_for_isolated_nodes_and_files) {
     ASSERT_EQ(yyjson_arr_size(projection_field(doc, "components")), 2);
     ASSERT_EQ(yyjson_arr_size(projection_field(doc, "dependencies")), 0);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -90,7 +94,7 @@ TEST(projection_preserves_typed_edges_and_contiguous_paths) {
     ASSERT_EQ(yyjson_get_sint(yyjson_obj_get(yyjson_arr_get(edges, 0), "id")), first);
     ASSERT_EQ(yyjson_arr_size(projection_field(doc, "dependencies")), 2);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     /* A real binding changes the answer; projected component edges alone did not. */
     projection_edge(store, b1, b2, "CALLS");
     ASSERT_EQ(cbm_store_architecture_projection(store, "projection", &opts, &json), CBM_STORE_OK);
@@ -100,7 +104,7 @@ TEST(projection_preserves_typed_edges_and_contiguous_paths) {
     ASSERT_EQ(yyjson_arr_size(nodes), 4);
     ASSERT_EQ(yyjson_get_sint(yyjson_obj_get(yyjson_arr_get(nodes, 3), "id")), c);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -126,7 +130,7 @@ TEST(projection_reports_dependency_cycles_without_fabricated_execution) {
     ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(yyjson_arr_get(cycles, 0), "component_ids")), 3);
     ASSERT_EQ(yyjson_arr_size(projection_field(doc, "paths")), 0);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_architecture_projection_options_t opts = {.max_components = 2};
     ASSERT_EQ(cbm_store_architecture_projection(store, "projection", &opts, &json), CBM_STORE_OK);
     doc = yyjson_read(json, strlen(json), 0);
@@ -135,7 +139,7 @@ TEST(projection_reports_dependency_cycles_without_fabricated_execution) {
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(projection_field(doc, "totals"), "cycles")), 1);
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(projection_field(doc, "limits"), "omitted_cycles")), 1);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -157,7 +161,7 @@ TEST(projection_graph_limits_abstain_instead_of_sampling) {
     ASSERT_EQ(yyjson_arr_size(projection_field(doc, "components")), 0);
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(projection_field(doc, "totals"), "nodes")), 2);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     opts.max_nodes = 0;
     opts.max_edges = 1;
     ASSERT_EQ(cbm_store_architecture_projection(store, "projection", &opts, &json), CBM_STORE_OK);
@@ -166,7 +170,7 @@ TEST(projection_graph_limits_abstain_instead_of_sampling) {
     ASSERT_STR_EQ(yyjson_get_str(projection_field(doc, "status")), "limited");
     ASSERT_EQ(yyjson_arr_size(projection_field(doc, "components")), 0);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -192,7 +196,7 @@ TEST(projection_cancellation_deadline_and_store_reuse) {
     ASSERT_NULL(json);
     ASSERT_EQ(cbm_store_architecture_projection(store, "projection", NULL, &json), CBM_STORE_OK);
     ASSERT_NOT_NULL(json);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     ASSERT_EQ(sqlite3_get_autocommit(cbm_store_get_db(store)), 1);
     cbm_store_close(store);
     PASS();
@@ -217,7 +221,7 @@ TEST(projection_display_caps_preserve_total_accounting) {
               2);
     ASSERT_FALSE(yyjson_get_bool(projection_field(doc, "complete")));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -234,7 +238,7 @@ TEST(projection_unknown_project_and_empty_project) {
     ASSERT_TRUE(yyjson_get_bool(projection_field(doc, "complete")));
     ASSERT_EQ(yyjson_arr_size(projection_field(doc, "components")), 0);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     projection_node(store, "Project", "projection", "", false);
     projection_node(store, "Folder", "projection.folder", "folder", false);
     ASSERT_EQ(cbm_store_architecture_projection(store, "projection", NULL, &json), CBM_STORE_OK);
@@ -245,7 +249,7 @@ TEST(projection_unknown_project_and_empty_project) {
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(projection_field(doc, "totals"), "structural_nodes")),
               2);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -271,7 +275,7 @@ TEST(projection_paths_depth_cap_is_explicit) {
     yyjson_val *path = yyjson_arr_get(projection_field(doc, "paths"), 0);
     ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(path, "edges")), 2);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -296,7 +300,7 @@ TEST(projection_channel_relationships_are_typed_not_fake_calls) {
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(projection_field(doc, "totals"), "unmodeled_edges")),
               1);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -343,7 +347,7 @@ TEST(projection_test_callers_cannot_absorb_source_components) {
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(projection_field(doc, "totals"), "accounted_nodes")),
               10);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -381,7 +385,7 @@ TEST(projection_indexed_embedded_test_has_separate_membership) {
     }
     ASSERT_TRUE(found);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -417,7 +421,7 @@ TEST(projection_shallow_leaves_do_not_hide_deeper_behavior) {
     ASSERT_TRUE(
         yyjson_get_bool(yyjson_obj_get(projection_field(doc, "limits"), "paths_truncated")));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -449,7 +453,7 @@ TEST(projection_behavior_preserves_first_hop_diversity) {
     int64_t hop2 = yyjson_get_sint(yyjson_obj_get(yyjson_arr_get(second, 1), "id"));
     ASSERT_TRUE((hop1 == a && hop2 == b) || (hop1 == b && hop2 == a));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -530,7 +534,7 @@ TEST(projection_corridor_preserves_joins_cycles_and_callsite_evidence) {
         }
     }
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     opts.target_node_id = ignored;
     ASSERT_EQ(cbm_store_architecture_projection(store, "projection", &opts, &json), CBM_STORE_OK);
     doc = yyjson_read(json, strlen(json), 0);
@@ -541,7 +545,7 @@ TEST(projection_corridor_preserves_joins_cycles_and_callsite_evidence) {
     ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(view, "nodes")), 0);
     ASSERT_EQ(yyjson_arr_size(projection_field(doc, "paths")), 0);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -568,7 +572,7 @@ TEST(projection_corridor_caps_abstain_without_hiding_joins) {
     ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(view, "edges")), 0);
     ASSERT_EQ(yyjson_arr_size(projection_field(doc, "paths")), 0);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     opts.target_node_id = 0;
     opts.max_targets = 1;
     ASSERT_EQ(cbm_store_architecture_projection(store, "projection", &opts, &json), CBM_STORE_OK);
@@ -579,7 +583,7 @@ TEST(projection_corridor_caps_abstain_without_hiding_joins) {
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_obj_get(view, "totals"), "omitted_targets")), 1);
     ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(view, "complete")));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -626,7 +630,7 @@ TEST(projection_overview_accounts_for_components_beyond_legacy_cap) {
     char stable[128];
     snprintf(stable, sizeof(stable), "%s", group_id);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     opts.target_node_id = target;
     ASSERT_EQ(cbm_store_architecture_projection(store, "projection", &opts, &json), CBM_STORE_OK);
     doc = yyjson_read(json, strlen(json), 0);
@@ -637,7 +641,7 @@ TEST(projection_overview_accounts_for_components_beyond_legacy_cap) {
     ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(projection_field(doc, "overview"), "components")),
               302);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -659,7 +663,7 @@ TEST(projection_aggregate_cycle_does_not_invent_symbol_cycle) {
     ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(projection_field(doc, "overview"), "connections")), 2);
     ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(projection_field(doc, "behavior"), "cycles")), 0);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -709,7 +713,7 @@ TEST(projection_provenance_budget_counts_utf8_bytes) {
         }
     }
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -761,7 +765,7 @@ TEST(projection_example_budgets_preserve_full_aggregate_counts) {
     ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(connection, "witnesses")), 1);
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(connection, "omitted_witnesses")), 4);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -871,7 +875,7 @@ TEST(projection_behavior_evidence_is_opt_in_and_shared_across_surfaces) {
     ASSERT_NULL(strstr(json, "\"arguments\""));
     ASSERT_NULL(strstr(json, "\"argument_limit\""));
     ASSERT_EQ(queries, 0);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     opts.include_behavior_evidence = true;
     ASSERT_EQ(cbm_store_architecture_projection(store, "projection", &opts, &json), CBM_STORE_OK);
@@ -884,7 +888,7 @@ TEST(projection_behavior_evidence_is_opt_in_and_shared_across_surfaces) {
     ASSERT_TRUE(queries > 0);
     ASSERT_TRUE(queries <= 4); /* cache once per displayed indexed node */
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     queries = 0;
     opts.include_behavior_evidence = false;
@@ -892,7 +896,7 @@ TEST(projection_behavior_evidence_is_opt_in_and_shared_across_surfaces) {
     ASSERT_NULL(strstr(json, "\"return_type\""));
     ASSERT_NULL(strstr(json, "\"arguments\""));
     ASSERT_EQ(queries, 0);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     sqlite3_trace_v2(cbm_store_get_db(store), 0, NULL, NULL);
     cbm_store_close(store);
     PASS();
@@ -958,7 +962,7 @@ TEST(projection_argument_validation_keeps_exact_edge_and_callsite_identity) {
     ASSERT_EQ(seen, 2);
     ASSERT_NULL(strstr(json, "ninth"));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -999,7 +1003,7 @@ TEST(projection_missing_corrupt_and_noncall_arguments_remain_unknown) {
         ASSERT_NULL(strstr(json, "\"parameters\""));
         ASSERT_NOT_NULL(strstr(json, "\"return_type\":\"Known\""));
         yyjson_doc_free(doc);
-        free(json);
+        cbm_free(CBM_MEM_CLASS_OTHER, json);
         cbm_store_close(store);
     }
     cbm_store_t *store = projection_store();
@@ -1018,7 +1022,7 @@ TEST(projection_missing_corrupt_and_noncall_arguments_remain_unknown) {
     char *json = NULL;
     ASSERT_EQ(cbm_store_architecture_projection(store, "projection", &opts, &json), CBM_STORE_OK);
     ASSERT_NULL(strstr(json, "\"arguments\""));
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -1062,7 +1066,7 @@ TEST(projection_oversized_evidence_is_omitted_without_truncating_values) {
     ASSERT_NULL(yyjson_obj_get(arg, "v"));
     ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(edge, "arguments_complete")));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -1134,13 +1138,315 @@ TEST(projection_repeated_behavior_evidence_preserves_base_graph_under_budget) {
     ASSERT_NOT_NULL(strstr(enriched_json, "Optional behavior evidence was omitted"));
     yyjson_doc_free(baseline);
     yyjson_doc_free(enriched);
-    free(baseline_json);
-    free(enriched_json);
+    cbm_free(CBM_MEM_CLASS_OTHER, baseline_json);
+    cbm_free(CBM_MEM_CLASS_OTHER, enriched_json);
     cbm_store_close(store);
     PASS();
 }
 
+/* Shaped like Django 5.2.7 (12,700 mostly single-symbol components, far below
+ * the node and edge budgets): one full overview entry per component used to
+ * exceed the 32 MB response budget, so the whole projection came back
+ * limited and empty. The overview now lists a bounded, ranked subset and
+ * still accounts for every component through its groups and totals. A group
+ * whose components all rank last, like Django's @no-source, still gets its
+ * own share of entries so that it can be opened. */
+TEST(projection_many_small_components_stay_within_response_budget) {
+    cbm_store_t *store = projection_store();
+    ASSERT_NOT_NULL(store);
+    enum { bulk = 14000, late = 20, parts = bulk + late, entries = 4096, share = 16 };
+    char padding[161];
+    memset(padding, 'x', sizeof(padding) - 1);
+    padding[sizeof(padding) - 1] = '\0';
+    ASSERT_EQ(cbm_store_begin(store), CBM_STORE_OK);
+    for (int i = 0; i < bulk; i++) {
+        char qn[256], file[256];
+        snprintf(qn, sizeof(qn), "projection.area%d.%s%05d.Part", i % 8, padding, i);
+        snprintf(file, sizeof(file), "src/area%d/%.*s%05d.py", i % 8, 120, padding, i);
+        ASSERT_TRUE(projection_node(store, "Class", qn, file, false) > 0);
+    }
+    /* Equal rank otherwise, so the later ids of this group rank last. */
+    for (int i = 0; i < late; i++) {
+        char qn[64], file[64];
+        snprintf(qn, sizeof(qn), "projection.late.Part%02d", i);
+        snprintf(file, sizeof(file), "late/part%02d.py", i);
+        ASSERT_TRUE(projection_node(store, "Class", qn, file, false) > 0);
+    }
+    ASSERT_EQ(cbm_store_commit(store), CBM_STORE_OK);
+    char *json = NULL;
+    ASSERT_EQ(cbm_store_architecture_projection(store, "projection", NULL, &json), CBM_STORE_OK);
+    ASSERT_NULL(strstr(json, "exceeded its memory budget"));
+    /* architecture_jobs.c rejects results above 8 MiB. */
+    ASSERT_TRUE(strlen(json) < 8 * 1024 * 1024);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_STR_EQ(yyjson_get_str(projection_field(doc, "status")), "ready");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(projection_field(doc, "totals"), "components")), parts);
+    yyjson_val *displayed = projection_field(doc, "components");
+    ASSERT_EQ(yyjson_arr_size(displayed), 256);
+    yyjson_val *overview = projection_field(doc, "overview"),
+               *listed = yyjson_obj_get(overview, "components"),
+               *groups = yyjson_obj_get(overview, "groups");
+    size_t listed_count = yyjson_arr_size(listed);
+    ASSERT_EQ(listed_count, entries);
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(overview, "complete")));
+    ASSERT_EQ(yyjson_get_int(
+                  yyjson_obj_get(yyjson_obj_get(overview, "limits"), "omitted_component_entries")),
+              parts - entries);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_obj_get(overview, "totals"), "components")),
+              parts);
+    /* Every displayed component keeps its overview entry. */
+    for (size_t i = 0; i < yyjson_arr_size(displayed); i++) {
+        const char *id = yyjson_get_str(yyjson_obj_get(yyjson_arr_get(displayed, i), "id"));
+        bool found = false;
+        for (size_t j = 0; j < listed_count && !found; j++)
+            found = !strcmp(id, yyjson_get_str(yyjson_obj_get(yyjson_arr_get(listed, j), "id")));
+        ASSERT_TRUE(found);
+    }
+    size_t membership = 0;
+    int members = 0;
+    for (size_t i = 0; i < yyjson_arr_size(groups); i++) {
+        yyjson_val *group = yyjson_arr_get(groups, i);
+        yyjson_val *ids = yyjson_obj_get(group, "component_ids");
+        membership += yyjson_arr_size(ids);
+        members += yyjson_get_int(yyjson_obj_get(group, "member_count"));
+        /* Equal ranks fall back to component order, so each group must list
+         * a prefix of its ids, and at least its share of them. */
+        const char *group_id = yyjson_get_str(yyjson_obj_get(group, "id"));
+        size_t count = yyjson_arr_size(ids), shown = 0, at, maximum;
+        yyjson_val *entry;
+        yyjson_arr_foreach(listed, at, maximum, entry) {
+            if (strcmp(group_id, yyjson_get_str(yyjson_obj_get(entry, "group_id"))))
+                continue;
+            ASSERT_TRUE(shown < count);
+            ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(entry, "id")),
+                          yyjson_get_str(yyjson_arr_get(ids, shown)));
+            shown++;
+        }
+        ASSERT_TRUE(shown >= (count < share ? count : (size_t)share));
+        if (!strcmp(yyjson_get_str(yyjson_obj_get(group, "label")), "late"))
+            ASSERT_EQ(shown, share);
+    }
+    ASSERT_EQ(membership, parts);
+    ASSERT_EQ(members, parts);
+    yyjson_doc_free(doc);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
+    cbm_store_close(store);
+    PASS();
+}
+
+static yyjson_val *projection_component_of(yyjson_doc *doc, const char *qn) {
+    yyjson_val *parts = projection_field(doc, "components");
+    for (size_t i = 0; i < yyjson_arr_size(parts); i++) {
+        yyjson_val *part = yyjson_arr_get(parts, i);
+        yyjson_val *rep = yyjson_arr_get(yyjson_obj_get(part, "representatives"), 0);
+        if (!strcmp(yyjson_get_str(yyjson_obj_get(rep, "qualified_name")), qn))
+            return part;
+    }
+    return NULL;
+}
+
+TEST(projection_python_test_files_follow_name_conventions) {
+    cbm_store_t *store = projection_store();
+    ASSERT_NOT_NULL(store);
+    projection_node(store, "Class", "projection.app.tests.ViewTests", "app/tests.py", false);
+    projection_node(store, "Function", "projection.app.models_test.check", "app/models_test.py",
+                    false);
+    projection_node(store, "Function", "projection.app.conftest.fixture", "app/conftest.py", false);
+    projection_node(store, "Function", "projection.check", "test/check.c", false);
+    /* A top-level test/ is a test suite, also for helpers without a test name. */
+    projection_node(store, "Function", "projection.test.helpers.build", "test/helpers.py", false);
+    projection_node(store, "Function", "projection.app.views.index", "app/views.py", false);
+    /* django/test/ ships Django's testing API. The extractor flags its
+     * functions from the directory alone; the class carries no flag. */
+    int64_t client = projection_node(store, "Class", "projection.django.test.client.Client",
+                                     "django/test/client.py", false);
+    cbm_node_t method = {.project = "projection",
+                         .label = "Method",
+                         .name = "get",
+                         .qualified_name = "projection.django.test.client.Client.get",
+                         .file_path = "django/test/client.py",
+                         .properties_json = "{\"is_test\":true}"};
+    int64_t get = cbm_store_upsert_node(store, &method);
+    projection_edge(store, client, get, "DEFINES_METHOD");
+    char *json = NULL;
+    ASSERT_EQ(cbm_store_architecture_projection(store, "projection", NULL, &json), CBM_STORE_OK);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    const char *tests[] = {"projection.app.tests.ViewTests", "projection.app.models_test.check",
+                           "projection.app.conftest.fixture", "projection.check",
+                           "projection.test.helpers.build"};
+    for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
+        yyjson_val *part = projection_component_of(doc, tests[i]);
+        ASSERT_NOT_NULL(part);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(part, "role")), "test");
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(part, "role_basis")), "test_path_convention");
+    }
+    yyjson_val *views = projection_component_of(doc, "projection.app.views.index");
+    ASSERT_NOT_NULL(views);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(views, "role")), "non_test");
+    /* One role per file: the class and its flagged method stay one part. */
+    yyjson_val *api = projection_component_of(doc, "projection.django.test.client.Client");
+    ASSERT_NOT_NULL(api);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(api, "role")), "non_test");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(api, "member_count")), 2);
+    ASSERT_EQ(yyjson_arr_size(projection_field(doc, "components")), 7);
+    yyjson_doc_free(doc);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
+    cbm_store_close(store);
+    PASS();
+}
+
+/* Django views are never named main; their HANDLES edge is the entry evidence.
+ * Test-client calls like self.client.get("/probe/") are indexed as route
+ * registrations, so a route that only test code registers proves nothing. */
+TEST(projection_route_handlers_are_entry_points) {
+    cbm_store_t *store = projection_store();
+    ASSERT_NOT_NULL(store);
+    int64_t route = projection_node(store, "Route", "projection.__route__GET__/orders", "", false);
+    int64_t view =
+        projection_node(store, "Function", "projection.shop.views.orders", "shop/views.py", false);
+    int64_t method =
+        projection_node(store, "Method", "projection.shop.api.Orders.get", "shop/api.py", false);
+    int64_t fixture =
+        projection_node(store, "Function", "projection.tests.urls.orders", "tests/urls.py", false);
+    int64_t query =
+        projection_node(store, "Function", "projection.shop.query.orders", "shop/query.py", false);
+    projection_node(store, "Function", "projection.shop.views.unrouted", "shop/views.py", false);
+    int64_t cart_route =
+        projection_node(store, "Route", "projection.__route__GET__/cart", "", false);
+    int64_t urls =
+        projection_node(store, "Function", "projection.shop.urls.register", "shop/urls.py", false);
+    int64_t cart =
+        projection_node(store, "Function", "projection.shop.views.cart", "shop/views.py", false);
+    int64_t probe_route =
+        projection_node(store, "Route", "projection.__route__GET__/probe", "", false);
+    int64_t probe = projection_node(store, "Method", "projection.tests.test_views.Tests.test_probe",
+                                    "tests/test_views.py", false);
+    int64_t text = projection_node(store, "Method", "projection.shop.models.Order.text",
+                                   "shop/models.py", false);
+    /* Created last, so only the ranking can put the indexed entry first. */
+    int64_t launcher =
+        projection_node(store, "Function", "projection.manage.main", "manage.py", true);
+    int64_t setup =
+        projection_node(store, "Function", "projection.manage.setup", "manage.py", false);
+    projection_edge(store, view, route, "HANDLES");
+    projection_edge(store, method, route, "HANDLES");
+    projection_edge(store, fixture, route, "HANDLES");
+    projection_edge(store, view, query, "CALLS");
+    projection_edge(store, urls, cart_route, "CALLS");
+    projection_edge(store, cart, cart_route, "HANDLES");
+    projection_edge(store, probe, probe_route, "CALLS");
+    projection_edge(store, text, probe_route, "HANDLES");
+    projection_edge(store, launcher, setup, "CALLS");
+    char *json = NULL;
+    ASSERT_EQ(cbm_store_architecture_projection(store, "projection", NULL, &json), CBM_STORE_OK);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *entries = projection_field(doc, "entrypoints");
+    const int64_t expected[] = {launcher, view, method, cart};
+    ASSERT_EQ(yyjson_arr_size(entries), sizeof(expected) / sizeof(expected[0]));
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++)
+        ASSERT_EQ(yyjson_get_sint(yyjson_obj_get(yyjson_arr_get(entries, i), "id")), expected[i]);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(projection_field(doc, "totals"), "entrypoints")), 4);
+    yyjson_val *paths = projection_field(doc, "paths");
+    ASSERT_EQ(yyjson_arr_size(paths), 2);
+    yyjson_val *first = yyjson_arr_get(paths, 0), *second = yyjson_arr_get(paths, 1);
+    ASSERT_EQ(yyjson_get_sint(yyjson_obj_get(first, "entrypoint_id")), launcher);
+    ASSERT_EQ(yyjson_get_sint(yyjson_obj_get(second, "entrypoint_id")), view);
+    ASSERT_EQ(
+        yyjson_get_sint(yyjson_obj_get(yyjson_arr_get(yyjson_obj_get(second, "nodes"), 1), "id")),
+        query);
+    yyjson_doc_free(doc);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(projection_response_memory_returns_to_caller_baseline) {
+    cbm_store_t *store = projection_store();
+    ASSERT_NOT_NULL(store);
+    projection_node(store, "File", "projection.a.c", "a.c", false);
+    int64_t entry = projection_node(store, "Function", "projection.start", "a.c", true);
+    int64_t target = projection_node(store, "Function", "projection.finish", "b.c", false);
+    projection_edge(store, entry, target, "CALLS");
+    cbm_architecture_projection_options_t options = {.entry_node_id = entry,
+                                                     .include_behavior_evidence = true};
+    size_t blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    size_t bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+    for (int limited = 0; limited < 2; limited++) {
+        options.max_nodes = limited ? 1 : 0;
+        char *json = NULL;
+        ASSERT_EQ(cbm_store_architecture_projection(store, "projection", &options, &json),
+                  CBM_STORE_OK);
+        ASSERT_NOT_NULL(json);
+        ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks + 1);
+        ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), bytes + cbm_mem_usable_size(json));
+        cbm_free(CBM_MEM_CLASS_OTHER, json);
+        ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks);
+        ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), bytes);
+    }
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(projection_completed_job_memory_returns_to_caller_baseline) {
+    char temp[256] = "/tmp/cbm_projection_memory_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(temp));
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/index.db", temp);
+    cbm_store_t *store = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "projection", temp), CBM_STORE_OK);
+    projection_node(store, "Function", "projection.entry", "entry.c", true);
+
+    /* A live caller allocation makes a lost worker delta observable even when
+     * the shared counters would otherwise saturate at zero on cache release. */
+    void *sentinel = cbm_alloc(CBM_MEM_CLASS_OTHER, 64);
+    ASSERT_NOT_NULL(sentinel);
+    size_t before_blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    size_t before_bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+    cbm_architecture_jobs_t *jobs = cbm_architecture_jobs_new();
+    ASSERT_NOT_NULL(jobs);
+    bool ready = false, cached = false;
+    uint64_t deadline = cbm_now_ms() + 10000;
+    do {
+        char *json = cbm_architecture_jobs_request(jobs, store, "projection", 0);
+        yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+        const char *status = doc ? yyjson_get_str(projection_field(doc, "status")) : NULL;
+        ready = status && strcmp(status, "ready") == 0;
+        bool pending = status && strcmp(status, "pending") == 0;
+        yyjson_doc_free(doc);
+        cbm_free(CBM_MEM_CLASS_OTHER, json);
+        if (!pending)
+            break;
+        cbm_usleep(1000);
+    } while (cbm_now_ms() < deadline);
+    if (ready) {
+        char *json = cbm_architecture_jobs_request(jobs, store, "projection", 0);
+        yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+        const char *status = doc ? yyjson_get_str(projection_field(doc, "status")) : NULL;
+        cached = status && strcmp(status, "ready") == 0;
+        yyjson_doc_free(doc);
+        cbm_free(CBM_MEM_CLASS_OTHER, json);
+    }
+    cbm_architecture_jobs_free(jobs); /* joins before the caller frees retained output */
+    size_t after_blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    size_t after_bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+    cbm_free(CBM_MEM_CLASS_OTHER, sentinel);
+    cbm_store_close(store);
+    th_rmtree(temp);
+
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(cached);
+    ASSERT_EQ(after_blocks, before_blocks);
+    ASSERT_EQ(after_bytes, before_bytes);
+    PASS();
+}
+
 SUITE(architecture_projection) {
+    RUN_TEST(projection_completed_job_memory_returns_to_caller_baseline);
+    RUN_TEST(projection_response_memory_returns_to_caller_baseline);
     RUN_TEST(projection_accounts_for_isolated_nodes_and_files);
     RUN_TEST(projection_preserves_typed_edges_and_contiguous_paths);
     RUN_TEST(projection_reports_dependency_cycles_without_fabricated_execution);
@@ -1165,4 +1471,7 @@ SUITE(architecture_projection) {
     RUN_TEST(projection_missing_corrupt_and_noncall_arguments_remain_unknown);
     RUN_TEST(projection_oversized_evidence_is_omitted_without_truncating_values);
     RUN_TEST(projection_repeated_behavior_evidence_preserves_base_graph_under_budget);
+    RUN_TEST(projection_many_small_components_stay_within_response_budget);
+    RUN_TEST(projection_python_test_files_follow_name_conventions);
+    RUN_TEST(projection_route_handlers_are_entry_points);
 }

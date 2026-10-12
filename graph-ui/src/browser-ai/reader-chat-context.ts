@@ -48,10 +48,10 @@ export function readerChatContext({ project, path, status, document, origin, sel
         } };
     }
     const missing: string[] = [];
-    if (document.firstLine > 1) missing.push(`Lines 1–${document.firstLine - 1} are not loaded.`);
+    if (document.firstLine > 1) missing.push(`Lines 1-${document.firstLine - 1} are not loaded.`);
     if (document.truncationNote) missing.push(document.truncationNote);
     else if (document.truncated || (document.fileLastLine !== undefined && document.lastLine < document.fileLastLine)) {
-        missing.push(`The reader has only lines ${document.firstLine}–${document.lastLine}.`);
+        missing.push(`The reader has only lines ${document.firstLine}-${document.lastLine}.`);
     }
     if (document.fileLastLine === undefined) missing.push('File length is unknown; this is the source currently loaded in the reader.');
     return { project, path, status: 'ready', source: {

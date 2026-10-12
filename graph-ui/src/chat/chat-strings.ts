@@ -14,13 +14,13 @@
 import { SIDECAR_PORT } from '../llm/sidecar';
 
 /** The word over the panel. */
-export const CHAT_TITLE = 'ATLAS_CHAT';
+export const CHAT_TITLE = 'CBM LENS CHAT';
 
 /** What the command line hint says when a question would be sent. */
-export const CHAT_HINT_READY = 'enter asks the atlas';
+export const CHAT_HINT_READY = 'enter asks CBM Lens';
 
 /** What it says when the line looks like a question and the model is off. */
-export const CHAT_HINT_OFF = 'enter asks the atlas: the local model is off';
+export const CHAT_HINT_OFF = 'enter asks CBM Lens: the local model is off';
 
 /** The sentence when the model is off and a question was typed. */
 export const CHAT_OFF_MESSAGE =

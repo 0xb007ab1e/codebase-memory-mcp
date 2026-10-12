@@ -53,8 +53,63 @@ describe('service map interactions', () => {
         expect(button('Open declaration')).toBeUndefined();
         expect(clear).toHaveBeenCalledOnce();
     });
+    it('says plainly that a project has no deployment files and leads to its endpoints', async () => {
+        vi.mocked(loadContainerInventory).mockResolvedValue({ project: 'p', rootPath: '/p', files: new Map(), manifests: [], warnings: [] });
+        const showEndpoints = vi.fn();
+        await act(async () => root.render(<ContainerMap project="p" active filter="" onNavigate={vi.fn()} onShowEndpoints={showEndpoints} />));
+        expect(container.textContent).toContain('No Docker Compose deployment files were found in this index. Endpoints shows the routes.');
+        expect(container.textContent).not.toContain('Could not read');
+        await act(async () => button('Show endpoints →').click());
+        expect(showEndpoints).toHaveBeenCalledOnce();
+        expect(loadContainerTopology).not.toHaveBeenCalled();
+    });
+    it('keeps a failed read distinct from a project without deployment files', async () => {
+        vi.mocked(loadContainerInventory).mockRejectedValue(new Error('query_graph: Incomplete query results'));
+        await act(async () => root.render(<ContainerMap project="p" active filter="" onNavigate={vi.fn()} onShowEndpoints={vi.fn()} />));
+        expect(container.textContent).toContain('Could not read the indexed deployment files. Refresh to try again.');
+        expect(container.textContent).not.toContain('No Docker Compose deployment files');
+        expect(button('Show endpoints →')).toBeUndefined();
+    });
     it('does not request deployment source while the workspace is inactive', async () => {
         await act(async () => root.render(<ContainerMap project="p" active={false} filter="" onNavigate={vi.fn()} />));
         expect(loadContainerTopology).not.toHaveBeenCalled(); expect(loadContainerInventory).not.toHaveBeenCalled();
+    });
+});
+
+/* Hand test 2026-10-04 (A3): a Refresh that reads everything again says so, and says what it found. */
+describe('service map refresh feedback', () => {
+    const refresh = () => [...container.querySelectorAll('button')].find(element => /^Refresh(ing…)?$/.test(element.textContent ?? ''))!;
+    const status = () => container.querySelector('[role="status"].atlas-refresh-status')?.textContent;
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('A3: reads the declared services again, busy meanwhile, then names the time and whether anything changed', async () => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(new Date(2026, 9, 4, 9, 5, 7));
+        await act(async () => root.render(<ContainerMap project="p" active filter="" onNavigate={vi.fn()} />));
+        let finish!: (value: ContainerReading) => void;
+        vi.mocked(loadContainerTopology).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+        await act(async () => refresh().click());
+        expect(refresh().textContent).toBe('Refreshing…');
+        expect(refresh().getAttribute('aria-disabled')).toBe('true');
+        await act(async () => finish(sample()));
+        expect(refresh().textContent).toBe('Refresh');
+        expect(status()).toBe('Up to date at 09:05:07: no changes since the last load');
+        const changed = sample();
+        changed.topology.services.pop();
+        vi.mocked(loadContainerTopology).mockResolvedValueOnce(changed);
+        await act(async () => refresh().click());
+        expect(status()).toBe('Service map refreshed at 09:05:07');
+    });
+
+    it('A3: also answers for a project without deployment files', async () => {
+        vi.mocked(loadContainerInventory).mockResolvedValue({ project: 'p', rootPath: '/p', files: new Map(), manifests: [], warnings: [] });
+        await act(async () => root.render(<ContainerMap project="p" active filter="" onNavigate={vi.fn()} />));
+        let finish!: (value: Awaited<ReturnType<typeof loadContainerInventory>>) => void;
+        vi.mocked(loadContainerInventory).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+        await act(async () => refresh().click());
+        expect(refresh().textContent).toBe('Refreshing…');
+        await act(async () => finish({ project: 'p', rootPath: '/p', files: new Map(), manifests: [], warnings: [] }));
+        expect(refresh().textContent).toBe('Refresh');
+        expect(status()).toMatch(/^Up to date at \d\d:\d\d:\d\d: no changes since the last load$/);
     });
 });

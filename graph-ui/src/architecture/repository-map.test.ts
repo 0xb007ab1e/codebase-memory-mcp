@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { areaConnections, areaOf, repositoryMap } from './repository-map';
+import { areaConnections, areaLevels, areaOf, areaTrail, repositoryMap } from './repository-map';
 import type { GraphData, GraphNode } from '../galaxy/types';
 
 export const node = (id: number, file_path: string, name = `symbol${id}`, status: GraphNode['status'] = 'normal'): GraphNode => ({
@@ -10,6 +10,26 @@ export const graph: GraphData = { total_nodes: 4, nodes: [node(1, 'src/api/serve
     node(2, 'src/service/users.ts', 'users'), node(3, 'src/store/db.ts', 'save'), node(4, 'test/users.test.ts', 'testUsers', 'test')],
 edges: [{ source: 1, target: 2, type: 'CALLS' }, { source: 2, target: 3, type: 'CALLS' },
     { source: 2, target: 3, type: 'IMPORTS' }, { source: 4, target: 2, type: 'CALLS' }] };
+
+describe('area trails', () => {
+    it('repeats the repository area rule below each opened area', () => {
+        expect(areaTrail('django/contrib/admin/options.py')).toEqual(['django', 'django/contrib', 'django/contrib/admin']);
+        expect(areaTrail('django/shortcuts.py')).toEqual(['django']);
+        expect(areaTrail('graph-ui/src/app/AtlasChrome.tsx')).toEqual(['graph-ui', 'graph-ui/src/app']);
+        expect(areaTrail('graph-ui/src/App.tsx')).toEqual(['graph-ui', 'graph-ui/src']);
+        expect(areaTrail('src/mcp/mcp.c')).toEqual(['src/mcp']);
+        expect(areaTrail('Makefile')).toEqual(['(root)']);
+        for (const path of ['django/contrib/admin/options.py', 'graph-ui/src/app/AtlasChrome.tsx', 'src/mcp/mcp.c', 'Makefile']) {
+            expect(areaTrail(path)[0]).toBe(areaOf(path));
+        }
+    });
+    it('reconstructs the drill-in steps of an area from the area alone', () => {
+        expect(areaLevels('django/contrib/admin')).toEqual(['django', 'django/contrib', 'django/contrib/admin']);
+        expect(areaLevels('graph-ui/src')).toEqual(['graph-ui', 'graph-ui/src']);
+        expect(areaLevels('src/mcp')).toEqual(['src/mcp']);
+        expect(areaLevels('(root)')).toEqual(['(root)']);
+    });
+});
 
 describe('repository map evidence', () => {
     it('retains exact directional edges and their source declarations across areas', () => {

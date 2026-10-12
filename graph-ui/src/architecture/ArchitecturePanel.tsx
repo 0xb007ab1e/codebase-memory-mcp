@@ -1,20 +1,26 @@
-import { lazy, Suspense, useEffect, useId, useMemo, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import type { JSX, ReactNode } from 'react';
-import type { ArchitectureBoundary, ArchitectureHotspot, ArchitectureOverviewDto } from '../core/intelligence-provider';
+import type { ArchitectureHotspot, ArchitectureOverviewDto } from '../core/intelligence-provider';
 import {
-    ARCHITECTURE_VIEWS, boundaryMap, DEFAULT_ARCHITECTURE_CONFIG,
-    matchingArchitecture, readArchitectureConfig, saveArchitectureConfig,
+    ARCHITECTURE_VIEWS, readArchitectureConfig, saveArchitectureConfig,
 } from './architecture-model';
 import type { ArchitectureView, ConfigStorage } from './architecture-model';
-import { architectureText as text } from './strings';
+import { architectureHistoryText as historyText, architectureText as text } from './strings';
+import { peekNavigation, type NavigationHistory } from '../graph/navigation-history';
+import { useDismissibleMenu } from '../graph/use-dismissible-menu';
+import {
+    architectureEntryDetail, architectureEntryLabel, architectureEntryName, architectureHistoryOptions, initialArchitecturePlace,
+    type ArchitectureHistoryEntry, type PlaceChange, type RoutesPerspective, type SpatialPlace, type SystemPlace,
+} from './architecture-history';
+import { useArchitectureHistory } from './use-architecture-history';
 import './architecture.css';
-import RepositoryMapView, { RelationshipEvidence } from './RepositoryMap';
+import { scenePaletteStyle } from './scene-palette';
 import type { RepositoryMapProps } from './RepositoryMap';
-import { repositoryMap } from './repository-map';
 import SpatialArchitecture from './SpatialArchitecture';
 import RoutesArchitecture from './RoutesArchitecture';
 import type { CoverageIndex } from '../app/tree-model';
 import type { SystemArchitectureLoader } from './system-architecture-source';
+import type { SelectionEvidenceListener } from '../galaxy/selection-evidence';
 
 const SystemArchitecture = lazy(() => import('./SystemArchitecture'));
 
@@ -22,12 +28,15 @@ export interface ArchitecturePanelProps extends Pick<RepositoryMapProps, 'graph'
     projectName: string;
     graphGeneration?: string;
     active?: boolean;
+    /** Another surface (help, settings, a dialog) takes the keys: Alt+Left and Alt+Right stay with it. */
+    escapeTaken?: boolean;
     coverage?: CoverageIndex;
     overview?: ArchitectureOverviewDto;
     loading?: boolean;
     error?: string;
     onRefresh?: () => void;
     onClearSelection?: () => void;
+    onSelectionEvidence?: SelectionEvidenceListener;
     systemArchitectureLoader?: SystemArchitectureLoader;
     /** The declaration line is 1-based, as returned by the provider. */
     onNavigate: (filePath: string, line?: number, name?: string) => void;
@@ -66,140 +75,6 @@ function SourceLink({ path, line, name, onNavigate }: {
     if (!path) return <span className="atlas-arch-muted" title={text.sourceMissing}>{text.unknown}</span>;
     return <button className="atlas-arch-source" aria-label={text.openSource(name ?? path)}
         onClick={() => onNavigate(path, line, name)}>{path}{line !== undefined ? `:${line}` : ''}</button>;
-}
-
-function BoundaryDiagram({ boundaries, onGroup }: {
-    boundaries: ArchitectureBoundary[]; onGroup: (group: string) => void;
-}): JSX.Element | null {
-    const markerId = useId().replace(/:/g, '');
-    const map = useMemo(() => boundaryMap(boundaries), [boundaries]);
-    if (map.groups.length === 0) return null;
-    const positions = new Map(map.groups.map((group, index) => {
-        const angle = -Math.PI / 2 + index * Math.PI * 2 / map.groups.length;
-        return [group, { x: 330 + Math.cos(angle) * 215, y: 153 + Math.sin(angle) * 104 }];
-    }));
-    const maxCalls = Math.max(1, ...map.boundaries.map(boundary => boundary.callCount));
-    return <div className="atlas-arch-map">
-        <svg viewBox="0 0 660 320" role="group" aria-label={text.mapLabel}>
-            <defs><marker id={markerId} markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
-                <polygon points="0 0, 7 3.5, 0 7" />
-            </marker></defs>
-            {map.boundaries.map((boundary, index) => {
-                const from = positions.get(boundary.from)!;
-                const to = positions.get(boundary.to)!;
-                const distance = Math.hypot(to.x - from.x, to.y - from.y);
-                const dx = distance ? (to.x - from.x) / distance : 0;
-                const dy = distance ? (to.y - from.y) / distance : 0;
-                const start = { x: from.x + dx * 25, y: from.y + dy * 25 };
-                const end = { x: to.x - dx * 30, y: to.y - dy * 30 };
-                // Offset reciprocal edges so each arrow retains its direction.
-                const control = { x: (start.x + end.x) / 2 - dy * 18, y: (start.y + end.y) / 2 + dx * 18 };
-                const d = distance ? `M${start.x},${start.y} Q${control.x},${control.y} ${end.x},${end.y}`
-                    : `M${from.x - 15},${from.y - 18} C${from.x - 50},${from.y - 55} ${from.x + 50},${from.y - 55} ${from.x + 18},${from.y - 20}`;
-                return <path key={`${boundary.from}:${boundary.to}:${index}`} d={d}
-                    markerEnd={`url(#${markerId})`} strokeWidth={1 + 2 * boundary.callCount / maxCalls}>
-                    <title>{`${boundary.from} → ${boundary.to}: ${boundary.callCount} ${text.calls}`}</title>
-                </path>;
-            })}
-            {map.groups.map(group => {
-                const position = positions.get(group)!;
-                const label = group.length > 25 ? `${group.slice(0, 22)}...` : group;
-                return <g key={group} role="button" tabIndex={0} aria-label={text.focusGroup(group)}
-                    onClick={() => onGroup(group)} onKeyDown={event => {
-                        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onGroup(group); }
-                    }}>
-                    <title>{group}</title><circle cx={position.x} cy={position.y} r="24" />
-                    <text x={position.x} y={position.y + 4} data-map-count="true">{group.split(/[/.]/).filter(Boolean).at(-1)?.slice(0, 3) ?? group.slice(0, 3)}</text>
-                    <text x={position.x} y={position.y + 41}>{label}</text>
-                </g>;
-            })}
-        </svg>
-        {map.omittedGroups > 0 && <p className="atlas-arch-map-note">{text.mapLimit(map.groups.length, map.omittedGroups)}</p>}
-    </div>;
-}
-
-function Overview({ data, filtered, filter, onGroup, onNavigate }: {
-    data: ArchitectureOverviewDto; filtered: ArchitectureOverviewDto; filter: string;
-    onGroup: (group: string) => void; onNavigate: ArchitecturePanelProps['onNavigate'];
-}): JSX.Element {
-    const maxSymbols = Math.max(1, ...filtered.groups.map(group => group.symbolCount));
-    const empty = filter.trim() ? text.noMatches : text.noData;
-    return <>
-        <div className="atlas-arch-metrics">
-            {[[text.symbols, data.totalSymbols], [text.relations, data.totalRelations],
-                [text.modules, data.groups.length], [text.files, data.files.length]].map(([label, count]) =>
-                <div className="atlas-arch-metric" key={label}><strong>{Number(count).toLocaleString()}</strong><span>{label}</span></div>)}
-        </div>
-        <section>
-            <SectionHeading title={text.modules} note={text.moduleNote} />
-            <Collection key={`modules:${filter}`} items={filtered.groups} empty={empty}>
-                {groups => <div className="atlas-arch-module-grid">{groups.map(group =>
-                    <button key={group.name} className="atlas-arch-module" onClick={() => onGroup(group.name)} aria-label={text.focusGroup(group.name)}>
-                        <strong>{group.name}</strong><span>{text.groupStats(group.symbolCount)}</span>
-                        <div className="atlas-arch-bar" aria-hidden="true"><i style={{ width: `${group.symbolCount / maxSymbols * 100}%` }} /></div>
-                    </button>)}</div>}
-            </Collection>
-        </section>
-        <div className="atlas-arch-columns">
-            <section><SectionHeading title={text.layers} note={text.layersNote} />
-                <Collection key={`layers:${filter}`} items={filtered.layers} empty={empty} pageSize={8}>
-                    {layers => <div className="atlas-arch-detail-list">{layers.map((layer, index) =>
-                        <div key={`${layer.group}:${index}`} className="atlas-arch-detail"><div>
-                            <button className="atlas-arch-link" onClick={() => onGroup(layer.group)}>{layer.group}</button>
-                            {layer.reason && <p>{layer.reason}</p>}
-                        </div><span className="atlas-arch-badge">{layer.layer}</span></div>)}</div>}
-                </Collection>
-            </section>
-            <section><SectionHeading title={text.clusters} note={text.clustersNote} />
-                <Collection key={`clusters:${filter}`} items={filtered.clusters} empty={empty} pageSize={8}>
-                    {clusters => <div className="atlas-arch-detail-list">{clusters.map(cluster =>
-                        <div key={cluster.id} className="atlas-arch-detail"><div>
-                            <strong>{cluster.label || cluster.id}</strong><p>{cluster.topMembers.join(', ')}</p>
-                            {cluster.cohesion !== undefined && <p>{text.cohesion(cluster.cohesion)}</p>}
-                        </div><span className="atlas-arch-badge">{text.numberOfMembers(cluster.memberCount)}</span></div>)}</div>}
-                </Collection>
-            </section>
-        </div>
-        <section><SectionHeading title={text.filesTitle} />
-            <Collection key={`files:${filter}`} items={filtered.files} empty={empty} pageSize={8}>
-                {files => <div className="atlas-arch-detail-list atlas-arch-files">{files.map(file =>
-                    <SourceLink key={file} path={file} onNavigate={onNavigate} />)}</div>}
-            </Collection>
-        </section>
-        <div className="atlas-arch-columns">
-            <section><SectionHeading title={text.languages} /><div className="atlas-arch-count-list">{data.languages.map(language =>
-                <span className="atlas-arch-badge" key={language.language}>{language.language} · {language.fileCount.toLocaleString()}</span>)}</div></section>
-            <section><SectionHeading title={text.kindsTitle} /><div className="atlas-arch-count-list">{data.symbolKinds.map(kind =>
-                <span className="atlas-arch-badge" key={kind.kind}>{kind.kind} · {kind.count.toLocaleString()}</span>)}</div></section>
-        </div>
-    </>;
-}
-
-function Dependencies({ data, empty, onGroup, graph, onNavigate }: { data: ArchitectureOverviewDto; empty: string; onGroup: (group: string) => void } & Pick<ArchitecturePanelProps, 'graph' | 'onNavigate'>): JSX.Element {
-    const boundaries = useMemo(() => [...data.boundaries].sort((a, b) => b.callCount - a.callCount), [data.boundaries]);
-    const [chosen, setChosen] = useState<ArchitectureBoundary>();
-    const edges = useMemo(() => graph && chosen ? repositoryMap(graph).evidence.filter(edge => edge.type === 'CALLS'
-        && edge.source.package_name === chosen.from && edge.target.package_name === chosen.to) : [], [graph, chosen]);
-    return <>
-        <section><SectionHeading title={text.dependencyTitle} note={text.dependencyNote} />
-            <BoundaryDiagram boundaries={boundaries} onGroup={onGroup} />
-        </section>
-        <section><SectionHeading title={text.tableTitle} />
-            <Collection items={boundaries} empty={empty} pageSize={24}>{rows =>
-                <div className="atlas-arch-table-wrap"><table className="atlas-arch-table"><thead><tr>
-                    <th scope="col">{text.from}</th><th scope="col">{text.to}</th><th scope="col" className="atlas-arch-number">{text.calls}</th><th scope="col">{text.evidence}</th>
-                </tr></thead><tbody>{rows.map((boundary, index) => <tr key={`${boundary.from}:${boundary.to}:${index}`}>
-                    <td><button className="atlas-arch-link" onClick={() => onGroup(boundary.from)}>{boundary.from}</button></td>
-                    <td><button className="atlas-arch-link" onClick={() => onGroup(boundary.to)}>{boundary.to}</button></td>
-                    <td className="atlas-arch-number">{boundary.callCount.toLocaleString()}</td>
-                    <td><button className="atlas-arch-link" onClick={() => setChosen(boundary)}>{text.inspectEdges}</button></td>
-                </tr>)}</tbody></table></div>}
-            </Collection>
-        </section>
-        {chosen && <section key={`${chosen.from}:${chosen.to}`}><SectionHeading title={`${chosen.from} → ${chosen.to}`} note={text.retainedEdges(edges.length, chosen.callCount)} />
-            {edges.length ? <RelationshipEvidence edges={edges} onNavigate={onNavigate} /> : <Empty>{text.edgeEvidenceUnavailable}</Empty>}
-        </section>}
-    </>;
 }
 
 function HotspotSignals({ hotspot }: { hotspot: ArchitectureHotspot }): JSX.Element {
@@ -245,55 +120,111 @@ function Findings({ view, data, empty, onNavigate }: {
     </section>;
 }
 
-function ArchitectureWorkspace({ projectName, overview, loading = false, error, onRefresh, onNavigate, graph, selection, selectionPanel, onSelect, onClearSelection, graphNote, graphGeneration, readSource, active = true, coverage, systemArchitectureLoader }: ArchitecturePanelProps): JSX.Element {
+const paletteStyle = scenePaletteStyle();
+
+/** Compact exploration history beside the current scope. Tooltips name each destination. */
+function HistoryControls({ history, place, onGo, onJump }: {
+    history: NavigationHistory<ArchitectureHistoryEntry>; place: ArchitectureHistoryEntry;
+    onGo: (step: -1 | 1) => void; onJump: (entry: ArchitectureHistoryEntry) => void;
+}): JSX.Element {
+    const back = peekNavigation(history, -1), forward = peekNavigation(history, 1);
+    const here = architectureHistoryOptions.recentKey?.(place);
+    const menu = useDismissibleMenu(architectureHistoryOptions.key(place));
+    return <div className="atlas-arch-history" role="group" aria-label={historyText.group} data-position={`${history.index + 1}/${history.entries.length}`}>
+        <button type="button" aria-label={historyText.back} disabled={!back} onClick={() => onGo(-1)}
+            title={back ? historyText.backTo(architectureEntryLabel(back)) : historyText.noBack}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12 5-5 5 5 5" /></svg></button>
+        <button type="button" aria-label={historyText.forward} disabled={!forward} onClick={() => onGo(1)}
+            title={forward ? historyText.forwardTo(architectureEntryLabel(forward)) : historyText.noForward}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m8 5 5 5-5 5" /></svg></button>
+        {history.recent.length > 1 && <details className="atlas-arch-recent" ref={menu.ref}>
+            <summary title={historyText.recentTitle} aria-label={historyText.recent}><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6a7 7 0 1 1-1 7M4 2v4H0m10 0v4l3 2" /></svg></summary>
+            <ul className="atlas-arch-recent-menu" aria-label={historyText.recentList}>{history.recent.map(entry => {
+                const id = architectureHistoryOptions.recentKey?.(entry);
+                const current = id === here;
+                const detail = architectureEntryDetail(entry);
+                return <li key={id}>
+                    <button type="button" disabled={current} aria-current={current ? 'true' : undefined} title={architectureEntryLabel(entry)} onClick={() => {
+                        menu.close();
+                        onJump(entry);
+                    }}><strong>{architectureEntryName(entry)}</strong>{detail && <span>{detail}</span>}</button>
+                </li>;
+            })}</ul>
+        </details>}
+    </div>;
+}
+
+function ArchitectureWorkspace({ projectName, overview, loading = false, error, onRefresh, onNavigate, graph, selectionPanel, onSelect, onClearSelection, onSelectionEvidence, graphNote, graphGeneration, active = true, escapeTaken = false, coverage, systemArchitectureLoader }: ArchitecturePanelProps): JSX.Element {
     const storage = useMemo(browserStorage, []);
-    const [config, setConfig] = useState(() => readArchitectureConfig(storage, projectName));
-    const [saved, setSaved] = useState(true);
-    useEffect(() => { setSaved(saveArchitectureConfig(storage, projectName, config)); }, [config, projectName, storage]);
+    /*
+     * The place is the whole history entry (K27): subtab, opened area or file,
+     * route perspective and filter, System structure focus and groups, Behavior
+     * start, destination and position, and Plan or 3D of each scene. The views
+     * below read their part of it and report changes back, so Back and Forward
+      * restore every part at once. Only deliberate exploration adds a stop;
+      * tabs and display controls update the current visit. A filter saved by an earlier
+     * session would silently hide routes, so only the subtab is read back.
+     */
+    const navigation = useArchitectureHistory(() => initialArchitecturePlace(readArchitectureConfig(storage, projectName).view), {
+        active, escapeTaken, onRestore: (from, to) => { if (from.view !== to.view) onSelectionEvidence?.(undefined); },
+    });
+    const { place, navigate } = navigation;
+    useEffect(() => { saveArchitectureConfig(storage, projectName, { view: place.view, filter: place.filter }); }, [place.view, place.filter, projectName, storage]);
+    const setView = useCallback((view: ArchitectureView) => navigate(current => ({ ...current, view: view === 'dependencies' ? 'overview' : view }), true), [navigate]);
+    const changeSpatial = useCallback<PlaceChange<SpatialPlace>>((change, automatic) =>
+        navigate(current => ({ ...current, spatial: { ...current.spatial, ...change } }), automatic), [navigate]);
+    const changeSystem = useCallback<PlaceChange<SystemPlace>>((change, automatic) =>
+        navigate(current => ({ ...current, system: { ...current.system, ...change } }), automatic), [navigate]);
+    const changePerspective = useCallback((routes: RoutesPerspective) => navigate(current => ({ ...current, routes }), true), [navigate]);
+    // Opening a route group is navigation; typing only refines the current visit.
+    const openRouteGroup = useCallback((filter: string) => navigate(current => ({ ...current, filter })), [navigate]);
     // A cached summary from another project must never appear here.
     const data = overview?.projectName && overview.projectName !== projectName ? undefined : overview;
-    const filtered = useMemo(() => data ? matchingArchitecture(data, config.filter) : undefined, [data, config.filter]);
-    const onGroup = (group: string) => setConfig({ view: 'overview', filter: group });
-    const empty = config.filter.trim() ? text.noMatches : text.noData;
-    const ready = Boolean(data && filtered && !loading && !error && projectName);
-    const systemView = config.view === 'structure' || config.view === 'behavior' ? config.view : undefined;
-    const SpatialView = config.view === 'routes' ? RoutesArchitecture : SpatialArchitecture;
-    return <section className="atlas-architecture" data-testid="atlas-architecture" data-system-view={systemView} aria-label={text.title} aria-busy={!systemView && loading}>
-        <nav className="atlas-arch-tabs" aria-label={text.navigation}>{ARCHITECTURE_VIEWS.map(view =>
-            <button className="atlas-arch-tab" key={view} aria-pressed={config.view === view || (view === 'overview' && ['dependencies', 'entryPoints'].includes(config.view))} data-view={view}
-                onClick={() => setConfig(current => ({ ...current, view }))}>{text.views[view]}</button>)}</nav>
-        <div className="atlas-arch-toolbar">
-            <label className="atlas-arch-filter"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.5" cy="6.5" r="4.5" fill="none" stroke="currentColor" strokeWidth="1.4" /><path d="m10 10 4 4" stroke="currentColor" strokeWidth="1.4" /></svg>
-                <input aria-label={text.filter} placeholder={text.filterPlaceholder} type="search" value={config.filter}
-                    onChange={event => setConfig(current => ({ ...current, filter: event.target.value }))} />
-            </label><span className="atlas-arch-saved">{saved ? text.saved : text.sessionOnly}</span>
-            <button className="atlas-arch-action" onClick={() => setConfig({ ...DEFAULT_ARCHITECTURE_CONFIG })}>{text.reset}</button>
+    const ready = Boolean(data && !loading && !error && projectName);
+    const systemView = place.view === 'structure' || place.view === 'behavior' ? place.view : undefined;
+    useEffect(() => {
+        if (active && (!projectName || (!systemView && (!ready || !graph)))) onSelectionEvidence?.(undefined);
+    }, [active, projectName, systemView, ready, graph, onSelectionEvidence]);
+    // Only the Routes view offers the filter, so no other view may receive a stale one.
+    const filter = place.view === 'routes' ? navigation.filter : '';
+    const historyControls = <HistoryControls history={navigation.history} place={place} onGo={navigation.go} onJump={navigation.jump} />;
+    const spatialProps = !systemView && ready && data && graph ? {
+        project: projectName, generation: graphGeneration, graph, overview: data,
+        view: place.view === 'dependencies' || place.view === 'structure' || place.view === 'behavior' ? 'overview' as const : place.view,
+        filter, onFilter: openRouteGroup, active, graphNote, coverage, onSelect, onClearSelection, onSelectionEvidence, selectionPanel, onNavigate, navigation: historyControls,
+        onView: (view: ArchitectureView) => { onSelectionEvidence?.(undefined); setView(view); }, place: place.spatial, onPlace: changeSpatial,
+    } : undefined;
+    // Every scene below draws with the same palette; the DOM reads it as CSS variables.
+    return <section className="atlas-architecture" data-testid="atlas-architecture" data-system-view={systemView} aria-label={text.title} aria-busy={!systemView && loading} style={paletteStyle}>
+        <div className="atlas-arch-tabrow">
+            <nav className="atlas-arch-tabs" aria-label={text.navigation}>{ARCHITECTURE_VIEWS.map(view =>
+                <button className="atlas-arch-tab" key={view} aria-pressed={place.view === view || (view === 'overview' && ['dependencies', 'entryPoints'].includes(place.view))} data-view={view}
+                    onClick={() => { if (view !== place.view) onSelectionEvidence?.(undefined); setView(view); }}>{text.views[view]}</button>)}</nav>
         </div>
         {systemView && projectName ? <Suspense fallback={<div role="status"><Empty>Preparing system analysis…</Empty></div>}><SystemArchitecture
-            project={projectName} generation={graphGeneration} view={systemView} filter={config.filter} active={active}
-            graph={graph} onSelect={onSelect} onClearSelection={onClearSelection} onNavigate={onNavigate} loader={systemArchitectureLoader} /></Suspense> : null}
+            project={projectName} generation={graphGeneration} view={systemView} filter={filter} active={active}
+            graph={graph} onSelect={onSelect} onClearSelection={onClearSelection} onSelectionEvidence={onSelectionEvidence} onNavigate={onNavigate} loader={systemArchitectureLoader}
+            place={place.system} onPlace={changeSystem} navigation={historyControls} /></Suspense> : null}
+        {!systemView && !spatialProps && <div className="atlas-arch-context">{historyControls}<span>{projectName}</span></div>}
         {!systemView && (!projectName ? <Empty>{text.chooseProject}</Empty> : loading ? <div role="status"><Empty>{text.loading}</Empty></div>
             : error ? <div role="alert" className="atlas-arch-empty" data-error="true"><p>{text.loadFailed}</p><p className="atlas-arch-error-detail">{error}</p>
                 {onRefresh && <button className="atlas-arch-action" onClick={onRefresh}>{text.retry}</button>}</div>
                 : !data ? <Empty>{text.unavailable}</Empty> : null)}
         {systemView && !projectName && <Empty>{text.chooseProject}</Empty>}
-        {!systemView && ready && data && graph && <SpatialView project={projectName} generation={graphGeneration} graph={graph} overview={data}
-            view={config.view === 'dependencies' || config.view === 'structure' || config.view === 'behavior' ? 'overview' : config.view} filter={config.filter} active={active}
-            graphNote={graphNote} coverage={coverage} onSelect={onSelect} onClearSelection={onClearSelection} selectionPanel={selectionPanel} onNavigate={onNavigate} onView={view => setConfig(current => ({ ...current, view: view === 'dependencies' ? 'overview' : view }))} />}
-        {!systemView && ready && data && filtered && <div className="atlas-arch-content" key={`${config.view}:${config.filter}:${graphGeneration ?? ""}`} data-testid="atlas-architecture-content">
-            <details open={!graph}><summary>Source guide and complete findings</summary>
-            {config.view === 'overview' ? <><RepositoryMapView graph={graph} graphNote={graphNote} overview={data} filter={config.filter} onNavigate={onNavigate} onSelect={onSelect} selection={selection} selectionPanel={selectionPanel} readSource={readSource} />
-                <details data-testid="architecture-dependency-details"><summary>Dependency details</summary><Dependencies data={filtered} empty={empty} onGroup={onGroup} graph={graph} onNavigate={onNavigate} /></details>
-                <details data-testid="architecture-entry-details"><summary>Entry-point source evidence</summary><Findings view="entryPoints" data={filtered} empty={empty} onNavigate={onNavigate} /></details>
-                <details><summary>{text.summaryDetails}</summary><Overview data={data} filtered={filtered} filter={config.filter} onGroup={onGroup} onNavigate={onNavigate} /></details></>
-                : config.view === 'dependencies' ? <Dependencies data={filtered} empty={empty} onGroup={onGroup} graph={graph} onNavigate={onNavigate} />
-                    : <Findings view={config.view} data={filtered} empty={empty} onNavigate={onNavigate} />}
-            </details>
+        {spatialProps && place.view === 'routes' && <div className="atlas-arch-toolbar"><label className="atlas-arch-filter">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.5" cy="6.5" r="4.5" fill="none" stroke="currentColor" strokeWidth="1.4" /><path d="m10 10 4 4" stroke="currentColor" strokeWidth="1.4" /></svg>
+            <input aria-label={text.filter} placeholder={text.filterPlaceholder} type="search" value={navigation.filter} onChange={event => navigation.type(event.target.value)} /></label></div>}
+        {spatialProps && (place.view === 'routes'
+            ? <RoutesArchitecture {...spatialProps} perspective={place.routes} onPerspective={changePerspective} />
+            : <SpatialArchitecture {...spatialProps} />)}
+        {!systemView && ready && data && !graph && <div className="atlas-arch-content" data-testid="atlas-architecture-content">
+            <p className="atlas-arch-fallback-summary">{data.files.length.toLocaleString()} files · {data.groups.length.toLocaleString()} source areas · {data.boundaries.length.toLocaleString()} cross-area connections</p>
+            <Findings view={place.view === 'overview' || place.view === 'dependencies' ? 'entryPoints' : place.view} data={data} empty={text.noData} onNavigate={onNavigate} />
         </div>}
-        {!systemView && ready && <details className="atlas-arch-evidence"><summary>{text.evidenceSummary}</summary><p>{text.evidenceDetail}</p></details>}
     </section>;
 }
 
+/** A project switch remounts the workspace: a fresh history, as in Galaxy. */
 export default function ArchitecturePanel(props: ArchitecturePanelProps): JSX.Element {
     return <ArchitectureWorkspace key={props.projectName} {...props} />;
 }

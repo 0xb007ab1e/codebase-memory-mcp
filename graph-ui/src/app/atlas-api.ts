@@ -9,11 +9,12 @@
  *
  * Same-origin ist der Normalfall. Der Server nimmt `/api` nur an, wenn der
  * Host-Kopf genau seine eigene Loopback-Adresse nennt und der Origin-Kopf
- * entweder fehlt oder dieselbe Adresse nennt (INVENTAR.md Abschnitt 5). Ein
+ * entweder fehlt oder dieselbe Adresse nennt. Ein
  * `base` ist darum nur fuer Node-Aufrufer da, die keinen Origin senden.
  */
 
 import { hasErrorObservers, reportError } from '../provider/error-observer';
+import { readConfigSnapshot, type ConfigSnapshot } from '../settings/config-model';
 import { readTreeLevel } from './tree-model';
 import type { TreeLevel } from './tree-model';
 import {
@@ -48,6 +49,8 @@ export interface AtlasApiOptions {
     base?: string;
     /** Ersetzbares fetch, damit Tests ohne Netz laufen. */
     fetch?: typeof globalThis.fetch;
+    /** Abbruchsignal fuer jeden Aufruf: das Projektfenster bricht so beim Wechsel ab (K24). */
+    signal?: AbortSignal;
 }
 
 /** Was `/api/repo-info` ueber ein Projekt weiss. Leere Felder heissen "unbekannt". */
@@ -84,7 +87,7 @@ function announce(error: AtlasApiError, detail?: string): AtlasApiError {
         const refused = error.status >= 400 && error.status < 500;
         reportError({
             source: 'api',
-            project: new URL(error.route, 'http://daemon.invalid').searchParams.get('project') ?? '',
+            project: new URL(error.route, 'http://127.0.0.1').searchParams.get('project') ?? '',
             level: refused ? 'warn' : 'error',
             message: error.message,
             detail,
@@ -98,6 +101,14 @@ const text = (value: unknown): string => (typeof value === 'string' ? value : ''
 export class AtlasApi {
 
     constructor(private readonly options: AtlasApiOptions = {}) { }
+
+    async configuration(): Promise<ConfigSnapshot> {
+        return readConfigSnapshot(await this.getJson('/api/config'));
+    }
+
+    async saveConfiguration(revision: string, changes: Record<string, string | null>): Promise<ConfigSnapshot> {
+        return readConfigSnapshot(await this.request('POST', '/api/config', { revision, changes }));
+    }
 
     private getJson(route: string): Promise<unknown> {
         return this.request('GET', route);
@@ -119,10 +130,14 @@ export class AtlasApi {
                 init.headers = { Accept: 'application/json', 'Content-Type': 'application/json' };
                 init.body = JSON.stringify(payload);
             }
+            if (this.options.signal !== undefined) init.signal = this.options.signal;
             response = await doFetch(url, init);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            throw announce(new AtlasApiError(route, 0, `${route} war nicht erreichbar: ${message}`));
+            const failure = new AtlasApiError(route, 0, `${route} war nicht erreichbar: ${message}`);
+            // Ein abgebrochener Aufruf ist die Sache des Aufrufers und kein Fehler des Servers.
+            if (this.options.signal?.aborted) throw failure;
+            throw announce(failure);
         }
         const body = await response.text();
         if (!response.ok) {

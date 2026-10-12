@@ -1,10 +1,11 @@
 import { ATTRIBUTION_PATTERNS, NAME_PATTERN, WATCHED_NAMES } from './forbidden-names.mjs';
 
 /** A real integration must identify its client and configuration protocol.
- * This exemption is limited to four operational source/test files and the
- * README's exact installation instructions. Two named local verification JSON
- * files permit only configuration-path/setup-command fields; the named download
- * artifact must equal the canonical hook. Authorship claims remain forbidden.
+ * This exemption is limited to four operational source/test files, the
+ * configuration reference's name of the client's own environment variable, and
+ * the README's exact installation instructions. Two named local verification JSON
+ * files permit only configuration-path/setup-command fields. Authorship claims
+ * remain forbidden.
  * Names use the guard's existing codepoint source, avoiding self-matches here.
  */
 const FILES = new Set([
@@ -18,12 +19,16 @@ const JSON_ARTIFACTS = new Set([
     'verification/pr-2068/final-agent-boundary-initial-unavailable.json',
     'verification/pr-2068/final-agent-diagnosis-restart.json',
 ]);
-export const DOWNLOADED_HOOK_ARTIFACT = 'verification/pr-2068/final-downloaded-hook.txt';
 const README_LINES = new Set([
+    `\`.${client}/settings.local.json\` and \`.${client}/hooks/\`.`,
     `python3 ~/Downloads/cbm-atlas-trace.py --install-${client} --root /absolute/repository --project INDEXED_NAME --daemon-url http://127.0.0.1:9749`,
     `Installation is explicit and local: it preserves unrelated ${client[0].toUpperCase() + client.slice(1)} settings,`,
     `adds a PostToolUse entry to \`.${client}/settings.local.json\`, and copies the hook`,
     `into \`.${client}/hooks/\`. It refuses conflicting hooks, symlinks and malformed`,
+]);
+/** The installer reads this variable, so the configuration reference must name it exactly. */
+const ENVIRONMENT_REFERENCES = new Map([
+    ['src/settings/ConfigReference.tsx', new RegExp(`\\b${client.toUpperCase()}_CONFIG_DIR\\b`, 'g')],
 ]);
 const REFERENCES = [
     new RegExp(`\\b${client} Code\\b`, 'gi'),
@@ -44,15 +49,13 @@ function setupEvidenceField(path, line) {
             && value.includes(' --project ') && value.includes(" --daemon-url 'http://127.0.0.1:");
 }
 
-export function operationalClientReference(path, line, evidence = {}) {
+export function operationalClientReference(path, line) {
     const setupInstruction = path === 'README.md' && README_LINES.has(line.trim());
-    const canonicalDownload = path === DOWNLOADED_HOOK_ARTIFACT && evidence.canonicalHook instanceof Uint8Array
-        && evidence.artifact instanceof Uint8Array && evidence.canonicalHook.length > 0
-        && evidence.artifact.length === evidence.canonicalHook.length
-        && evidence.artifact.every((byte, index) => byte === evidence.canonicalHook[index]);
-    if ((!FILES.has(path) && !setupInstruction && !canonicalDownload && !setupEvidenceField(path, line)) || !NAME_PATTERN.test(line)
+    const environment = ENVIRONMENT_REFERENCES.get(path);
+    if ((!FILES.has(path) && !environment && !setupInstruction && !setupEvidenceField(path, line)) || !NAME_PATTERN.test(line)
         || ATTRIBUTION_PATTERNS.some(({ pattern }) => pattern.test(line))) return false;
     if (setupInstruction) return true;
+    if (environment) return !NAME_PATTERN.test(line.replace(environment, ''));
     let remaining = line;
     for (const pattern of REFERENCES) remaining = remaining.replace(pattern, '');
     return !NAME_PATTERN.test(remaining);
@@ -60,4 +63,4 @@ export function operationalClientReference(path, line, evidence = {}) {
 
 export const OPERATIONAL_CLIENT_REASON =
     'explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, '
-    + 'named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden';
+    + 'named local evidence fields; authorship claims remain forbidden';

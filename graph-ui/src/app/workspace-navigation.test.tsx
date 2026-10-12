@@ -167,33 +167,56 @@ it('replaces legacy model and twin controls when selected-code context is suppli
     expect(host.querySelector('[data-testid="legacy-twin-splitter"]')).not.toBeNull();
 });
 
-it('opens search on demand, retains its query, and returns keyboard focus on Escape', async () => {
-    const props = { ...makeProps(), commandValue: 'index', onCommandKeyDown: vi.fn() };
-    await act(async () => root.render(<AtlasChrome {...props} />));
-    const trigger = host.querySelector<HTMLInputElement>('[aria-label="Preserved reader"]');
-    expect(trigger).not.toBeNull();
-    const dialog = host.querySelector<HTMLDialogElement>('dialog');
-    expect(dialog?.open).toBe(false);
-    await act(async () => {
-        trigger!.focus();
-        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true }));
-    });
-    expect(dialog?.open).toBe(true);
-    const input = host.querySelector<HTMLInputElement>('[data-testid="atlas-command-input"]')!;
-    expect(document.activeElement).toBe(input);
-    expect(input.value).toBe('index');
-    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })));
-    expect(dialog?.open).toBe(false);
-    expect(document.activeElement).toBe(trigger);
-    await act(async () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true })));
-    expect(dialog?.open).toBe(true);
-    expect(input.value).toBe('index');
+it.each(['ctrlKey', 'metaKey'] as const)('routes %s+K to Galaxy and focuses its dedicated search after navigation', async modifier => {
+    const onWorkspaceChange = vi.fn(); const focused = vi.fn();
+    let frame: FrameRequestCallback | undefined;
+    const raf = vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => { frame = callback; return 1; });
+    window.addEventListener('cbm:focus-galaxy-search', focused);
+    try {
+        await act(async () => root.render(<AtlasChrome {...makeProps()} onWorkspaceChange={onWorkspaceChange} />));
+        const reader = host.querySelector<HTMLInputElement>('[aria-label="Preserved reader"]')!;
+        reader.focus();
+        const event = new KeyboardEvent('keydown', { key: 'k', [modifier]: true, bubbles: true, cancelable: true });
+        await act(async () => window.dispatchEvent(event));
+        expect(event.defaultPrevented).toBe(true);
+        expect(onWorkspaceChange).toHaveBeenCalledExactlyOnceWith('galaxy');
+        expect(focused).not.toHaveBeenCalled();
+        expect(host.querySelector('dialog')).toBeNull();
+        expect(host.querySelector('[data-testid="atlas-command-input"]')).toBeNull();
+        await act(async () => frame!(0));
+        expect(focused).toHaveBeenCalledOnce();
+        expect(reader.value).toBe('selected source');
+    } finally { window.removeEventListener('cbm:focus-galaxy-search', focused); raf.mockRestore(); }
 });
 
-it('opens the command palette for existing keyboard and graph-action requests', async () => {
-    await act(async () => root.render(<AtlasChrome {...makeProps()} />));
-    await act(async () => window.dispatchEvent(new Event('cbm:open-command-search')));
-    expect(host.querySelector<HTMLDialogElement>('dialog')?.open).toBe(true);
+it('routes legacy graph search requests to the dedicated Galaxy workspace', async () => {
+    const onWorkspaceChange = vi.fn(); const focused = vi.fn();
+    let frame: FrameRequestCallback | undefined;
+    const raf = vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => { frame = callback; return 1; });
+    window.addEventListener('cbm:focus-galaxy-search', focused);
+    try {
+        await act(async () => root.render(<AtlasChrome {...makeProps()} onWorkspaceChange={onWorkspaceChange} />));
+        await act(async () => window.dispatchEvent(new Event('cbm:open-command-search')));
+        expect(onWorkspaceChange).toHaveBeenCalledExactlyOnceWith('galaxy');
+        await act(async () => frame!(0));
+        expect(focused).toHaveBeenCalledOnce();
+        expect(host.querySelector('dialog')).toBeNull();
+    } finally { window.removeEventListener('cbm:focus-galaxy-search', focused); raf.mockRestore(); }
+});
+
+it('shows compact reader context alongside preserved code without mounting a full impact report', async () => {
+    const props = makeProps();
+    await act(async () => root.render(<AtlasChrome {...props} workspace="explore" readerSummary={<aside aria-label="File impact">3 dependent files · 2 tests</aside>} />));
+    const reader = host.querySelector<HTMLInputElement>('[aria-label="Preserved reader"]')!;
+    const summary = host.querySelector('[aria-label="File impact"]')!;
+    expect(summary.textContent).toContain('3 dependent files');
+    expect(summary.compareDocumentPosition(reader) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(reader.closest('[hidden]')).toBeNull();
+    expect(host.querySelector('[data-testid="impact-workspace"]')).toBeNull();
+    await act(async () => root.render(<AtlasChrome {...props} workspace="explore" readerSummary={<aside aria-label="File impact">Selection · 1 dependent file</aside>} />));
+    expect(host.querySelector('[aria-label="Preserved reader"]')).toBe(reader);
+    expect(reader.value).toBe('selected source');
+    expect(host.querySelector('[aria-label="File impact"]')?.textContent).toContain('Selection');
 });
 
 it('resizes local chat by keyboard and exposes daemon navigation', async () => {
@@ -233,34 +256,38 @@ it('keeps tools and explanation-depth controls out of the header', async () => {
     expect([...header.querySelectorAll('button')].some(button => button.textContent === 'Edges')).toBe(false);
 });
 
-it('places Chat directly after the project selector and keeps its toggle wired', async () => {
+it('places separate agent settings and chat controls directly after the project selector', async () => {
     const onOpenBrowserAi = vi.fn();
+    const onToggleBrowserAi = vi.fn();
     await act(async () => root.render(<AtlasChrome {...makeProps()} workspace="adr"
         projectSwitcher={<div data-testid="project-selector">Project</div>}
-        onOpenBrowserAi={onOpenBrowserAi} chatOpen />));
+        onOpenBrowserAi={onOpenBrowserAi} onToggleBrowserAi={onToggleBrowserAi} chatOpen />));
     const project = host.querySelector('[data-testid="project-selector"]')!;
-    const chat = project.nextElementSibling as HTMLButtonElement;
-    expect(chat.textContent).toBe('Chat');
+    const controls = project.nextElementSibling!;
+    expect(controls.getAttribute('aria-label')).toBe('Local agent');
+    const settings = controls.querySelector<HTMLButtonElement>('.atlas-browser-ai-action')!;
+    const chat = controls.querySelector<HTMLButtonElement>('[aria-label="Hide chat"]')!;
     expect(chat.getAttribute('aria-expanded')).toBe('true');
     await act(async () => chat.click());
+    expect(onToggleBrowserAi).toHaveBeenCalledOnce();
+    expect(onOpenBrowserAi).not.toHaveBeenCalled();
+    await act(async () => settings.click());
     expect(onOpenBrowserAi).toHaveBeenCalledOnce();
 });
 
-it('keeps pending results visible until activation succeeds and refocuses an open search', async () => {
-    const props = { ...makeProps(), onCommandKeyDown: (event: {preventDefault: () => void}) => event.preventDefault() };
-    await act(async () => root.render(<AtlasChrome {...props} />));
-    await act(async () => window.dispatchEvent(new Event('cbm:open-command-search')));
-    const input = host.querySelector<HTMLInputElement>('[data-testid="atlas-command-input"]')!;
-    const dialog = host.querySelector<HTMLDialogElement>('dialog')!;
-    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })));
-    expect(dialog.open).toBe(true);
-    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Close search"]')!.focus());
-    await act(async () => window.dispatchEvent(new Event('cbm:open-command-search')));
-    expect(document.activeElement).toBe(input);
-    await act(async () => window.dispatchEvent(new Event('cbm:close-command-search')));
-    expect(dialog.open).toBe(false);
+it('leaves reader typing and Enter untouched by removed command handlers', async () => {
+    const onCommandChange = vi.fn(); const onCommandKeyDown = vi.fn();
+    await act(async () => root.render(<AtlasChrome {...makeProps()} onCommandChange={onCommandChange} onCommandKeyDown={onCommandKeyDown} />));
+    const reader = host.querySelector<HTMLInputElement>('[aria-label="Preserved reader"]')!;
+    reader.focus();
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    await act(async () => reader.dispatchEvent(enter));
+    expect(enter.defaultPrevented).toBe(false);
+    expect(onCommandKeyDown).not.toHaveBeenCalled();
+    expect(onCommandChange).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(reader);
+    expect(host.querySelector('dialog')).toBeNull();
 });
-
 
 it('keeps Explorer graph and chat draft mounted when chat folds', async () => {
     const props = makeProps();

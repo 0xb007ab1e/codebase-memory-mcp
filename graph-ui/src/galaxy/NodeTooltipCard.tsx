@@ -16,7 +16,9 @@
  */
 
 import type { JSX } from 'react';
-import { Html } from '@react-three/drei';
+import { galaxyCardText } from './galaxy-strings';
+import { HoverCardHtml } from './hover-layer';
+import { graphNodeIndexName, graphNodeName, nodeFilePath } from './node-names';
 import type { GraphNode } from './types';
 
 /** Der Zeilenbereich, wenn das Layout einen fuehrt. */
@@ -39,8 +41,10 @@ export function tooltipRows(node: GraphNode): [string, string][] {
     if (node.out_calls !== undefined) {
         rows.push(['fan-out', String(node.out_calls)]);
     }
+    // Zeile 0 ist keine Zeile: so antwortet query_graph fuer einen Knoten ohne Quelle (Runde 4, N1).
     if (
         node.start_line !== undefined &&
+        node.start_line > 0 &&
         node.end_line !== undefined &&
         node.end_line >= node.start_line
     ) {
@@ -51,29 +55,29 @@ export function tooltipRows(node: GraphNode): [string, string][] {
 
 /** Was ein Klick auf diesen Knoten tun wird, als Satz. */
 export function tooltipAction(node: GraphNode): string {
-    return node.file_path === undefined || node.file_path.length === 0
-        ? 'no file in the index: nothing to open'
-        : 'click to open the file and follow the twin';
+    const file = nodeFilePath(node);
+    return file === undefined || file.length === 0 ? galaxyCardText.nothingToOpen : galaxyCardText.openFile;
 }
 
 export function NodeTooltipCard({ node }: { node: GraphNode }): JSX.Element {
     const rows = tooltipRows(node);
     const lines = lineRangeOf(node);
+    // Round 4 (N1): a Branch node shows what it is, its name in the index stands where a file would, and "{}" is no file.
+    const file = nodeFilePath(node);
+    const indexName = graphNodeIndexName(node);
     return (
-        <Html
-            position={[node.x, node.y + node.size * 0.7, node.z]}
-            center
-            style={{ pointerEvents: 'none' }}
-        >
+        /* Review zu K29: in der Ebene der Hover-Karten, ueber den Flaechen der Galaxie (hover-layer.tsx). */
+        <HoverCardHtml position={[node.x, node.y + node.size * 0.7, node.z]}>
             <div className="atlas-galaxy-card" data-testid="atlas-galaxy-card">
                 <div className="atlas-galaxy-card-head">
                     <span className="atlas-galaxy-card-dot" style={{ backgroundColor: node.color }} />
-                    <span className="atlas-galaxy-card-name">{node.name}</span>
+                    <span className="atlas-galaxy-card-name">{graphNodeName(node)}</span>
                     <span className="atlas-galaxy-card-label">{node.label}</span>
                 </div>
-                {node.file_path !== undefined && node.file_path.length > 0 && (
+                {indexName !== undefined && <p className="atlas-galaxy-card-path">{indexName}</p>}
+                {file !== undefined && file.length > 0 && (
                     <p className="atlas-galaxy-card-path">
-                        {node.file_path}
+                        {file}
                         {lines.length > 0 && <span className="atlas-galaxy-card-lines"> {lines}</span>}
                     </p>
                 )}
@@ -92,7 +96,7 @@ export function NodeTooltipCard({ node }: { node: GraphNode }): JSX.Element {
                 )}
                 <p className="atlas-galaxy-card-action">{tooltipAction(node)}</p>
             </div>
-        </Html>
+        </HoverCardHtml>
     );
 }
 

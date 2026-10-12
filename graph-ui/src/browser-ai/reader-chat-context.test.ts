@@ -51,11 +51,11 @@ describe('automatic Explorer source context', () => {
     });
 
     it('labels missing leading lines and incomplete pages instead of claiming a full file', () => {
-        const partial = { ...document, firstLine: 8, lastLine: 9, fileLastLine: 50, truncated: true, truncationNote: 'Lines 10–50 were not loaded.' };
+        const partial = { ...document, firstLine: 8, lastLine: 9, fileLastLine: 50, truncated: true, truncationNote: 'Lines 10-50 were not loaded.' };
         const source = readerChatContext({ ...input, document: partial }).source!;
         expect(source.text).toBe(document.source);
-        expect(source.partial).toContain('Lines 1–7 are not loaded');
-        expect(source.partial).toContain('Lines 10–50 were not loaded');
+        expect(source.partial).toContain('Lines 1-7 are not loaded');
+        expect(source.partial).toContain('Lines 10-50 were not loaded');
         expect(source.startLine).toBe(8);
         expect(source.endLine).toBe(10);
         expect(readerChatContext({ ...input, document: partial, selection: { ...selection, startLine: 9, endLine: 9 } }).source?.kind).toBe('selection');

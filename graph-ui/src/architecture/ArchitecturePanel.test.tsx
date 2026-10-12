@@ -7,7 +7,7 @@ import type { ArchitecturePanelProps } from './ArchitecturePanel';
 import type { ArchitectureOverviewDto } from '../core/intelligence-provider';
 import { architectureText as text } from './strings';
 vi.mock('./ArchitectureScene', () => ({ ArchitectureScene: () => <div data-testid="scene" /> }));
-vi.mock('./ContainerMap', () => ({ default: () => <div data-testid="container-map" /> }));
+vi.mock('./ContainerMap', () => ({ default: ({ filter }: { filter: string }) => <div data-testid="container-map" data-filter={filter} /> }));
 
 let container: HTMLDivElement;
 let root: Root;
@@ -59,12 +59,6 @@ async function click(selector: string): Promise<void> {
     await act(async () => target?.click());
 }
 
-async function filter(value: string): Promise<void> {
-    const input = container.querySelector<HTMLInputElement>('input[type="search"]')!;
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-    await act(async () => { setter?.call(input, value); input.dispatchEvent(new Event('input', { bubbles: true })); });
-}
-
 describe('architecture workspace', () => {
     it('loads system structure independently when the legacy summary is unavailable', async () => {
         const loader = vi.fn().mockResolvedValue({ status: 'failed', generation: 'g1', error: 'System analysis service unavailable.' });
@@ -103,14 +97,21 @@ describe('architecture workspace', () => {
         expect(container.querySelector('select[aria-label="Entry point"]')).not.toBeNull();
     });
 
-    it('keeps module, layer, community and indexed-file evidence available in Overview', async () => {
+    it('keeps the graph primary without duplicating the source guide or architecture search', async () => {
+        await render({ graph: { nodes: [], edges: [], total_nodes: 0 } });
+        expect(container.querySelector('[data-testid="spatial-architecture"]')).not.toBeNull();
+        expect(container.querySelector('[data-testid="atlas-architecture-content"]')).toBeNull();
+        expect(container.textContent).not.toContain('Source guide and complete findings');
+        expect(container.querySelector('input[type="search"]')).toBeNull();
+        expect(container.querySelector<HTMLDetailsElement>('.spatial-map-details')?.open).toBe(false);
+        expect(container.querySelector<HTMLDetailsElement>('.spatial-node-list')?.open).toBe(false);
+    });
+
+    it('provides a compact source fallback when the graph has not loaded', async () => {
         await render();
-        expect(container.textContent).toContain('41');
-        expect(container.textContent).toContain('Registered route handlers');
-        expect(container.textContent).toContain('persist');
-        expect(container.textContent).toContain('src/storage.ts');
-        const statistics = [...container.querySelectorAll('details')].find(details => details.querySelector('summary')?.textContent === text.summaryDetails);
-        expect(statistics?.open).toBe(false);
+        expect(container.textContent).toContain('2 files · 2 source areas · 1 cross-area connections');
+        expect(container.querySelectorAll('tbody tr')).toHaveLength(2);
+        expect(container.textContent).not.toContain('Registered route handlers');
     });
 
     it('opens a source location at the exact provider line and leaves unknown locations unlinked', async () => {
@@ -123,54 +124,48 @@ describe('architecture workspace', () => {
         expect(missing?.textContent).toContain(text.unknown);
     });
 
-    it('retains source-derived route evidence when filtering by handler', async () => {
-        await render();
+    it('retains source-derived route evidence and pagination in the non-graph fallback', async () => {
+        const data = overview();
+        data.routes = Array.from({ length: 30 }, (_, index) => ({ ...data.routes[0], path: `/users/${index}` }));
+        await render({ overview: data });
         await click('[data-view="routes"]');
-        await filter('create');
-        expect(container.querySelectorAll('tbody tr')).toHaveLength(1);
+        expect(container.querySelectorAll('tbody tr')).toHaveLength(24);
         expect(container.querySelector('[data-origin="source"]')?.textContent).toBe(text.sourceOrigin);
-        await filter('unrecorded');
-        expect(container.textContent).toContain(text.noMatches);
-        expect(container.querySelector('tbody')).toBeNull();
+        const more = [...container.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === text.showMore)!;
+        await act(async () => more.click());
+        expect(container.querySelectorAll('tbody tr')).toHaveLength(30);
     });
 
-    it('restores configuration per project and prevents a cached project summary from leaking across the switch', async () => {
-        await render();
+    it('offers the filter in Routes only and hands it to the service and endpoint views', async () => {
+        await render({ graph: { nodes: [], edges: [], total_nodes: 0 } });
+        expect(container.querySelector('input[type="search"]')).toBeNull();
         await click('[data-view="routes"]');
-        await filter('users');
+        await act(async () => { await vi.dynamicImportSettled(); });
+        const search = container.querySelector<HTMLInputElement>('input[type="search"]')!;
+        expect(search.getAttribute('aria-label')).toBe(text.filter);
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(search, '/users');
+            search.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        expect(container.querySelector('[data-testid="container-map"]')?.getAttribute('data-filter')).toBe('/users');
+        await click('[data-view="hotspots"]');
+        expect(container.querySelector('input[type="search"]')).toBeNull();
+        await click('[data-view="routes"]');
+        expect(container.querySelector<HTMLInputElement>('input[type="search"]')?.value).toBe('/users');
+    });
+
+    it('restores the view per project while discarding old hidden search filters', async () => {
+        window.localStorage.setItem('atlas.architecture.v1:sample', JSON.stringify({ version: 1, view: 'routes', filter: 'unrecorded' }));
+        await render();
+        expect(container.querySelector('[data-view="routes"]')?.getAttribute('aria-pressed')).toBe('true');
+        expect(container.querySelectorAll('tbody tr')).toHaveLength(1);
+        expect(container.querySelector('input[type="search"]')).toBeNull();
         await render({ projectName: 'different' });
         expect(container.querySelector('[data-view="overview"]')?.getAttribute('aria-pressed')).toBe('true');
         expect(container.querySelector('[data-testid="atlas-architecture-content"]')).toBeNull();
         await render();
         expect(container.querySelector('[data-view="routes"]')?.getAttribute('aria-pressed')).toBe('true');
-        expect(container.querySelector<HTMLInputElement>('input')?.value).toBe('users');
-        const reset = [...container.querySelectorAll('button')].find(button => button.textContent === text.reset)!;
-        await act(async () => reset.click());
-        expect(container.querySelector('[data-view="overview"]')?.getAttribute('aria-pressed')).toBe('true');
-        expect(container.querySelector<HTMLInputElement>('input')?.value).toBe('');
-    });
-
-    it('links the module card and keyboard-accessible dependency map to the same filter', async () => {
-        await render();
-        await click('button[aria-label="Show relationships for api"]');
-        expect(container.querySelector('[data-view="overview"]')?.getAttribute('aria-pressed')).toBe('true');
-        const target = container.querySelector<SVGGElement>('g[aria-label="Show relationships for storage"]')!;
-        expect(target.getAttribute('tabindex')).toBe('0');
-        await act(async () => target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
-        expect(container.querySelector<HTMLInputElement>('input')?.value).toBe('storage');
-        expect(container.querySelectorAll('[data-testid="architecture-dependency-details"] tbody tr')).toHaveLength(1);
-    });
-
-    it('bounds the diagram while keeping every reported relationship reachable', async () => {
-        const data = overview();
-        data.boundaries = Array.from({ length: 30 }, (_, index) => ({ from: `module-${index}`, to: 'core', callCount: index + 1 }));
-        await render({ overview: data });
-        expect(container.querySelectorAll('[data-testid="architecture-dependency-details"] svg g[role="button"]')).toHaveLength(8);
-        expect(container.textContent).toContain(text.mapLimit(8, 23));
-        expect(container.querySelectorAll('[data-testid="architecture-dependency-details"] tbody tr')).toHaveLength(24);
-        const more = [...container.querySelectorAll<HTMLButtonElement>('[data-testid="architecture-dependency-details"] button')].find(button => button.textContent === text.showMore)!;
-        await act(async () => more.click());
-        expect(container.querySelectorAll('[data-testid="architecture-dependency-details"] tbody tr')).toHaveLength(30);
+        expect(JSON.parse(window.localStorage.getItem('atlas.architecture.v1:sample')!).filter).toBe('');
     });
 
     it('distinguishes missing hotspot measurements from a measured zero', async () => {

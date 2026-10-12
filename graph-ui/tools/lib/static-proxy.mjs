@@ -2,8 +2,7 @@
  * Ein Ursprung fuer den Beweislauf: dist/ ausliefern und /rpc plus /api an den
  * C-Server weiterreichen.
  *
- * Warum das noetig ist, steht in INVENTAR.md Abschnitt 5 und ist keine
- * Bequemlichkeit: der Server nimmt eine Anfrage auf /api oder /rpc nur an, wenn
+ * Der Server nimmt eine Anfrage auf /api oder /rpc nur an, wenn
  * der Host-Kopf genau seine eigene Loopback-Adresse mit seinem eigenen Port
  * nennt, und weist jeden Origin ab, der nicht derselbe Server ist. Ein anderer
  * localhost-Port ist fuer ihn ein anderes Principal. Eine Seite auf Port B kann
@@ -21,7 +20,7 @@
  *    dasselbe Ergebnis mit einer Luege mehr im Kopf.
  *
  * Im Betrieb gibt es diesen Proxy nicht: dort liefert der C-Server die Assets
- * selbst aus und alles ist same-origin (INVENTAR.md Abschnitt 8). Der Proxy ist
+ * selbst aus und alles ist same-origin. Der Proxy ist
  * der Ersatz dafuer im Beweislauf, und der Unterschied ist genau ein Ursprung.
  *
  * Nebenbei schreibt er mit, welche /api-Routen und welche /rpc-Werkzeuge

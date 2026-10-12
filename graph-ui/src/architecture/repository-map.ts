@@ -33,6 +33,25 @@ export function areaOf(path: string): string {
     return parts[0];
 }
 
+/**
+ * Every area a file belongs to, from the repository root inward. Each level
+ * applies areaOf to the path below the previous one, so an opened area shows
+ * its next folder level the same way the repository root shows its first.
+ * The last entry is the area the file sits in directly.
+ */
+export function areaTrail(path: string): string[] {
+    const trail = [areaOf(path)];
+    for (let area = trail[0]; area !== '(root)';) {
+        const inner = areaOf(path.slice(area.length + 1));
+        if (inner === '(root)') break;
+        area = `${area}/${inner}`; trail.push(area);
+    }
+    return trail;
+}
+
+/** The drill-in steps from the repository root down to an area taken from a trail. */
+export const areaLevels = (area: string): string[] => area === '(root)' ? [area] : areaTrail(`${area}/-`);
+
 const isSource = (node: GraphNode) => Boolean(node.file_path && node.file_path !== '{}'
     && !['Project', 'Folder', 'Package', 'Branch'].includes(node.label));
 const priority = (a: GraphNode, b: GraphNode) => (b.in_calls ?? 0) - (a.in_calls ?? 0)

@@ -73,6 +73,43 @@ describe('die Werkzeuge, die von sich aus JSON liefern', () => {
         expect(result.projects[0].root_path).toContain('fixtures/atlas-sample');
     });
 
+    it('loads every project page instead of silently returning the first page', async () => {
+        const first = Array.from({ length: 500 }, (_, index) => ({ name: `project-${index}` }));
+        const { client: c, rpc } = client([
+            { tool: 'list_projects', when: args => args.offset === 0, json: { projects: first, total: 501, offset: 0, limit: 500, returned: 500, has_more: true, next_offset: 500 } },
+            { tool: 'list_projects', when: args => args.offset === 500, json: { projects: [{ name: 'project-500' }], total: 501, offset: 500, limit: 500, returned: 1, has_more: false } },
+        ]);
+        const result = await c.listProjects();
+        expect(result.projects).toHaveLength(501);
+        expect(result.projects.at(-1)?.name).toBe('project-500');
+        expect(rpc.calls.map(call => call.args)).toEqual([{ limit: 500, offset: 0, format: 'json' }, { limit: 500, offset: 500, format: 'json' }]);
+    });
+
+    it.each([
+        { projects: [{ name: 'a' }], total: 2, returned: 1, offset: 0, has_more: true, next_offset: 0 },
+        { projects: [{ name: 'a' }], total: 2, returned: 1, offset: 0, has_more: false },
+        { projects: [], total: 2, returned: 0, offset: 0, has_more: true, next_offset: 1 },
+        { projects: [{ name: 'a' }], returned: 2, offset: 0, has_more: false },
+        { projects: [{ name: 'a' }], has_more: 'true' },
+    ])('refuses incomplete or inconsistent project pagination %#', async json => {
+        const { client: c, rpc } = client([{ tool: 'list_projects', json }]);
+        await expect(c.listProjects()).rejects.toBeInstanceOf(EngineError);
+        expect(rpc.calls).toHaveLength(1);
+    });
+
+    it('rejects repeated projects and changed totals across pages', async () => {
+        for (const page of [
+            { projects: [{ name: 'a' }], total: 2, returned: 1, offset: 1, has_more: false },
+            { projects: [{ name: 'b' }], total: 3, returned: 1, offset: 1, has_more: true, next_offset: 2 },
+        ]) {
+            const { client: c } = client([
+                { tool: 'list_projects', when: args => args.offset === 0, json: { projects: [{ name: 'a' }], total: 2, returned: 1, offset: 0, has_more: true, next_offset: 1 } },
+                { tool: 'list_projects', when: args => args.offset === 1, json: page },
+            ]);
+            await expect(c.listProjects()).rejects.toBeInstanceOf(EngineError);
+        }
+    });
+
     it('liest den Quelltext eines Symbols samt Spanne', async () => {
         const { client: c } = client([{
             tool: 'get_code_snippet',
@@ -198,6 +235,16 @@ describe('die Werkzeuge, die erst auf Bitte JSON liefern', () => {
         ]);
         expect(result.callees?.[2].hop).toBe(2);
         expect(result.callers).toHaveLength(1);
+    });
+
+    it('spricht Richtung und Tiefe in den Woertern des trace_path-Schemas', async () => {
+        const { client: c, rpc } = client([{ tool: 'trace_path', json: { function: 'createUser', direction: 'inbound' } }]);
+        await c.tracePath(RECORDED_PROJECT, 'createUser', { direction: 'inbound', depth: 2 });
+        expect(rpc.calls[0].args).toMatchObject({ function_name: 'createUser', direction: 'inbound', depth: 2 });
+        expect(rpc.calls[0].args).not.toHaveProperty('max_depth');
+        await c.tracePath(RECORDED_PROJECT, 'createUser');
+        expect(rpc.calls[1].args).not.toHaveProperty('direction');
+        expect(rpc.calls[1].args).not.toHaveProperty('depth');
     });
 
     it('gibt die Ablehnung wegen Mehrdeutigkeit als Antwort weiter, nicht als Fehler', async () => {

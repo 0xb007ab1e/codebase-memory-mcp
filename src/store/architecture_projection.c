@@ -2,6 +2,7 @@
 #include "store/architecture_projection.h"
 #include "foundation/hash_table.h"
 #include "foundation/platform.h"
+#include "foundation/mem_core.h"
 #include <sqlite3.h>
 #include <yyjson/yyjson.h>
 #include <limits.h>
@@ -19,7 +20,14 @@ enum {
     AP_ARGUMENT_LIMIT = 8,
     AP_SIGNATURE_BYTES = 4096,
     AP_VALUE_BYTES = 1024,
-    AP_PARAMETER_LIMIT = 64
+    AP_PARAMETER_LIMIT = 64,
+    /* Overview entries carry a full representative symbol (about 1.3 KB of
+     * mutable JSON each). Django 5.2.7 has 12,700 components: listing all of
+     * them took half of AP_JSON_BUDGET before any other section. Keep it at
+     * least the max_components ceiling (512) plus 64 groups * AP_GROUP_ENTRIES
+     * so displayed parts and every group's share always fit. */
+    AP_OVERVIEW_COMPONENTS = 4096,
+    AP_GROUP_ENTRIES = 16
 };
 enum { AP_EVIDENCE_CONTEXT, AP_EVIDENCE_CORRIDOR, AP_EVIDENCE_PATH, AP_EVIDENCE_SCOPES };
 
@@ -34,7 +42,7 @@ static void *ap_json_malloc(void *context, size_t size) {
         budget->failed = true;
         return NULL;
     }
-    void *p = malloc(size);
+    void *p = cbm_alloc(CBM_MEM_CLASS_OTHER, size);
     if (p)
         budget->allocated += size;
     else
@@ -49,7 +57,7 @@ static void *ap_json_realloc(void *context, void *ptr, size_t old_size, size_t s
         budget->failed = true;
         return NULL;
     }
-    void *p = realloc(ptr, size);
+    void *p = cbm_realloc(CBM_MEM_CLASS_OTHER, ptr, size);
     if (p)
         budget->allocated += growth;
     else
@@ -59,7 +67,7 @@ static void *ap_json_realloc(void *context, void *ptr, size_t old_size, size_t s
 
 static void ap_json_free(void *context, void *ptr) {
     (void)context;
-    free(ptr);
+    cbm_free(CBM_MEM_CLASS_OTHER, ptr);
 }
 
 /* Presence and references are deliberately separate from execution. */
@@ -68,13 +76,13 @@ static const char *const ap_types[] = {
     "IMPLEMENTS", "INHERITS",   "CONFIGURES", "WRITES",         "READS",          "USAGE",
     "PUBLISHES",  "SUBSCRIBES", "DEFINES",    "DEFINES_METHOD", "CONTAINS",       "EMITS",
     "LISTENS_ON", "HANDLES",    "DATA_FLOWS", "INFRA_MAPS"};
-enum { AP_DEFINES = 14, AP_METHOD = 15, AP_CONTAINS = 16 };
+enum { AP_CALLS = 1, AP_DEFINES = 14, AP_METHOD = 15, AP_CONTAINS = 16, AP_HANDLES = 19 };
 
 typedef struct {
     int64_t id;
     char *name, *qn, *file, *label;
     int line, end, atom, component, degree;
-    bool entry, structural, declared, test, test_property;
+    bool entry, handler, route, callable, structural, declared, test, test_property;
 } ap_node;
 typedef struct {
     int64_t id;
@@ -89,6 +97,7 @@ typedef struct {
 typedef struct {
     int root, members, files, atoms, representative, degree, displayed;
     int overview_group;
+    bool listed;
     char *directory;
     int samples[AP_REPRESENTATIVES], sample_count;
 } ap_component;
@@ -149,7 +158,7 @@ static char *ap_copy(ap_context *c, const unsigned char *text) {
         c->limited = "Indexed symbol text exceeds the analysis memory budget.";
         return NULL;
     }
-    char *result = malloc(bytes);
+    char *result = cbm_alloc(CBM_MEM_CLASS_OTHER, bytes);
     if (!result)
         return NULL;
     memcpy(result, s, bytes);
@@ -186,21 +195,49 @@ static bool ap_cluster_edge(int type) {
     return type == 1 || type == 5 || type == 11;
 }
 
+static bool ap_named(const char *text, size_t length, const char *name) {
+    return length == strlen(name) && !strncmp(text, name, length);
+}
+
+static bool ap_suffix(const char *text, const char *suffix) {
+    size_t length = strlen(text);
+    size_t tail = strlen(suffix);
+    return length > tail && !strcmp(text + length - tail, suffix);
+}
+
 /* Conservative source conventions supplement the positive indexed is_test
- * flag. Non-test classification means no test evidence, not production use. */
-static bool ap_test_path(const char *path) {
+ * flag. Non-test classification means no test evidence, not production use.
+ * tests/ and __tests__/ are test directories anywhere, and so is a top-level
+ * test/. Python discovers tests by file name (test_*.py, *_test.py, tests.py,
+ * conftest.py); a nested test/ there is often a shipped package (django/test/
+ * is Django's public testing API), so for a .py file without a test name it
+ * is no signal on its own. *package then tells the caller that the indexed
+ * flag only repeats that directory rule (cbm_is_test_file) and must not
+ * decide alone either; it keeps one role per file. */
+static bool ap_test_path(const char *path, bool *package) {
     const char *base = path;
+    bool nested = false;
     for (const char *p = path;; p++) {
         if (*p == '/' || *p == '\\' || !*p) {
             size_t len = (size_t)(p - base);
-            if ((len == 4 && !strncmp(base, "test", len)) ||
-                (len == 5 && !strncmp(base, "tests", len)) ||
-                (len == 9 && !strncmp(base, "__tests__", len)))
+            bool singular = ap_named(base, len, "test");
+            if ((singular && base == path) || ap_named(base, len, "tests") ||
+                ap_named(base, len, "__tests__")) {
                 return true;
+            }
+            nested = nested || singular;
             if (!*p)
                 break;
             base = p + 1;
         }
+    }
+    if (ap_suffix(base, ".py")) {
+        if (!strcmp(base, "tests.py") || !strcmp(base, "conftest.py")) {
+            return true;
+        }
+        *package = nested;
+    } else if (nested) {
+        return true;
     }
     return !strncmp(base, "test_", 5) || strstr(base, "_test.") || strstr(base, ".test.") ||
            strstr(base, ".spec.");
@@ -233,9 +270,54 @@ static int ap_counts(ap_context *c, const char *project) {
     return CBM_STORE_OK;
 }
 
+/* Web code enters through route handlers, not main: HANDLES runs from a
+ * Function/Method to its Route (atlas_flows.c scores them alike). A CALLS edge
+ * into a Route is the call that registered it, as pass_route_nodes.c reads it.
+ * Handlers in test code are fixtures, and so are the handlers of routes that
+ * only test code registers: test-client calls like self.client.get("/x/") are
+ * indexed as registrations. Routes without a registration call (decorators)
+ * keep their handlers. Indexed entry points stay ahead of handlers. */
+static int ap_route_handlers(ap_context *c) {
+    enum { AP_PRODUCTION_REGISTRAR = 1, AP_TEST_REGISTRAR = 2 };
+    unsigned char *registrars =
+        cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(*registrars));
+    if (!registrars) {
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < c->m; i++) {
+        const ap_edge *e = &c->edges[i];
+        if (e->type == AP_CALLS && c->nodes[e->target].route) {
+            registrars[e->target] |=
+                c->nodes[e->source].test ? AP_TEST_REGISTRAR : AP_PRODUCTION_REGISTRAR;
+        }
+    }
+    for (int i = 0; i < c->m; i++) {
+        const ap_edge *e = &c->edges[i];
+        ap_node *handler = &c->nodes[e->source];
+        if (e->type == AP_HANDLES && c->nodes[e->target].route && handler->callable &&
+            !handler->test && !handler->entry && registrars[e->target] != AP_TEST_REGISTRAR) {
+            handler->handler = true;
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, registrars);
+    return CBM_STORE_OK;
+}
+
+/* The roles a node plays in the projection, from its label, path and flags. */
+static void ap_classify(ap_node *n) {
+    bool package = false;
+    n->test = ap_test_path(n->file, &package) || (n->test_property && !package);
+    n->structural = !strcmp(n->label, "Project") || !strcmp(n->label, "Folder");
+    n->declared = !strcmp(n->label, "Module") || !strcmp(n->label, "Package") ||
+                  !strcmp(n->label, "Namespace") || !strcmp(n->label, "Class") ||
+                  !strcmp(n->label, "Struct") || !strcmp(n->label, "Interface");
+    n->route = !strcmp(n->label, "Route");
+    n->callable = !strcmp(n->label, "Function") || !strcmp(n->label, "Method");
+}
+
 static int ap_load(ap_context *c, const char *project) {
-    c->nodes = calloc((size_t)c->total_nodes + 1, sizeof(*c->nodes));
-    c->edges = calloc((size_t)c->total_edges + 1, sizeof(*c->edges));
+    c->nodes = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->total_nodes + 1) * sizeof(*c->nodes));
+    c->edges = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->total_edges + 1) * sizeof(*c->edges));
     if (!c->nodes || !c->edges)
         return CBM_STORE_ERR;
     sqlite3_stmt *stmt = NULL;
@@ -263,11 +345,7 @@ static int ap_load(ap_context *c, const char *project) {
         n->end = sqlite3_column_int(stmt, 6);
         n->entry = sqlite3_column_int(stmt, 7) != 0;
         n->test_property = sqlite3_column_int(stmt, 8) != 0;
-        n->test = n->test_property || ap_test_path(n->file);
-        n->structural = !strcmp(n->label, "Project") || !strcmp(n->label, "Folder");
-        n->declared = !strcmp(n->label, "Module") || !strcmp(n->label, "Package") ||
-                      !strcmp(n->label, "Namespace") || !strcmp(n->label, "Class") ||
-                      !strcmp(n->label, "Struct") || !strcmp(n->label, "Interface");
+        ap_classify(n);
         n->atom = c->n - 1;
         n->component = -1;
     }
@@ -299,7 +377,7 @@ static int ap_load(ap_context *c, const char *project) {
         }
     }
     sqlite3_finalize(stmt);
-    return step == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
+    return step == SQLITE_DONE ? ap_route_handlers(c) : CBM_STORE_ERR;
 }
 
 /* Ownership is grounded in declared module/type names and explicit definition
@@ -343,7 +421,7 @@ static int ap_ownership(ap_context *c) {
         }
         /* QN ownership is an indexed declaration match, not a path heuristic. */
         size_t len = strlen(n->qn);
-        char *qn = malloc(len + 1);
+        char *qn = cbm_alloc(CBM_MEM_CLASS_OTHER, len + 1);
         if (!qn) {
             rc = CBM_STORE_ERR;
             break;
@@ -360,7 +438,7 @@ static int ap_ownership(ap_context *c) {
                 break;
             }
         }
-        free(qn);
+        cbm_free(CBM_MEM_CLASS_OTHER, qn);
         /* Embedded tests can share a production file/class, but not its
          * architecture atom. Prefer a same-role file declaration if present. */
         if (n->test != c->nodes[n->atom].test)
@@ -392,19 +470,19 @@ static int ap_pair_compare(const void *a, const void *b) {
  * have a fixed atom-size ceiling. These remain component candidates. */
 static int ap_components(ap_context *c) {
     int n = c->n;
-    int *group = malloc(((size_t)n + 1) * sizeof(int));
-    int *sizes = calloc((size_t)n + 1, sizeof(int));
-    int *offset = calloc((size_t)n + 2, sizeof(int));
-    int *score = calloc((size_t)n + 1, sizeof(int));
-    int *touched = malloc(((size_t)n + 1) * sizeof(int));
-    ap_pair *pairs = malloc(((size_t)c->m * 2 + 1) * sizeof(*pairs));
+    int *group = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)n + 1) * sizeof(int));
+    int *sizes = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)n + 1) * sizeof(int));
+    int *offset = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)n + 2) * sizeof(int));
+    int *score = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)n + 1) * sizeof(int));
+    int *touched = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)n + 1) * sizeof(int));
+    ap_pair *pairs = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->m * 2 + 1) * sizeof(*pairs));
     if (!group || !sizes || !offset || !score || !touched || !pairs) {
-        free(group);
-        free(sizes);
-        free(offset);
-        free(score);
-        free(touched);
-        free(pairs);
+        cbm_free(CBM_MEM_CLASS_OTHER, group);
+        cbm_free(CBM_MEM_CLASS_OTHER, sizes);
+        cbm_free(CBM_MEM_CLASS_OTHER, offset);
+        cbm_free(CBM_MEM_CLASS_OTHER, score);
+        cbm_free(CBM_MEM_CLASS_OTHER, touched);
+        cbm_free(CBM_MEM_CLASS_OTHER, pairs);
         return CBM_STORE_ERR;
     }
     for (int i = 0; i < n; i++)
@@ -470,7 +548,7 @@ static int ap_components(ap_context *c) {
         if (!changed)
             break;
     }
-    c->components = calloc((size_t)n + 1, sizeof(*c->components));
+    c->components = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)n + 1) * sizeof(*c->components));
     if (!c->components) {
         rc = CBM_STORE_ERR;
         goto finish;
@@ -512,10 +590,10 @@ static int ap_components(ap_context *c) {
     }
     /* Count unique file memberships, including isolated files. */
     CBMHashTable *seen = cbm_ht_create((uint32_t)n);
-    char **keys = calloc((size_t)n + 1, sizeof(char *));
+    char **keys = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)n + 1) * sizeof(char *));
     if (!seen || !keys) {
         cbm_ht_free(seen);
-        free(keys);
+        cbm_free(CBM_MEM_CLASS_OTHER, keys);
         rc = CBM_STORE_ERR;
         goto finish;
     }
@@ -525,7 +603,7 @@ static int ap_components(ap_context *c) {
         if (node->component < 0 || !node->file[0])
             continue;
         size_t len = strlen(node->file) + 32;
-        char *key = malloc(len);
+        char *key = cbm_alloc(CBM_MEM_CLASS_OTHER, len);
         if (!key) {
             rc = CBM_STORE_ERR;
             break;
@@ -536,19 +614,19 @@ static int ap_components(ap_context *c) {
             keys[key_count++] = key;
             c->components[node->component].files++;
         } else
-            free(key);
+            cbm_free(CBM_MEM_CLASS_OTHER, key);
     }
     cbm_ht_free(seen);
     for (int i = 0; i < key_count; i++)
-        free(keys[i]);
-    free(keys);
+        cbm_free(CBM_MEM_CLASS_OTHER, keys[i]);
+    cbm_free(CBM_MEM_CLASS_OTHER, keys);
 finish:
-    free(group);
-    free(sizes);
-    free(offset);
-    free(score);
-    free(touched);
-    free(pairs);
+    cbm_free(CBM_MEM_CLASS_OTHER, group);
+    cbm_free(CBM_MEM_CLASS_OTHER, sizes);
+    cbm_free(CBM_MEM_CLASS_OTHER, offset);
+    cbm_free(CBM_MEM_CLASS_OTHER, score);
+    cbm_free(CBM_MEM_CLASS_OTHER, touched);
+    cbm_free(CBM_MEM_CLASS_OTHER, pairs);
     return rc;
 }
 
@@ -603,8 +681,8 @@ static int ap_overview_grouping(ap_context *c) {
     }
     for (int depth = 2; depth >= 0; depth--) {
         for (int g = 0; g < c->group_count; g++) {
-            free(c->groups[g].id);
-            free(c->groups[g].label);
+            cbm_free(CBM_MEM_CLASS_OTHER, c->groups[g].id);
+            cbm_free(CBM_MEM_CLASS_OTHER, c->groups[g].label);
         }
         c->group_count = 0;
         bool retry = false;
@@ -626,7 +704,7 @@ static int ap_overview_grouping(ap_context *c) {
             }
             bool test = c->nodes[part->root].test;
             size_t bytes = length + 32;
-            char *key = malloc(bytes);
+            char *key = cbm_alloc(CBM_MEM_CLASS_OTHER, bytes);
             if (!key)
                 return CBM_STORE_ERR;
             snprintf(key, bytes, "%s:%s:%.*s", part->directory ? "directory" : "unlocated",
@@ -637,7 +715,7 @@ static int ap_overview_grouping(ap_context *c) {
                     break;
             if (g == c->group_count) {
                 if (g >= 64) {
-                    free(key);
+                    cbm_free(CBM_MEM_CLASS_OTHER, key);
                     retry = true;
                     break;
                 }
@@ -652,11 +730,11 @@ static int ap_overview_grouping(ap_context *c) {
                     snprintf(key, bytes, "(root)");
                 group->label = ap_copy(c, (const unsigned char *)key);
                 if (!group->id || !group->label) {
-                    free(key);
+                    cbm_free(CBM_MEM_CLASS_OTHER, key);
                     return CBM_STORE_ERR;
                 }
             }
-            free(key);
+            cbm_free(CBM_MEM_CLASS_OTHER, key);
             part->overview_group = g;
             c->groups[g].components++;
             c->groups[g].members += part->members;
@@ -670,10 +748,10 @@ static int ap_overview_grouping(ap_context *c) {
     }
     /* File counts are unique within a group; component file counts can overlap. */
     CBMHashTable *seen = cbm_ht_create((uint32_t)c->n);
-    char **keys = calloc((size_t)c->n + 1, sizeof(*keys));
+    char **keys = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(*keys));
     if (!seen || !keys) {
         cbm_ht_free(seen);
-        free(keys);
+        cbm_free(CBM_MEM_CLASS_OTHER, keys);
         return CBM_STORE_ERR;
     }
     int count = 0, rc = CBM_STORE_OK;
@@ -683,14 +761,14 @@ static int ap_overview_grouping(ap_context *c) {
             continue;
         int g = c->components[node->component].overview_group;
         size_t length = strlen(node->file) + 32;
-        char *key = malloc(length);
+        char *key = cbm_alloc(CBM_MEM_CLASS_OTHER, length);
         if (!key) {
             rc = CBM_STORE_ERR;
             break;
         }
         snprintf(key, length, "%d:%s", g, node->file);
         if (cbm_ht_has(seen, key))
-            free(key);
+            cbm_free(CBM_MEM_CLASS_OTHER, key);
         else {
             cbm_ht_set(seen, key, (void *)1);
             keys[count++] = key;
@@ -703,8 +781,8 @@ static int ap_overview_grouping(ap_context *c) {
     }
     cbm_ht_free(seen);
     for (int i = 0; i < count; i++)
-        free(keys[i]);
-    free(keys);
+        cbm_free(CBM_MEM_CLASS_OTHER, keys[i]);
+    cbm_free(CBM_MEM_CLASS_OTHER, keys);
     return rc;
 }
 
@@ -720,11 +798,12 @@ static yyjson_val *ap_symbol_properties(ap_context *c, int index) {
     if (c->metadata_budget.failed)
         return NULL;
     if (!c->symbol_properties) {
-        c->symbol_properties = calloc((size_t)c->n, sizeof(*c->symbol_properties));
-        c->symbol_properties_loaded = calloc((size_t)c->n, 1);
+        c->symbol_properties =
+            cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n) * sizeof(*c->symbol_properties));
+        c->symbol_properties_loaded = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)c->n);
         if (!c->symbol_properties || !c->symbol_properties_loaded) {
-            free(c->symbol_properties);
-            free(c->symbol_properties_loaded);
+            cbm_free(CBM_MEM_CLASS_OTHER, c->symbol_properties);
+            cbm_free(CBM_MEM_CLASS_OTHER, c->symbol_properties_loaded);
             c->symbol_properties = NULL;
             c->symbol_properties_loaded = NULL;
             c->metadata_budget.failed = true;
@@ -992,23 +1071,23 @@ static yyjson_mut_val *ap_witness(yyjson_mut_doc *doc, ap_context *c, int edge) 
 static int ap_cycles(ap_context *c, yyjson_mut_doc *doc, yyjson_mut_val *cycles, const ap_dep *deps,
                      int count) {
     int n = c->component_count;
-    int *out = calloc((size_t)n + 2, sizeof(int));
-    int *in = calloc((size_t)n + 2, sizeof(int));
-    int *forward = malloc(((size_t)count + 1) * sizeof(int));
-    int *reverse = malloc(((size_t)count + 1) * sizeof(int));
-    int *cursor = calloc((size_t)n + 1, sizeof(int));
-    int *stack = malloc(((size_t)n + 1) * sizeof(int));
-    int *order = malloc(((size_t)n + 1) * sizeof(int));
-    unsigned char *seen = calloc((size_t)n + 1, 1);
+    int *out = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)n + 2) * sizeof(int));
+    int *in = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)n + 2) * sizeof(int));
+    int *forward = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)count + 1) * sizeof(int));
+    int *reverse = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)count + 1) * sizeof(int));
+    int *cursor = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)n + 1) * sizeof(int));
+    int *stack = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)n + 1) * sizeof(int));
+    int *order = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)n + 1) * sizeof(int));
+    unsigned char *seen = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)n + 1);
     if (!out || !in || !forward || !reverse || !cursor || !stack || !order || !seen) {
-        free(out);
-        free(in);
-        free(forward);
-        free(reverse);
-        free(cursor);
-        free(stack);
-        free(order);
-        free(seen);
+        cbm_free(CBM_MEM_CLASS_OTHER, out);
+        cbm_free(CBM_MEM_CLASS_OTHER, in);
+        cbm_free(CBM_MEM_CLASS_OTHER, forward);
+        cbm_free(CBM_MEM_CLASS_OTHER, reverse);
+        cbm_free(CBM_MEM_CLASS_OTHER, cursor);
+        cbm_free(CBM_MEM_CLASS_OTHER, stack);
+        cbm_free(CBM_MEM_CLASS_OTHER, order);
+        cbm_free(CBM_MEM_CLASS_OTHER, seen);
         return CBM_STORE_ERR;
     }
     for (int i = 0; i < count; i++) {
@@ -1096,14 +1175,14 @@ static int ap_cycles(ap_context *c, yyjson_mut_doc *doc, yyjson_mut_val *cycles,
         }
     }
 done:
-    free(out);
-    free(in);
-    free(forward);
-    free(reverse);
-    free(cursor);
-    free(stack);
-    free(order);
-    free(seen);
+    cbm_free(CBM_MEM_CLASS_OTHER, out);
+    cbm_free(CBM_MEM_CLASS_OTHER, in);
+    cbm_free(CBM_MEM_CLASS_OTHER, forward);
+    cbm_free(CBM_MEM_CLASS_OTHER, reverse);
+    cbm_free(CBM_MEM_CLASS_OTHER, cursor);
+    cbm_free(CBM_MEM_CLASS_OTHER, stack);
+    cbm_free(CBM_MEM_CLASS_OTHER, order);
+    cbm_free(CBM_MEM_CLASS_OTHER, seen);
     return rc;
 }
 
@@ -1127,21 +1206,22 @@ static int ap_path_candidate_compare(const void *left, const void *right) {
  * tree stays linear in graph size; we never enumerate all possible paths. */
 static int ap_paths(ap_context *c, yyjson_mut_doc *doc, yyjson_mut_val *paths, const int *entries,
                     int entry_count, bool *truncated) {
-    int *offset = calloc((size_t)c->n + 2, sizeof(int));
-    int *adj = malloc(((size_t)c->m + 1) * sizeof(int));
-    int *cursor = calloc((size_t)c->n + 1, sizeof(int));
-    int *queue = malloc(((size_t)c->n + 1) * sizeof(int));
-    int *previous = malloc(((size_t)c->n + 1) * sizeof(int));
-    int *depth = calloc((size_t)c->n + 1, sizeof(int));
-    ap_path_candidate *candidates = malloc(((size_t)c->n + 1) * sizeof(*candidates));
+    int *offset = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 2) * sizeof(int));
+    int *adj = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->m + 1) * sizeof(int));
+    int *cursor = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(int));
+    int *queue = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(int));
+    int *previous = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(int));
+    int *depth = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(int));
+    ap_path_candidate *candidates =
+        cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(*candidates));
     if (!offset || !adj || !cursor || !queue || !previous || !depth || !candidates) {
-        free(offset);
-        free(adj);
-        free(cursor);
-        free(queue);
-        free(previous);
-        free(depth);
-        free(candidates);
+        cbm_free(CBM_MEM_CLASS_OTHER, offset);
+        cbm_free(CBM_MEM_CLASS_OTHER, adj);
+        cbm_free(CBM_MEM_CLASS_OTHER, cursor);
+        cbm_free(CBM_MEM_CLASS_OTHER, queue);
+        cbm_free(CBM_MEM_CLASS_OTHER, previous);
+        cbm_free(CBM_MEM_CLASS_OTHER, depth);
+        cbm_free(CBM_MEM_CLASS_OTHER, candidates);
         return CBM_STORE_ERR;
     }
     for (int i = 0; i < c->m; i++)
@@ -1249,14 +1329,40 @@ static int ap_paths(ap_context *c, yyjson_mut_doc *doc, yyjson_mut_val *paths, c
         }
     }
 done:
-    free(offset);
-    free(adj);
-    free(cursor);
-    free(queue);
-    free(previous);
-    free(depth);
-    free(candidates);
+    cbm_free(CBM_MEM_CLASS_OTHER, offset);
+    cbm_free(CBM_MEM_CLASS_OTHER, adj);
+    cbm_free(CBM_MEM_CLASS_OTHER, cursor);
+    cbm_free(CBM_MEM_CLASS_OTHER, queue);
+    cbm_free(CBM_MEM_CLASS_OTHER, previous);
+    cbm_free(CBM_MEM_CLASS_OTHER, depth);
+    cbm_free(CBM_MEM_CLASS_OTHER, candidates);
     return rc;
+}
+
+/* Overview entries are bounded; groups still carry every id and count. The
+ * displayed components are listed first, then each group's own top-ranked
+ * components up to AP_GROUP_ENTRIES, so that every group can be opened, and
+ * the global rank fills the remaining entries. */
+static void ap_list_overview(ap_context *c, const ap_rank *ranks) {
+    enum { AP_LIST_DISPLAYED, AP_LIST_GROUPS, AP_LIST_RANK, AP_LIST_PASSES };
+    int group_entries[sizeof(c->groups) / sizeof(c->groups[0])] = {0};
+    int listed = 0;
+    for (int i = 0; i < c->component_count; i++) {
+        c->components[i].listed = false;
+    }
+    for (int pass = 0; pass < AP_LIST_PASSES; pass++) {
+        for (int pick = 0; pick < c->component_count && listed < AP_OVERVIEW_COMPONENTS; pick++) {
+            ap_component *part = &c->components[ranks[pick].index];
+            int *entries = &group_entries[part->overview_group];
+            if (part->listed || (pass == AP_LIST_DISPLAYED && part->displayed < 0) ||
+                (pass == AP_LIST_GROUPS && *entries >= AP_GROUP_ENTRIES)) {
+                continue;
+            }
+            part->listed = true;
+            (*entries)++;
+            listed++;
+        }
+    }
 }
 
 static const char *ap_component_basis(const ap_context *c, int i) {
@@ -1279,6 +1385,7 @@ static int ap_overview(ap_context *c, yyjson_mut_doc *doc, yyjson_mut_val *root)
     yyjson_mut_obj_add_val(doc, overview, "totals", totals);
     yyjson_mut_obj_add_val(doc, overview, "limits", limits);
     int connection_count = 0, shown = 0;
+    int omitted_entries = 0;
     if (!c->limited) {
         for (int g = 0; g < c->group_count; g++) {
             ap_overview_group *group = &c->groups[g];
@@ -1309,8 +1416,14 @@ static int ap_overview(ap_context *c, yyjson_mut_doc *doc, yyjson_mut_val *root)
             if (ap_stopped(c))
                 return CBM_STORE_ERR;
         }
+        /* Groups above keep every component id and count; only the detailed
+         * entries are bounded (ap_list_overview). */
         for (int i = 0; i < c->component_count; i++) {
             ap_component *part = &c->components[i];
+            if (!part->listed) {
+                omitted_entries++;
+                continue;
+            }
             yyjson_mut_val *value = yyjson_mut_obj(doc), *reps = yyjson_mut_arr(doc);
             char id[48];
             ap_component_id(c, i, id);
@@ -1331,7 +1444,7 @@ static int ap_overview(ap_context *c, yyjson_mut_doc *doc, yyjson_mut_val *root)
             if ((i & 255) == 0 && ap_stopped(c))
                 return CBM_STORE_ERR;
         }
-        ap_dep *edges = malloc(((size_t)c->m + 1) * sizeof(*edges));
+        ap_dep *edges = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->m + 1) * sizeof(*edges));
         if (!edges)
             return CBM_STORE_ERR;
         int count = 0;
@@ -1363,18 +1476,20 @@ static int ap_overview(ap_context *c, yyjson_mut_doc *doc, yyjson_mut_val *root)
             }
             i = end;
             if (ap_stopped(c)) {
-                free(edges);
+                cbm_free(CBM_MEM_CLASS_OTHER, edges);
                 return CBM_STORE_ERR;
             }
         }
-        free(edges);
+        cbm_free(CBM_MEM_CLASS_OTHER, edges);
     }
-    yyjson_mut_obj_add_bool(doc, overview, "complete", !c->limited && shown == connection_count);
+    yyjson_mut_obj_add_bool(doc, overview, "complete",
+                            !c->limited && shown == connection_count && !omitted_entries);
     yyjson_mut_obj_add_int(doc, totals, "groups", c->limited ? 0 : c->group_count);
     yyjson_mut_obj_add_int(doc, totals, "components", c->limited ? 0 : c->component_count);
     yyjson_mut_obj_add_int(doc, totals, "accounted_nodes", c->limited ? 0 : c->accounted);
     yyjson_mut_obj_add_int(doc, totals, "connections", connection_count);
     yyjson_mut_obj_add_int(doc, limits, "omitted_connections", connection_count - shown);
+    yyjson_mut_obj_add_int(doc, limits, "omitted_component_entries", omitted_entries);
     return CBM_STORE_OK;
 }
 
@@ -1382,15 +1497,15 @@ static int ap_overview(ap_context *c, yyjson_mut_doc *doc, yyjson_mut_val *root)
 static int ap_symbol_cycles(ap_context *c, yyjson_mut_doc *doc, yyjson_mut_val *cycles,
                             const int *out, const int *in, const int *forward, const int *reverse,
                             const bool *nodes, const bool *edges) {
-    int *stack = malloc(((size_t)c->n + 1) * sizeof(int));
-    int *cursor = malloc(((size_t)c->n + 1) * sizeof(int));
-    int *order = malloc(((size_t)c->n + 1) * sizeof(int));
-    bool *seen = calloc((size_t)c->n + 1, sizeof(bool));
+    int *stack = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(int));
+    int *cursor = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(int));
+    int *order = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(int));
+    bool *seen = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(bool));
     if (!stack || !cursor || !order || !seen) {
-        free(stack);
-        free(cursor);
-        free(order);
-        free(seen);
+        cbm_free(CBM_MEM_CLASS_OTHER, stack);
+        cbm_free(CBM_MEM_CLASS_OTHER, cursor);
+        cbm_free(CBM_MEM_CLASS_OTHER, order);
+        cbm_free(CBM_MEM_CLASS_OTHER, seen);
         return CBM_STORE_ERR;
     }
     memcpy(cursor, out, ((size_t)c->n + 1) * sizeof(int));
@@ -1457,10 +1572,10 @@ static int ap_symbol_cycles(ap_context *c, yyjson_mut_doc *doc, yyjson_mut_val *
             }
         }
 done:
-    free(stack);
-    free(cursor);
-    free(order);
-    free(seen);
+    cbm_free(CBM_MEM_CLASS_OTHER, stack);
+    cbm_free(CBM_MEM_CLASS_OTHER, cursor);
+    cbm_free(CBM_MEM_CLASS_OTHER, order);
+    cbm_free(CBM_MEM_CLASS_OTHER, seen);
     return rc;
 }
 
@@ -1497,17 +1612,18 @@ static int ap_behavior(ap_context *c, yyjson_mut_doc *doc, yyjson_mut_val *root,
         yyjson_mut_obj_add_int(doc, totals, "corridor_edges", 0);
         return CBM_STORE_OK;
     }
-    int *out = calloc((size_t)c->n + 2, sizeof(int)), *in = calloc((size_t)c->n + 2, sizeof(int));
-    int *forward = malloc(((size_t)c->m + 1) * sizeof(int)),
-        *reverse = malloc(((size_t)c->m + 1) * sizeof(int));
-    int *queue = malloc(((size_t)c->n + 1) * sizeof(int)),
-        *cursor = malloc(((size_t)c->n + 1) * sizeof(int));
-    int *distance = malloc(((size_t)c->n + 1) * sizeof(int)),
-        *back = malloc(((size_t)c->n + 1) * sizeof(int));
-    int *previous = malloc(((size_t)c->n + 1) * sizeof(int)),
-        *next = malloc(((size_t)c->n + 1) * sizeof(int));
-    bool *keep_nodes = calloc((size_t)c->n + 1, sizeof(bool)),
-         *keep_edges = calloc((size_t)c->m + 1, sizeof(bool));
+    int *out = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 2) * sizeof(int)),
+        *in = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 2) * sizeof(int));
+    int *forward = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->m + 1) * sizeof(int)),
+        *reverse = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->m + 1) * sizeof(int));
+    int *queue = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(int)),
+        *cursor = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(int));
+    int *distance = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(int)),
+        *back = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(int));
+    int *previous = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(int)),
+        *next = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(int));
+    bool *keep_nodes = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->n + 1) * sizeof(bool)),
+         *keep_edges = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->m + 1) * sizeof(bool));
     int rc = CBM_STORE_OK, reachable = 0, kept_nodes = 0, kept_edges = 0, target_count = 0;
     bool complete = true, corridor_complete = true;
     if (!out || !in || !forward || !reverse || !queue || !cursor || !distance || !back ||
@@ -1685,18 +1801,18 @@ static int ap_behavior(ap_context *c, yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_int(doc, totals, "corridor_edges", kept_edges);
 done:
     c->evidence_scope = AP_EVIDENCE_CONTEXT;
-    free(out);
-    free(in);
-    free(forward);
-    free(reverse);
-    free(queue);
-    free(cursor);
-    free(distance);
-    free(back);
-    free(previous);
-    free(next);
-    free(keep_nodes);
-    free(keep_edges);
+    cbm_free(CBM_MEM_CLASS_OTHER, out);
+    cbm_free(CBM_MEM_CLASS_OTHER, in);
+    cbm_free(CBM_MEM_CLASS_OTHER, forward);
+    cbm_free(CBM_MEM_CLASS_OTHER, reverse);
+    cbm_free(CBM_MEM_CLASS_OTHER, queue);
+    cbm_free(CBM_MEM_CLASS_OTHER, cursor);
+    cbm_free(CBM_MEM_CLASS_OTHER, distance);
+    cbm_free(CBM_MEM_CLASS_OTHER, back);
+    cbm_free(CBM_MEM_CLASS_OTHER, previous);
+    cbm_free(CBM_MEM_CLASS_OTHER, next);
+    cbm_free(CBM_MEM_CLASS_OTHER, keep_nodes);
+    cbm_free(CBM_MEM_CLASS_OTHER, keep_edges);
     return rc;
 }
 
@@ -1732,14 +1848,12 @@ static int ap_render(ap_context *c, const char *project, char **out_json) {
     bool paths_truncated = false;
     int rc = CBM_STORE_OK;
     ap_dep *deps = NULL;
-    if (ap_overview(c, doc, root) != CBM_STORE_OK) {
-        rc = CBM_STORE_ERR;
-        goto done;
-    }
     if (!c->limited) {
         /* Prefer the largest connected candidates, retaining deterministic IDs.
-         * Never relabel discarded components as a single invented component. */
-        ap_rank *ranks = malloc(((size_t)c->component_count + 1) * sizeof(*ranks));
+         * Never relabel discarded components as a single invented component.
+         * The same rank picks the overview entries, before they render. */
+        ap_rank *ranks =
+            cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->component_count + 1) * sizeof(*ranks));
         if (!ranks) {
             rc = CBM_STORE_ERR;
             goto done;
@@ -1751,11 +1865,18 @@ static int ap_render(ap_context *c, const char *project, char **out_json) {
         qsort(ranks, (size_t)c->component_count, sizeof(*ranks), ap_rank_compare);
         for (int pick = 0; pick < c->options.max_components && pick < c->component_count; pick++)
             c->components[ranks[pick].index].displayed = shown++;
-        free(ranks);
+        ap_list_overview(c, ranks);
+        cbm_free(CBM_MEM_CLASS_OTHER, ranks);
         if (ap_stopped(c)) {
             rc = CBM_STORE_ERR;
             goto done;
         }
+    }
+    if (ap_overview(c, doc, root) != CBM_STORE_OK) {
+        rc = CBM_STORE_ERR;
+        goto done;
+    }
+    if (!c->limited) {
         for (int i = 0; i < c->component_count; i++) {
             ap_component *p = &c->components[i];
             if (p->displayed < 0)
@@ -1785,7 +1906,7 @@ static int ap_render(ap_context *c, const char *project, char **out_json) {
                                    p->members - (p->sample_count > 0 ? 1 : 0));
             yyjson_mut_arr_add_val(parts, part);
         }
-        deps = malloc(((size_t)c->m + 1) * sizeof(*deps));
+        deps = cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)c->m + 1) * sizeof(*deps));
         if (!deps) {
             rc = CBM_STORE_ERR;
             goto done;
@@ -1831,11 +1952,17 @@ static int ap_render(ap_context *c, const char *project, char **out_json) {
             rc = CBM_STORE_ERR;
             goto done;
         }
-        for (int i = 0; i < c->n; i++) {
-            ap_node *node = &c->nodes[i];
-            if (node->component < 0)
-                continue;
-            if (node->entry) {
+        /* Indexed entry points first, then route handlers, each in id order:
+         * paths take their slots in this order, so many handlers cannot crowd
+         * main out of the default paths. */
+        enum { AP_ENTRY_INDEXED, AP_ENTRY_HANDLER, AP_ENTRY_PASSES };
+        for (int pass = AP_ENTRY_INDEXED; pass < AP_ENTRY_PASSES; pass++) {
+            for (int i = 0; i < c->n; i++) {
+                ap_node *node = &c->nodes[i];
+                if (node->component < 0 ||
+                    !(pass == AP_ENTRY_HANDLER ? node->handler : node->entry)) {
+                    continue;
+                }
                 entry_total++;
                 if (entry_count < AP_ENTRYPOINTS) {
                     entry_indexes[entry_count++] = i;
@@ -1944,7 +2071,7 @@ static int ap_render(ap_context *c, const char *project, char **out_json) {
             rc = budget.failed ? CBM_STORE_SCAN_LIMIT : CBM_STORE_ERR;
     }
 done:
-    free(deps);
+    cbm_free(CBM_MEM_CLASS_OTHER, deps);
     yyjson_mut_doc_free(doc);
     return rc;
 }
@@ -2018,26 +2145,26 @@ int cbm_store_architecture_projection(cbm_store_t *store, const char *project,
     if (transaction)
         sqlite3_exec(c.db, "ROLLBACK", NULL, NULL, NULL);
     for (int i = 0; i < c.n; i++) {
-        free(c.nodes[i].name);
-        free(c.nodes[i].qn);
-        free(c.nodes[i].file);
-        free(c.nodes[i].label);
+        cbm_free(CBM_MEM_CLASS_OTHER, c.nodes[i].name);
+        cbm_free(CBM_MEM_CLASS_OTHER, c.nodes[i].qn);
+        cbm_free(CBM_MEM_CLASS_OTHER, c.nodes[i].file);
+        cbm_free(CBM_MEM_CLASS_OTHER, c.nodes[i].label);
         if (c.symbol_properties)
             yyjson_doc_free(c.symbol_properties[i]);
     }
-    free(c.symbol_properties);
-    free(c.symbol_properties_loaded);
+    cbm_free(CBM_MEM_CLASS_OTHER, c.symbol_properties);
+    cbm_free(CBM_MEM_CLASS_OTHER, c.symbol_properties_loaded);
     for (int i = 0; i < c.component_count; i++)
-        free(c.components[i].directory);
+        cbm_free(CBM_MEM_CLASS_OTHER, c.components[i].directory);
     for (int i = 0; i < c.group_count; i++) {
-        free(c.groups[i].id);
-        free(c.groups[i].label);
+        cbm_free(CBM_MEM_CLASS_OTHER, c.groups[i].id);
+        cbm_free(CBM_MEM_CLASS_OTHER, c.groups[i].label);
     }
-    free(c.nodes);
-    free(c.edges);
-    free(c.components);
+    cbm_free(CBM_MEM_CLASS_OTHER, c.nodes);
+    cbm_free(CBM_MEM_CLASS_OTHER, c.edges);
+    cbm_free(CBM_MEM_CLASS_OTHER, c.components);
     if (c.cancelled) {
-        free(*out_json);
+        cbm_free(CBM_MEM_CLASS_OTHER, *out_json);
         *out_json = NULL;
         return CBM_STORE_CANCELLED;
     }

@@ -3,6 +3,7 @@ import type { JSX } from 'react';
 import type { ProjectEntry } from '../provider/rpc-schemas';
 import { projectSwitcherStrings as text } from './project-switcher-strings';
 import { projectPickerPlacement } from './project-picker-placement';
+import { RefreshControl, useRefreshFeedback } from '../ui/refresh/refresh-feedback';
 import './project-switcher.css';
 
 interface ProjectSwitcherProps {
@@ -15,14 +16,14 @@ interface ProjectSwitcherProps {
 
 export default function ProjectSwitcher(props: ProjectSwitcherProps): JSX.Element {
     const [open, setOpen] = useState(false);
-    const [query, setQuery] = useState('');
     const [entries, setEntries] = useState<readonly ProjectEntry[]>([]);
     const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
     const [revision, setRevision] = useState(0);
+    // Every reading of the list counts, also the one an opening starts; the Refresh status speaks about one of them (review of K42).
+    const [reads, setReads] = useState(0);
     const [placement, setPlacement] = useState({ top: 64, left: 12, width: 370, maxHeight: 520 });
     const disclosure = useRef<HTMLDetailsElement>(null);
     const trigger = useRef<HTMLElement>(null);
-    const search = useRef<HTMLInputElement>(null);
     const close = (restoreFocus = false): void => {
         setOpen(false);
         if (restoreFocus) trigger.current?.focus();
@@ -51,6 +52,7 @@ export default function ProjectSwitcher(props: ProjectSwitcherProps): JSX.Elemen
         if (!open) return;
         let current = true;
         setStatus('loading');
+        setReads(value => value + 1);
         void Promise.resolve().then(props.listProjects).then(
             (projects) => {
                 if (!current) return;
@@ -64,7 +66,6 @@ export default function ProjectSwitcher(props: ProjectSwitcherProps): JSX.Elemen
 
     useEffect(() => {
         if (!open) return;
-        search.current?.focus();
         const outside = (event: PointerEvent): void => {
             if (event.target instanceof Node && !disclosure.current?.contains(event.target)) setOpen(false);
         };
@@ -72,10 +73,17 @@ export default function ProjectSwitcher(props: ProjectSwitcherProps): JSX.Elemen
         return () => document.removeEventListener('pointerdown', outside);
     }, [open]);
 
-    const needle = query.trim().toLocaleLowerCase();
+    /*
+     * Review of K42: "Refresh projects" showed "Loading projects..." for about
+     * 150 ms and then the same list. Now it says that it runs, then when and
+     * whether the list changed; a failure only gets its time, the list area
+     * says what failed and offers Try again.
+     */
+    const refresh = useRefreshFeedback({ key: String(reads), settled: status !== 'loading',
+        value: entries.map(entry => [entry.name, entry.root_path]), error: status === 'error' ? '' : undefined });
+
     const projects = Array.from(new Map(entries.map(entry => [entry.name, entry])).values())
-        .filter(entry => entry.name.length > 0 &&
-            `${entry.name}\n${entry.root_path ?? ''}`.toLocaleLowerCase().includes(needle))
+        .filter(entry => entry.name.length > 0)
         .sort((left, right) => Number(right.name === props.currentProject) - Number(left.name === props.currentProject)
             || left.name.localeCompare(right.name));
 
@@ -93,7 +101,7 @@ export default function ProjectSwitcher(props: ProjectSwitcherProps): JSX.Elemen
             title={props.currentProject || text.choose}
             onClick={(event) => {
                 event.preventDefault();
-                if (!open) { setQuery(''); setStatus('loading'); }
+                if (!open) setStatus('loading');
                 setOpen(value => !value);
             }}>
             <span className="atlas-project-switcher-label">{text.project}</span>
@@ -101,14 +109,12 @@ export default function ProjectSwitcher(props: ProjectSwitcherProps): JSX.Elemen
             <span aria-hidden="true">⌄</span>
         </summary>
         {open && <div className="atlas-project-picker" style={placement}>
-            <input ref={search} type="search" aria-label={text.search} placeholder={text.searchPlaceholder}
-                value={query} onChange={event => setQuery(event.target.value)} />
             <div className="atlas-project-results" aria-busy={status === 'loading'}>
                 {status === 'loading' && <p role="status">{text.loading}</p>}
                 {status === 'error' && <div role="status"><p>{text.failed}</p>
                     <button type="button" onClick={() => setRevision(value => value + 1)}>{text.retry}</button>
                 </div>}
-                {status === 'ready' && projects.length === 0 && <p role="status">{entries.length === 0 ? text.empty : text.noMatches}</p>}
+                {status === 'ready' && projects.length === 0 && <p role="status">{text.empty}</p>}
                 {status === 'ready' && <ul>{projects.map(entry => <li key={entry.name}>
                     <button type="button" aria-current={entry.name === props.currentProject ? 'true' : undefined}
                         onClick={() => {
@@ -127,7 +133,7 @@ export default function ProjectSwitcher(props: ProjectSwitcherProps): JSX.Elemen
             </button>}
             <footer>
                 <button type="button" onClick={() => { close(true); props.onAddProject(); }}>{text.add}</button>
-                <button type="button" disabled={status === 'loading'} onClick={() => setRevision(value => value + 1)}>{text.refresh}</button>
+                <RefreshControl labels={text.refreshFeedback} feedback={refresh.feedback} onRefresh={() => { refresh.begin(); setRevision(value => value + 1); }} />
             </footer>
         </div>}
     </details>;

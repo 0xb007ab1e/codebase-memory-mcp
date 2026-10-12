@@ -34,6 +34,15 @@ describe('focused Behavior journeys', () => {
         expect(result.scene.focusId).toBeUndefined();
     });
 
+    it('treats the source_id 0 of an unselected projection as no selection', () => {
+        const data = projection({ paths: [path([1, 2])], behavior: behavior([], [], { source_id: 0, complete: false, limits_hit: ['select_source'] }) });
+        const result = behaviorJourney(data);
+        expect(result.entry?.id).toBe(1);
+        expect(result.mode).toBe('choices');
+        expect(drawnPairs(result)).toEqual([[1, 2]]);
+        expect(behaviorJourney({ ...data, entrypoints: [], paths: [] }).mode).toBe('empty');
+    });
+
     it('uses exact-source witnesses and valid first hops but never aggregate counts or references', () => {
         const data = projection({ paths: [path([1, 2, 8])], dependencies: [
             { source: 'app', target: 'other', type: 'CALLS', count: 500, witnesses: [] },
@@ -133,19 +142,42 @@ describe('focused Behavior journeys', () => {
         expect(behaviorJourney(projection({ paths: [path([1, 2, 5])] }), { targetId: 5, filter: 'absent' }).mode).toBe('empty');
     });
 
+    it('draws every direct callee the counter names, so the page counter and the count agree (cbm main: 14)', () => {
+        const callees = Array.from({ length: 14 }, (_, index) => symbol(index + 2));
+        const data = projection({ behavior: behavior([symbol(1), ...callees], callees.map((target, index) => edge(300 + index, 1, target.id))) });
+        const result = behaviorJourney(data);
+        expect(result.counts.directChoices).toBe(14);
+        expect(result.scene.nodes).toHaveLength(15);
+        expect(result.counts.omittedNodes).toBe(0);
+        expect(result.choices.filter(choice => choice.direct)).toHaveLength(14);
+    });
+
+    it('counts a start operation that calls itself apart from its callees, so the heading and the pages agree', () => {
+        const callees = Array.from({ length: 6 }, (_, index) => symbol(index + 2));
+        const data = projection({ behavior: behavior([symbol(1), ...callees], [...callees.map((target, index) => edge(300 + index, 1, target.id)), edge(399, 1, 1)]) });
+        const result = behaviorJourney(data);
+        // Six callees drawn beside the start, which is drawn once; the recursion is named, not counted as a seventh callee.
+        expect(result.counts.directChoices).toBe(6);
+        expect(result.counts.selfCalls).toBe(true);
+        expect(result.scene.nodes).toHaveLength(7);
+        expect(result.counts.omittedNodes).toBe(0);
+        expect(behaviorJourney(projection({ behavior: behavior([symbol(1), ...callees], callees.map((target, index) => edge(300 + index, 1, target.id))) })).counts.selfCalls).toBe(false);
+    });
+
     it('bounds a direct fan while reserving a real edge for every displayed callee', () => {
-        const targets = Array.from({ length: 20 }, (_, index) => ({ ...symbol(index + 2), name: `target${String(index).padStart(2, '0')}` }));
+        const targets = Array.from({ length: 60 }, (_, index) => ({ ...symbol(index + 2), name: `target${String(index).padStart(2, '0')}` }));
         const edges = [...Array.from({ length: 130 }, (_, index) => edge(index, 1, 2)),
             ...targets.slice(1).map((target, index) => edge(200 + index, 1, target.id))];
         const data = projection({ behavior: behavior([symbol(1), ...targets], edges, {
             complete: false, limits_hit: ['server-node-cap'], reachable_targets: targets.map(target => ({ ...target, distance: 1 })),
         }) });
         const result = behaviorJourney(data);
-        expect(result.scene.nodes).toHaveLength(13); expect(result.scene.edges).toHaveLength(120);
-        expect(result.choices.filter(choice => choice.direct)).toHaveLength(12);
+        // Twelve pages of four calls; the rest is counted, not drawn.
+        expect(result.scene.nodes).toHaveLength(49); expect(result.scene.edges).toHaveLength(120);
+        expect(result.choices.filter(choice => choice.direct)).toHaveLength(48);
         const connected = new Set(result.scene.edges.map(item => item.target));
         expect(result.scene.nodes.slice(1).every(node => connected.has(node.id))).toBe(true);
-        expect(result.counts.omittedNodes).toBe(8); expect(result.counts.omittedChoices).toBe(8);
+        expect(result.counts.omittedNodes).toBe(12); expect(result.counts.omittedChoices).toBe(12);
         expect(result.counts.omittedEdges).toBe(edges.length - 120);
         expect(result.limits.sampled).toBe(true);
         expect(result.limits.hit).toEqual(expect.arrayContaining(['server-node-cap', 'direct-choices', 'direct-edges']));

@@ -137,6 +137,45 @@ describe('Hint', () => {
      * passiert ist. An den Schaltern dieser Oberflaeche ist er dann obendrein
      * falsch, weil ihre Beschriftung mit dem Zustand kippt.
      */
+    /*
+     * Handtest 2026-10-04 (G3): der Kasten an "Expand +1" stand rechts neben
+     * dem Knopf und ragte in den Kopf der Seite, obwohl unter ihm Platz war.
+     * Geschuetzt waren die Eingabefelder der zugeklappten Menues daneben
+     * ("Path to…", "Edge types"): ihr Inhalt ist nicht gezeichnet, hatte im
+     * Browser aber weiter einen Kasten. Geschuetzt ist nur, was zu sehen ist.
+     */
+    it('weicht keinem Feld aus, das in einem zugeklappten details gar nicht gezeichnet ist', async () => {
+        const rect = (x: number, y: number, width: number, height: number) => () =>
+            ({ x, y, width, height, left: x, top: y, right: x + width, bottom: y + height, toJSON: () => ({}) }) as DOMRect;
+        const size = vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockImplementation(function (this: HTMLElement) {
+            return this.dataset.testid === 'atlas-hint' ? 200 : 0;
+        });
+        const height = vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockImplementation(function (this: HTMLElement) {
+            return this.dataset.testid === 'atlas-hint' ? 40 : 0;
+        });
+        await render(
+            <div>
+                <Hint name="probe" text="what this does"><button type="button">go</button></Hint>
+                <details><summary>menu</summary><input aria-label="field in the menu" /></details>
+            </div>,
+        );
+        trigger().getBoundingClientRect = rect(100, 100, 80, 24);
+        // Right under the trigger, where the box goes first: the field of the closed menu.
+        const field = container.querySelector('input')!;
+        field.getBoundingClientRect = rect(100, 130, 300, 30);
+        const hover = async () => {
+            await act(async () => { trigger().dispatchEvent(new MouseEvent('mouseover', { bubbles: true })); });
+            const side = tooltip()?.getAttribute('data-side');
+            await act(async () => { trigger().dispatchEvent(new MouseEvent('mouseout', { bubbles: true })); });
+            return side;
+        };
+        expect(await hover()).toBe('below');
+        // Open, the field is drawn and protected again: the box goes above.
+        container.querySelector('details')!.open = true;
+        expect(await hover()).toBe('above');
+        size.mockRestore(); height.mockRestore();
+    });
+
     it('schliesst sich, sobald der Ausloeser gedrueckt wurde', async () => {
         await render(<Hint name="probe" text="what this does"><button type="button">go</button></Hint>);
         await act(async () => {

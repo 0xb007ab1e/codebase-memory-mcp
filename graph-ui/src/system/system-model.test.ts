@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { readProcesses } from '../projects/projects-model';
-import { cpuText, filterLogs, logLevel, memoryLabel, memoryText } from './system-model';
+import { collapseRepeats, cpuText, filterLogs, logLevel, memoryLabel, memoryText } from './system-model';
+import { repeatDetail, UiLogBuffer } from '../app/ui-log';
+import type { UiLogPayload } from '../app/ui-log';
 
 describe('System measurements', () => {
     it('keeps missing readings distinct from measured zero', () => {
@@ -50,5 +52,33 @@ describe('System log levels', () => {
         const lines = ['level=INFO msg=Indexer', 'level=ERROR msg=Indexer', 'level=ERROR msg=Daemon'];
         expect(filterLogs(lines, 'INDEX', 'error')).toEqual([lines[1]]);
         expect(filterLogs(lines, '', 'all')).toEqual(lines);
+    });
+
+    it('shows identical frontend messages once with how often they occurred', () => {
+        const clock = 'THREE.THREE.Clock: This module has been deprecated. Please use THREE.Timer instead.';
+        const line = (session: string, seq: number, message: string, detail?: string) => JSON.stringify({ received: '2026-10-03T16:05:22Z', page: '/?project=cbm', session, seq, ts: '2026-10-03T16:05:20.914Z', level: 'warn', source: 'console', message, ...(detail ? { detail } : {}), project: 'cbm' });
+        const record = (id: number, message: string, source = 'console') => ({ id, ts: `2026-10-03T16:05:${String(id).padStart(2, '0')}Z`, level: 'warn', source, message, project: 'cbm' });
+        const rows = collapseRepeats([
+            // Before the fix every occurrence was its own record; after it, one record and its counts.
+            record(1, line('old', 3, clock)), record(2, line('old', 5, clock)), record(3, 'level=warn msg=watcher.slow path=src'),
+            record(4, line('old', 9, clock)), record(5, line('new', 2, clock)), record(6, line('new', 3, 'Another warning')),
+            record(7, line('new', 4, clock, repeatDetail(10))), record(8, line('new', 5, clock, repeatDetail(100))), record(9, line('new', 6, clock, repeatDetail(120))),
+        ]);
+        expect(rows.map((row) => [row.record.id, row.count])).toEqual([[3, 1], [6, 1], [9, 123]]);
+        expect(rows[2]?.first).toBe('2026-10-03T16:05:01Z');
+    });
+
+    it('keeps a repeated request failure with a response body on one row with its count, and its body', async () => {
+        // What the buffer actually posts for twelve identical failures, stored the way the daemon stores them.
+        const posted: UiLogPayload[] = [];
+        const buffer = new UiLogBuffer({ page: '/?project=cbm', session: 'rpc12', schedule: () => 0, cancel: () => undefined, bufferMax: 200, batchMax: 200,
+            transport: { send: async (payload) => { posted.push(payload); return true; } } });
+        for (let i = 0; i < 12; i++) buffer.record('error', 'rpc', '/rpc query_graph: HTTP 500', { project: 'cbm', detail: 'HTTP 500 body text' });
+        buffer.record('error', 'rpc', '/rpc query_graph: HTTP 500', { project: 'cbm', detail: 'another body' });
+        await buffer.flush(true);
+        const records = posted.flatMap((post) => post.entries.map((entry) => ({ ...entry, session: post.session, page: post.page })))
+            .map((line, index) => ({ id: index + 1, ts: line.ts, level: line.level, source: line.source, project: line.project, message: JSON.stringify(line) }));
+        const rows = collapseRepeats(records);
+        expect(rows.map((row) => [JSON.parse(row.record.message).detail.split('\n').at(-1), row.count])).toEqual([['another body', 1], ['HTTP 500 body text', 12]]);
     });
 });

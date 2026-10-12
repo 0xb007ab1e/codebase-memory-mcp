@@ -19,6 +19,8 @@ export interface SystemSceneEdge {
 export interface SystemSceneLane {
     id: string; label: string; position: [number, number, number]; width: number; depth: number;
     height?: number; pathIndices?: number[];
+    /** The scene nodes laid out on this lane. */
+    memberIds?: string[];
 }
 export interface SystemSceneModel {
     nodes: SystemSceneNode[]; edges: SystemSceneEdge[]; lanes: SystemSceneLane[];
@@ -31,6 +33,20 @@ export interface SystemSceneModel {
 export const componentBasis = (basis: string): string => basis === 'declared_module' ? 'Declared module'
     : basis === 'interaction_community' ? 'Inferred collaboration' : basis === 'unassigned' ? 'Unassigned'
         : basis === 'common_source_directory_aggregate' ? 'Source directory group' : basis === 'aggregate_remainder' ? 'Other components' : 'Inferred component';
+
+/*
+ * Every projection opens its warnings with the same two interpretation caveats
+ * and appends what actually limited this answer. Only the caveats are left out;
+ * an unknown or reworded warning stays visible, so a change in the server text
+ * can never hide a limit.
+ */
+const STANDING_CAVEATS = [/^Component candidates are inferred\b/, /^Paths are bounded static witnesses\b/];
+/** The warnings that explain this particular projection, without the standing caveats. */
+export const projectionLimits = (data: SystemProjection): string[] =>
+    data.warnings.filter(warning => !STANDING_CAVEATS.some(caveat => caveat.test(warning)));
+/** A limited or empty projection has nothing to draw, whatever the current filters are. */
+export const projectionUnavailable = (data: SystemProjection): boolean =>
+    data.status === 'limited' || !(data.overview ? data.overview.groups.length : data.components.length);
 
 export interface SystemOverviewOptions {
     expandedGroupIds?: readonly string[]; focusId?: string; relationshipTypes?: readonly string[];
@@ -111,7 +127,8 @@ function overviewLayout(groups: readonly SystemOverviewGroup[], groupingBasis?: 
         if (x && x + region.width > rowWidth) { x = 0; y += rowHeight + 18; rowHeight = 0; }
         region.members.forEach(({ group }, index) => positions.set(group.id, [x + 46 + index % region.columns * 76, -y - 28 - Math.floor(index / region.columns) * 34, 0]));
         lanes.push({ id: `directory:${region.path}`, label: region.path === '\uffff' ? 'Location unavailable' : region.path || 'Repository root',
-            position: [x + region.width / 2, -y - region.height / 2, -4], width: region.width, height: region.height, depth: .5 });
+            position: [x + region.width / 2, -y - region.height / 2, -4], width: region.width, height: region.height, depth: .5,
+            memberIds: region.members.map(({ group }) => group.id) });
         width = Math.max(width, x + region.width); rowHeight = Math.max(rowHeight, region.height); x += region.width + 18;
     }
     const height = y + rowHeight;
@@ -224,6 +241,18 @@ export function systemBehaviorOverviewGraph(data: SystemProjection, base: System
     }
     return { ...base, highlightActive: true, preferredPathIndex: activePathIndex,
         nodes: base.nodes.map(node => ({ ...node, inCorridor: corridorNodes.has(node.id), pathIndices: [...(nodePaths.get(node.id) ?? [])] })), edges };
+}
+
+const sameName = (name: string) => name.trim().toLowerCase().replace(/^(?:\(root\)|\.|repository root)$/, '(root)');
+
+/**
+ * A lane that holds one group of its own name ("django" on the django lane,
+ * "(root)" on the repository root) would print the name twice, one over the
+ * other. The chip names the group; the lane name gives way while it is shown.
+ */
+export function laneRepeatsMember(lane: SystemSceneLane, nodes: readonly SystemSceneNode[]): boolean {
+    const members = nodes.filter(node => lane.memberIds?.includes(node.id));
+    return members.length === 1 && sameName(members[0]!.label) === sameName(lane.label);
 }
 
 /** A component cycle does not establish a contiguous symbol path through that component. */
@@ -381,7 +410,7 @@ export function systemBehaviorGraph(data: SystemProjection, input: SystemPath | 
         return { id, label: components.get(componentId)?.label ?? componentId,
             position: [(left + right) / 2, (bottom + top) / 2 + 1, -3] as [number, number, number],
             width: right - left + 10, height: top - bottom + 6, depth: 0.65,
-            pathIndices: [...new Set(members.flatMap(node => node.pathIndices ?? []))] };
+            pathIndices: [...new Set(members.flatMap(node => node.pathIndices ?? []))], memberIds: members.map(node => node.id) };
     });
     return { nodes, edges, lanes, omittedNodes: allNodes.size - nodes.length, omittedEdges: allEdges.size - edges.length,
         preferredPathIndex: ranked[0], scopeKey: `behavior:${nodes.map(node => node.id).join('|')}` };

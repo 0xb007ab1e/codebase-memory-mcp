@@ -10,7 +10,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import AtlasChrome, { COMMAND_PLACEHOLDER, MENU_ITEMS, splitMenuLabel } from './AtlasChrome';
+import AtlasChrome, { splitMenuLabel } from './AtlasChrome';
 import type { AtlasChromeProps } from './AtlasChrome';
 import type { TreeRow } from './tree-model';
 
@@ -81,9 +81,80 @@ const testId = (id: string): HTMLElement | null => container.querySelector(`[dat
 
 describe('AtlasChrome', () => {
 
+    it('leaves general configuration out of the top bar', async () => {
+        const onOpenConfig = vi.fn();
+        await render(props({ onOpenConfig, configOpen: true, onOpenBrowserAi: vi.fn(), projectSwitcher: <button>Project</button> }));
+        expect(testId('atlas-header')?.querySelector('[aria-label="Open configuration"]')).toBeNull();
+        expect(testId('atlas-header')?.lastElementChild?.getAttribute('aria-label')).toBe('Local agent');
+        expect(onOpenConfig).not.toHaveBeenCalled();
+    });
+
+    it('shows a robot with a status lamp and keeps the model name in the tooltip and the label', async () => {
+        const settings = vi.fn(), toggle = vi.fn();
+        await render(props({ agentState: 'active', agentModelName: 'Qwen 3.5 0.8B', onOpenBrowserAi: settings, onToggleBrowserAi: toggle }));
+        const button = container.querySelector<HTMLButtonElement>('.atlas-browser-ai-action')!;
+        expect(button.textContent).toBe('');
+        expect(button.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+        expect(button.querySelector(':scope > span[aria-hidden="true"]')).not.toBeNull();
+        expect(button.dataset.state).toBe('active');
+        expect(button.getAttribute('aria-label')).toBe('Local agent settings: Agent active, Qwen 3.5 0.8B');
+        expect(button.title).toBe('Agent active · Qwen 3.5 0.8B. Configure the browser-local agent.');
+        await act(async () => button.click());
+        expect(settings).toHaveBeenCalledOnce();
+        expect(toggle).not.toHaveBeenCalled();
+        expect(container.querySelector('[role="menu"]')).toBeNull();
+    });
+
+    it('omits the model from the label when no model is selected', async () => {
+        await render(props({ agentState: 'off', onOpenBrowserAi: vi.fn() }));
+        expect(container.querySelector('.atlas-browser-ai-action')?.getAttribute('aria-label')).toBe('Local agent settings: Agent off');
+    });
+
+    it.each([['off', 'Agent off'], ['active', 'Agent active'], ['busy', 'Agent working'], ['loading', 'Agent loading'], ['error', 'Agent error']] as const)('shows truthful local agent state %s and opens settings beside the project', async (agentState, label) => {
+        const settings = vi.fn();
+        await render(props({ agentState, onOpenBrowserAi: settings, projectSwitcher: <button>Project</button> }));
+        const button = container.querySelector<HTMLButtonElement>('.atlas-browser-ai-action')!;
+        expect(button.dataset.state).toBe(agentState);
+        expect(button.getAttribute('aria-label')).toBe(`Local agent settings: ${label}`);
+        expect(button.title).toContain(label);
+        expect(button.parentElement?.previousElementSibling?.textContent).toBe('Project');
+        await act(async () => button.click());
+        expect(settings).toHaveBeenCalledOnce();
+    });
+
+    it.each(['explore', 'architecture', 'galaxy', 'system', 'adr', 'coverage', 'agents'] as const)('groups independent configuration and chat controls in the top bar for %s', async workspace => {
+        const settings = vi.fn(), toggle = vi.fn();
+        const next = (chatOpen: boolean) => props({ workspace, chatOpen, onOpenBrowserAi: settings, onToggleBrowserAi: toggle, chatDock: <input aria-label="Chat draft" defaultValue="conversation draft" /> });
+        await render(next(false));
+        const group = testId('atlas-header')?.querySelector('[role="group"][aria-label="Local agent"]');
+        expect(group?.querySelectorAll('button')).toHaveLength(2);
+        const draft = container.querySelector<HTMLInputElement>('[aria-label="Chat draft"]')!;
+        draft.value = 'retained draft';
+        const settingsButton = group?.querySelector<HTMLButtonElement>('.atlas-browser-ai-action')!;
+        const openButton = group?.querySelector<HTMLButtonElement>('[aria-label="Open chat"]')!;
+        expect(openButton.getAttribute('aria-expanded')).toBe('false');
+        await act(async () => settingsButton.click());
+        expect(settings).toHaveBeenCalledOnce();
+        expect(toggle).not.toHaveBeenCalled();
+        await act(async () => openButton.click());
+        expect(toggle).toHaveBeenCalledOnce();
+        expect(settings).toHaveBeenCalledOnce();
+        await render(next(true));
+        const hideButton = testId('atlas-header')?.querySelector<HTMLButtonElement>('[aria-label="Hide chat"]')!;
+        expect(hideButton.getAttribute('aria-expanded')).toBe('true');
+        await act(async () => hideButton.click());
+        expect(toggle).toHaveBeenCalledTimes(2);
+        expect(settings).toHaveBeenCalledOnce();
+        await render(next(false));
+        expect(container.querySelector('[aria-label="Chat draft"]')).toBe(draft);
+        expect(draft.value).toBe('retained draft');
+        expect(container.querySelector('.atlas-agent-reopen')).toBeNull();
+        expect(container.querySelector('[role="menu"]')).toBeNull();
+    });
+
     it('traegt jede Testmarke, an der der Beweislauf das Chrome erkennt', async () => {
         await render(props());
-        for (const id of ['atlas-header', 'atlas-menu', 'atlas-tabs', 'atlas-command',
+        for (const id of ['atlas-header', 'atlas-tabs',
             'atlas-statusbar', 'atlas-tree', 'atlas-breadcrumb']) {
             expect(testId(id), `${id} fehlt`).not.toBeNull();
         }
@@ -91,8 +162,9 @@ describe('AtlasChrome', () => {
 
     it('zeigt Marke und Versions-Chip in der Kopfzeile', async () => {
         await render(props());
-        expect(container.querySelector('.atlas-brand')?.textContent).toBe('CODEATLAS');
-        expect(testId('atlas-version')?.textContent).toBe('v0.0.0-dirty');
+        expect(container.querySelector('.atlas-brand')?.textContent).toBe('CBM LENS Beta');
+        expect(container.querySelector('.atlas-brand-beta')?.textContent).toBe('Beta');
+        expect(testId('atlas-version')?.textContent).toBe('v0.0.0');
     });
 
     it('keeps project switching at the end of the header without a duplicate project chip', async () => {
@@ -106,18 +178,10 @@ describe('AtlasChrome', () => {
         expect(header?.querySelector('[data-chip="sym"]')?.textContent).toContain('76');
     });
 
-    /*
-     * Der Zustand des Arbeitsbaums steht neben der Fassung, nicht in ihr.
-     *
-     * Der Chip beantwortet "welche Fassung ist das" und `v1.0.0-dirty` waere
-     * darauf eine Antwort, die es als Release nicht gibt. Ohne Zusatz steht
-     * daneben nichts: ein leeres Element waere ein Platz, an dem jemand eine
-     * Angabe vermutet.
-     */
-    it('haelt den Bau-Zusatz getrennt vom Versions-Chip', async () => {
+    it('omits build diagnostics from the header', async () => {
         await render(props({ version: 'v1.0.0', buildSuffix: 'dirty' }));
         expect(testId('atlas-version')?.textContent).toBe('v1.0.0');
-        expect(testId('atlas-version-suffix')?.textContent).toBe('dirty');
+        expect(testId('atlas-version-suffix')).toBeNull();
     });
 
     it('zeigt gar kein Zusatz-Element, wenn der Baum sauber war', async () => {
@@ -126,113 +190,25 @@ describe('AtlasChrome', () => {
         expect(testId('atlas-version-suffix')).toBeNull();
     });
 
-    /*
-     * Die Menuezeile nach W7a (Nutzerauftrag 2026-08-29): sie zeichnet nur, was
-     * eine Verdrahtung hat. Ein Punkt ohne Verdrahtung ist kein blasser Knopf
-     * mit Tooltip mehr, sondern gar kein Knopf.
-     */
-    it('zeichnet nur Menuepunkte, hinter denen etwas liegt', async () => {
-        const onSelect = vi.fn();
-        await render(props({
-            menus: { a: { title: 'atlas: hide the galaxy panel (alt+a)', state: 'on', onSelect } },
-        }));
-        const buttons = [...(testId('atlas-menu')?.querySelectorAll('button') ?? [])];
-        expect(buttons.map((button) => button.getAttribute('data-menu'))).toEqual(['a']);
-        expect(buttons).toHaveLength(1);
-        expect(MENU_ITEMS.length).toBeGreaterThan(1);
-        expect(testId('atlas-menu')?.textContent).toContain('[a]tlas');
-        expect(testId('atlas-menu')?.textContent).not.toContain('[?]help');
-    });
-
-    it('sagt in der Zeile, dass die Klammer Alt verlangt', async () => {
-        await render(props());
-        expect(testId('atlas-menu-legend')?.textContent).toContain('alt');
-    });
-
-    it('macht die verdrahteten Menuepunkte anklickbar', async () => {
-        const onSelect = vi.fn();
-        await render(props({
-            menus: { a: { title: 'atlas: hide the galaxy panel (alt+a)', state: 'on', onSelect } },
-        }));
-        const atlas = container.querySelector('[data-menu="a"]') as HTMLButtonElement;
-        expect(atlas.getAttribute('aria-disabled')).toBeNull();
-        expect(atlas.getAttribute('data-state')).toBe('on');
-        expect(atlas.getAttribute('aria-pressed')).toBe('true');
-        expect(atlas.getAttribute('data-hint') ?? '').toContain('galaxy');
-        await act(async () => {
-            atlas.click();
-        });
-        expect(onSelect).toHaveBeenCalledTimes(1);
-    });
-
-    /*
-     * Die Menuezeile nach W7b (Nutzerbefund 2026-08-29, Screenshot): `[a]tlas`
-     * und `[?]help` trugen einen Rahmen, die vier Eintraege dazwischen einen
-     * gepunkteten Unterstrich in kleinerer Schrift, und dadurch sahen sie aus
-     * wie Beschriftungen zwischen zwei Bedienelementen. Sie sind aber alle
-     * dasselbe, also sehen sie jetzt auch so aus. Geprueft wird die Struktur,
-     * nicht die Farbe: eine Klasse, ein Element, ein Buchstabe in Klammern.
-     */
-    it('gibt den fensterweiten Eintraegen dieselbe Gestalt', async () => {
-        const acts = Object.fromEntries(
-            ['a', 'why', 'bug', 'impact', 'llm', 'help'].map((key) => [key, vi.fn()]),
-        );
-        await render(props({
-            menus: {
-                a: {
-                    title: 'atlas: hide the galaxy panel (alt+a)',
-                    state: 'on',
-                    onSelect: acts['a'],
-                    extras: [
-                        { key: 'why', label: '[w]hy am I here', title: 'w', onSelect: acts['why'] },
-                        { key: 'bug', label: '[b]ug hunt', title: 'b', onSelect: acts['bug'] },
-                        { key: 'impact', label: '[c]hange scope', title: 'c', onSelect: acts['impact'] },
-                        { key: 'llm', label: '[l]lm off', title: 'l', onSelect: acts['llm'] },
-                    ],
-                },
-                '?': { title: 'help', state: 'off', onSelect: acts['help'] },
-            },
-        }));
-        const entries = [...(testId('atlas-menu')?.querySelectorAll('[data-menu]') ?? [])];
-        expect(entries.map((node) => node.getAttribute('data-menu')))
-            .toEqual(['a', 'a-why', 'a-llm', '?']);
-        for (const entry of entries) {
-            expect(entry.tagName, entry.getAttribute('data-menu') ?? '').toBe('BUTTON');
-            expect(entry.getAttribute('class'), entry.getAttribute('data-menu') ?? '')
-                .toBe('atlas-menu-item');
-            expect(entry.querySelector('.atlas-menu-key')?.textContent, entry.textContent ?? '')
-                .toMatch(/^\[[a-z?]\]$/);
-        }
-    });
-
-    it('laesst jeden sichtbaren Eintrag mit der Maus ausloesen', async () => {
-        const acts = Object.fromEntries(
-            ['a', 'why', 'bug', 'impact', 'llm', 'help'].map((key) => [key, vi.fn()]),
-        );
-        await render(props({
-            menus: {
-                a: {
-                    title: 'atlas',
-                    state: 'on',
-                    onSelect: acts['a'],
-                    extras: [
-                        { key: 'why', label: '[w]hy am I here', title: 'w', onSelect: acts['why'] },
-                        { key: 'bug', label: '[b]ug hunt', title: 'b', onSelect: acts['bug'] },
-                        { key: 'impact', label: '[c]hange scope', title: 'c', onSelect: acts['impact'] },
-                        { key: 'llm', label: '[l]lm off', title: 'l', onSelect: acts['llm'] },
-                    ],
-                },
-                '?': { title: 'help', state: 'off', onSelect: acts['help'] },
-            },
-        }));
-        for (const entry of [...(testId('atlas-menu')?.querySelectorAll('[data-menu]') ?? [])]) {
-            await act(async () => {
-                (entry as HTMLButtonElement).click();
-            });
-        }
-        for (const [name, act_] of Object.entries(acts)) {
-            expect(act_, name).toHaveBeenCalledTimes(name === 'bug' || name === 'impact' ? 0 : 1);
-        }
+    it.each(['on', 'off'] as const)('keeps removed tool menus absent even when legacy actions are supplied (%s)', async state => {
+        const onSelect = vi.fn(); const extra = vi.fn(); const help = vi.fn();
+        await render(props({ menus: {
+            a: { title: 'Legacy tools', state, onSelect, extras: [
+                { key: 'why', label: '[w]hy am I here', title: 'Where to start', onSelect: extra },
+                { key: 'bug', label: '[b]ug hunt', title: 'Bug hunt', onSelect: extra },
+                { key: 'impact', label: '[c]hange scope', title: 'Impact', onSelect: extra },
+                { key: 'llm', label: '[l]lm off', title: 'Model', onSelect: extra },
+            ] },
+            '?': { title: 'Help', state, onSelect: help },
+        } }));
+        expect(testId('atlas-menu')).toBeNull();
+        expect(testId('atlas-menu-legend')).toBeNull();
+        expect(container.querySelector('[data-menu]')).toBeNull();
+        expect(container.querySelector('.atlas-tools-menu')).toBeNull();
+        expect(testId('fake-reader')).not.toBeNull();
+        expect(onSelect).not.toHaveBeenCalled();
+        expect(extra).not.toHaveBeenCalled();
+        expect(help).not.toHaveBeenCalled();
     });
 
     it('laesst ein Etikett ohne Klammer ganz stehen, statt eine zu erfinden', () => {
@@ -241,71 +217,22 @@ describe('AtlasChrome', () => {
         expect(splitMenuLabel('plain')).toEqual({ key: '', rest: 'plain' });
     });
 
-    it('haelt die Kommandozeile fokussierbar und zeigt Platzhalter und Hinweis', async () => {
+    it('does not render a global command bar, search dialog or legacy search results', async () => {
         const onCommandChange = vi.fn();
-        await render(props({ onCommandChange }));
-        const input = testId('atlas-command-input') as HTMLInputElement;
-        expect(input.placeholder).toBe(COMMAND_PLACEHOLDER);
-        expect(input.placeholder).toContain('type a command or ask the atlas');
-        input.focus();
-        expect(document.activeElement).toBe(input);
-        expect(container.querySelector('.atlas-command-hint')?.textContent)
-            .toContain('search by meaning');
+        await render(props({ onCommandChange, commandValue: 'old query', commandOverlay: <div data-testid="fake-overlay" /> }));
+        expect(testId('atlas-command')).toBeNull();
+        expect(testId('atlas-command-input')).toBeNull();
+        expect(testId('fake-overlay')).toBeNull();
+        expect(container.querySelector('dialog')).toBeNull();
+        expect(container.querySelector('.atlas-command-hint')).toBeNull();
+        expect(onCommandChange).not.toHaveBeenCalled();
     });
 
-    /*
-     * AC10 (Nutzer-Screenshot 2026-08-29): der native Tooltip legte sich beim
-     * Zeigen ueber den Anfang der Zeile, also ueber den Text, den der Leser
-     * gerade tippt. Was er sagte, steht jetzt in der Hilfe.
-     */
-    it('haengt keinen nativen Tooltip mehr an die Zeile', async () => {
-        await render(props());
-        expect((testId('atlas-command-input') as HTMLInputElement).hasAttribute('title')).toBe(false);
-        expect(testId('atlas-command')?.hasAttribute('title')).toBe(false);
-    });
-
-    /*
-     * AC9: die Zeile sagt, ob sie den Fokus hat. Ohne das war der Zustand, in
-     * dem Tippen frueher ins Leere lief, unsichtbar.
-     */
-    it('zeigt im DOM, ob die Zeile den Fokus hat', async () => {
-        await render(props());
-        expect(testId('atlas-command')?.getAttribute('data-focused')).toBe('false');
-        const input = testId('atlas-command-input') as HTMLInputElement;
-        await act(async () => {
-            input.focus();
-        });
-        expect(testId('atlas-command')?.getAttribute('data-focused')).toBe('true');
-        await act(async () => {
-            input.blur();
-        });
-        expect(testId('atlas-command')?.getAttribute('data-focused')).toBe('false');
-    });
-
-    it('forwards command keys while Escape closes search and restores its trigger', async () => {
-        const handled = vi.fn();
-        await render(props({ onCommandKeyDown: handled, children: <button data-testid="reader-focus">Reader</button> }));
-        const trigger = testId('reader-focus') as HTMLButtonElement;
-        await act(async () => {
-            trigger.focus();
-            window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true }));
-        });
-        const input = testId('atlas-command-input') as HTMLInputElement;
-        await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })));
-        expect(handled).toHaveBeenCalledOnce();
-        await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })));
-        expect(handled).toHaveBeenCalledOnce();
-        expect(container.querySelector<HTMLDialogElement>('dialog')?.open).toBe(false);
-        expect(document.activeElement).toBe(trigger);
-    });
-
-    it('zeigt das Suchfenster in der Kommandozeile und die Galaxie neben dem Twin', async () => {
-        await render(props({
-            commandOverlay: <div data-testid="fake-overlay" />,
-            twin: <aside data-testid="fake-twin" />,
-            galaxy: <section data-testid="fake-galaxy" />,
-        }));
-        expect(testId('atlas-command')?.querySelector('[data-testid="fake-overlay"]')).not.toBeNull();
+    it('preserves the reader and galaxy when obsolete command props are supplied', async () => {
+        await render(props({ commandOverlay: <div data-testid="fake-overlay" />,
+            twin: <aside data-testid="fake-twin" />, galaxy: <section data-testid="fake-galaxy" /> }));
+        expect(testId('fake-reader')).not.toBeNull();
+        expect(testId('fake-overlay')).toBeNull();
         const side = container.querySelector('.atlas-side');
         expect(side?.querySelector('[data-testid="fake-twin"]')).not.toBeNull();
         expect(side?.querySelector('[data-testid="fake-galaxy"]')).not.toBeNull();

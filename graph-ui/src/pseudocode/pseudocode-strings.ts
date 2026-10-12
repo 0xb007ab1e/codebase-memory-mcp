@@ -106,7 +106,7 @@ export function pseudocodeCappedNote(hidden: number): string {
  * the one way this feature could mislead without saying anything untrue.
  */
 export const PSEUDOCODE_PARTIAL_SCOPE =
-    'CodeAtlas sampled this range rather than reading every line of it, so a very short member may be missing.';
+    'CBM Lens sampled this range rather than reading every line of it, so a very short member may be missing.';
 
 /**
  * The footer, and the sentence that keeps the whole block honest.
@@ -169,7 +169,7 @@ export function pseudocodeLeadUnused(symbol: string, unused: number, total: numb
 
 export function pseudocodeLeadUnchecked(symbol: string, unknown: number): string {
     return `You cannot see this in the code: every name this file pulls in is one the index links to `
-        + `${symbol}, except ${countOf(unknown, 'one', 'ones')} CodeAtlas cannot check either way.`;
+        + `${symbol}, except ${countOf(unknown, 'one', 'ones')} CBM Lens cannot check either way.`;
 }
 
 export function pseudocodeLeadBehind(steps: number): string {
@@ -179,7 +179,7 @@ export function pseudocodeLeadBehind(steps: number): string {
 
 export function pseudocodeLeadNone(symbol: string, total: number): string {
     if (total === 0) {
-        return 'Nothing stands above the steps this time: CodeAtlas found no import in this file, and the '
+        return 'Nothing stands above the steps this time: CBM Lens found no import in this file, and the '
             + 'index records nothing behind the steps below.';
     }
     return `Nothing stands above the steps this time: every name this file pulls in is one the index links `
@@ -293,7 +293,7 @@ export function importsFindingHeading(unused: number, unknown: number, total: nu
             + 'as far as the index shows';
     }
     if (unknown > 0) {
-        return `${IMPORTS_GROUP_HEADING}: ${countOf(unknown, 'name', 'names')} CodeAtlas cannot check `
+        return `${IMPORTS_GROUP_HEADING}: ${countOf(unknown, 'name', 'names')} CBM Lens cannot check `
             + 'against this file';
     }
     return `${IMPORTS_GROUP_HEADING}: every name here is linked to a symbol in this file`;
@@ -318,7 +318,7 @@ export function importsUnusedLine(name: string, module: string): string {
 
 /** Said on an entry that could not be checked at all. */
 export function importsUnknownLine(name: string, module: string): string {
-    return `${name} from ${module}: CodeAtlas cannot tell whether this file uses it`;
+    return `${name} from ${module}: CBM Lens cannot tell whether this file uses it`;
 }
 
 /** Said on `import * as db from ...` and its equivalents in the other languages. */
@@ -344,7 +344,7 @@ export const IMPORTS_NOTE_UNUSED =
     'The index answered every checked symbol in this file, and none of their recorded facts mentions this name.';
 
 export const IMPORTS_NOTE_UNKNOWN =
-    'CodeAtlas does not have a complete answered reading for every callable in this file, so it will not claim the import is unused.';
+    'CBM Lens does not have a complete answered reading for every callable in this file, so it will not claim the import is unused.';
 
 export const IMPORTS_NOTE_NAMESPACE =
     'A namespace import binds every export of the module under one name, and the index records a call through it under the member\'s name. So nothing here can be matched against the binding.';
@@ -353,7 +353,7 @@ export const IMPORTS_NOTE_SIDE_EFFECT =
     'This statement binds no name, so there is nothing for the index to match it against. What the module does when it loads is not something the analysis records.';
 
 export const IMPORTS_NOTE_INDEX_ONLY =
-    'This came from the dependency the index recorded rather than from the file\'s text, so CodeAtlas has the imported file and not the imported name.';
+    'This came from the dependency the index recorded rather than from the file\'s text, so CBM Lens has the imported file and not the imported name.';
 
 /** Said at the end of a group the display cap cut short. */
 export function importsCappedNote(hidden: number, shown: number): string {
@@ -362,11 +362,11 @@ export function importsCappedNote(hidden: number, shown: number): string {
 
 /** Said when the file's own text could not be read at all. */
 export const IMPORTS_SOURCE_UNREAD =
-    'CodeAtlas could not read this file\'s text, so what follows is the dependencies the index recorded and not the import statements themselves.';
+    'CBM Lens could not read this file\'s text, so what follows is the dependencies the index recorded and not the import statements themselves.';
 
 /** Said when the file pulls in nothing at all. */
 export const IMPORTS_EMPTY =
-    'The index records no dependency for this file and CodeAtlas found no import statement in it.';
+    'The index records no dependency for this file and CBM Lens found no import statement in it.';
 
 /**
  * The standing sentence under the group, in both surfaces.
@@ -377,7 +377,7 @@ export const IMPORTS_EMPTY =
  * the judgement about use comes from every callable declaration the file read.
  */
 export const IMPORTS_SOURCE_NOTE =
-    'The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading '
+    'The dependency comes from the index; the statement, its line and the name it binds are CBM Lens reading '
     + 'this file. Use is checked against the recorded facts of every callable symbol in the file.';
 
 /** The three markers. Short enough to sit beside a name, and never the only carrier of meaning. */
@@ -395,7 +395,7 @@ export const IMPORTS_SECTION_NOTE = IMPORTS_SOURCE_NOTE;
 
 /** How the group's own tally reads, under the entries. */
 export function importsTally(used: number, unused: number, unknown: number): string {
-    return `${used} used in this file, ${unused} not used in it, ${unknown} that CodeAtlas cannot check.`;
+    return `${used} used in this file, ${unused} not used in it, ${unknown} that CBM Lens cannot check.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +581,7 @@ export function explainerWalkBound(depth: number, cap: number): string {
  * entworfen, muss sagen, dass sie aus einem Index gerechnet ist.
  */
 export const EXPLAINER_GENERATED_NOTE =
-    'Nobody drew this picture. CodeAtlas laid it out from what the index recorded for this walk, so it can '
+    'Nobody drew this picture. CBM Lens laid it out from what the index recorded for this walk, so it can '
     + 'be incomplete about the code and exact about what was reported.';
 
 /** Die Notiz im Bild, wenn eine Kante in eine schon besuchte Kette zurueckfuehrt. */
@@ -636,4 +636,4 @@ export const FLOW_LOADING = 'Reading what this symbol reaches.';
  * hier nichts zu zeigen, und keiner davon heisst "dieses Symbol ruft nichts".
  */
 export const FLOW_UNAVAILABLE =
-    'CodeAtlas has no walk for this symbol right now. Place the caret in an indexed function, or reindex the workspace.';
+    'CBM Lens has no walk for this symbol right now. Place the caret in an indexed function, or reindex the workspace.';

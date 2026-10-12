@@ -210,8 +210,12 @@ export class RpcIntelligenceClient {
      * schreibt an derselben Stelle `""`, und ohne die Uebersetzung wuerde ein
      * Bindestrich als Dateiname durch das Produkt wandern.
      */
-    async queryGraph(project: string, query: string, cursor?: string): Promise<QueryGraphResult> {
-        const text = await this.text('query_graph', { project, query, ...(cursor ? { cursor } : {}) });
+    async queryGraph(project: string, query: string, cursor?: string,
+        /* Groessere Seiten fuer Lader, die alles brauchen (Galaxy-Scope, Handtest K8). */
+        budget?: { maxRows?: number; maxOutputTokens?: number }): Promise<QueryGraphResult> {
+        const text = await this.text('query_graph', { project, query, ...(cursor ? { cursor } : {}),
+            ...(budget?.maxRows ? { max_rows: budget.maxRows } : {}),
+            ...(budget?.maxOutputTokens ? { max_output_tokens: budget.maxOutputTokens } : {}) });
         let parsed: CompactRows;
         try {
             parsed = parseCompactRows(text);
@@ -249,7 +253,35 @@ export class RpcIntelligenceClient {
     }
 
     async listProjects(): Promise<ListProjectsResult> {
-        return readListProjects(await this.json('list_projects', {}));
+        const projects: ListProjectsResult['projects'] = [];
+        const names = new Set<string>();
+        let offset = 0;
+        let total: number | undefined;
+        for (let pageNumber = 0; pageNumber < 100; pageNumber++) {
+            const raw = await this.json('list_projects', { limit: 500, offset });
+            let page: ListProjectsResult;
+            try { page = readListProjects(raw); }
+            catch (error) { throw asParseFailure('list_projects', error); }
+            if ((page.offset !== undefined && page.offset !== offset) || (page.returned !== undefined && page.returned !== page.projects.length))
+                throw new EngineError('list_projects', 'Project pagination did not match the requested page.');
+            if (total !== undefined && page.total !== undefined && total !== page.total)
+                throw new EngineError('list_projects', 'Project inventory changed during pagination. Refresh to read it again.');
+            total ??= page.total;
+            for (const project of page.projects) {
+                if (names.has(project.name)) throw new EngineError('list_projects', 'Project pagination repeated a project.');
+                names.add(project.name); projects.push(project);
+            }
+            const next = offset + page.projects.length;
+            if (page.hasMore !== true) {
+                if (page.nextOffset !== undefined || (total !== undefined && total !== projects.length))
+                    throw new EngineError('list_projects', 'Incomplete project inventory.');
+                return { projects };
+            }
+            if (!page.projects.length || page.nextOffset !== next || next <= offset || (total !== undefined && next >= total))
+                throw new EngineError('list_projects', 'Project pagination did not advance.');
+            offset = next;
+        }
+        throw new EngineError('list_projects', 'Project inventory exceeded the 100-page retrieval limit.');
     }
 
     async indexStatus(project: string): Promise<IndexStatusResult> {
@@ -303,17 +335,22 @@ export class RpcIntelligenceClient {
      * Pfade von einem Symbol aus laufen. Liefert die Vereinigung: eine
      * Ablehnung wegen Mehrdeutigkeit ist hier eine normale Antwort, kein
      * Fehler.
+     *
+     * Richtung und Tiefe in den Woertern des Servers (src/mcp/mcp.c,
+     * `trace_path`): `inbound`/`outbound`/`both` und `depth`. Bis zum Review
+     * vom 2026-10-02 gingen hier `callers`/`callees` und `max_depth` hinaus,
+     * und beides kennt das Schema nicht.
      */
     async tracePath(
         project: string,
         functionName: string,
-        args: { direction?: 'callers' | 'callees' | 'both'; maxDepth?: number } = {},
+        args: { direction?: 'inbound' | 'outbound' | 'both'; depth?: number } = {},
     ): Promise<PathResult> {
         return readPathResult(await this.json('trace_path', {
             project,
             function_name: functionName,
             ...(args.direction ? { direction: args.direction } : {}),
-            ...(args.maxDepth !== undefined ? { max_depth: args.maxDepth } : {}),
+            ...(args.depth !== undefined ? { depth: args.depth } : {}),
         }));
     }
 

@@ -85,7 +85,7 @@ describe('the sentence over the block', () => {
     it('leads with what cannot be checked when nothing is unused', () => {
         const lead = blockLeadOf(document, importsOf([USED, UNCHECKABLE]), 'getOrder');
         expect(lead.kind).toBe('unchecked-imports');
-        expect(lead.text).toContain('CodeAtlas cannot check either way');
+        expect(lead.text).toContain('CBM Lens cannot check either way');
     });
 
     it('leads with what lies behind the calls when the imports check out', () => {

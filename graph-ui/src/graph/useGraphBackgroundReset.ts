@@ -1,7 +1,10 @@
 import { useRef, type PointerEvent as ReactPointerEvent } from 'react';
 
-/** A missed raycast is a reset only after a primary, stationary canvas gesture.
- * Tracking the entire gesture also excludes drags that return to their start. */
+/** A missed raycast counts as an empty-canvas click only after a primary,
+ * stationary canvas gesture. Tracking the entire gesture also excludes drags
+ * that return to their start. What the click does is the caller's decision:
+ * inside a Galaxy scope it only clears highlights and never leaves the scope
+ * (hand test K9, GalaxyPanel `handleBackgroundClick`). */
 export function useGraphBackgroundReset(onReset?: () => void) {
     const gesture = useRef<{ id: number; x: number; y: number; moved: boolean } | undefined>(undefined);
     const onPointerDownCapture = (event: ReactPointerEvent) => {

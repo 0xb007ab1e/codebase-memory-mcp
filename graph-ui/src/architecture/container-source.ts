@@ -18,8 +18,17 @@ const isCode = (path: string) => /\.(?:py|js|jsx|ts|tsx|cs|go|java|kt|rs|rb|php|
     && !/\.(?:min|test|spec)\.[^.]+$/.test(path);
 const checkAbort = (signal: AbortSignal) => { if (signal.aborted) throw new DOMException('Aborted', 'AbortError'); };
 
-/** Queries only indexed files. The caller explicitly selects each additional project. */
+/** File names that can be Compose manifests; isComposePath decides. The filter keeps the answer small in any repository. */
+const COMPOSE_CANDIDATES = 'MATCH (f:File) WHERE f.file_path =~ "[Cc][Oo][Mm][Pp][Oo][Ss][Ee][^/]*[.][Yy][Aa]?[Mm][Ll]$" RETURN f.file_path AS path, f.qualified_name AS qn ORDER BY f.file_path LIMIT 201';
+
+/**
+ * Queries only indexed files. The caller explicitly selects each additional project.
+ * Manifests are found first with a filtered query: a repository without one (Django)
+ * then reads as "no deployment files" and never pages through its whole inventory.
+ */
 export async function loadContainerInventory(project: ProjectEntry, client: RpcIntelligenceClient): Promise<ContainerInventory> {
+    const candidates = (await client.queryRows(project.name, COMPOSE_CANDIDATES)).filter(row => row.path && row.qn && isComposePath(row.path));
+    if (!candidates.length) return { project: project.name, rootPath: project.root_path ?? '', files: new Map(), manifests: [], warnings: [] };
     const [rows, modules, classes, interfaces] = await Promise.all([
         client.queryRows(project.name, 'MATCH (f:File) RETURN f.file_path AS path, f.qualified_name AS qn ORDER BY f.file_path LIMIT 4001'),
         client.queryRows(project.name, 'MATCH (f:Module) RETURN f.file_path AS path, f.qualified_name AS qn, f.start_line AS first_line, f.end_line AS last_line ORDER BY f.file_path LIMIT 4001'),
@@ -50,6 +59,8 @@ export async function loadContainerInventory(project: ProjectEntry, client: RpcI
         }
         sourceSpans.set(path, outer);
     }
+    // A manifest beyond the bounded inventory stays readable through its own identity.
+    for (const row of candidates) if (!files.has(row.path)) files.set(row.path, row.qn);
     const manifests = [...files.keys()].filter(isComposePath).sort((a, b) =>
         Number(!/^(?:docker-)?compose\.ya?ml$/.test(a)) - Number(!/^(?:docker-)?compose\.ya?ml$/.test(b)) || a.localeCompare(b));
     return { project: project.name, rootPath: project.root_path ?? '', files, manifests, sourceEnds, sourceSpans,

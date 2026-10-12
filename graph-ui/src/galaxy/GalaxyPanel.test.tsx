@@ -656,7 +656,8 @@ describe('GalaxyPanel und die Hierarchie', () => {
     it('sagt es, wenn nichts von diesem Walk im Fokus steht', async () => {
         await render(props({ walk: walkOf() }));
         expect(seam().pulsedQn).toBe('');
-        expect(noteText()).toContain('nothing of this walk is in focus');
+        // Runde 4 (N2): in einfachen Worten, und nur neben dem Reader von Explore.
+        expect(noteText()).toBe('None of these nodes is open in Explore; the ring marks the symbol open there.');
     });
 
     it('oeffnet einen angeklickten Knoten der Projektion ueber denselben Weg', async () => {
@@ -753,9 +754,7 @@ describe('hierarchy selection regression', () => {
         await render(props({ workspaceExpanded: true, onSelectNode }));
         expect(seam().mode).toBe('hierarchy');
         expect(seam().hierarchy).toBeUndefined();
-        await act(async () => {
-            container.querySelector<HTMLInputElement>('.atlas-galaxy-node-picker input[type="checkbox"]')!.click();
-        });
+        await act(async () => container.querySelector<HTMLInputElement>('[aria-label="Find a graph node"]')!.focus());
         const result = [...container.querySelectorAll<HTMLButtonElement>('.atlas-galaxy-node-picker button')]
             .find(button => button.textContent?.includes('createUser'));
         expect(result).toBeDefined();
@@ -794,25 +793,29 @@ describe('hierarchy selection regression', () => {
 });
 
 describe('mini galaxy follows the code reader', () => {
+    const waitForReader = (assertion: () => void) => vi.waitFor(async () => {
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+        assertion();
+    });
     it('frames the active file even when no twin symbol is available', async () => {
         await render(props({ focusFilePath: 'src/services/userService.ts' }));
-        expect(seam().highlightedCount).toBe(1);
+        await waitForReader(() => expect(seam().highlightedCount).toBe(1));
         expect(seam().lastTargetQn).toBe('src/services/userService.ts');
         expect(noteText()).toBe('');
     });
 
     it('uses the selected source range and clears highlights for an absent file', async () => {
         await render(props({ focusFilePath: 'src/util/validate.ts', focusSourceRange: { startLine: 20, endLine: 21 } }));
-        expect(seam().highlightedCount).toBe(1);
+        await waitForReader(() => expect(seam().highlightedCount).toBe(1));
         expect(seam().lastTargetQn).toBe('src/util/validate.ts');
         await render(props({ focusFilePath: 'src/missing.ts' }));
         expect(seam().highlightedCount).toBe(0);
-        expect(noteText()).toContain('src/missing.ts is not in the loaded graph layout');
+        await waitForReader(() => expect(noteText()).toContain('src/missing.ts is not in the loaded graph layout'));
     });
 
     it('falls back to file context when its focused symbol is outside the layout budget', async () => {
         await render(props({ focusFilePath: 'src/util/validate.ts', focusQualifiedName: 'atlas.notLoaded' }));
-        expect(seam().highlightedCount).toBe(1);
+        await waitForReader(() => expect(seam().highlightedCount).toBe(1));
         expect(seam().lastTargetQn).toBe('src/util/validate.ts');
         await render(props({ focusFilePath: '' }));
         expect(seam().highlightedCount).toBe(0);
@@ -947,4 +950,15 @@ describe('GalaxyPanel: die Hierarchie aus dem Fokus', () => {
         });
         expect(seam().hierarchy!.placements).toEqual(fromWalk);
     });
+});
+
+it('keeps graph selection evidence collapsed until explicitly inspected', async () => {
+    await render(props({ workspaceExpanded: true, selectionPanel: <p>Selected relationship evidence</p> }));
+    const details = container.querySelector<HTMLDetailsElement>('.atlas-galaxy-selection-details')!;
+    expect(details).not.toBeNull();
+    expect(details.open).toBe(false);
+    expect(details.querySelector('summary')?.textContent).toBe('Selection details');
+    await act(async () => { details.querySelector('summary')!.click(); });
+    expect(details.open).toBe(true);
+    expect(details.textContent).toContain('Selected relationship evidence');
 });

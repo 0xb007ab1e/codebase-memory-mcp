@@ -48,6 +48,13 @@ export const workspaceStrings = {
     changeLater: 'Switch workspaces at any time.',
     localAi: 'Set up browser AI',
     browserAi: 'Chat',
+    agentControls: 'Local agent',
+    agentStatus: { off: 'Agent off', loading: 'Agent loading', active: 'Agent active', busy: 'Agent working', error: 'Agent error' },
+    /** The header shows a robot and a lamp; state and model are read out and shown on hover. */
+    agentSettings: (status: string, model?: string) => `Local agent settings: ${status}${model ? `, ${model}` : ''}`,
+    agentSettingsTitle: (status: string, model?: string) => `${status}${model ? ` · ${model}` : ''}. Configure the browser-local agent.`,
+    openChat: 'Open chat',
+    hideChat: 'Hide chat',
     daemon: 'Daemon',
     daemonNavigation: (state: string) => `Open System: daemon ${state}`,
     chatWidth: 'Width of local chat',

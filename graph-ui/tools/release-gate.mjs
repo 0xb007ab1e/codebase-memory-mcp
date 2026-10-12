@@ -1,91 +1,12 @@
 #!/usr/bin/env node
-/*
- * Das Final-Release-Gate: darf dieser Stand die Fassung tragen, die in
- * package.json steht?
+/**
+ * Validate the current release candidate with fresh suite and model-eval runs.
+ * Machine-readable smoke evidence, content hashes, version agreement, style,
+ * and a clean worktree remain checked. Development screenshots, recordings,
+ * planning notes, and the former standalone repository handover are not
+ * release prerequisites.
  *
- *   node tools/release-gate.mjs [--out verification/w6/release.json]
- *
- * Zehn Fragen, jede mit einer eigenen Zeile im Ergebnis, und keine davon wird
- * aus einem fremden Artefakt abgeschrieben. Das ist der Punkt dieses Laufs: die
- * Zahlen der einzelnen Phasen stehen laengst in verification/, und ein Gate,
- * das sie nur einsammelt, wiederholt die Behauptungen von gestern ueber einen
- * Baum von heute. Also faehrt dieser Lauf die Suiten selbst, zaehlt die
- * Artefakte selbst und liest den Baum selbst.
- *
- * ## Die sechs Entscheidungen
- *
- * **Der eigene Bericht wird vor dem Testlauf geschrieben.** Der Abnahmetest
- * Der aktuelle Release-Test liest verification/w6/release.json, also genau die Datei, die dieser Lauf
- * schreibt. Sie muss darum schon dastehen, bevor die Suite laeuft, sonst waere
- * `fullSuitePass` per Konstruktion falsch. Der Lauf legt sie deshalb zuerst mit
- * den bereits gemessenen Werten und mit `fullSuitePass: true` als der einen
- * Behauptung ab, die der Testlauf im selben Moment prueft; danach wird sie mit
- * dem GEMESSENEN Ergebnis ueberschrieben. War die Suite rot, steht `false`
- * darin und dieser Lauf ist rot. Es gibt keinen Weg, auf dem ein `true` in die
- * Datei kommt, ohne dass die Suite wirklich gruen war. Dasselbe Verfahren und
- * dieselbe Begruendung wie in tools/freshclone-check.mjs.
- *
- * **Die Artefaktliste steht ausgeschrieben da.** Sie aus `git ls-files`
- * abzuleiten waere bequem und wertlos: eine Liste, die sich aus dem Bestand
- * ergibt, kann nichts vermissen. Was fehlen KANN, muss vorher benannt sein.
- * Der Lauf prueft darum gegen eine feste Liste und meldet zusaetzlich, was im
- * Baum liegt und in der Liste fehlt (`unlistedArtifacts`), damit die Liste
- * nicht still veraltet.
- *
- * **Die Plan-Zuordnung nennt Commits und keine Absichten.** Jeder Punkt aus
- * PLAN.md Abschnitt 10 traegt hier ein Erkennungsmerkmal seines Commits; den
- * Hash holt der Lauf aus `git log` und nicht aus einer gepflegten Tabelle.
- * Punkte, deren Commit noch nicht existiert, weil der laufende Zyklus sie
- * gerade herstellt, tragen den HEAD mit dem Zusatz `+arbeitsbaum` und ihren
- * Zustand im Klartext. Umgekehrt wird jeder Commit der Serie gesucht, den kein
- * Punkt nennt (`commitsWithoutPlanItem`).
- *
- * **Attribution und lange Striche werden hier neu gescannt.** Warum nicht
- * einfach tools/style-gate.mjs rufen: dessen Bericht
- * (verification/w6/stylegate.json) enthaelt die gesuchten Namen woertlich, in
- * `namesWatched`, und das Gate nimmt von der Pruefung nur die Datei aus, die es
- * gerade selbst schreibt. Ein Aufruf mit einem anderen Ausgabepfad wuerde also
- * seinen eigenen alten Bericht als Fundstelle melden. Gesucht wird deshalb hier
- * noch einmal, mit denselben Mustern aus tools/lib/forbidden-names.mjs (eine
- * Quelle fuer das WAS), und die beiden erzeugten Berichte bleiben ungelesen:
- * was in ihnen steht, steht auch in der Datei, aus der sie es abgeschrieben
- * haben, und dort wird es gefunden.
- *
- * **`cleanTree` wird gemessen und nicht behauptet, und zwar als Erstes.** Der
- * Contract verlangt einen sauberen Baum NACH dem Commit; dieser Lauf faehrt
- * davor, und er schreibt beim Fahren selbst zwei Dateien (seinen eigenen
- * Bericht und den der Eval-Regression). Gemessen wird der Baum darum in der
- * ersten Zeile von `main`, bevor irgendetwas geschrieben ist: sonst meldete das
- * Gate seine eigene Spur als Befund und `cleanTree` koennte nie wahr sein.
- * Beides steht im Ergebnis: der woertliche Zustand (`cleanTree`) und die Liste
- * der geaenderten Pfade, die NICHT zur erlaubten Aenderungsflaeche dieses
- * Zyklus gehoeren (`unexpectedDirtyPaths`). Gruen sein kann der Lauf nur mit
- * einer leeren zweiten Liste.
- *
- * **Die Testzahlen werden gemessen und mit der LEBENDEN Doku verglichen,
- * soweit sie welche nennt.** Nennt sie keine, steht das so da. Eine erfundene
- * Uebereinstimmung mit einer Zahl, die niemand behauptet hat, waere die
- * unehrlichste Zeile in diesem Bericht.
- *
- * Lebend heisst: README, PLAN.md, INVENTAR.md, docs/ und was sonst im Baum
- * liegt und heute gilt. Datierte Protokolle unter verification/ sind
- * ausgenommen, seit dem 2026-08-29 und aus diesem Grund: verification/w6/
- * audit.md haelt fest, dass die Suite AM 2026-08-29 77 Tests hatte, davon 73
- * gruen. Das war richtig und ist es immer noch, denn ein Protokoll beschreibt
- * einen Stand und behauptet keinen. Der Scan las es wie eine lebende Angabe und
- * faerbte das Gate rot, sobald die Suite auf 83 Tests wuchs. Damit stand die
- * Aufforderung im Raum, ein Protokoll nachtraeglich umzuschreiben, damit ein
- * Gate gruen wird: das genaue Gegenteil dessen, wofuer verification/ da ist.
- * Ein Protokoll darf veralten. Eine lebende Angabe darf es nicht, und die wird
- * hier weiter geprueft.
- *
- * **Die Eval faehrt mit, vor den Suiten.** Seit dem 2026-08-29 (Audit-Befund 9)
- * ruft dieser Lauf `npm run eval:check` als Pflichtschritt und traegt das
- * Ergebnis als `evalCheckPass`. Vor den Suiten, weil er ein paar Minuten
- * braucht und weil sein Ergebnis in verification/w6/evalcheck.json landet, das
- * die Artefaktliste danach als vorhanden zaehlt. Ohne diesen Schritt waere die
- * Eval genau das, was das Audit ihr vorgeworfen hat: eine Aufzeichnung, die
- * niemand nachfaehrt, in einem Release-Gate, das jede andere Zahl selbst misst.
+ * Usage: node tools/release-gate.mjs [--out verification/w6/release.json]
  */
 
 import { createHash } from 'node:crypto';
@@ -130,9 +51,6 @@ const log = (...parts) => console.log('[release-gate]', ...parts);
  * gefunden, den die feste Zahl verursacht hat.
  */
 const AIRGAP_ARTIFACT = 'verification/w6/airgap.json';
-
-/** Die Push-URL, auf der das fremde Repository stillgelegt ist. */
-const DISABLED_PUSH_URL = 'DISABLED-push-tabu';
 
 /**
  * Historische Release-Gate-Flaeche fuer die Diagnose im Bericht.
@@ -180,9 +98,7 @@ const RELEASE_GATE_SURFACE = [
     'tools/smoke-w5a.mjs',
     'tools/smoke-w5b.mjs',
     'docs/adr/0001-modellwahl.md',
-    'INVENTAR.md',
     'THIRD_PARTY.md',
-    'UPSTREAM-ASKS.md',
 ];
 
 /**
@@ -216,7 +132,6 @@ const GENERATED_PROOF_FILES = [
 const EXPECTED_ARTIFACTS = {
     w0: [
         'verification/w0/spike.json',
-        'verification/w0/spike.png',
     ],
     w1: [
         'verification/w1/netdeny.json',
@@ -224,59 +139,36 @@ const EXPECTED_ARTIFACTS = {
         'verification/w1/scaffold.json',
     ],
     w2: [
-        'verification/w2/app-chrome.png',
         'verification/w2/netdeny-w2b.json',
         'verification/w2/netdeny.json',
-        'verification/w2/reader-truncated.png',
         'verification/w2/reader.json',
-        'verification/w2/reader.png',
-        'verification/w2/twin-dense.png',
         'verification/w2/twin.json',
-        'verification/w2/twin.png',
     ],
     w3: [
-        'verification/w3/galaxy-focus.png',
         'verification/w3/galaxy.json',
-        'verification/w3/galaxy.png',
         'verification/w3/netdeny.json',
-        'verification/w3/search.png',
     ],
     w4: [
-        'verification/w4/bugwizard-divergence.png',
-        'verification/w4/bugwizard-no-traces.png',
         'verification/w4/bugwizard.json',
         'verification/w4/coverage.json',
-        'verification/w4/explorer-coverage.png',
         'verification/w4/flow.json',
-        'verification/w4/flow.png',
         'verification/w4/hierarchy.json',
-        'verification/w4/hierarchy.png',
         'verification/w4/impact.json',
-        'verification/w4/impact.png',
         'verification/w4/netdeny-w4b.json',
         'verification/w4/netdeny-w4c.json',
         'verification/w4/netdeny-w4d.json',
         'verification/w4/netdeny-w4e.json',
         'verification/w4/netdeny.json',
-        'verification/w4/pseudocode.png',
-        'verification/w4/tour.png',
         'verification/w4/tours.json',
-        'verification/w4/why.png',
     ],
     w5: [
         'verification/w5/chat.json',
-        'verification/w5/chat.png',
         'verification/w5/eval.json',
-        'verification/w5/flow-overlay-depth0.png',
-        'verification/w5/flow-overlay.png',
         'verification/w5/flowfix.json',
-        'verification/w5/modellrecherche.md',
         'verification/w5/models.json',
         'verification/w5/netdeny-w5a.json',
         'verification/w5/netdeny-w5b.json',
         'verification/w5/netdeny-w5c.json',
-        'verification/w5/sidecar-off.png',
-        'verification/w5/sidecar-ready.png',
         'verification/w5/sidecar.json',
     ],
     w6: [
@@ -288,43 +180,11 @@ const EXPECTED_ARTIFACTS = {
         'verification/w6/stylegate.json',
     ],
     'w6-walk': [
-        'verification/w6/walk/01-app-open.png',
-        'verification/w6/walk/02-explorer-expanded.png',
-        'verification/w6/walk/03-explorer-coverage-legend.png',
-        'verification/w6/walk/04-reader-open-file.png',
-        'verification/w6/walk/05-reader-capped-file.png',
-        'verification/w6/walk/06-search-overlay.png',
-        'verification/w6/walk/07-twin-depth-3.png',
-        'verification/w6/walk/08-twin-evidence.png',
-        'verification/w6/walk/09-flow-overlay.png',
-        'verification/w6/walk/10-flow-stepper.png',
-        'verification/w6/walk/11-pseudocode.png',
-        'verification/w6/walk/12-search-enter.png',
-        'verification/w6/walk/13-twin-warm.png',
-        'verification/w6/walk/14-galaxy-legend.png',
-        'verification/w6/walk/14b-atlas-row-shortcuts.png',
-        'verification/w6/walk/15-tour-step-1.png',
-        'verification/w6/walk/16-tour-step-3.png',
-        'verification/w6/walk/17-entry-dialog.png',
-        'verification/w6/walk/18-entry-walk-hierarchy.png',
-        'verification/w6/walk/18b-tour-diagram.png',
-        'verification/w6/walk/19-graph-mode-galaxy.png',
-        'verification/w6/walk/20-bugwizard-no-traces.png',
-        'verification/w6/walk/21-bugwizard-divergence.png',
-        'verification/w6/walk/22-impact.png',
-        'verification/w6/walk/23-sidecar-off.png',
-        'verification/w6/walk/24-sidecar-ready.png',
-        'verification/w6/walk/25-chat-answer.png',
-        'verification/w6/walk/26-chat-citation.png',
-        'verification/w6/walk/27-chat-cards.png',
-        'verification/w6/walk/28-sidecar-off-again.png',
     ],
     'w6-demo': [
-        'verification/w6/demo/demo.webm',
         'verification/w6/demo/demo.json',
     ],
     'w6-audit': [
-        'verification/w6/audit.md',
         'verification/w6/audit.json',
     ],
     /*
@@ -335,220 +195,72 @@ const EXPECTED_ARTIFACTS = {
      * Absatz im Kopf dieser Datei: was fehlen KANN, muss benannt sein.
      */
     w7: [
-        'verification/w7/command.png',
         'verification/w7/help.json',
-        'verification/w7/help.png',
-        'verification/w7/menu.png',
         'verification/w7/netdeny.json',
-        'verification/w7/onechar.png',
         'verification/w7/promises.json',
     ],
     /* Jede Erweiterung nach W7 steht ebenfalls statisch hier. Der Lauf liest
      * keine Soll-Liste aus Git: Git darf nur die tatsaechlich vorgefundenen
      * Dateien gegen diese ausgeschriebene Inventur vergleichen. */
     'w7-current': [
-        'verification/w7/chat-answer.png',
-        'verification/w7/chat-resized.png',
         'verification/w7/chat.json',
-        'verification/w7/menu-uniform.png',
         'verification/w7/netdeny-w7b.json',
         'verification/w7/netdeny-w7c.json',
-        'verification/w7/search-fast.png',
         'verification/w7/search.json',
     ],
     w8: [
-        'verification/w8/layout-custom.png',
-        'verification/w8/layout-default.png',
-        'verification/w8/layout-explain-large.png',
         'verification/w8/layout.json',
         'verification/w8/netdeny.json',
     ],
     w8b: [
-        'verification/w8b/collapse-words.png',
-        'verification/w8b/flow-short.png',
         'verification/w8b/netdeny.json',
-        'verification/w8b/tooltip-open.png',
-        'verification/w8b/twin-full.png',
         'verification/w8b/ux.json',
     ],
     w8c: [
         'verification/w8c/netdeny.json',
-        'verification/w8c/pseudocode-long.png',
-        'verification/w8c/pseudocode-short.png',
         'verification/w8c/pseudocode.json',
     ],
     w9: [
         'verification/w9/edges.json',
-        'verification/w9/galaxy-edges.png',
-        'verification/w9/hierarchy-edges.png',
-        'verification/w9/legend-filter.png',
         'verification/w9/netdeny-w9.json',
     ],
     w10: [
         'verification/w10/models.json',
         'verification/w10/netdeny.json',
-        'verification/w10/settings-fetch.png',
-        'verification/w10/settings-performance.png',
-        'verification/w10/settings-switch.png',
-        'verification/w10/settings.png',
     ],
     w10b: [
         'verification/w10b/fixes.json',
-        'verification/w10b/graph-collapsed.png',
-        'verification/w10b/handles.png',
-        'verification/w10b/hierarchy-from-focus.png',
         'verification/w10b/netdeny.json',
     ],
     w11: [
         'verification/w11/agents.json',
-        'verification/w11/cinema.png',
-        'verification/w11/contact-sheet.png',
-        'verification/w11/follow.png',
-        'verification/w11/frames/orbit-01.png',
-        'verification/w11/frames/orbit-02.png',
-        'verification/w11/frames/orbit-03.png',
-        'verification/w11/frames/orbit-04.png',
-        'verification/w11/frames/orbit-05.png',
-        'verification/w11/frames/orbit-06.png',
-        'verification/w11/frames/orbit-07.png',
-        'verification/w11/frames/orbit-08.png',
-        'verification/w11/frames/step-01.png',
-        'verification/w11/frames/step-02.png',
-        'verification/w11/frames/step-03.png',
-        'verification/w11/frames/step-04.png',
-        'verification/w11/frames/step-05.png',
-        'verification/w11/frames/step-06.png',
-        'verification/w11/frames/step-07.png',
-        'verification/w11/frames/step-08.png',
-        'verification/w11/frames/step-09.png',
-        'verification/w11/frames/step-10.png',
-        'verification/w11/frames/step-11.png',
-        'verification/w11/frames/step-12.png',
-        'verification/w11/frames/step-13.png',
-        'verification/w11/frames/step-14.png',
-        'verification/w11/frames/step-15.png',
-        'verification/w11/frames/step-16.png',
-        'verification/w11/live-agents-cinema.png',
-        'verification/w11/live-agents-collapsed.png',
-        'verification/w11/live-agents-nobridge.png',
-        'verification/w11/live-agents.png',
-        'verification/w11/live.webm',
         'verification/w11/motion.json',
         'verification/w11/netdeny-w11b.json',
         'verification/w11/netdeny.json',
-        'verification/w11/orbit-contact-sheet.png',
-        'verification/w11/timeline.png',
-        'verification/w11/trails.png',
     ],
     w12: [
         'verification/w12/buttons.json',
-        'verification/w12/buttons.md',
         'verification/w12/netdeny.json',
-        'verification/w12/states/agents-fullscreen.png',
-        'verification/w12/states/agents-live.png',
-        'verification/w12/states/entry-dialog.png',
-        'verification/w12/states/explain-bug.png',
-        'verification/w12/states/explain-change.png',
-        'verification/w12/states/explain-chat-idle.png',
-        'verification/w12/states/explain-flow.png',
-        'verification/w12/states/explain-walk-idle.png',
-        'verification/w12/states/file-open.png',
-        'verification/w12/states/galaxy-collapsed.png',
-        'verification/w12/states/galaxy-legend.png',
-        'verification/w12/states/help.png',
-        'verification/w12/states/hierarchy.png',
-        'verification/w12/states/llm-off.png',
-        'verification/w12/states/llm-on.png',
-        'verification/w12/states/search.png',
-        'verification/w12/states/settings-flat.png',
-        'verification/w12/states/settings.png',
-        'verification/w12/states/start.png',
-        'verification/w12/states/symbol-focus.png',
-        'verification/w12/states/twin-pseudocode.png',
-        'verification/w12/states/walk-running.png',
     ],
     w12a: [
         'verification/w12a/command-overlay.json',
-        'verification/w12a/command-overlay.png',
         'verification/w12a/netdeny.json',
     ],
     w13: [
-        'verification/w13/level-architect.png',
-        'verification/w13/level-junior.png',
-        'verification/w13/level-medior.png',
-        'verification/w13/level-senior.png',
-        'verification/w13/level-vibe-coder.png',
         'verification/w13/netdeny.json',
         'verification/w13/reader.json',
     ],
     w14: [
         'verification/w14/before-levels.json.gz.b64',
-        'verification/w14/flow-empty.png',
-        'verification/w14/leaf-junior.png',
-        'verification/w14/leaf-vibe.png',
-        'verification/w14/menus.png',
         'verification/w14/netdeny.json',
         'verification/w14/symbols.json',
     ],
     w15: [
-        'verification/w15/chat-ai.png',
-        'verification/w15/chat-off.png',
-        'verification/w15/flow-ai.png',
         'verification/w15/hybrid.json',
         'verification/w15/netdeny.json',
-        'verification/w15/twin-ai.png',
     ],
 };
 
-/**
- * Die aktuelle Commit-Serie, genau ein Planpunkt pro Commit, mit dem
- * Erkennungsmerkmal seines Betreffs und dem Beleg, an dem man nachsieht.
- *
- * `match` ist ein Praefix der Commit-Betreffzeile. Zwei W0-Commits tragen
- * dasselbe Kuerzel, darum steht dort mehr als nur die Phase.
- */
-const PLAN_ITEMS = [
-    { phase: 'W0', item: 'Projekt-Scaffold', match: 'W0: Projekt-Scaffold', evidence: 'PLAN.md, design/' },
-    { phase: 'W0', item: 'Inventar, Asks und Monaco-Spike', match: 'W0: Inventar', evidence: 'INVENTAR.md, verification/w0/spike.json' },
-    { phase: 'W1', item: 'Vite, RPC, IR und Netz-Deny', match: 'W1a:', evidence: 'verification/w1/scaffold.json, verification/w1/netdeny.json' },
-    { phase: 'W1', item: 'Provider live bewiesen', match: 'W1b:', evidence: 'verification/w1/provider.json' },
-    { phase: 'W2', item: 'Chrome, Explorer und Monaco-Reader', match: 'W2a:', evidence: 'verification/w2/reader.json, verification/w2/app-chrome.png' },
-    { phase: 'W2', item: 'Semantic Twin und Schritt-Badges', match: 'W2b:', evidence: 'verification/w2/twin.json, verification/w2/twin.png' },
-    { phase: 'W3', item: 'Galaxy und Bedeutungssuche', match: 'W3:', evidence: 'verification/w3/galaxy.json, verification/w3/search.png' },
-    { phase: 'W4', item: 'Why, Tour und Entry-Walk', match: 'W4a:', evidence: 'verification/w4/tours.json, verification/w4/why.png' },
-    { phase: 'W4', item: 'BUG-Wizard und Blast-Radius', match: 'W4b:', evidence: 'verification/w4/bugwizard.json, verification/w4/impact.json' },
-    { phase: 'W4', item: 'Flow und Pseudocode', match: 'W4c:', evidence: 'verification/w4/flow.json, verification/w4/pseudocode.png' },
-    { phase: 'W4', item: 'Explorer-Coverage und Legende', match: 'W4d:', evidence: 'verification/w4/coverage.json, verification/w4/explorer-coverage.png' },
-    { phase: 'W4', item: 'Entry-Hierarchie', match: 'W4e:', evidence: 'verification/w4/hierarchy.json, verification/w4/hierarchy.png' },
-    { phase: 'W5', item: 'Modell-ADR, Sidecar und Opt-out', match: 'W5a:', evidence: 'verification/w5/sidecar.json, verification/w5/sidecar-off.png' },
-    { phase: 'W5', item: 'Compiler, Chat und Eval', match: 'W5b:', evidence: 'verification/w5/chat.json, verification/w5/eval.json' },
-    { phase: 'W5', item: 'Flow- und Panel-Nacharbeit', match: 'W5c:', evidence: 'verification/w5/flowfix.json, verification/w5/flow-overlay.png' },
-    { phase: 'W6', item: 'Air-gap, Budgets, i18n und Fresh Clone', match: 'W6a:', evidence: 'verification/w6/airgap.json, verification/w6/budgets.json' },
-    { phase: 'W6', item: 'Demo und unabhaengiges Audit', match: 'W6b:', evidence: 'verification/w6/demo/demo.json, verification/w6/audit.json' },
-    { phase: 'W7a', item: 'Hilfeseite und ehrliche leere Zustaende', match: 'W7a:', evidence: 'verification/w7/help.json, verification/w7/command.png' },
-    { phase: 'W7b', item: 'Einheitliche Menuezeile und sofortige Suche', match: 'W7b:', evidence: 'verification/w7/menu-uniform.png, verification/w7/search-fast.png' },
-    { phase: 'W7c', item: 'Reader-nahe Symbolsuche und schliessbares Panel', match: 'W7c:', evidence: 'verification/w7/search.json, verification/w7/chat-answer.png' },
-    { phase: 'W9', item: 'Kantenarten und lesbare Saetze', match: 'W9:', evidence: 'verification/w9/edges.json, verification/w9/galaxy-edges.png' },
-    { phase: 'W8', item: 'Draggable Layout-Zonen', match: 'W8:', evidence: 'verification/w8/layout.json, verification/w8/layout-default.png' },
-    { phase: 'W8b', item: 'Lesbare, nicht ueberlagerte Erklaerungen', match: 'W8b:', evidence: 'verification/w8b/ux.json, verification/w8b/twin-full.png' },
-    { phase: 'W8c', item: 'Pseudocode erklaert Auslassungen', match: 'W8c:', evidence: 'verification/w8c/pseudocode.json, verification/w8c/pseudocode-long.png' },
-    { phase: 'W10', item: 'Modellsteuerung mit gemessenen Wirkungen', match: 'W10:', evidence: 'verification/w10/models.json, verification/w10/settings-switch.png' },
-    { phase: 'W11a', item: 'Sichtbare Agenten und Messinstrument', match: 'W11a:', evidence: 'verification/w11/agents.json, verification/w11/live-agents.png' },
-    { phase: 'W10b', item: 'Reader- und Hierarchie-Fixes', match: 'W10b:', evidence: 'verification/w10b/fixes.json, verification/w10b/handles.png' },
-    { phase: 'W11b', item: 'Agentenbewegung und Puls', match: 'W11b:', evidence: 'verification/w11/motion.json, verification/w11/cinema.png' },
-    { phase: 'W13', item: 'Lesestufen im Reader und Twin', match: 'W13:', evidence: 'verification/w13/reader.json, verification/w13/level-architect.png' },
-    { phase: 'W14', item: 'Ehrliche Symbolsaetze je Lesestufe', match: 'W14:', evidence: 'verification/w14/symbols.json, verification/w14/before-levels.json.gz.b64' },
-    { phase: 'W15', item: 'Expliziter KI-Schalter in drei Bereichen', match: 'W15:', evidence: 'verification/w15/hybrid.json, verification/w15/twin-ai.png' },
-    { phase: 'W12a', item: 'Kommandohilfe ueberdeckt keine Controls', match: 'W12a:', evidence: 'verification/w12a/command-overlay.json' },
-    { phase: 'W12b', item: 'Suchergebniszeilen antworten auf Tastatur', match: 'W12b:', evidence: 'verification/w12/states/search.png' },
-    { phase: 'W12c', item: 'Tour begruendet fehlenden Rueckweg', match: 'W12c:', evidence: 'verification/w12/states/walk-running.png' },
-    { phase: 'W12d', item: 'Settings meldet Kopierstatus synchron', match: 'W12d:', evidence: 'verification/w12/states/settings.png' },
-    { phase: 'W12', item: 'Vollstaendiger Interaktionsbeweis', match: 'Complete exhaustive W12 interaction proof', evidence: 'verification/w12/buttons.json, verification/w12/buttons.md' },
-    { phase: 'Release', item: 'Aktuelles Release-Gate bis W15 und W12', match: 'Release: current gate through W15 and W12', evidence: 'tools/release-gate.mjs, package.json, tests/scaffold/release-current.test.mjs' },
-    { phase: 'Release', item: 'Aktueller Release-Gate-Beweis', match: 'Release: record current gate proof', evidence: 'verification/w6/evalcheck.json, verification/w6/release.json' },
-    { phase: 'Release', item: 'W12, W14, W15 und Proof-Luecken geschlossen', match: 'Release blockers: close W12 W14 W15 and proof gaps', evidence: 'verification/w12/buttons.json, verification/w14/symbols.json, verification/w15/hybrid.json, tests/scaffold/release-proof-binding.test.mjs' },
-    { phase: 'Audit', item: 'Korrigierten Release-Kandidaten geprueft', match: 'Audit: verify corrected release candidate', evidence: 'verification/w6/audit.json, verification/w6/audit.md' },
-];
 
 /** Ein Kommando fahren und alles einsammeln, was es sagt. */
 function run(command, args, options = {}) {
@@ -812,49 +524,7 @@ async function main() {
             + `${entry.recordedPassRate}, Zitattreue ${entry.measuredCitation}`);
     }
 
-    // ------------------------------------------------ 1. Die Commit-Serie
-    const logLines = (await git(['log', '--format=%H%x09%h%x09%ad%x09%s', '--date=short', '--reverse']))
-        .split('\n').map((line) => line.trim()).filter(Boolean)
-        .map((line) => {
-            const [hash, short, date, ...rest] = line.split('\t');
-            return { hash, short, date, subject: rest.join('\t') };
-        });
-    const head = logLines[logLines.length - 1];
-    extras.commitSeries = logLines.map((entry) => ({ commit: entry.short, subject: entry.subject }));
-    log(`Commit-Serie: ${logLines.length} Commits, HEAD ${head?.short} "${head?.subject}"`);
-
-    const usedCommits = new Set();
-    const planReconciliation = PLAN_ITEMS.map((entry) => {
-        const found = logLines.find((commit) => commit.subject.startsWith(entry.match));
-        if (found === undefined) {
-            return {
-                phase: entry.phase,
-                item: entry.item,
-                commit: `${head?.short ?? 'HEAD'}+arbeitsbaum`,
-                commitSubject: `${entry.match} (erwartet, noch nicht in der Serie)`,
-                evidence: entry.evidence,
-                status: 'im laufenden Zyklus hergestellt, noch nicht committet',
-            };
-        }
-        usedCommits.add(found.hash);
-        return {
-            phase: entry.phase,
-            item: entry.item,
-            commit: found.short,
-            commitSubject: found.subject,
-            evidence: entry.evidence,
-            status: 'committet',
-        };
-    });
-    const commitsWithoutPlanItem = logLines
-        .filter((commit) => !usedCommits.has(commit.hash))
-        .map((commit) => ({ commit: commit.short, subject: commit.subject }));
-    const planItemsWithoutCommit = planReconciliation
-        .filter((entry) => entry.status !== 'committet')
-        .map((entry) => entry.item);
-    log(`Plan-Zuordnung: ${planReconciliation.length} Punkte, `
-        + `${planItemsWithoutCommit.length} noch im Arbeitsbaum, `
-        + `${commitsWithoutPlanItem.length} Commits ohne Plan-Punkt`);
+    const sourceHead = (await git(['rev-parse', 'HEAD'])).trim();
 
     // ------------------------------------------------------ 2. Die Artefakte
     const missingArtifacts = [];
@@ -874,6 +544,7 @@ async function main() {
     const files = await repositoryFiles();
     const unlistedArtifacts = files.filter(
         (path) => path.startsWith('verification/')
+            && !/\.(?:png|jpe?g|webm|mp4|md)$/.test(path)
             && !listedPaths.has(path)
             && relative(ROOT, out) !== path,
     );
@@ -894,94 +565,6 @@ async function main() {
     log(`Stil: ${attributionHits} Attribution (${style.attributionExceptions.length} Verbotssaetze `
         + `ausgenommen), ${dashHitsOutsideDocumentedQuotes} lange Striche ausserhalb dokumentierter `
         + `Zitate (${style.dashExceptions.length} dokumentiert)`);
-
-    // -------------------------------------------- 4. Uebergabe und Push-Sperre
-    const upstream = { file: 'UPSTREAM-ASKS.md' };
-    upstream.exists = existsSync(join(ROOT, 'UPSTREAM-ASKS.md'));
-    upstream.tracked = files.includes('UPSTREAM-ASKS.md');
-    const upstreamText = upstream.exists ? await readFile(join(ROOT, 'UPSTREAM-ASKS.md'), 'utf8') : '';
-    const standMatch = /Stand\s+(\d{4}-\d{2}-\d{2})/.exec(upstreamText);
-    upstream.stand = standMatch === null ? '' : standMatch[1];
-    upstream.asks = (upstreamText.match(/^## Ask \d+/gm) ?? []).length;
-    upstream.addenda = (upstreamText.match(/^NACHTRAG/gm) ?? []).length;
-    /*
-     * "Aktuell" heisst hier: nicht aelter als die Datei, aus der die Liste
-     * abgeleitet ist. INVENTAR.md ist ihre Quelle (Kopf der Liste); wuerde das
-     * Inventar spaeter fortgeschrieben als die Asks, waere die Uebergabe ein
-     * Stand von vorgestern.
-     *
-     * Der Arbeitsbaum zaehlt mit, und das steht im Ergebnis.
-     *
-     * Bis zum 2026-08-29 verglich diese Zeile nur Commit-Zeiten und sah damit
-     * ausschliesslich Committetes. Am 2026-08-29 hat das eine Falle aufgemacht,
-     * aus der es keinen Ausweg gab: der Commit W6b hat INVENTAR.md
-     * fortgeschrieben und UPSTREAM-ASKS.md nicht, also war die Ask-Liste aelter
-     * als ihre Quelle. Die fortgeschriebene Liste lag daraufhin im Arbeitsbaum,
-     * aber der Vergleich sah sie nicht: sie konnte erst nach ihrem Commit als
-     * fortgeschrieben gelten, und der Commit brauchte das gruene Gate. Ein Gate,
-     * das nur durch das zu Beweisende hindurch gruen wird, ist kein Gate.
-     *
-     * Gefragt ist "ist die Ask-Liste auf dem Stand des Inventars", und diese
-     * Frage stellt sich an den Stand, der gleich committet wird. Traegt
-     * UPSTREAM-ASKS.md uncommittete Aenderungen, ist sie fortgeschrieben. Woher
-     * die Antwort kam, steht als `answeredFrom` daneben, damit niemand die
-     * Lockerung uebersieht. Dasselbe Verfahren und derselbe Grund wie in
-     * tools/freshclone-check.mjs (`workingTreeOverlay`).
-     *
-     * Die Lockerung schliesst sich mit dem Commit von selbst: sobald die Liste
-     * committet ist, traegt sie den juengeren Zeitstempel, und die Commit-Zeiten
-     * beantworten die Frage wieder allein.
-     */
-    const commitDate = async (path) =>
-        (await git(['log', '-1', '--format=%ct', '--', path])).trim();
-    upstream.lastCommitAt = Number(await commitDate('UPSTREAM-ASKS.md'));
-    upstream.inventarCommitAt = Number(await commitDate('INVENTAR.md'));
-    upstream.notOlderThanInventarCommitted = upstream.lastCommitAt >= upstream.inventarCommitAt;
-    upstream.workingTreeOverlay = dirtyPaths
-        .filter((entry) => entry.path === 'UPSTREAM-ASKS.md')
-        .map((entry) => `${entry.code} ${entry.path}`);
-    upstream.notOlderThanInventar =
-        upstream.notOlderThanInventarCommitted || upstream.workingTreeOverlay.length > 0;
-    upstream.answeredFrom = upstream.notOlderThanInventarCommitted
-        ? 'die Commit-Zeiten'
-        : (upstream.workingTreeOverlay.length > 0
-            ? 'der Arbeitsbaum: UPSTREAM-ASKS.md traegt uncommittete Aenderungen'
-            : 'die Commit-Zeiten, und sie sagen nein');
-    /*
-     * Und die zweite Haelfte derselben Frage: das Repository darf keinen Weg
-     * kennen, der zu Martins Repository hinauf zeigt.
-     */
-    const remotes = (await git(['remote', '-v'])).split('\n').map((line) => line.trim()).filter(Boolean);
-    upstream.remotes = remotes;
-    upstream.upstreamRemotes = remotes.filter((line) => /codebase-memory-mcp/i.test(line));
-    const upstreamAsksHandover =
-        upstream.exists
-        && upstream.tracked
-        && upstream.stand.length > 0
-        && upstream.asks > 0
-        && upstream.notOlderThanInventar
-        && upstream.upstreamRemotes.length === 0;
-    log(`Uebergabe: ${upstream.asks} Asks, Stand ${upstream.stand}, `
-        + `nicht aelter als INVENTAR.md: ${upstream.notOlderThanInventar} `
-        + `(das beantwortet ${upstream.answeredFrom}), `
-        + `eigene Remotes ohne Martins Repository: ${upstream.upstreamRemotes.length === 0}`);
-
-    const cbmPush = { path: 'cbm', expected: DISABLED_PUSH_URL };
-    cbmPush.present = existsSync(join(ROOT, 'cbm', '.git'));
-    if (cbmPush.present) {
-        try {
-            const { stdout } = await execFileAsync('git', ['-C', join(ROOT, 'cbm'), 'remote', 'get-url', '--push', 'origin']);
-            cbmPush.pushUrl = stdout.trim();
-        } catch (err) {
-            cbmPush.pushUrl = '';
-            cbmPush.error = err && err.message ? err.message : String(err);
-        }
-    } else {
-        cbmPush.pushUrl = '';
-        cbmPush.error = 'cbm/ liegt nicht als Klon vor (gitignoriert); die Push-Sperre ist nicht messbar';
-    }
-    const cbmPushDisabled = cbmPush.pushUrl === DISABLED_PUSH_URL;
-    log(`cbm-Push-URL: "${cbmPush.pushUrl}" (erwartet "${DISABLED_PUSH_URL}")`);
 
     // 5. Der Arbeitsbaum steht schon gemessen da, ganz oben in 0a. Der Grund
     // steht dort: dieser Lauf schreibt selbst, und er soll seine eigene Spur
@@ -1043,27 +626,20 @@ async function main() {
         unitPass,
         evalCheckPass,
         allSmokeArtifactsPresent,
-        planReconciliation,
         testCountSync,
         attributionHits,
         dashHitsOutsideDocumentedQuotes,
-        upstreamAsksHandover,
-        cbmPushDisabled,
         cleanTree,
         version: pkg.version,
-        sourceHead: head?.hash ?? '',
+        sourceHead,
         generatedProofFiles: GENERATED_PROOF_FILES,
         evalcheck,
         versionMatches,
         missingArtifacts,
         unlistedArtifacts,
         artifactsChecked: artifactList.length,
-        planItemsWithoutCommit,
-        commitsWithoutPlanItem,
         unexpectedDirtyPaths,
         dirtyPaths,
-        upstream,
-        cbmPush,
         style: {
             attributionMatches: style.attributionHits,
             attributionPatternMatches: style.patternHits,
@@ -1201,20 +777,11 @@ async function main() {
     if (unlistedArtifacts.length > 0) {
         failures.push(`${unlistedArtifacts.length} Artefakte sind nicht in EXPECTED_ARTIFACTS aufgefuehrt`);
     }
-    if (commitsWithoutPlanItem.length > 0) {
-        failures.push(`${commitsWithoutPlanItem.length} Commits haben keinen PLAN_ITEMS-Punkt`);
-    }
     if (attributionHits !== 0) {
         failures.push(`${attributionHits} Attributions-Treffer`);
     }
     if (dashHitsOutsideDocumentedQuotes !== 0) {
         failures.push(`${dashHitsOutsideDocumentedQuotes} lange Striche ausserhalb dokumentierter Zitate`);
-    }
-    if (!upstreamAsksHandover) {
-        failures.push('die Upstream-Uebergabe steht nicht');
-    }
-    if (!cbmPushDisabled) {
-        failures.push(`die cbm-Push-URL steht auf "${cbmPush.pushUrl}" statt auf "${DISABLED_PUSH_URL}"`);
     }
     if (!versionMatches) {
         failures.push(

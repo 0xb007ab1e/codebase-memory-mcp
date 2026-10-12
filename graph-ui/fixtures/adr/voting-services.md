@@ -2,7 +2,7 @@
 
 > Preview example for voting-services. This proposed review note is test content, not an upstream architectural decision.
 
-## 001 — Distinguish declared and observed connections
+## 001: Distinguish declared and observed connections
 
 **Status:** Proposed · **Scope:** Service map review
 

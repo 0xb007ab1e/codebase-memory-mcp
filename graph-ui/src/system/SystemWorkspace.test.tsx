@@ -3,7 +3,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SystemWorkspace, { type SystemWorkspaceProps } from './SystemWorkspace';
-import { readLogs, readProcesses } from '../projects/projects-model';
+import { readHealth, readLogs, readProcesses } from '../projects/projects-model';
 
 let container: HTMLDivElement;
 let root: Root;
@@ -18,8 +18,8 @@ const click = async (label: string) => {
     expect(button).toBeDefined();
     await act(async () => { button?.click(); });
 };
-const render = async (api = source(), onOpenProjects = vi.fn(), project = 'fixture-a') => {
-    await act(async () => { root.render(<SystemWorkspace api={api} onOpenProjects={onOpenProjects} pollMs={100} project={project} />); });
+const render = async (api = source(), onOpenProjects = vi.fn(), project = 'fixture-a', configuration?: SystemWorkspaceProps['configuration'], listProjects?: SystemWorkspaceProps['listProjects']) => {
+    await act(async () => { root.render(<SystemWorkspace api={api} onOpenProjects={onOpenProjects} pollMs={100} project={project} configuration={configuration} listProjects={listProjects} />); });
     return api;
 };
 
@@ -40,6 +40,38 @@ afterEach(async () => {
 });
 
 describe('System workspace', () => {
+    it('places Configuration second in a vertical navigation and keeps its draft mounted between views', async () => {
+        await render(source(), vi.fn(), 'fixture-a', <label>Configuration draft<input aria-label="Configuration draft" defaultValue="saved value" /></label>);
+        expect([...container.querySelectorAll('[role="tab"]')].map(tab => tab.textContent)).toEqual(['Overview', 'Configuration', 'Indexes', 'Logs']);
+        expect(container.querySelector('[role="tablist"]')?.getAttribute('aria-orientation')).toBe('vertical');
+        const panel = container.querySelector<HTMLDivElement>('#system-panel-configuration')!;
+        const draft = container.querySelector<HTMLInputElement>('[aria-label="Configuration draft"]')!;
+        expect(panel.hidden).toBe(true);
+        await click('Configuration');
+        expect(panel.hidden).toBe(false);
+        expect(container.querySelector('.system-read-status')).toBeNull();
+        expect([...container.querySelectorAll('button')].some(button => button.textContent === 'Refresh')).toBe(false);
+        draft.value = 'unsaved value';
+        await click('Logs');
+        expect(panel.hidden).toBe(true);
+        await click('Configuration');
+        expect(container.querySelector('[aria-label="Configuration draft"]')).toBe(draft);
+        expect(draft.value).toBe('unsaved value');
+    });
+    it('tells embedded configuration when its subpage is active without remounting it', async () => {
+        const configuration = vi.fn((active: boolean) => <input aria-label="Embedded settings" data-active={active} defaultValue="draft" />);
+        await render(source(), vi.fn(), 'fixture-a', configuration);
+        const field = container.querySelector<HTMLInputElement>('[aria-label="Embedded settings"]')!;
+        expect(field.getAttribute('data-active')).toBe('false');
+        await click('Configuration');
+        expect(field.getAttribute('data-active')).toBe('true');
+        field.value = 'unsaved';
+        await click('Indexes');
+        expect(field.getAttribute('data-active')).toBe('false');
+        await click('Configuration');
+        expect(container.querySelector('[aria-label="Embedded settings"]')).toBe(field);
+        expect(field.value).toBe('unsaved');
+    });
     it('shows explicit units and serving identity without made-up capacities', async () => {
         await render();
         const overview = container.querySelector('#system-panel-overview')?.textContent;
@@ -78,6 +110,22 @@ describe('System workspace', () => {
         await act(async () => { await vi.advanceTimersByTimeAsync(500); });
         expect(api.indexJobs).toHaveBeenCalledTimes(1);
     });
+    it('shows persisted indexes even when the current daemon has no index jobs', async () => {
+        const api = source();
+        api.indexJobs = vi.fn().mockResolvedValue([]);
+        api.projectHealth = vi.fn().mockResolvedValue(readHealth({ status: 'healthy', nodes: 12, edges: 21, indexed_at: '2026-09-07T10:00:00Z', watch_registered: true, watcher_running: false }));
+        api.configuration = vi.fn().mockResolvedValue({ revision: 'r1', settings: [] });
+        const listProjects = vi.fn().mockResolvedValue([{ name: 'persisted-index', root_path: '/persisted' }]);
+        await render(api, vi.fn(), 'fixture-a', undefined, listProjects);
+        expect(listProjects).not.toHaveBeenCalled();
+        await click('Indexes');
+        const inventory = container.querySelector('.system-index-table');
+        expect(inventory?.textContent).toContain('persisted-index');
+        expect(inventory?.textContent).toContain('12 nodes');
+        expect(inventory?.textContent).toContain('Registered · daemon watcher stopped');
+        expect(inventory?.querySelector('time')?.getAttribute('datetime')).toBe('2026-09-07T10:00:00Z');
+        expect(container.querySelector('.system-index-activity')?.textContent).toContain('No index activity');
+    });
     it('fetches errors from retained history rather than filtering the latest 200 info lines', async () => {
         const writeText = vi.fn().mockResolvedValue(undefined);
         Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
@@ -111,22 +159,14 @@ describe('System workspace', () => {
         expect(container.querySelector('.system-log')?.textContent).not.toContain('project A');
         expect(container.querySelector('.system-log')?.textContent).not.toContain('wrong daemon-wide');
     });
-    it('debounces text search and requires a confirmed full-history query', async () => {
+    it('loads retained history without a separate text-search input or query', async () => {
         const api = source();
-        api.logs = vi.fn().mockImplementation(async (_limit, _level, _project, filters) => ({
-            lines: filters?.query ? ['archived src/broken.ts failure'] : ['latest info'], total: 1,
-            persistent: true, query: filters?.query ?? '',
-        }));
+        api.logs = vi.fn().mockResolvedValue({ lines: ['latest retained event'], total: 1, persistent: true });
         await render(api); await click('Logs');
-        const input = container.querySelector<HTMLInputElement>('input[type="search"]')!;
-        await act(async () => {
-            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, 'src/broken.ts');
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-        });
+        expect(container.querySelector('input[type="search"]')).toBeNull();
         expect(api.logs).toHaveBeenLastCalledWith(200, undefined, undefined, {});
-        await act(async () => { await vi.advanceTimersByTimeAsync(250); });
-        expect(api.logs).toHaveBeenLastCalledWith(200, undefined, undefined, { query: 'src/broken.ts' });
-        expect(container.querySelector('.system-log')?.textContent).toContain('archived src/broken.ts failure');
+        expect(container.querySelector('.system-log')?.textContent).toContain('latest retained event');
+        expect(container.querySelector('select[aria-label="Log severity"]')).not.toBeNull();
     });
     it('retains the last successful reading and shows refresh failure', async () => {
         const api = source();
@@ -140,8 +180,13 @@ describe('System workspace', () => {
     it('moves tab selection and focus together with arrow keys', async () => {
         await render();
         const overviewTab = container.querySelector<HTMLButtonElement>('#system-tab-overview')!;
-        await act(async () => { overviewTab.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true })); });
-        expect(container.querySelector('#system-tab-indexes')?.getAttribute('aria-selected')).toBe('true');
+        await act(async () => { overviewTab.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })); });
+        expect(container.querySelector('#system-tab-configuration')?.getAttribute('aria-selected')).toBe('true');
+        expect(document.activeElement?.id).toBe('system-tab-configuration');
+        await act(async () => { document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true })); });
+        expect(container.querySelector('#system-tab-logs')?.getAttribute('aria-selected')).toBe('true');
+        expect(document.activeElement?.id).toBe('system-tab-logs');
+        await act(async () => { document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true })); });
         expect(document.activeElement?.id).toBe('system-tab-indexes');
     });
     it('shows persisted error severity, source, receipt time and path in the real log view', async () => {
@@ -153,5 +198,18 @@ describe('System workspace', () => {
         expect(record?.textContent).toContain('src/broken.ts'); expect(record?.textContent).toContain('Event #17');
         expect(record?.querySelector('time')?.dateTime).toBe('2026-09-09T12:00:00Z');
         expect(container.textContent).toContain('SQLite history');
+    });
+    it('combines repeated identical frontend warnings into one line with a count', async () => {
+        const api = source();
+        const clock = 'THREE.THREE.Clock: This module has been deprecated. Please use THREE.Timer instead.';
+        const records = Array.from({ length: 120 }, (_, index) => ({ id: 100 + index, ts: '2026-10-03T16:05:22Z', level: 'warn', source: 'console', project: 'cbm',
+            message: JSON.stringify({ session: 'a31adcaf', seq: index + 2, level: 'warn', source: 'console', message: clock, project: 'cbm' }) }));
+        records.push({ id: 400, ts: '2026-10-03T16:06:00Z', level: 'error', source: 'rpc', project: 'cbm', message: JSON.stringify({ session: 'a31adcaf', seq: 300, level: 'error', source: 'rpc', message: '/rpc query_graph: Failed to fetch' }) });
+        api.logs = vi.fn().mockResolvedValue(readLogs({ lines: [], total: 121, persistent: true, retention_limit: 5000, generation: 'fixture', records }));
+        await render(api); await click('Logs');
+        const rows = [...container.querySelectorAll('.system-log-record')];
+        expect(rows.filter((row) => row.textContent?.includes('THREE.THREE.Clock'))).toHaveLength(1);
+        expect(rows.find((row) => row.textContent?.includes('THREE.THREE.Clock'))?.querySelector('.system-log-repeat')?.textContent).toBe('×120');
+        expect(rows.find((row) => row.textContent?.includes('Failed to fetch'))?.querySelector('.system-log-repeat')).toBeNull();
     });
 });

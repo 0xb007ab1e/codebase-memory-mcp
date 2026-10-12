@@ -1,12 +1,14 @@
-import { Component, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { Component, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Edges, Html, Line, OrbitControls, OrthographicCamera } from '@react-three/drei';
-import { Box3, Color, MOUSE, TOUCH, OrthographicCamera as ThreeOrthographicCamera, QuadraticBezierCurve3, Quaternion, Vector3 } from 'three';
-import type { SystemSceneEdge, SystemSceneLane, SystemSceneModel, SystemSceneNode } from './system-architecture-model';
+import { Box3, Color, MOUSE, TOUCH, OrthographicCamera as ThreeOrthographicCamera, QuadraticBezierCurve3, Vector3 } from 'three';
+import { laneRepeatsMember, type SystemSceneEdge, type SystemSceneLane, type SystemSceneModel, type SystemSceneNode } from './system-architecture-model';
 import { edgeColor, isDirectedEdge, normalizeEdgeType } from '../graph/edge-style';
 import { EdgePulseLayer } from '../graph/EdgePulseLayer';
 import { useGraphBackgroundReset } from '../graph/useGraphBackgroundReset';
 import { connectionLoad, type ConnectionLoad } from '../graph/connection-load';
+import { journeyEdgeColor, SCENE_MAX_TILT, SCENE_PALETTE } from './scene-palette';
+import { journeyChipForm, placeSecondaryLabels, type LabelRect, type SecondaryLabel } from './label-space';
 
 /** The model keeps its stable XY layout; rendering places that footprint on XZ. */
 const groundPosition = ([x, y, z]: [number, number, number]): Vector3 => new Vector3(x, z, -y);
@@ -33,11 +35,13 @@ function ScopeCamera({ model, resetKey, planar, presentation }: { model: SystemS
         const orbit = controls as unknown as { target: Vector3; update: () => void } | undefined;
         if (!orbit || !(camera instanceof ThreeOrthographicCamera) || size.width < 1 || size.height < 1) return;
         const last = previous.current;
-        if (last && last.key !== key) {
+        // A Behavior page is always fitted afresh: a view kept from an earlier visit may frame none of its boxes.
+        const remember = presentation !== 'journey';
+        if (remember && last && last.key !== key) {
             cameraViews.set(last.key, { position: camera.position.toArray() as [number, number, number], target: orbit.target.toArray() as [number, number, number], zoom: camera.zoom, far: camera.far, width: last.width, height: last.height });
             if (cameraViews.size > 24) cameraViews.delete(cameraViews.keys().next().value!);
         }
-        const stored = last?.reset === resetKey ? cameraViews.get(key) : undefined;
+        const stored = remember && last?.reset === resetKey ? cameraViews.get(key) : undefined;
         previous.current = { key, reset: resetKey, width: size.width, height: size.height };
         camera.up.set(0, planar ? 0 : 1, planar ? -1 : 0);
         if (stored && last?.key !== key && stored.width === size.width && stored.height === size.height) {
@@ -76,20 +80,26 @@ function ScopeCamera({ model, resetKey, planar, presentation }: { model: SystemS
     return null;
 }
 
-/** Folder backplates are visual containment, never selectable nodes or relationships. */
+/** Folder backplates are visual containment, never selectable nodes or relationships; NodeLabels names them. */
 function FolderBackplate({ lane }: { lane: SystemSceneLane }) {
     const height = lane.height ?? 24;
     return <group position={groundPosition(lane.position)}>
         <mesh raycast={() => null}>
             <boxGeometry args={[lane.width, lane.depth, height]} />
-            <meshStandardMaterial color="#536977" roughness={0.95} transparent opacity={0.09} depthWrite={false} />
-            <Edges color="#6e8a98" transparent opacity={0.24} />
+            <meshStandardMaterial color={SCENE_PALETTE.plate} roughness={0.95} transparent opacity={0.09} depthWrite={false} />
+            <Edges color={SCENE_PALETTE.plateEdge} transparent opacity={0.24} />
         </mesh>
-        <Html position={[-lane.width / 2 + 3, lane.depth / 2 + 0.2, -height / 2 + 3]} zIndexRange={[5, 1]} style={{ pointerEvents: 'none' }}>
-            <span className="system-scene-lane-label" data-folder-id={lane.id} title={lane.label}>{lane.label}</span>
-        </Html>
     </group>;
 }
+
+/** The corners a lane name may take, the far left first (where it always sat). */
+function laneSpots(lane: SystemSceneLane): { point: [number, number, number]; align: 'start' | 'end' }[] {
+    const height = lane.height ?? 24, base = groundPosition(lane.position), top = lane.depth / 2 + 0.2;
+    const x = lane.width / 2 - 3, far = -height / 2 + 3, near = height / 2 - 6;
+    return ([[-x, far, 'start'], [-x, near, 'start'], [x, far, 'end'], [x, near, 'end']] as const)
+        .map(([dx, dz, align]) => ({ point: base.clone().add(new Vector3(dx, top, dz)).toArray() as [number, number, number], align }));
+}
+const JOURNEY_CHIP = { width: 116, height: 58 }, JOURNEY_COMPACT = { width: 116, height: 26 };
 
 /** Source-to-target geometry is shared by the base edge and the GPU pulse batch. */
 function connectionGeometry(source: SystemSceneNode, target: SystemSceneNode, offset: number) {
@@ -111,28 +121,25 @@ function connectionGeometry(source: SystemSceneNode, target: SystemSceneNode, of
         control = start.clone().lerp(end, 0.5).add(side).add(new Vector3(0, Math.min(10, 3.5 + direction.length() * 0.035), 0));
     }
     const curve = new QuadraticBezierCurve3(start, control, end);
-    return { curve, points: curve.getPoints(32), arrow: curve.getPoint(0.76), rotation: new Quaternion().setFromUnitVectors(new Vector3(0, 1, 0), curve.getTangent(0.76).normalize()) };
+    return { curve, points: curve.getPoints(32) };
 }
 
 interface ConnectionStrand { type: string; geometry: ReturnType<typeof connectionGeometry> }
 
-function Connection({ edge, strands, selected, dimmed, emphasized, onSelect }: {
+function Connection({ edge, strands, selected, dimmed, emphasized, onSelect, colorOf }: {
     edge: SystemSceneEdge; strands: ConnectionStrand[]; selected: boolean;
     dimmed: boolean; emphasized: boolean; onSelect: () => void;
+    colorOf: (type: string, types?: readonly string[]) => string;
 }) {
     const internal = edge.source === edge.target;
     const opacity = selected ? 0.98 : dimmed ? 0.065 : emphasized ? 0.86 : internal ? 0.15 : 0.34;
     return <group onClick={event => { event.stopPropagation(); onSelect(); }}>
         {strands.map(({ type, geometry }) => <group key={type}>
-            <Line points={geometry.points} color={edgeColor(type)} lineWidth={selected ? 2 : emphasized ? 1.6 : 0.7}
+            <Line points={geometry.points} color={colorOf(type)} lineWidth={selected ? 2 : emphasized ? 1.6 : 0.7}
                 transparent opacity={opacity} depthWrite={false} />
-            {isDirectedEdge(type) && <mesh position={geometry.arrow} quaternion={geometry.rotation}>
-                <coneGeometry args={[selected || emphasized ? 0.85 : 0.62, 2.2, 7]} />
-                <meshBasicMaterial color={edgeColor(type)} transparent opacity={opacity} depthWrite={false} />
-            </mesh>}
         </group>)}
         {selected && <Html position={strands[0].geometry.curve.getPoint(0.5).lerp(strands.at(-1)!.geometry.curve.getPoint(0.5), 0.5)} center zIndexRange={[15, 10]} style={{ pointerEvents: 'none' }}>
-            <span className="system-scene-edge-label" style={{ borderColor: edgeColor(edge.type, edge.types) }}>{internal ? 'Within group · ' : ''}{edge.types?.length ? edge.types.join(' · ').replaceAll('_', ' ') : edge.type.replaceAll('_', ' ')} · {edge.count}</span>
+            <span className="system-scene-edge-label" style={{ borderColor: colorOf(edge.type, edge.types) }}>{internal ? 'Within group · ' : ''}{edge.types?.length ? edge.types.join(' · ').replaceAll('_', ' ') : edge.type.replaceAll('_', ' ')} · {edge.count}</span>
         </Html>}
     </group>;
 }
@@ -142,14 +149,26 @@ const labelPosition = (node: SystemSceneNode): [number, number, number] => {
     return [point.x, point.y + size[1] / 2 + (node.parentId ? 2.6 : 4), point.z - (node.expanded ? size[2] / 2 + 2 : 0)];
 };
 
-/** Corridor labels take priority; neither hovering nor ordinary selection changes membership. */
+/**
+ * Corridor labels take priority; neither hovering nor ordinary selection changes membership.
+ * A Behavior call box always keeps its name: when the full chips would overlap,
+ * every chip shows the name alone (the tooltip keeps the rest). Lane names come
+ * last and take a free corner of their lane, or wait hidden; a lane that only
+ * repeats its one visible group name gives way to that chip.
+ */
 function NodeLabels({ model, selectedNode, highlightedPathIndex, onSelect, onExpand, loads, presentation }: {
     model: SystemSceneModel; selectedNode?: string; highlightedPathIndex?: number;
     onSelect: (id: string) => void; onExpand?: (id: string) => void;
     loads?: Map<string, ConnectionLoad>; presentation?: 'system' | 'journey';
 }) {
-    const { camera, size, gl } = useThree(), previous = useRef('');
+    const { camera, size, gl, events } = useThree(), previous = useRef(''), previousLanes = useRef('');
+    // Html labels mount where drei puts them: the event source, else the canvas parent.
+    const labelHost = (events.connected as HTMLElement | undefined) ?? gl.domElement.parentElement;
     const [visible, setVisible] = useState<Set<string>>(new Set());
+    const [compactChips, setCompactChips] = useState(false);
+    const [laneSpot, setLaneSpot] = useState<Map<string, number>>(new Map());
+    const laneBoxes = useRef(new Map<string, { width: number; height: number }>());
+    useEffect(() => { laneBoxes.current.clear(); }, [model.lanes]);
     const [captionHeight, setCaptionHeight] = useState(36);
     const ordered = useMemo(() => [...model.nodes].sort((a, b) => (model.highlightActive
         ? Number(Boolean(activeNode(model, b, highlightedPathIndex))) - Number(Boolean(activeNode(model, a, highlightedPathIndex))) : 0)
@@ -163,37 +182,65 @@ function NodeLabels({ model, selectedNode, highlightedPathIndex, onSelect, onExp
         return () => observer.disconnect();
     }, [gl]);
     useFrame(() => {
-        const boxes: { left: number; right: number; top: number; bottom: number }[] = [], ids: string[] = [];
+        const boxes: LabelRect[] = [], ids: string[] = [];
         const zoom = 'zoom' in camera ? Number(camera.zoom) : 1;
+        const screen = (point: [number, number, number]) => {
+            const projected = new Vector3(...point).project(camera);
+            return { x: (projected.x + 1) * size.width / 2, y: (1 - projected.y) * size.height / 2, z: projected.z };
+        };
+        const journey = presentation === 'journey';
+        const chipForm = journey ? journeyChipForm(ordered.map(node => screen(labelPosition(node))), JOURNEY_CHIP) : 'full';
         for (const node of ordered) {
             if (node.parentId && zoom < 5) continue;
-            const projected = new Vector3(...labelPosition(node)).project(camera);
-            if (projected.z < -1 || projected.z > 1) continue;
-            const x = (projected.x + 1) * size.width / 2, y = (1 - projected.y) * size.height / 2;
+            const { x, y, z } = screen(labelPosition(node));
+            if (z < -1 || z > 1) continue;
             const compact = node.kind === 'group' && !node.expanded;
-            const width = presentation === 'journey' ? 116 : compact ? 76 : node.parentId ? 110 : node.expanded ? 126 : 96, height = presentation === 'journey' ? 58 : compact ? 24 : 28;
+            const { width, height } = journey ? chipForm === 'compact' ? JOURNEY_COMPACT : JOURNEY_CHIP
+                : { width: compact ? 76 : node.parentId ? 110 : node.expanded ? 126 : 96, height: compact ? 24 : 28 };
             const box = { left: x - width / 2, right: x + width / 2, top: y - height / 2, bottom: y + height / 2 };
-            if (box.left < 2 || box.right > size.width - 2 || box.top < 2 || box.bottom > size.height - captionHeight) continue;
-            if (boxes.some(other => box.left < other.right && box.right > other.left && box.top < other.bottom && box.bottom > other.top)) continue;
+            if (!journey && (box.left < 2 || box.right > size.width - 2 || box.top < 2 || box.bottom > size.height - captionHeight)) continue;
+            if (!journey && boxes.some(other => box.left < other.right && box.right > other.left && box.top < other.bottom && box.bottom > other.top)) continue;
             boxes.push(box); ids.push(node.id);
         }
-        const key = ids.join('|');
-        if (key !== previous.current) { previous.current = key; setVisible(new Set(ids)); }
+        const key = `${chipForm}:${ids.join('|')}`;
+        if (key !== previous.current) { previous.current = key; setVisible(new Set(ids)); setCompactChips(chipForm === 'compact'); }
+        const shown = new Set(ids);
+        const names: SecondaryLabel[] = [], given: string[] = [];
+        for (const lane of [...(model.lanes ?? [])].sort((a, b) => b.width * (b.height ?? 24) - a.width * (a.height ?? 24) || a.id.localeCompare(b.id))) {
+            if (laneRepeatsMember(lane, model.nodes) && lane.memberIds!.some(id => shown.has(id))) { given.push(lane.id); continue; }
+            const measured = laneBoxes.current.get(lane.id) ?? (() => {
+                const element = [...labelHost?.querySelectorAll<HTMLElement>('.system-scene-lane-label[data-folder-id]') ?? []].find(item => item.dataset.folderId === lane.id);
+                const box = element?.offsetWidth ? { width: element.offsetWidth, height: element.offsetHeight } : undefined;
+                if (box) laneBoxes.current.set(lane.id, box);
+                return box;
+            })();
+            names.push({ id: lane.id, width: measured?.width ?? Math.min(180, lane.label.length * 6 + 14), height: measured?.height ?? 20,
+                spots: laneSpots(lane).map(({ point, align }) => ({ ...screen(point), align })) });
+        }
+        const spots = placeSecondaryLabels(names, boxes, size.width, size.height - captionHeight);
+        for (const id of given) spots.set(id, -1);
+        const laneKey = [...spots].map(([id, spot]) => `${id}:${spot}`).sort().join('|');
+        if (laneKey !== previousLanes.current) { previousLanes.current = laneKey; setLaneSpot(spots); }
     });
-    return <>{ordered.filter(node => visible.has(node.id)).map(node => <Html key={node.id}
+    return <>{(model.lanes ?? []).map(lane => {
+        const spot = laneSpot.get(lane.id) ?? 0, place = laneSpots(lane)[Math.max(0, spot)]!;
+        return <Html key={`lane:${lane.id}`} position={place.point} zIndexRange={[5, 1]} style={{ pointerEvents: 'none' }}>
+            <span className={`system-scene-lane-label${spot < 0 ? ' is-hidden' : ''}`} data-folder-id={lane.id} data-align={place.align} title={lane.label}>{lane.label}</span>
+        </Html>;
+    })}{ordered.filter(node => visible.has(node.id)).map(node => <Html key={node.id}
         position={labelPosition(node)} center zIndexRange={[10, 6]}>
-        <button className="system-scene-node-label" data-presentation={presentation} data-kind={node.kind} data-expanded={node.expanded} data-child={Boolean(node.parentId)}
+        <button className="system-scene-node-label" data-presentation={presentation} data-compact={presentation === 'journey' && compactChips} data-kind={node.kind} data-expanded={node.expanded} data-child={Boolean(node.parentId)}
             data-selected={selectedNode === node.id} data-focus={model.focusId === node.id}
             data-node-id={node.id} data-position={center(node).toArray().join(',')} data-size={dimensions(node).join(',')}
             data-color={node.visual?.color} data-color-label={node.visual?.label}
             data-connection-load={loads?.get(node.id)?.links}
-            style={{ '--system-node-tint': node.visual?.color ?? '#91a6b4' } as CSSProperties}
+            style={{ '--system-node-tint': node.visual?.color ?? SCENE_PALETTE.node } as CSSProperties}
             data-muted={!activeNode(model, node, highlightedPathIndex)} title={`${node.label} · ${node.detail}${loads ? ` · ${loads.get(node.id)?.links ?? 0} visible links · ${loads.get(node.id)?.neighbors ?? 0} connected items` : ''}${node.visual ? ` · ${node.visual.label}${node.visual.basis ? ` (${node.visual.basis})` : ''}` : ''}`}
             type="button" aria-label={`${node.label} · ${node.detail}`} aria-pressed={selectedNode === node.id}
             onClick={() => onSelect(node.id)} onDoubleClick={onExpand && (node.group || presentation === 'journey') ? () => onExpand(node.id) : undefined}>
-            {presentation === 'journey' && <small>{node.depth === 0 ? 'START' : node.pathIndices?.length ? `HOP ${node.depth}` : 'POSSIBLE CALL'}</small>}
+            {presentation === 'journey' && !compactChips && <small>{node.depth === 0 ? 'START' : node.pathIndices?.length ? `HOP ${node.depth}` : 'POSSIBLE CALL'}</small>}
             <strong>{node.label}</strong>
-            {presentation === 'journey' && <small>{node.symbol?.file_path?.split('/').at(-1) ?? 'Source unavailable'}</small>}
+            {presentation === 'journey' && !compactChips && <small>{node.symbol?.file_path?.split('/').at(-1) ?? 'Source unavailable'}</small>}
         </button>
     </Html>)}</>;
 }
@@ -238,22 +285,24 @@ export default function SystemArchitectureScene({ model, selectedNode, selectedE
         }
         return result;
     }, [model.edges, nodes, offsets]);
+    // Behavior draws only invocations: its plain calls take the green of the scheme.
+    const colorOf = presentation === 'journey' ? journeyEdgeColor : edgeColor;
     const pulsePaths = useMemo(() => model.edges.flatMap(edge => {
         const dimmed = !activeEdge(model, edge, activePath) || !focusedEdge(edge), emphasized = (model.highlightActive || neighborhood.size > 0) && !dimmed;
-        return (edgeStrands.get(edge.id) ?? []).filter(strand => isDirectedEdge(strand.type)).map(({ type, geometry }) => ({ id: `${edge.id}:${type}`, type, points: geometry.points,
+        return (edgeStrands.get(edge.id) ?? []).filter(strand => isDirectedEdge(strand.type)).map(({ type, geometry }) => ({ id: `${edge.id}:${type}`, type, points: geometry.points, color: colorOf(type),
             opacity: edge.id === selectedEdge ? 0.95 : dimmed ? 0.04 : emphasized ? 0.8 : edge.source === edge.target ? 0.22 : 0.65 }));
-    }), [model, edgeStrands, activePath, selectedEdge, selectedNode, neighborhood]);
+    }), [model, edgeStrands, activePath, selectedEdge, selectedNode, neighborhood, colorOf]);
     const background = useGraphBackgroundReset(onClearSelection);
     const floorY = Math.min(0, ...model.nodes.map(node => center(node).y - dimensions(node)[1] / 2), ...(model.lanes ?? []).map(lane => lane.position[2] - lane.depth / 2)) - 0.2;
     const extent = Math.max(120, ...model.nodes.map(node => Math.max(Math.abs(node.position[0]) + dimensions(node)[0] / 2, Math.abs(node.position[1]) + dimensions(node)[2] / 2) * 2 + 40));
-    return <SceneBoundary><div className="system-scene" data-testid="system-scene" data-projection={planar ? 'plan' : '3d'}>
+    return <SceneBoundary><div className="system-scene" data-testid="system-scene" data-projection={planar ? 'plan' : '3d'} data-node-count={model.nodes.length}>
         <Canvas {...background} frameloop={active ? 'demand' : 'never'} dpr={[1, 1.5]} gl={{ antialias: true, alpha: false, powerPreference: 'low-power' }}
             role="img" aria-label={presentation === 'journey' ? 'Behavior call journey. Follow recorded invocations across component lanes. Double-click an operation to explore its calls.' : `System ${planar ? 'plan' : '3D map'}. Groups lie on a ground plane; expanded members sit above their group. Use the adjacent list to inspect source evidence.`}>
-            <color attach="background" args={['#0b1118']} />
+            <color attach="background" args={[SCENE_PALETTE.background]} />
             <OrthographicCamera makeDefault position={[80, 115, 105]} zoom={4} near={0.1} far={10000} />
-            <ambientLight intensity={1.6} /><directionalLight position={[30, 80, 20]} intensity={2.4} color="#dcfff3" />
-            <directionalLight position={[-20, 20, -30]} intensity={1.2} color="#a899ff" />
-            <gridHelper args={[extent, Math.min(80, Math.ceil(extent / 12)), '#1c3440', '#15242e']} position={[0, floorY, 0]} raycast={() => null} />
+            <ambientLight intensity={1.6} /><directionalLight position={[30, 80, 20]} intensity={2.4} color={SCENE_PALETTE.keyLight} />
+            <directionalLight position={[-20, 20, -30]} intensity={1.2} color={SCENE_PALETTE.fillLight} />
+            <gridHelper args={[extent, Math.min(80, Math.ceil(extent / 12)), SCENE_PALETTE.gridMajor, SCENE_PALETTE.gridMinor]} position={[0, floorY, 0]} raycast={() => null} />
             {(model.lanes ?? []).map(lane => <FolderBackplate key={lane.id} lane={lane} />)}
             {showConnectionLoad && model.nodes.map(node => {
                 const load = loads.get(node.id)!;
@@ -263,7 +312,7 @@ export default function SystemArchitectureScene({ model, selectedNode, selectedE
                 return <mesh key={`load:${node.id}`} position={[position.x, position.y - size[1] / 2 - 0.1, position.z]}
                     rotation={[-Math.PI / 2, 0, 0]} scale={[size[0] * 0.56, size[2] * 0.62, 1]} raycast={() => null}>
                     <ringGeometry args={[1, Math.sqrt(1 + load.strength * 1.1), 48]} />
-                    <meshBasicMaterial color="#91a6b4" transparent opacity={muted ? 0.025 : 0.08 + load.strength * 0.12} depthWrite={false} />
+                    <meshBasicMaterial color={SCENE_PALETTE.node} transparent opacity={muted ? 0.025 : 0.08 + load.strength * 0.12} depthWrite={false} />
                 </mesh>;
             })}
             {model.edges.map(edge => {
@@ -271,26 +320,26 @@ export default function SystemArchitectureScene({ model, selectedNode, selectedE
                 return strands ? <Connection key={edge.id} edge={edge} strands={strands}
                     selected={selectedEdge === edge.id} dimmed={!activeEdge(model, edge, activePath) || !focusedEdge(edge)}
                     emphasized={Boolean((model.highlightActive || neighborhood.size > 0) && activeEdge(model, edge, activePath) && focusedEdge(edge))}
-                    onSelect={() => onSelectEdge(edge.id)} /> : null;
+                    onSelect={() => onSelectEdge(edge.id)} colorOf={colorOf} /> : null;
             })}
             <EdgePulseLayer paths={pulsePaths} active={active} />
             {model.nodes.map(node => {
                 const selected = selectedNode === node.id, active = activeNode(model, node, activePath) && (!neighborhood.size || neighborhood.has(node.id)), size = dimensions(node);
-                const color = node.visual?.color ?? (node.kind === 'remainder' ? '#9c9a8b' : '#91a6b4');
-                const fill = new Color('#27333e').lerp(new Color(color), selected ? 0.34 : 0.2);
+                const color = node.visual?.color ?? (node.kind === 'remainder' ? SCENE_PALETTE.remainder : SCENE_PALETTE.node);
+                const fill = new Color(SCENE_PALETTE.body).lerp(new Color(color), selected ? 0.34 : 0.2);
                 return <mesh key={node.id} position={center(node)} onClick={event => { event.stopPropagation(); onSelectNode(node.id); }}
                     onDoubleClick={onExpandNode && (node.group || presentation === 'journey') ? event => { event.stopPropagation(); onExpandNode(node.id); } : undefined}>
                     <boxGeometry args={size} />
                     <meshStandardMaterial color={fill} roughness={0.85} metalness={0.05} emissive={color} emissiveIntensity={selected ? 0.05 : 0.008}
                         transparent opacity={selected ? 0.6 : !active ? 0.045 : node.expanded ? 0.065 : node.parentId ? 0.36 : 0.28} depthWrite={false} />
-                    <Edges color={selected ? '#f0f6fa' : color} transparent opacity={selected ? 0.95 : !active ? 0.12 : node.expanded ? 0.36 : 0.46} />
+                    <Edges color={selected ? SCENE_PALETTE.selected : color} transparent opacity={selected ? 0.95 : !active ? 0.12 : node.expanded ? 0.36 : 0.46} />
                 </mesh>;
             })}
             <NodeLabels model={model} selectedNode={selectedNode} highlightedPathIndex={activePath} onSelect={onSelectNode} onExpand={onExpandNode} loads={showConnectionLoad ? loads : undefined} presentation={presentation} />
             <OrbitControls makeDefault enabled={active} enableRotate={!planar} enableDamping={false}
                 mouseButtons={{ LEFT: planar ? MOUSE.PAN : MOUSE.ROTATE, MIDDLE: MOUSE.DOLLY, RIGHT: MOUSE.PAN }}
                 touches={{ ONE: planar ? TOUCH.PAN : TOUCH.ROTATE, TWO: TOUCH.DOLLY_PAN }}
-                minZoom={0.15} maxZoom={90} rotateSpeed={0.5} zoomSpeed={0.8} maxPolarAngle={Math.PI / 2.05} />
+                minZoom={0.15} maxZoom={90} rotateSpeed={0.5} zoomSpeed={0.8} maxPolarAngle={SCENE_MAX_TILT} zoomToCursor />
             <ScopeCamera model={model} resetKey={resetKey} planar={planar} presentation={presentation} />
         </Canvas>
     </div></SceneBoundary>;

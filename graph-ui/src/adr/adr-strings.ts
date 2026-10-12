@@ -2,7 +2,8 @@ export const adrStrings = {
     label: 'Architecture decisions',
     noProject: 'Select a project to read its architecture decisions.',
     loading: 'Loading decisions…',
-    refresh: 'Refresh',
+    /** Review of K42: the Refresh button says that it runs, then when it ran (shared words in ui/refresh/strings.ts). */
+    refreshFeedback: { idle: 'Refresh', busy: 'Refreshing…', done: (time: string) => `Decisions refreshed at ${time}` },
     retry: 'Try again',
     edit: 'Edit',
     add: 'Add decision',

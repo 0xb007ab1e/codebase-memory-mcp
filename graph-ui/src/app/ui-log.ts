@@ -30,6 +30,19 @@
  *  - **Capped fields.** Every text field is cut at UI_LOG_FIELD_MAX
  *    characters, the same cap the server applies; a cut is marked so nobody
  *    reads a truncated stack as a complete one.
+ *  - **Once per session, then counted.** An entry identical to an earlier
+ *    one of this session (level, source, project, message, detail, stack and
+ *    place) is counted, not queued. A deprecation warning that a library
+ *    prints on every scene mount (THREE.Clock from @react-three/fiber) would
+ *    otherwise push the real messages out of System › Logs. The count goes
+ *    out as one more entry with the same fields at 10, 100, 1000 repeats and
+ *    when the page is left (`final`), so the journal holds a handful of
+ *    lines, not hundreds. The same message from another place or with
+ *    another response body is another entry and is recorded in full.
+ *  - **One page per post.** The server files every entry of a post under
+ *    the post's page. A project switch stays in the page and only changes
+ *    the address (app/project-windows.tsx), so each entry keeps the page it
+ *    was recorded on, and a batch never spans two of them.
  *
  * Time and timers are injectable so a test runs in one tick.
  */
@@ -92,9 +105,13 @@ export const UI_LOG_BATCH_MAX = 25;
 export const UI_LOG_FLUSH_MS = 1500;
 export const UI_LOG_BUFFER_MAX = 200;
 export const UI_LOG_BACKOFF_MS: readonly number[] = [2000, 5000, 15000, 60000];
+/** Distinct entries counted per session; beyond this, new texts are recorded one by one again. */
+export const UI_LOG_REPEAT_KEYS_MAX = 256;
 
 export interface UiLogOptions {
     page: string;
+    /** The page as it is now, sampled when recording like the project; `page` without it. */
+    getPage?: () => string;
     session: string;
     transport: UiLogTransport;
     /** Sampled when recording, never when sending a delayed or retried batch. */
@@ -108,13 +125,48 @@ export interface UiLogOptions {
     backoffMs?: readonly number[];
 }
 
+/**
+ * The detail of a repeat count. The server keeps only the known fields of an
+ * entry, so the count travels in `detail`, in words a reader understands and
+ * in a form System › Logs reads back (repeatCount). The detail of the counted
+ * entry follows on the next line, so the count stays beside its own entry.
+ */
+export function repeatDetail(count: number, detail?: string): string {
+    const words = `${count} identical entries in this session; only the first is recorded in full`;
+    return detail ? capField(`${words}\n${detail}`) : words;
+}
+
+/** The count of a repeat entry, undefined for an ordinary one. */
+export function repeatCount(detail: string | undefined): number | undefined {
+    const match = /^(\d+) identical entries in this session\b/.exec(detail ?? '');
+    return match ? Number(match[1]) : undefined;
+}
+
+/** The detail of the entry a repeat count stands for; an ordinary detail as it is. */
+export function countedDetail(detail: string | undefined): string | undefined {
+    if (repeatCount(detail) === undefined) return detail;
+    const newline = detail!.indexOf('\n');
+    return newline < 0 ? undefined : detail!.slice(newline + 1);
+}
+
 /** Cut a text field at the shared cap and say so. */
 export function capField(text: string, max = UI_LOG_FIELD_MAX): string {
     return text.length > max ? `${text.slice(0, max)} [cut at ${max}]` : text;
 }
 
+interface Repeat {
+    entry: UiLogEntry;
+    count: number;
+    reported: number;
+}
+
+const powerOfTen = (count: number): boolean => count >= 10 && /^10*$/.test(String(count));
+
 export class UiLogBuffer {
     private readonly queue: UiLogEntry[] = [];
+    /** The page each queued entry was recorded on. */
+    private readonly pages = new WeakMap<UiLogEntry, string>();
+    private readonly repeats = new Map<string, Repeat>();
     private seq = 0;
     private sent = 0;
     private dropped = 0;
@@ -147,7 +199,7 @@ export class UiLogBuffer {
     }
 
     get page(): string {
-        return this.options.page;
+        return this.options.getPage?.() ?? this.options.page;
     }
 
     /** Queue one entry. Never throws and never writes to the console. */
@@ -178,8 +230,32 @@ export class UiLogBuffer {
         if (typeof extra.col === 'number' && Number.isFinite(extra.col)) {
             entry.col = extra.col;
         }
+        // Only a truly identical entry is counted: the same text from another place stays its own entry.
+        const key = JSON.stringify([entry.level, entry.source, entry.project ?? '', entry.message, entry.detail ?? '',
+            entry.stack ?? '', entry.url ?? '', entry.line ?? null, entry.col ?? null]);
+        const repeat = this.repeats.get(key);
+        if (repeat !== undefined) {
+            this.seq -= 1;
+            repeat.count += 1;
+            if (powerOfTen(repeat.count)) {
+                this.report(repeat);
+                this.arm(this.flushMs);
+            }
+            return;
+        }
+        if (this.repeats.size < UI_LOG_REPEAT_KEYS_MAX) {
+            this.repeats.set(key, { entry, count: 1, reported: 1 });
+        }
         this.push(entry);
         this.arm(this.flushMs);
+    }
+
+    /** Queue the running count of a repeated entry, with every field of its first occurrence. */
+    private report(repeat: Repeat): void {
+        const { ts: _ts, seq: _seq, detail, ...first } = repeat.entry;
+        const entry: UiLogEntry = { ...first, ts: this.now().toISOString(), seq: ++this.seq, detail: repeatDetail(repeat.count, detail) };
+        repeat.reported = repeat.count;
+        this.push(entry);
     }
 
     stats(): UiLogStats {
@@ -193,8 +269,9 @@ export class UiLogBuffer {
 
     /**
      * Send what is queued, one batch now and the rest on the timer. With
-     * `final` the page is going away: the transport is told so, and nothing
-     * is rescheduled.
+     * `final` the page is going away: the transport is told so, nothing is
+     * rescheduled, and a batch goes out for each page the entries were
+     * recorded on.
      */
     async flush(final = false): Promise<void> {
         if (this.timer !== undefined) {
@@ -204,14 +281,28 @@ export class UiLogBuffer {
         if (this.inFlight && !final) {
             return;
         }
+        if (final) {
+            // The page is going away: every count not yet reported goes with it.
+            for (const repeat of this.repeats.values()) {
+                if (repeat.count > repeat.reported) {
+                    this.report(repeat);
+                }
+            }
+        }
         if (this.queue.length === 0) {
             return;
         }
-        const batch = this.queue.splice(0, this.batchMax);
+        // One page per post: the batch ends where an entry of another page starts.
+        const page = this.pageOf(this.queue[0]);
+        let size = 1;
+        while (size < Math.min(this.batchMax, this.queue.length) && this.pageOf(this.queue[size]) === page) {
+            size += 1;
+        }
+        const batch = this.queue.splice(0, size);
         if (this.droppedSinceFlush > 0) {
             const lost = this.droppedSinceFlush;
             this.droppedSinceFlush = 0;
-            batch.unshift({
+            const notice: UiLogEntry = {
                 // Loss can span several projects. Do not attribute the aggregate
                 // to whichever project happens to be open when delivery resumes.
                 project: '',
@@ -220,10 +311,12 @@ export class UiLogBuffer {
                 level: 'warn',
                 source: 'ui-log',
                 message: `${lost} entries were dropped before this batch: the page keeps ${this.bufferMax} while the server does not answer`,
-            });
+            };
+            this.pages.set(notice, page);
+            batch.unshift(notice);
         }
         const payload: UiLogPayload = {
-            page: this.options.page,
+            page,
             session: this.options.session,
             entries: batch,
         };
@@ -241,6 +334,9 @@ export class UiLogBuffer {
             this.backoffStep = 0;
             if (this.queue.length > 0 && !final) {
                 this.arm(0);
+            } else if (final && this.queue.length > 0 && this.pageOf(this.queue[0]) !== page) {
+                // The page is going away: the entries of the other page it was on go with it.
+                await this.flush(true);
             }
             return;
         }
@@ -267,7 +363,12 @@ export class UiLogBuffer {
             this.dropped += 1;
             this.droppedSinceFlush += 1;
         }
+        this.pages.set(entry, this.page);
         this.queue.push(entry);
+    }
+
+    private pageOf(entry: UiLogEntry | undefined): string {
+        return (entry === undefined ? undefined : this.pages.get(entry)) ?? this.options.page;
     }
 
     private arm(ms: number): void {

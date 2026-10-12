@@ -11,11 +11,18 @@ export interface BehaviorJourney {
     counts: {
         directChoices: number; reachableTargets: number; validPaths: number; invalidPaths: number;
         filteredPaths: number; omittedChoices: number; omittedNodes: number; omittedEdges: number;
+        /** The start operation calls itself: named beside the callees, never counted as one of them. */
+        selfCalls: boolean;
     };
     limits: { maxChoices: number; maxNodes: number; maxEdges: number; hit: string[]; sampled: boolean };
 }
 
-const MAX_CHOICES = 12, MAX_NODES = 60, MAX_EDGES = 120;
+/**
+ * Direct callees drawn and offered: twelve pages of four. The page counter and
+ * the "direct callees" count name the same calls up to this bound; beyond it
+ * the page counter says how many were left out.
+ */
+const MAX_CHOICES = 48, MAX_NODES = 60, MAX_EDGES = 120;
 const INVOCATIONS = new Set(['CALLS', 'HTTP_CALLS', 'ASYNC_CALLS', 'GRPC_CALLS', 'GRAPHQL_CALLS', 'TRPC_CALLS',
     'CROSS_HTTP_CALLS', 'CROSS_ASYNC_CALLS', 'CROSS_GRPC_CALLS', 'CROSS_GRAPHQL_CALLS', 'CROSS_TRPC_CALLS']);
 const invocation = (edge: { type: string }) => INVOCATIONS.has(edge.type.trim().replaceAll('-', '_').toUpperCase());
@@ -42,7 +49,7 @@ function laneLayout(data: SystemProjection, nodes: SystemSceneNode[]): SystemSce
         const left = Math.min(...xs), right = Math.max(...xs), bottom = Math.min(...ys), top = Math.max(...ys);
         return { id: `journey-component:${id}`, label: labels.get(id) ?? id,
             position: [(left + right) / 2, (bottom + top) / 2, -2] as [number, number, number],
-            width: right - left + 62, height: top - bottom + 32, depth: 0.4 };
+            width: right - left + 62, height: top - bottom + 32, depth: 0.4, memberIds: members.map(node => node.id) };
     });
 }
 
@@ -99,10 +106,18 @@ function corridorPath(data: SystemProjection, source: number, target: number, hi
     return { entrypoint_id: source, nodes: nodes.reverse(), edges: edges.reverse() };
 }
 
+/**
+ * The operation a journey starts from when none was requested: the server's pick, else the first classified entry
+ * point, else the first connected path. The server reports source_id 0 when no operation was requested; node IDs
+ * start at 1.
+ */
+export function defaultJourneyStart(data: SystemProjection): number | undefined {
+    return (data.behavior?.source_id || undefined) ?? data.entrypoints[0]?.id ?? data.paths.find(validPath)?.entrypoint_id;
+}
+
 /** A focused static journey: positions describe hops, never catalog distance or runtime order. */
 export function behaviorJourney(data: SystemProjection, options: BehaviorJourneyOptions = {}): BehaviorJourney {
-    const entryId = options.entryId ?? data.behavior?.source_id ?? data.entrypoints[0]?.id
-        ?? data.paths.find(validPath)?.entrypoint_id;
+    const entryId = options.entryId ?? defaultJourneyStart(data);
     const scopedBehavior = data.behavior?.source_id === entryId ? data.behavior : undefined;
     const dependencies = [...data.dependencies, ...(data.overview?.connections ?? [])];
     const symbols = new Map<number, SystemSymbol>();
@@ -126,7 +141,7 @@ export function behaviorJourney(data: SystemProjection, options: BehaviorJourney
         paths: [], entry, mode: 'empty', choices: [],
         counts: { directChoices: 0, reachableTargets: scopedBehavior?.reachable_targets.length ?? 0,
             validPaths: 0, invalidPaths: scopedPaths.length - valid.length, filteredPaths: 0,
-            omittedChoices: 0, omittedNodes: 0, omittedEdges: 0 },
+            omittedChoices: 0, omittedNodes: 0, omittedEdges: 0, selfCalls: false },
         limits: { maxChoices: MAX_CHOICES, maxNodes: MAX_NODES, maxEdges: MAX_EDGES,
             hit: [], sampled: !data.complete || data.status === 'limited' || scopedBehavior?.complete === false
                 || scopedBehavior?.corridor_complete === false || (options.targetId === undefined && (sampledWitnesses || data.overview?.complete === false)) },
@@ -178,16 +193,18 @@ export function behaviorJourney(data: SystemProjection, options: BehaviorJourney
             callsite: witness.callsite, resolution: witness.resolution,
         });
     }
-    const callees = [...new Set([...direct.values()].map(edge => edge.target_id))].map(id => symbols.get(id)!)
+    // The start is drawn once; calling itself is not one more callee.
+    const callees = [...new Set([...direct.values()].map(edge => edge.target_id))].filter(id => id !== entry.id).map(id => symbols.get(id)!)
         .sort((a, b) => compareText(a.file_path ?? '', b.file_path ?? '') || compareText(a.name, b.name) || a.id - b.id);
     result.counts.directChoices = callees.length;
+    result.counts.selfCalls = [...direct.values()].some(edge => edge.target_id === entry.id);
     const candidates = callees.filter(symbol => matches(entry) || matches(symbol));
     const shown = candidates.slice(0, MAX_CHOICES), shownIds = new Set(shown.map(symbol => symbol.id));
     if (candidates.length > shown.length) hit.add('direct-choices');
     result.choices = shown.map(symbol => ({ ...symbol, distance: 1, direct: true }));
     const calleeIds = new Set(callees.map(symbol => symbol.id));
     const catalog = new Map<number, BehaviorJourneyChoice>();
-    for (const target of scopedBehavior?.reachable_targets ?? []) if (matches(target) && !calleeIds.has(target.id)) {
+    for (const target of scopedBehavior?.reachable_targets ?? []) if (matches(target) && target.id !== entry.id && !calleeIds.has(target.id)) {
         catalog.set(target.id, { ...target, direct: false });
     }
     // Older projections expose sampled paths without a separate destination catalog.
@@ -199,7 +216,7 @@ export function behaviorJourney(data: SystemProjection, options: BehaviorJourney
     result.choices.push(...[...catalog.values()].slice(0, MAX_NODES - result.choices.length));
     result.counts.omittedChoices = new Set([...candidates.map(symbol => symbol.id), ...catalog.keys()]).size - result.choices.length;
     if (result.counts.omittedChoices > 0) hit.add('target-choices');
-    const visible = [entry, ...shown.filter(symbol => symbol.id !== entry.id)];
+    const visible = [entry, ...shown];
     const nodes: SystemSceneNode[] = visible.map((symbol, index) => ({ id: `journey-choice:${symbol.id}`, label: symbol.name,
         symbol, detail: symbol.file_path ?? symbol.qualified_name, depth: index === 0 ? 0 : 1,
         size: [48, 18, 3], position: index === 0 ? [0, 0, 0] : [88, (index - 1 - (visible.length - 2) / 2) * 28, 0] }));
@@ -212,7 +229,7 @@ export function behaviorJourney(data: SystemProjection, options: BehaviorJourney
     const edges = eligibleEdges.filter(edge => admitted.has(edgeKey(edge))).map(edge => ({ id: `journey-choice-edge:${edgeKey(edge)}`,
         source: `journey-choice:${entry.id}`, target: `journey-choice:${edge.target_id}`, type: edge.type, count: 1,
         pathEdge: edge, depth: 1, handoff: symbols.get(edge.target_id)!.component_id !== entry.component_id }));
-    result.counts.omittedNodes = candidates.filter(symbol => symbol.id !== entry.id && !shownIds.has(symbol.id)).length;
+    result.counts.omittedNodes = candidates.filter(symbol => !shownIds.has(symbol.id)).length;
     result.counts.omittedEdges = [...direct.values()].filter(edge => matches(entry) || matches(symbols.get(edge.target_id)!)).length - edges.length;
     if (eligibleEdges.length > edges.length) hit.add('direct-edges');
     result.mode = 'choices';

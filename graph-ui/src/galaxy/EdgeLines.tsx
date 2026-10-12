@@ -40,6 +40,7 @@ import type { GraphNode, GraphEdge } from './types';
 import { edgeIntensityScale } from './density';
 import { edgeColor, edgePhase, isDirectedEdge } from '../graph/edge-style';
 import { useEdgeMotion } from '../graph/edge-motion';
+import { EdgePulseLayer, type EdgePulsePath } from '../graph/EdgePulseLayer';
 
 // Keep the existing import surface; every graph now reads the shared palette.
 export { EDGE_TYPE_COLORS, DEFAULT_EDGE_COLOR } from '../graph/edge-style';
@@ -295,6 +296,17 @@ export function EdgeLines({ active = true, opacity = 1.0, ...props }: EdgeLinesP
         () => createEdgeGeometry({ nodes, edges, highlightedIds, emphasizeIncidentEdges, targetNodes, brightness }),
         [nodes, edges, highlightedIds, emphasizeIncidentEdges, targetNodes, brightness],
     );
+    const arrowPaths = useMemo<EdgePulsePath[]>(() => {
+        const positions = geometry.getAttribute('position'), colors = geometry.getAttribute('color');
+        const bySource = new Map(nodes.map(node => [node.id, node]));
+        const byTarget = new Map((targetNodes ?? nodes).map(node => [node.id, node]));
+        const valid = edges.filter(edge => bySource.has(edge.source) && byTarget.has(edge.target)
+            && (!highlightedIds?.size || highlightedIds.has(edge.source) || highlightedIds.has(edge.target)));
+        return valid.map((edge, index) => ({ id: `${edge.source}:${edge.target}:${edge.type}`, type: edge.type,
+            opacity: Math.min(.75, Math.max(.15, colors.getX(index * 2) + colors.getY(index * 2) + colors.getZ(index * 2))) * opacity,
+            points: [index * 2, index * 2 + 1].map(i => ({ x: positions.getX(i), y: positions.getY(i), z: positions.getZ(i) })),
+        }));
+    }, [geometry, nodes, targetNodes, edges, highlightedIds, opacity]);
     const uniforms = useMemo(() => ({ edgeTime: { value: 0 }, edgeMotion: { value: 0 } }), []);
     const lastFrame = useRef<number | null>(null);
 
@@ -341,6 +353,7 @@ diffuseColor.rgb *= 0.72 + 0.28 * edgeMotion * vEdgeFlow.z * edgePulse;`);
     }, [uniforms]);
 
     return (
+        <>
         <lineSegments geometry={geometry}>
             <lineBasicMaterial
                 vertexColors
@@ -353,5 +366,7 @@ diffuseColor.rgb *= 0.72 + 0.28 * edgeMotion * vEdgeFlow.z * edgePulse;`);
                 customProgramCacheKey={() => 'directed-edge-pulse-v1'}
             />
         </lineSegments>
+        <EdgePulseLayer paths={arrowPaths} active={active} />
+        </>
     );
 }

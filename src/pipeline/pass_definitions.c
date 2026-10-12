@@ -18,12 +18,15 @@ enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_MARGIN = 3, PD
 enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "pipeline/pipeline.h"
 #include <stdint.h>
+#include <ctype.h>
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h" /* cbm_alloc/cbm_free: the grown properties buffer */
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
+#include "foundation/mem_core.h"
 #include "foundation/str_util.h"
 #include "cbm.h"
 #include "arena.h"
@@ -201,6 +204,24 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
     *pos = p;
 }
 
+/* Append an already-serialized JSON value verbatim: ,"key":<json>. Atomic like
+ * append_json_string. For `variants`, which extraction builds as a JSON array
+ * of objects (cbm.h). Twin of pass_parallel.c -- keep both in sync. */
+static void append_json_raw(char *buf, size_t bufsize, size_t *pos, const char *key,
+                            const char *json) {
+    if (!json || json[0] == '\0') {
+        return;
+    }
+    size_t required = strlen(key) + strlen(json) + PD_JSON_FIELD_OVERHEAD;
+    if (*pos + required + PD_ESC_SPACE > bufsize) {
+        return; /* whole field would not fit — skip it atomically */
+    }
+    int w = snprintf(buf + *pos, bufsize - *pos, ",\"%s\":%s", key, json);
+    if (w > 0 && (size_t)w < bufsize - *pos) {
+        *pos += (size_t)w;
+    }
+}
+
 /* Append a JSON array of strings: ,"key":["a","b","c"]. Atomic like
  * append_json_string: emitted only if the whole array fits. */
 static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const char *key,
@@ -255,6 +276,9 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
      * dump. Gate the block to functions; other labels keep the lean base. */
     const bool is_fn =
         def->label && (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0);
+    const char *test_role = def->test_role == CBM_TEST_ROLE_CASE    ? ",\"test_role\":\"case\""
+                            : def->test_role == CBM_TEST_ROLE_SUITE ? ",\"test_role\":\"suite\""
+                                                                    : "";
     int n;
     if (is_fn) {
         n = snprintf(buf, bufsize,
@@ -262,20 +286,21 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
                      "\"self_recursive\":%s,\"param_count\":%d,\"max_access_depth\":%d,"
                      "\"linear_scan_in_loop\":%d,\"alloc_in_loop\":%d,\"recursion_in_loop\":%s,"
                      "\"unguarded_recursion\":%s,"
-                     "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s",
+                     "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s%s",
                      def->complexity, def->cognitive, def->loop_count, def->loop_depth,
                      def->is_recursive ? "true" : "false", def->param_count, def->max_access_depth,
                      def->linear_scan_in_loop, def->alloc_in_loop,
                      def->recursion_in_loop ? "true" : "false",
                      def->unguarded_recursion ? "true" : "false", def->lines,
                      def->is_exported ? "true" : "false", def->is_test ? "true" : "false",
-                     def->is_entry_point ? "true" : "false");
+                     def->is_entry_point ? "true" : "false", test_role);
     } else {
         n = snprintf(buf, bufsize,
                      "{\"complexity\":%d,\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,"
-                     "\"is_entry_point\":%s",
+                     "\"is_entry_point\":%s%s",
                      def->complexity, def->lines, def->is_exported ? "true" : "false",
-                     def->is_test ? "true" : "false", def->is_entry_point ? "true" : "false");
+                     def->is_test ? "true" : "false", def->is_entry_point ? "true" : "false",
+                     test_role);
     }
 
     if (n <= 0 || (size_t)n >= bufsize) {
@@ -284,6 +309,9 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
     size_t pos = (size_t)n;
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
+    /* Right after the docstring: the buffer is sized for exactly these two
+     * uncapped fields (pd_props_buf), so neither can be squeezed out. */
+    append_json_raw(buf, bufsize, &pos, "variants", def->variants);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
     append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
     append_json_string(buf, bufsize, &pos, "parent_class", def->parent_class);
@@ -293,6 +321,12 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "http_client", def->http_client);
+    append_json_string(buf, bufsize, &pos, "http_base_url", def->http_base_url);
+    /* A document definition's facts (an ADR's id, status, date, ...): key, value pairs. */
+    for (const char **kv = def->extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
+        append_json_string(buf, bufsize, &pos, kv[0], kv[SKIP_ONE]);
+    }
 
     /* MinHash fingerprint — append if present and buffer has room. */
     if (def->fingerprint && def->fingerprint_k > 0 &&
@@ -318,26 +352,90 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
 }
 
-/* Process one definition: create node, register, DEFINES + DEFINES_METHOD edges. */
-static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel) {
+/* A def's properties buffer: CBM_SZ_2K for every other field plus the whole
+ * serialized docstring and variants fields, which have no length cap (a field
+ * that does not fit is dropped whole). Returns `stack` for a def with neither,
+ * or when the larger buffer cannot be allocated. Twin of pass_parallel.c --
+ * keep both in sync. */
+static char *pd_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
+    size_t need = *size;
+    if (def->docstring && def->docstring[0]) {
+        need += strlen("docstring") + def_json_escaped_len(def->docstring) + PD_JSON_FIELD_OVERHEAD;
+    }
+    if (def->variants && def->variants[0]) {
+        need += strlen("variants") + strlen(def->variants) + PD_JSON_FIELD_OVERHEAD;
+    }
+    if (need == *size) {
+        return stack;
+    }
+    char *buf = cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, need);
+    if (!buf) {
+        return stack;
+    }
+    *size = need;
+    return buf;
+}
+
+/* Add a file's own doc (Go package comment, Rust inner docs) to its File
+ * node as "docstring". Twin of pass_parallel.c -- keep both in sync. */
+static void pd_add_file_doc(const cbm_gbuf_node_t *file_node, const char *doc) {
+    if (!file_node || !doc || !doc[0]) {
+        return;
+    }
+    const char *old = file_node->properties_json ? file_node->properties_json : "{}";
+    size_t olen = strlen(old);
+    if (olen < PAIR_LEN || old[olen - SKIP_ONE] != '}') {
+        return; /* not a JSON object -- leave it untouched */
+    }
+    size_t cap = olen + strlen("docstring") + def_json_escaped_len(doc) + PD_JSON_FIELD_OVERHEAD +
+                 PD_ESC_SPACE + SKIP_ONE;
+    char *neu = cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, cap);
+    if (!neu) {
+        return;
+    }
+    size_t pos = olen - SKIP_ONE; /* without the closing brace */
+    memcpy(neu, old, pos);
+    neu[pos] = '\0';
+    append_json_string(neu, cap, &pos, "docstring", doc);
+    if (olen == PAIR_LEN && pos > PAIR_LEN) { /* "{}": drop the leading comma */
+        memmove(neu + SKIP_ONE, neu + PAIR_LEN, pos - SKIP_ONE);
+        pos--;
+    }
+    neu[pos++] = '}';
+    neu[pos] = '\0';
+    (void)cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file_node, neu);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, neu);
+}
+
+/* Process one definition: create node, register, DEFINES + DEFINES_METHOD edges.
+ * `file_doc`, the file's own doc (passed with its first def only), goes on the
+ * File node. */
+static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
+                        const char *file_doc, CBMLanguage lang) {
     if (!def->qualified_name || !def->name) {
         return;
     }
-    char props[CBM_SZ_2K];
-    build_def_props(props, sizeof(props), def);
+    char stack[CBM_SZ_2K];
+    size_t props_size = sizeof(stack);
+    char *props = pd_props_buf(def, stack, &props_size);
+    build_def_props(props, props_size, def);
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
+    if (props != stack) {
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, props);
+    }
     /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
      * (helpers.c): callables + type-like containers (INHERITS/IMPLEMENTS/method/
      * field resolution), Variable/Field (READS/WRITES resolution), and Table/View
      * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
      * through the same predicate, so the three registries cannot diverge. */
     if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
+        cbm_registry_add_lang(ctx->registry, def->name, def->qualified_name, def->label, lang);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+    pd_add_file_doc(file_node, file_doc);
     if (file_node && node_id > 0) {
         cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, node_id, "DEFINES", "{}");
     }
@@ -348,6 +446,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, node_id, "DEFINES_METHOD", "{}");
         }
     }
+    cbm_pipeline_diagram_parent_edge(ctx, def, node_id);
 }
 
 /* Create Channel nodes + EMITS / LISTENS_ON edges for one file's channels.
@@ -544,35 +643,109 @@ static bool objectscript_export_append_secondary_arrays(CBMFileResult *aggregate
 /* Preserve every generated class's parse diagnostics. The generated UDL
  * snippets all map back to one physical Studio Export file, so their compact
  * range lists can be concatenated using the ordinary comma separator. */
+/* Read the trailing ",+<N>" truncation marker off a range string. Returns the
+ * number of dropped ranges the marker reports, or 0 when there is no marker,
+ * and writes the length of the part before the marker to `body_len`. */
+static int objectscript_export_split_range_marker(const char *ranges, size_t *body_len) {
+    size_t len = ranges ? strlen(ranges) : 0;
+    *body_len = len;
+    if (len == 0) {
+        return 0;
+    }
+    size_t i = len;
+    while (i > 0 && isdigit((unsigned char)ranges[i - 1])) {
+        i--;
+    }
+    if (i == len || i == 0 || ranges[i - 1] != '+') {
+        return 0;
+    }
+    size_t marker = i - 1; /* index of '+' */
+    if (marker > 0 && ranges[marker - 1] == ',') {
+        marker--; /* drop the separator too */
+    }
+    *body_len = marker;
+    return atoi(ranges + i);
+}
+
+/* Join one Studio Export part's ranges onto the aggregate.
+ *
+ * One export file can hold several <Class> elements, each parsed separately,
+ * so their range strings get concatenated. A ",+<N>" truncation marker must
+ * end up ONCE, at the very end: every reader stops at the first token that is
+ * not a range, so a marker left in the middle would silently hide every range
+ * after it. Strip the marker off both sides, join the plain ranges, then add
+ * one marker back carrying the summed count. */
 static bool objectscript_export_append_error_ranges(CBMFileResult *aggregate,
                                                     const CBMFileResult *part) {
     aggregate->parse_incomplete = aggregate->parse_incomplete || part->parse_incomplete;
+    aggregate->parse_unusable = aggregate->parse_unusable || part->parse_unusable;
     aggregate->error_region_count += part->error_region_count;
     if (!part->error_ranges || !part->error_ranges[0]) {
         return true;
     }
-    const char *combined = NULL;
-    if (aggregate->error_ranges && aggregate->error_ranges[0]) {
-        combined = cbm_arena_sprintf(&aggregate->arena, "%s,%s", aggregate->error_ranges,
-                                     part->error_ranges);
+
+    size_t agg_len = 0;
+    size_t part_len = 0;
+    int dropped = 0;
+    const char *agg_body = aggregate->error_ranges;
+    if (agg_body && agg_body[0]) {
+        dropped += objectscript_export_split_range_marker(agg_body, &agg_len);
     } else {
-        combined = cbm_arena_strdup(&aggregate->arena, part->error_ranges);
+        agg_body = NULL;
+    }
+    dropped += objectscript_export_split_range_marker(part->error_ranges, &part_len);
+
+    const char *combined = NULL;
+    if (agg_body && agg_len > 0 && part_len > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%.*s,%.*s", (int)agg_len, agg_body,
+                                     (int)part_len, part->error_ranges);
+    } else if (agg_body && agg_len > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%.*s", (int)agg_len, agg_body);
+    } else if (part_len > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%.*s", (int)part_len, part->error_ranges);
+    } else {
+        combined = cbm_arena_strdup(&aggregate->arena, "");
     }
     if (!combined) {
         return false;
     }
+    if (dropped > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%s%s+%d", combined, combined[0] ? "," : "",
+                                     dropped);
+        if (!combined) {
+            return false;
+        }
+    }
     aggregate->error_ranges = combined;
     return true;
 }
+
+#if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
+/* Test seam. This join only fires for a Studio Export file holding several
+ * <Class> elements where a class overruns the 256-region cap — hard to reach
+ * through the pipeline, easy to get wrong, and a wrong result hides ranges
+ * without saying so. Expose the join so the marker rules can be pinned. */
+bool cbm_pipeline_coverage_marker_test_join(CBMFileResult *aggregate, const CBMFileResult *part) {
+    return objectscript_export_append_error_ranges(aggregate, part);
+}
+#endif
 
 /* Studio Export files may contain multiple <Class> elements, while the
  * pipeline cache has one slot per physical file. Extract each generated UDL
  * class independently (preserving the upstream parser behavior), then compose
  * every extracted carrier into one result for the normal registry/call/usage/
  * semantic passes. */
-CBMFileResult *cbm_pipeline_extract_objectscript_export(
+static CBM_TLS cbm_objectscript_export_extractor_t objectscript_export_test_extractor;
+
+void cbm_pipeline_set_objectscript_export_extractor_for_tests(
+    cbm_objectscript_export_extractor_t extractor) {
+    objectscript_export_test_extractor = extractor;
+}
+
+CBMFileResult *cbm_pipeline_extract_objectscript_export_with_timeout(
     const char *source, int source_len, const char *project_name, const char *rel_path,
-    const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table) {
+    const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table,
+    int64_t timeout_micros) {
     CBMArena export_arena;
     cbm_arena_init(&export_arena);
     int class_count = 0;
@@ -602,10 +775,13 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export(
     }
     aggregate->cached_lang = CBM_LANG_OBJECTSCRIPT_UDL;
 
+    cbm_objectscript_export_extractor_t extract = objectscript_export_test_extractor
+                                                      ? objectscript_export_test_extractor
+                                                      : cbm_extract_file_ex;
     for (int ci = 0; ci < class_count; ci++) {
-        CBMFileResult *part = cbm_extract_file_ex(
-            udl_strings[ci], (int)strlen(udl_strings[ci]), CBM_LANG_OBJECTSCRIPT_UDL, project_name,
-            rel_path, CBM_EXTRACT_BUDGET, NULL, NULL, macro_table, return_type_table);
+        CBMFileResult *part = extract(udl_strings[ci], (int)strlen(udl_strings[ci]),
+                                      CBM_LANG_OBJECTSCRIPT_UDL, project_name, rel_path,
+                                      timeout_micros, NULL, NULL, macro_table, return_type_table);
         if (!part) {
             continue;
         }
@@ -655,6 +831,14 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export(
     return aggregate;
 }
 
+CBMFileResult *cbm_pipeline_extract_objectscript_export(
+    const char *source, int source_len, const char *project_name, const char *rel_path,
+    const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table) {
+    return cbm_pipeline_extract_objectscript_export_with_timeout(
+        source, source_len, project_name, rel_path, macro_table, return_type_table,
+        CBM_EXTRACT_BUDGET);
+}
+
 #undef OBJECTSCRIPT_EXPORT_APPEND_ARRAY
 
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
@@ -682,7 +866,8 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     CBMFileResult **local_cache = ctx->result_cache;
     bool owns_local_cache = false;
     if (!local_cache) {
-        local_cache = (CBMFileResult **)calloc((size_t)file_count, sizeof(CBMFileResult *));
+        local_cache = (CBMFileResult **)cbm_calloc(CBM_MEM_CLASS_EXTRACT,
+                                                   (size_t)file_count * sizeof(CBMFileResult *));
         owns_local_cache = (local_cache != NULL);
     }
 
@@ -701,7 +886,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                         cbm_free_result(local_cache[j]);
                     }
                 }
-                free(local_cache);
+                cbm_free(CBM_MEM_CLASS_EXTRACT, local_cache);
             }
             return CBM_NOT_FOUND;
         }
@@ -728,6 +913,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                                                                  : "quarantined after crash";
             cbm_pipeline_add_file_error(ctx->pipeline, rel, reason, phase);
             errors++;
+            if (!cbm_pipeline_test_extraction_ok(ctx, lang, NULL)) {
+                goto configured_failure;
+            }
             continue;
         }
 
@@ -753,25 +941,42 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
                 cbm_pipeline_add_file_error(ctx->pipeline, rel, "read failed", "read");
             }
-            /* CBM_READ_EMPTY: benign 0-byte file — nothing to index, not reported. */
+            /* Proven empty files contain no invocation; other missing source
+             * cannot certify an active configured-definition mapping. */
+            if (rst != CBM_READ_EMPTY && !cbm_pipeline_test_extraction_ok(ctx, lang, NULL)) {
+                goto configured_failure;
+            }
             continue;
         }
 
         /* Studio Export XML is transformed to one cacheable aggregate so later
          * passes see the same calls/usages/semantic carriers as native UDL. */
         CBMFileResult *result =
-            lang == CBM_LANG_OBJECTSCRIPT_EXPORT
+            cbm_pipeline_test_force_extract_null(ctx, lang) ? NULL
+            : lang == CBM_LANG_OBJECTSCRIPT_EXPORT
                 ? cbm_pipeline_extract_objectscript_export(source, source_len, ctx->project_name,
                                                            rel, ctx->macro_table, NULL)
-                : cbm_extract_file_ex(
-                      source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL,
-                      NULL /* no extra defines or include paths */, ctx->macro_table, NULL);
+                : cbm_extract_file_ex_with_tests(source, source_len, lang, ctx->project_name, rel,
+                                                 CBM_EXTRACT_BUDGET, NULL,
+                                                 NULL /* no extra defines or include paths */,
+                                                 ctx->macro_table, NULL, ctx->test_declarations);
         free(source);
 
+        if (!cbm_pipeline_test_extraction_ok(ctx, lang, result)) {
+            cbm_free_result(result);
+            goto configured_failure;
+        }
         if (!result) {
             errors++;
             cbm_pipeline_add_file_error(ctx->pipeline, rel, "extract failed", "extract");
             continue;
+        }
+        if (result->has_test_definition_owners && result->lsp_skipped) {
+            cbm_pipeline_test_owner_error(result);
+        }
+        if (!cbm_pipeline_test_result_ok(ctx, result)) {
+            cbm_free_result(result);
+            goto configured_failure;
         }
         /* Consume the previously-ignored has_error flag: a parse timeout /
          * parse failure / unsupported-grammar result carries no defs but must
@@ -785,14 +990,24 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         } else if (result->parse_incomplete) {
             /* Best-effort parse-coverage signal (#963): indexed, but with
              * ERROR/MISSING regions — see pass_parallel.c (keep in sync). */
-            cbm_pipeline_add_file_error(ctx->pipeline, rel,
-                                        result->error_ranges ? result->error_ranges : "unknown",
-                                        "parse_partial");
+            cbm_pipeline_add_file_error(
+                ctx->pipeline, rel, result->error_ranges ? result->error_ranges : "unknown",
+                result->parse_unusable ? "parse_unusable" : "parse_partial");
+        }
+        if (result->test_declarations_degraded) {
+            /* Its configured test forms could not be mapped: indexed without
+             * configured test roles (degraded per file, not the index). */
+            cbm_pipeline_add_file_error(
+                ctx->pipeline, rel,
+                cbm_test_extract_status_message(result->test_declarations_degraded_status),
+                "test_declarations");
         }
 
         /* Create nodes for each definition */
+        const char *file_doc = result->module_doc; /* goes with the first def */
         for (int d = 0; d < result->defs.count; d++) {
-            process_def(ctx, &result->defs.items[d], rel);
+            process_def(ctx, &result->defs.items[d], rel, file_doc, lang);
+            file_doc = NULL;
             total_defs++;
         }
 
@@ -809,6 +1024,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
              * map is available without the cache (single-file scope). */
             total_imports += create_import_edges_for_file(ctx, result, rel, NULL);
             create_channel_edges_for_file(ctx, result, rel);
+            cbm_pipeline_diagram_arrows(ctx, result);
             cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
             cbm_free_result(result);
         }
@@ -842,6 +1058,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             total_imports +=
                 create_import_edges_for_file(ctx, result, files[i].rel_path, namespace_map);
             create_channel_edges_for_file(ctx, result, files[i].rel_path);
+            cbm_pipeline_diagram_arrows(ctx, result);
             cbm_pipeline_create_env_configures_for_file(ctx, result, files[i].rel_path);
         }
         cbm_pipeline_namespace_map_free(namespace_map);
@@ -851,7 +1068,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                     cbm_free_result(local_cache[i]);
                 }
             }
-            free(local_cache);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, local_cache);
         }
     }
 
@@ -859,4 +1076,13 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                  itoa_log(total_calls), "imports", itoa_log(total_imports), "errors",
                  itoa_log(errors));
     return 0;
+
+configured_failure:
+    if (owns_local_cache) {
+        for (int j = 0; j < file_count; j++) {
+            cbm_free_result(local_cache[j]);
+        }
+        cbm_free(CBM_MEM_CLASS_EXTRACT, local_cache);
+    }
+    return CBM_PIPELINE_ABORT_PRESERVE_DB;
 }

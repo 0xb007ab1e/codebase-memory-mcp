@@ -11,8 +11,11 @@
 #include "ui/embedded_assets.h"
 #include "ui/layout3d.h"
 #include "ui/atlas.h"
+#include "cli/cli.h"
 #include "store/store.h"
 #include "foundation/subprocess.h"
+#include "foundation/mem_core.h"
+#include "foundation/platform.h"
 
 #include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
@@ -961,9 +964,9 @@ TEST(layout_regions_two_communities) {
     ASSERT_NOT_NULL(json2);
     ASSERT_STR_EQ(json, json2);
 
-    free(json2);
+    cbm_free(CBM_MEM_CLASS_OTHER, json2);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     cbm_layout_regions_cache_clear();
     PASS();
@@ -989,7 +992,7 @@ TEST(layout_regions_scope_restricts_nodes) {
             alpha_id = (int)yyjson_get_int(yyjson_obj_get(rv, "id"));
     }
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     ASSERT_GT(alpha_id, -1);
 
     cbm_layout_result_t *r = cbm_layout_compute_region(store, "regions-test", alpha_id, 100);
@@ -1167,7 +1170,7 @@ TEST(atlas_tree_aggregates_children) {
     ASSERT_TRUE(saw_alpha);
     ASSERT_TRUE(saw_beta);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     cbm_layout_regions_cache_clear();
     PASS();
@@ -1214,13 +1217,13 @@ TEST(atlas_symbol_bundle_totals_and_sections) {
                   "src/beta/b1.c");
 
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* qn lookup resolves the same node. */
     char *by_qn =
         cbm_atlas_symbol_json(store, "regions-test", -1, "regions-test::alpha_one", 10, 0);
     ASSERT_NOT_NULL(by_qn);
-    free(by_qn);
+    cbm_free(CBM_MEM_CLASS_OTHER, by_qn);
     /* Unknown symbol → NULL. */
     ASSERT_NULL(cbm_atlas_symbol_json(store, "regions-test", 999999, NULL, 10, 0));
 
@@ -1260,7 +1263,7 @@ TEST(atlas_flows_walk_and_rank) {
     }
     ASSERT_TRUE(alpha_flow);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* Flow detail: coherent DFS structure (parent before child, depths). */
     char *detail = cbm_atlas_flow_json(store, "regions-test", alpha_flow_id);
@@ -1285,7 +1288,7 @@ TEST(atlas_flows_walk_and_rank) {
         }
     }
     yyjson_doc_free(ddoc);
-    free(detail);
+    cbm_free(CBM_MEM_CLASS_OTHER, detail);
 
     /* Determinism: fresh cache → byte-identical list. */
     char *again = NULL;
@@ -1294,8 +1297,8 @@ TEST(atlas_flows_walk_and_rank) {
     ASSERT_NOT_NULL(again);
     char *first = cbm_atlas_flows_json(store, "regions-test");
     ASSERT_STR_EQ(again, first);
-    free(again);
-    free(first);
+    cbm_free(CBM_MEM_CLASS_OTHER, again);
+    cbm_free(CBM_MEM_CLASS_OTHER, first);
 
     /* Unknown flow id → NULL. */
     ASSERT_NULL(cbm_atlas_flow_json(store, "regions-test", 9999));
@@ -1344,10 +1347,61 @@ TEST(atlas_metrics_totals_and_certainty) {
     ASSERT_NOT_NULL(yyjson_obj_get(root, "history"));
 
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     cbm_atlas_metrics_cache_clear();
     cbm_layout_regions_cache_clear();
+    PASS();
+}
+
+TEST(atlas_response_memory_cache_and_passthrough) {
+    cbm_atlas_flows_cache_clear();
+    cbm_atlas_metrics_cache_clear();
+    cbm_layout_regions_cache_clear();
+    cbm_store_t *store = atlas_fixture(NULL);
+    ASSERT_NOT_NULL(store);
+    /* This fixture exercises graph response caches without retained Git history. */
+    ASSERT_EQ(cbm_store_upsert_project(store, "regions-test", ""), CBM_STORE_OK);
+    /* Replace any history retained by an earlier metrics test before taking the
+     * baseline; clearing response caches alone does not clear history. */
+    char *settled = cbm_atlas_metrics_json(store, "regions-test");
+    ASSERT_NOT_NULL(settled);
+    cbm_free(CBM_MEM_CLASS_OTHER, settled);
+    cbm_atlas_metrics_cache_clear();
+    cbm_layout_regions_cache_clear();
+    size_t before_blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    size_t before_bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+    char *(*responses[])(cbm_store_t *, const char *) = {cbm_atlas_metrics_json,
+                                                         cbm_atlas_flows_json};
+    for (size_t i = 0; i < sizeof(responses) / sizeof(responses[0]); i++) {
+        char *cold = responses[i](store, "regions-test");
+        ASSERT_NOT_NULL(cold);
+        size_t with_cold = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+        ASSERT_GT(with_cold, before_blocks);
+        char *warm = responses[i](store, "regions-test");
+        ASSERT_NOT_NULL(warm);
+        ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), with_cold + 1);
+        ASSERT_STR_EQ(cold, warm);
+        cbm_free(CBM_MEM_CLASS_OTHER, warm);
+        cbm_free(CBM_MEM_CLASS_OTHER, cold);
+        ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), with_cold - 1);
+    }
+    cbm_atlas_flows_cache_clear();
+    cbm_atlas_metrics_cache_clear();
+    cbm_layout_regions_cache_clear();
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), before_blocks);
+    ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), before_bytes);
+
+    char *input = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, "{");
+    ASSERT_NOT_NULL(input);
+    char *unchanged = cbm_atlas_attach_observed(store, "regions-test", input);
+    ASSERT_TRUE(unchanged == input);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), before_blocks + 1);
+    cbm_free(CBM_MEM_CLASS_OTHER, unchanged);
+    ASSERT_NULL(cbm_atlas_calloc_array(SIZE_MAX, 2));
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), before_blocks);
+    ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), before_bytes);
+    cbm_store_close(store);
     PASS();
 }
 
@@ -1371,7 +1425,7 @@ TEST(atlas_trace_reachability_calls_and_data) {
     int hops = (int)yyjson_get_int(yyjson_obj_get(root, "hops"));
     ASSERT_EQ((int)yyjson_arr_size(path), hops + 1);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* beta_three does NOT reach alpha_one (calls point the other way and
      * the beta cycle never calls into alpha). */
@@ -1381,7 +1435,7 @@ TEST(atlas_trace_reachability_calls_and_data) {
     doc = yyjson_read(json, strlen(json), 0);
     ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(yyjson_doc_get_root(doc), "reachable")));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* Data mode follows only DATA_FLOWS: alpha_two → beta_two works,
      * alpha_one → beta_two does not (no data edge from alpha_one). */
@@ -1394,7 +1448,7 @@ TEST(atlas_trace_reachability_calls_and_data) {
     ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "reachable")));
     ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(root, "hops")), 1);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     json = cbm_atlas_trace_json(store, "regions-test", -1, "regions-test::alpha_one", -1,
                                 "regions-test::beta_two", "data");
@@ -1402,7 +1456,7 @@ TEST(atlas_trace_reachability_calls_and_data) {
     doc = yyjson_read(json, strlen(json), 0);
     ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(yyjson_doc_get_root(doc), "reachable")));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* Unknown endpoint answers with an error, not a crash. */
     json = cbm_atlas_trace_json(store, "regions-test", -1, "regions-test::nope", -1,
@@ -1411,7 +1465,7 @@ TEST(atlas_trace_reachability_calls_and_data) {
     doc = yyjson_read(json, strlen(json), 0);
     ASSERT_NOT_NULL(yyjson_obj_get(yyjson_doc_get_root(doc), "error"));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     cbm_store_close(store);
     cbm_atlas_flows_cache_clear();
@@ -1460,7 +1514,7 @@ TEST(atlas_impact_reverse_reachability_and_tests) {
     yyjson_val *tests = yyjson_obj_get(root, "tests");
     ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(tests, "count")), 0);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* A test function calling into the beta cycle is reported as a test
      * to run, with its call distance. */
@@ -1512,7 +1566,7 @@ TEST(atlas_impact_reverse_reachability_and_tests) {
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(tnear, 0), "name")), "test_beta");
     ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(yyjson_arr_get(tnear, 0), "distance")), 3);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* Unknown symbol answers with an error, not a crash. */
     json = cbm_atlas_impact_json(store, "regions-test", -1, "regions-test::nope");
@@ -1520,7 +1574,7 @@ TEST(atlas_impact_reverse_reachability_and_tests) {
     doc = yyjson_read(json, strlen(json), 0);
     ASSERT_NOT_NULL(yyjson_obj_get(yyjson_doc_get_root(doc), "error"));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     cbm_store_close(store);
     cbm_atlas_flows_cache_clear();
@@ -1556,7 +1610,7 @@ TEST(atlas_symbol_data_flows_and_history_shape) {
     ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(history, "available")));
 
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     cbm_atlas_metrics_cache_clear();
     cbm_layout_regions_cache_clear();
@@ -1589,7 +1643,7 @@ TEST(atlas_scent_buckets_matches_by_region) {
     ASSERT_EQ(max_count, 3);
     ASSERT_EQ((int)(bucketed + yyjson_get_int(yyjson_obj_get(root, "unmapped"))), 4);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     json = cbm_atlas_scent_json(store, "regions-test", "_two");
     ASSERT_NOT_NULL(json);
@@ -1598,7 +1652,7 @@ TEST(atlas_scent_buckets_matches_by_region) {
     ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(root, "total")), 2);
     ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(root, "regions")), 2);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* Sub-2-char queries refuse rather than scan everything. */
     ASSERT_NULL(cbm_atlas_scent_json(store, "regions-test", "a"));
@@ -1628,7 +1682,7 @@ TEST(atlas_bridges_rank_by_region_reach) {
      * exactly 1 foreign region, so the honest answer is an empty list. */
     ASSERT_EQ((int)yyjson_arr_size(bridges), 0);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* A third dense community (mirroring the beta pattern: a 3-cycle plus
      * exactly one inbound cross call) so alpha_one spans TWO foreign
@@ -1698,7 +1752,7 @@ TEST(atlas_bridges_rank_by_region_reach) {
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(top, "name")), "alpha_one");
     ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(top, "regions")), 2);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     cbm_store_close(store);
     cbm_layout_regions_cache_clear();
@@ -1757,7 +1811,7 @@ TEST(atlas_symbol_overflow_tail_and_dataflow_presence) {
     ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "project_has_data_flows")));
 
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     cbm_atlas_metrics_cache_clear();
     cbm_layout_regions_cache_clear();
@@ -1792,7 +1846,7 @@ TEST(atlas_blast_buckets_files_by_region) {
     ASSERT_EQ((int)(bucketed + unmapped), 4);
     ASSERT_EQ(max_count, 2); /* both alpha files land in one region */
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     ASSERT_NULL(cbm_atlas_blast_json(store, "regions-test", ""));
 
@@ -1819,7 +1873,7 @@ TEST(atlas_handout_is_selfcontained_and_escaped) {
     ASSERT_NULL(strstr(html, "/Users/"));
     /* Honest churn: fixture root has no git history → the section says so. */
     ASSERT_NOT_NULL(strstr(html, "No readable git history"));
-    free(html);
+    cbm_free(CBM_MEM_CLASS_OTHER, html);
 
     cbm_store_close(store);
     cbm_atlas_metrics_cache_clear();
@@ -1882,7 +1936,7 @@ TEST(atlas_attach_observed_marks_hops) {
     yyjson_val *hop2 = yyjson_arr_get(path, 2);
     ASSERT_NULL(yyjson_obj_get(hop2, "observed"));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* Flow shape: steps with parent indices join the same way. */
     int64_t alpha_one_id = -1, beta_one_id = -1;
@@ -1911,11 +1965,12 @@ TEST(atlas_attach_observed_marks_hops) {
     snprintf(flow_json, sizeof(flow_json),
              "{\"steps\":[{\"id\":%lld,\"parent\":-1},{\"id\":%lld,\"parent\":0}]}",
              (long long)alpha_one_id, (long long)beta_one_id);
-    char *owned = malloc(strlen(flow_json) + 1);
+    size_t before_owned = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    char *owned = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, flow_json);
     ASSERT_NOT_NULL(owned);
-    strcpy(owned, flow_json);
     owned = cbm_atlas_attach_observed(store, "regions-test", owned);
     ASSERT_NOT_NULL(owned);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), before_owned + 1);
     doc = yyjson_read(owned, strlen(owned), 0);
     ASSERT_NOT_NULL(doc);
     yyjson_val *steps = yyjson_obj_get(yyjson_doc_get_root(doc), "steps");
@@ -1924,7 +1979,8 @@ TEST(atlas_attach_observed_marks_hops) {
     ASSERT_NOT_NULL(obs);
     ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(obs, "count")), 2);
     yyjson_doc_free(doc);
-    free(owned);
+    cbm_free(CBM_MEM_CLASS_OTHER, owned);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), before_owned);
 
     cbm_store_close(store);
     cbm_atlas_flows_cache_clear();
@@ -2016,7 +2072,7 @@ TEST(atlas_who_reports_authorship_evidence) {
     ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(second, "commits_here")), 1);
     ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(second, "files_repo_wide")), 1);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* A file with no recorded commits answers honestly, not with an error. */
     json = cbm_atlas_who_json(store, "who-test", "src/never.c");
@@ -2027,7 +2083,7 @@ TEST(atlas_who_reports_authorship_evidence) {
     ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(jroot, "commits_1y")), 0);
     ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(jroot, "people")), 0);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     cbm_store_close(store);
     cbm_atlas_metrics_cache_clear();
@@ -2052,7 +2108,7 @@ TEST(atlas_symbol_history_log_l_and_remote) {
     yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
     ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(yyjson_doc_get_root(doc), "available")));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(probe);
 
 #ifdef _WIN32
@@ -2106,7 +2162,7 @@ TEST(atlas_symbol_history_log_l_and_remote) {
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(commit, "author")), "Test");
     ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(hroot, "truncated")));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     (void)th_rmtree(root);
     PASS();
@@ -2148,7 +2204,7 @@ TEST(atlas_repository_map_snapshot_evidence) {
     ASSERT_NULL(yyjson_obj_get(missing, "strategy"));
     ASSERT_NULL(yyjson_obj_get(missing, "confidence"));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     PASS();
 }
@@ -2189,21 +2245,88 @@ TEST(atlas_selection_impact_evidence_and_missing_history) {
         yyjson_get_str(yyjson_obj_get(yyjson_obj_get(root, "snapshot"), "index_revision")),
         "unknown");
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     json = cbm_atlas_impact_analysis_json(store, "regions-test", "src/new.c", -1, NULL);
     ASSERT_NOT_NULL(json);
     doc = yyjson_read(json, strlen(json), 0);
     ASSERT_FALSE(yyjson_get_bool(
         yyjson_obj_get(yyjson_obj_get(yyjson_doc_get_root(doc), "structural"), "available")));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     ASSERT_NULL(cbm_atlas_impact_analysis_json(store, "regions-test", "../private.c", -1, NULL));
     cbm_store_close(store);
     PASS();
 }
 
+TEST(atlas_impact_completed_worker_memory_returns_to_caller_baseline) {
+    cbm_atlas_impact_analysis_shutdown();
+    char temp[256] = "/tmp/cbm_impact_memory_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(temp));
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/index.db", temp);
+    cbm_store_t *store = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "impact-memory", temp), CBM_STORE_OK);
+    bool statuses_match = true, cache_matches = true, blocks_match = true, bytes_match = true;
+    const char *projects[] = {"impact-memory", "missing-project"};
+    const char *expected[] = {"ready", "failed"};
+    for (size_t i = 0; i < 2; i++) {
+        /* The missing project takes the worker's fallback JSON allocation. */
+        void *sentinel = cbm_alloc(CBM_MEM_CLASS_OTHER, 64);
+        ASSERT_NOT_NULL(sentinel);
+        size_t before_blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+        size_t before_bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+        char *json = NULL;
+        bool terminal = false;
+        uint64_t deadline = cbm_now_ms() + 15000;
+        do {
+            json =
+                cbm_atlas_impact_analysis_request(store, projects[i], "sample.c", -1, NULL, false);
+            yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+            const char *status =
+                doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "status")) : NULL;
+            terminal = status && strcmp(status, expected[i]) == 0;
+            bool pending = status && strcmp(status, "pending") == 0;
+            yyjson_doc_free(doc);
+            if (!pending)
+                break;
+            cbm_free(CBM_MEM_CLASS_OTHER, json);
+            json = NULL;
+            cbm_usleep(1000);
+        } while (cbm_now_ms() < deadline);
+        statuses_match = statuses_match && terminal;
+        char *cached = terminal ? cbm_atlas_impact_analysis_request(store, projects[i], "sample.c",
+                                                                    -1, NULL, false)
+                                : NULL;
+        cache_matches = cache_matches && json && cached && strcmp(json, cached) == 0;
+        cbm_free(CBM_MEM_CLASS_OTHER, cached);
+        cbm_free(CBM_MEM_CLASS_OTHER, json);
+        cbm_atlas_impact_analysis_shutdown(); /* joins and frees the retained worker result */
+        blocks_match =
+            blocks_match && cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER) == before_blocks;
+        bytes_match = bytes_match && cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER) == before_bytes;
+        cbm_free(CBM_MEM_CLASS_OTHER, sentinel);
+    }
+    cbm_store_close(store);
+    th_rmtree(temp);
+    ASSERT_TRUE(statuses_match);
+    ASSERT_TRUE(cache_matches);
+    ASSERT_TRUE(blocks_match);
+    ASSERT_TRUE(bytes_match);
+    PASS();
+}
+
 static bool impact_test_git(const char *root, const char *const *args) {
-    const char *argv[30] = {"git",
+    const char *git = "git";
+#ifdef _WIN32
+    char git_path[1024];
+    const char *resolved = cbm_find_cli("git", NULL);
+    if (!resolved || !*resolved || strlen(resolved) >= sizeof(git_path))
+        return false;
+    snprintf(git_path, sizeof(git_path), "%s", resolved);
+    git = git_path;
+#endif
+    const char *argv[30] = {git,
                             "-C",
                             root,
                             "-c",
@@ -2215,7 +2338,8 @@ static bool impact_test_git(const char *root, const char *const *args) {
     int n = 9;
     while (*args && n < 29)
         argv[n++] = *args++;
-    cbm_proc_opts_t opts = {.bin = "git", .argv = argv, .quiet_timeout_ms = 3000};
+    cbm_proc_opts_t opts = {
+        .bin = git, .argv = argv, .quiet_timeout_ms = 3000, .strip_git_repo_env = true};
     cbm_proc_result_t result;
     return cbm_subprocess_run(&opts, &result) == 0 && result.outcome == CBM_PROC_CLEAN;
 }
@@ -2228,6 +2352,152 @@ static bool impact_test_write(const char *root, const char *file, const char *va
         return false;
     fputs(value, fp);
     return fclose(fp) == 0;
+}
+
+static bool atlas_history_test_repo(const char *root, const char *subject, const char *remote) {
+    const char *init[] = {"init", "-q", NULL};
+    const char *add[] = {"add", "sample.c", NULL};
+    const char *commit[] = {"-c", "core.hooksPath=", "commit", "-qm", subject, NULL};
+    const char *origin[] = {"remote", "add", "origin", remote, NULL};
+    return impact_test_git(root, init) &&
+           impact_test_write(root, "sample.c", "int sample(void) {\n    return 1;\n}\n") &&
+           impact_test_git(root, add) && impact_test_git(root, commit) &&
+           impact_test_git(root, origin);
+}
+
+static bool atlas_history_test_commit(const char *json, const char *array, const char *subject) {
+    yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    if (!doc)
+        return false;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *commits = yyjson_obj_get(root, array);
+    const char *got = yyjson_get_str(yyjson_obj_get(yyjson_arr_get(commits, 0), "subject"));
+    bool matches = yyjson_get_bool(yyjson_obj_get(root, "available")) &&
+                   yyjson_arr_size(commits) == 1 && got && strcmp(got, subject) == 0;
+    yyjson_doc_free(doc);
+    return matches;
+}
+
+static bool atlas_history_test_remote(const char *json, const char *expected) {
+    yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    if (!doc)
+        return false;
+    const char *got = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "remote_url"));
+    bool matches = got && strcmp(got, expected) == 0;
+    yyjson_doc_free(doc);
+    return matches;
+}
+
+TEST(atlas_history_ignores_inherited_git_context) {
+    char temp[256] = "/tmp/cbm_atlas_git_context_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(temp));
+    char selected[1024], decoy[1024], git_dir[1100], git_config[1100];
+    snprintf(selected, sizeof(selected), "%s/selected", temp);
+    snprintf(decoy, sizeof(decoy), "%s/decoy", temp);
+    ASSERT_EQ(th_mkdir_p(selected), 0);
+    ASSERT_EQ(th_mkdir_p(decoy), 0);
+    ASSERT_TRUE(atlas_history_test_repo(selected, "selected repository history",
+                                        "https://example.invalid/selected/repo.git"));
+    ASSERT_TRUE(atlas_history_test_repo(decoy, "decoy repository history",
+                                        "https://example.invalid/decoy/repo.git"));
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", decoy);
+    snprintf(git_config, sizeof(git_config), "%s/.git/config", decoy);
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    cbm_store_upsert_project(store, "atlas-git-context", selected);
+
+    const char *names[] = {
+        "GIT_DIR",          "GIT_WORK_TREE",      "GIT_CONFIG",           "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_PARAMETERS"};
+    const char *values[] = {git_dir,
+                            decoy,
+                            git_config,
+                            "1",
+                            "remote.origin.url",
+                            "https://example.invalid/injected/repo.git",
+                            "'remote.origin.url=https://example.invalid/parameters/repo.git'"};
+    char *saved[7] = {0};
+    bool save_ok = true;
+    for (int i = 0; i < 7; i++) {
+        const char *value = getenv(names[i]);
+        saved[i] = value ? strdup(value) : NULL;
+        save_ok = save_ok && (!value || saved[i]);
+    }
+    ASSERT_TRUE(save_ok);
+    bool env_ready = true;
+    for (int i = 0; i < 7; i++)
+        env_ready = cbm_setenv(names[i], values[i], 1) == 0 && env_ready;
+
+    /* Force the churn scan under the hostile environment, even if another
+     * history test populated the process-wide cache. */
+    cbm_atlas_metrics_cache_clear();
+    char *metrics = cbm_atlas_metrics_json(store, "atlas-git-context");
+    char *file = cbm_atlas_file_history_json(store, "atlas-git-context", "sample.c");
+    char *symbol = cbm_atlas_symbol_history_json(store, "atlas-git-context", "sample.c", 1, 3);
+    bool file_history_ok = atlas_history_test_commit(file, "recent", "selected repository history");
+    bool symbol_history_ok =
+        atlas_history_test_commit(symbol, "commits", "selected repository history");
+    bool file_remote_ok = atlas_history_test_remote(file, "https://example.invalid/selected/repo");
+    bool symbol_remote_ok =
+        atlas_history_test_remote(symbol, "https://example.invalid/selected/repo");
+    bool parent_unchanged = true;
+    for (int i = 0; i < 7; i++) {
+        const char *value = getenv(names[i]);
+        parent_unchanged = parent_unchanged && value && strcmp(value, values[i]) == 0;
+        if (saved[i])
+            cbm_setenv(names[i], saved[i], 1);
+        else
+            cbm_unsetenv(names[i]);
+        free(saved[i]);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, metrics);
+    cbm_free(CBM_MEM_CLASS_OTHER, file);
+    cbm_free(CBM_MEM_CLASS_OTHER, symbol);
+    cbm_store_close(store);
+    cbm_atlas_metrics_cache_clear();
+    (void)th_rmtree(temp);
+    ASSERT_TRUE(env_ready);
+    ASSERT_TRUE(parent_unchanged);
+    ASSERT_TRUE(file_history_ok);
+    ASSERT_TRUE(symbol_history_ok);
+    ASSERT_TRUE(file_remote_ok);
+    ASSERT_TRUE(symbol_remote_ok);
+    PASS();
+}
+
+TEST(atlas_history_remote_urls_strip_credentials_and_force_https) {
+    char temp[256] = "/tmp/cbm_atlas_remote_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(temp));
+    /* All credentials are synthetic fixtures; neither endpoint may echo them. */
+    const char *remotes[] = {"https://fixture-user:fixture-token@example.invalid/org/repo.git",
+                             "http://fixture-user:fixture-token@example.invalid/org/repo.git"};
+    ASSERT_TRUE(atlas_history_test_repo(temp, "remote fixture history", remotes[0]));
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    cbm_store_upsert_project(store, "atlas-remote-credentials", temp);
+    cbm_atlas_metrics_cache_clear();
+    bool setup_ok = true;
+    bool file_ok[2] = {false, false}, symbol_ok[2] = {false, false};
+    for (int i = 0; i < 2; i++) {
+        const char *set_url[] = {"remote", "set-url", "origin", remotes[i], NULL};
+        setup_ok = impact_test_git(temp, set_url) && setup_ok;
+        char *file = cbm_atlas_file_history_json(store, "atlas-remote-credentials", "sample.c");
+        char *symbol =
+            cbm_atlas_symbol_history_json(store, "atlas-remote-credentials", "sample.c", 1, 3);
+        file_ok[i] = atlas_history_test_remote(file, "https://example.invalid/org/repo");
+        symbol_ok[i] = atlas_history_test_remote(symbol, "https://example.invalid/org/repo");
+        cbm_free(CBM_MEM_CLASS_OTHER, file);
+        cbm_free(CBM_MEM_CLASS_OTHER, symbol);
+    }
+    cbm_store_close(store);
+    cbm_atlas_metrics_cache_clear();
+    (void)th_rmtree(temp);
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(file_ok[0]);
+    ASSERT_TRUE(symbol_ok[0]);
+    ASSERT_TRUE(file_ok[1]);
+    ASSERT_TRUE(symbol_ok[1]);
+    PASS();
 }
 
 TEST(atlas_selection_impact_git_filters_and_worktree) {
@@ -2283,7 +2553,7 @@ TEST(atlas_selection_impact_git_filters_and_worktree) {
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_arr_get(co, 0), "shared_commits")), 2);
     ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(yyjson_arr_get(co, 0), "commit_refs")), 2);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     cbm_store_close(store);
     (void)th_rmtree(root);
     PASS();
@@ -2359,7 +2629,7 @@ TEST(atlas_why_extracts_guard_chains) {
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(guards, 1), "cond")), "strict");
     ASSERT_NULL(yyjson_obj_get(yyjson_arr_get(guards, 1), "negated"));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* delta sits in the ELSE arm: same conditions, innermost negated. */
     json = cbm_atlas_why_json(store, "why-test", ids[2], NULL, true);
@@ -2370,7 +2640,7 @@ TEST(atlas_why_extracts_guard_chains) {
     ASSERT_EQ((int)yyjson_arr_size(guards), 2);
     ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(yyjson_arr_get(guards, 1), "negated")));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* gamma_fn runs in a loop; downward from alpha lists all three callees
      * with their guards computed from alpha's own file. */
@@ -2380,7 +2650,7 @@ TEST(atlas_why_extracts_guard_chains) {
     entry = yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(doc), "entries"), 0);
     ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(entry, "loop")));
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     json = cbm_atlas_why_json(store, "why-test", ids[3], NULL, false);
     ASSERT_NOT_NULL(json);
@@ -2389,7 +2659,7 @@ TEST(atlas_why_extracts_guard_chains) {
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root_v, "direction")), "down");
     ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(root_v, "entries")), 3);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     /* Callsite guards helper (the A→B trace hop path). */
     json = cbm_atlas_callsite_guards_json(store, "why-test", "src/w1.c", 7);
@@ -2397,7 +2667,7 @@ TEST(atlas_why_extracts_guard_chains) {
     doc = yyjson_read(json, strlen(json), 0);
     ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(yyjson_doc_get_root(doc), "guards")), 2);
     yyjson_doc_free(doc);
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
 
     cbm_store_close(store);
     th_rmtree(root);
@@ -2441,6 +2711,7 @@ SUITE(ui) {
     RUN_TEST(atlas_symbol_bundle_totals_and_sections);
     RUN_TEST(atlas_flows_walk_and_rank);
     RUN_TEST(atlas_metrics_totals_and_certainty);
+    RUN_TEST(atlas_response_memory_cache_and_passthrough);
     RUN_TEST(atlas_trace_reachability_calls_and_data);
     RUN_TEST(atlas_impact_reverse_reachability_and_tests);
     RUN_TEST(atlas_symbol_data_flows_and_history_shape);
@@ -2452,8 +2723,11 @@ SUITE(ui) {
     RUN_TEST(atlas_attach_observed_marks_hops);
     RUN_TEST(atlas_who_reports_authorship_evidence);
     RUN_TEST(atlas_symbol_history_log_l_and_remote);
+    RUN_TEST(atlas_history_ignores_inherited_git_context);
+    RUN_TEST(atlas_history_remote_urls_strip_credentials_and_force_https);
     RUN_TEST(atlas_why_extracts_guard_chains);
     RUN_TEST(atlas_selection_impact_evidence_and_missing_history);
+    RUN_TEST(atlas_impact_completed_worker_memory_returns_to_caller_baseline);
     RUN_TEST(atlas_selection_impact_git_filters_and_worktree);
     RUN_TEST(atlas_repository_map_snapshot_evidence);
 }

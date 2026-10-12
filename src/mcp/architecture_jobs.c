@@ -3,6 +3,8 @@
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/platform.h"
+#include "foundation/mem_core.h"
+#include "foundation/json_writer.h"
 #include <sqlite3.h>
 #include <yyjson/yyjson.h>
 #include <stdatomic.h>
@@ -48,7 +50,7 @@ struct cbm_architecture_jobs {
 
 static char *copy_string(const char *text) {
     size_t size = strlen(text) + 1;
-    char *copy = malloc(size);
+    char *copy = cbm_alloc(CBM_MEM_CLASS_OTHER, size);
     if (copy) {
         memcpy(copy, text, size);
     }
@@ -56,10 +58,10 @@ static char *copy_string(const char *text) {
 }
 
 static void clear_job(arch_job_t *job) {
-    free(job->path);
-    free(job->project);
-    free(job->indexed_at);
-    free(job->result);
+    cbm_free(CBM_MEM_CLASS_OTHER, job->path);
+    cbm_free(CBM_MEM_CLASS_OTHER, job->project);
+    cbm_free(CBM_MEM_CLASS_OTHER, job->indexed_at);
+    cbm_free(CBM_MEM_CLASS_OTHER, job->result);
     memset(job, 0, sizeof(*job));
 }
 
@@ -150,20 +152,22 @@ static void *run_projection(void *context) {
         }
     }
     if (error) {
-        free(result);
+        cbm_free(CBM_MEM_CLASS_OTHER, result);
         result = NULL;
     }
     cbm_mutex_lock(&jobs->mutex);
     job->result = result;
     job->error = error;
     job->touched_ms = cbm_now_ms();
+    /* The caller may free this worker's retained output after completion. */
+    cbm_mem_class_flush_thread();
     jobs->done = true;
     cbm_mutex_unlock(&jobs->mutex);
     return NULL;
 }
 
 cbm_architecture_jobs_t *cbm_architecture_jobs_new(void) {
-    cbm_architecture_jobs_t *jobs = calloc(1, sizeof(*jobs));
+    cbm_architecture_jobs_t *jobs = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*jobs));
     if (jobs) {
         cbm_mutex_init(&jobs->mutex);
         atomic_init(&jobs->cancelled, false);
@@ -184,7 +188,7 @@ void cbm_architecture_jobs_free(cbm_architecture_jobs_t *jobs) {
         clear_job(&jobs->cache[i]);
     }
     cbm_mutex_destroy(&jobs->mutex);
-    free(jobs);
+    cbm_free(CBM_MEM_CLASS_OTHER, jobs);
 }
 
 static char *envelope(const char *status, const char *generation, const char *result,
@@ -208,7 +212,7 @@ static char *envelope(const char *status, const char *generation, const char *re
         yyjson_mut_obj_add_val(doc, root, "result",
                                yyjson_val_mut_copy(doc, yyjson_doc_get_root(payload)));
     }
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL);
     yyjson_doc_free(payload);
     yyjson_mut_doc_free(doc);
     return json;

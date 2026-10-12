@@ -15,6 +15,7 @@ import {
     FLAT_MIN_ZOOM,
     FRAME_MARGIN,
     FRAME_MIN_DISTANCE,
+    containShift,
     fitCamera,
     flatBounds,
     frameDistance,
@@ -324,9 +325,68 @@ describe('fitCamera', () => {
         expect(fitCamera([{ x: Number.NaN, y: Number.NaN, z: Number.NaN }], FOV, ASPECT)).toBeNull();
     });
 
+    it('steht auf der Wurzel und nicht auf der Mitte, und haelt trotzdem jeden Knoten im Bild', () => {
+        // Eine Wolke, deren Wurzel am Rand liegt: die Mitte des Kastens ist weit weg.
+        const points = cloud(300, [900, 500, 160], 31).map((point) => ({ x: point.x + 380, y: point.y, z: point.z }));
+        const root = { x: 0, y: 0, z: 0 };
+        const fit = fitCamera([...points, root], FOV, ASPECT, FRAME_MARGIN, root)!;
+        expect(fit.center).toEqual(root);
+        const seen = project(root, fit, FOV, ASPECT);
+        expect(Math.abs(seen.x)).toBeLessThan(1e-9);
+        expect(Math.abs(seen.y)).toBeLessThan(1e-9);
+        for (const point of points) {
+            const at = project(point, fit, FOV, ASPECT);
+            expect(at.z).toBeGreaterThan(0);
+            expect(Math.max(Math.abs(at.x), Math.abs(at.y))).toBeLessThanOrEqual(1);
+        }
+        expect(fit.distance).toBeGreaterThan(fitCamera(points, FOV, ASPECT)!.distance);
+    });
+
     it('steht bei einem einzigen Punkt an der Untergrenze und sieht ihn an', () => {
         const fit = fitCamera([{ x: 40, y: -12, z: 5 }], FOV, ASPECT)!;
         expect(fit.distance).toBe(FRAME_MIN_DISTANCE);
         expect(fit.center).toEqual({ x: 40, y: -12, z: 5 });
+    });
+});
+
+/*
+ * Das naechste Bild desselben Scopes (Review-Befund G1).
+ *
+ * Ein Expand und die Antwort nach einer Vorschau passen nicht neu ein; die
+ * Kamera tritt entlang ihrer Blickrichtung nur so weit zurueck oder vor, dass
+ * der aeusserste Knoten mit Rand am Bildrand steht. Gerechnet im Blickraum:
+ * vor der Kamera ist z negativ.
+ */
+describe('containShift', () => {
+    const ASPECT = 1.5;
+    const half = Math.tan((FOV * Math.PI) / 360);
+
+    it('tritt genau so weit zurueck, dass der aeusserste Punkt am Rand steht', () => {
+        const point = { x: 0, y: 300, z: -200 };
+        const back = containShift([point], FOV, ASPECT);
+        expect(back).toBeGreaterThan(0);
+        expect((point.y * FRAME_MARGIN) / ((200 + back) * half)).toBeCloseTo(1, 6);
+    });
+
+    it('tritt vor, wenn ein kleineres Bild mit viel Rand dasteht', () => {
+        const points = [{ x: 0, y: 0, z: -400 }, { x: 100, y: -80, z: -500 }];
+        const shift = containShift(points, FOV, ASPECT);
+        expect(shift).toBeLessThan(0);
+        const fills = points.map((point) => Math.max(
+            (Math.abs(point.x) * FRAME_MARGIN) / ((-point.z + shift) * half * ASPECT),
+            (Math.abs(point.y) * FRAME_MARGIN) / ((-point.z + shift) * half)));
+        expect(Math.max(...fills)).toBeCloseTo(1, 6);
+    });
+
+    it('rechnet die Breite mit dem Seitenverhaeltnis und holt auch Punkte hinter der Kamera', () => {
+        const wide = { x: 600, y: 0, z: -100 };
+        const back = containShift([wide], FOV, ASPECT);
+        expect((wide.x * FRAME_MARGIN) / ((100 + back) * half * ASPECT)).toBeCloseTo(1, 6);
+        expect(containShift([{ x: 0, y: 0, z: 50 }], FOV, ASPECT)).toBeCloseTo(50, 6);
+    });
+
+    it('bleibt ohne brauchbare Punkte stehen, statt NaN zu liefern', () => {
+        expect(containShift([{ x: Number.NaN, y: 0, z: -1 }], FOV, ASPECT)).toBe(0);
+        expect(containShift([], FOV, ASPECT)).toBe(0);
     });
 });

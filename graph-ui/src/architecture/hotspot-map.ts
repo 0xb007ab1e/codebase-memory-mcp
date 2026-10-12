@@ -1,7 +1,7 @@
 import type { ArchitectureHotspot } from '../core/intelligence-provider';
 import type { GraphData, GraphNode } from '../galaxy/types';
 import { layoutFolderHierarchy, pruneHierarchyPlatforms, type SemanticGraph, type SemanticNode } from './semantic-graph';
-import { areaOf } from './repository-map';
+import { areaOf, areaTrail } from './repository-map';
 import { hotspotScore } from '../provider/cbm-rpc-provider';
 
 export interface HotspotGroup { findings: ArchitectureHotspot[]; maxFanIn?: number; peakScore: number }
@@ -57,7 +57,15 @@ export function collectHotspots(findings: ArchitectureHotspot[], graph: GraphDat
 }
 
 export function hotspotsForNode(node: SemanticNode, catalog: HotspotCatalog): HotspotGroup | undefined {
-    if (node.kind === 'area') return node.areaPath ? catalog.byArea.get(node.areaPath) : undefined;
+    if (node.kind === 'area') {
+        const area = node.areaPath;
+        if (!area) return undefined;
+        // byArea holds the repository areas; the sub-areas of an opened area collect theirs by trail.
+        const repositoryArea = catalog.byArea.get(area);
+        if (repositoryArea) return repositoryArea;
+        const nested = catalog.findings.filter(finding => finding.filePath && areaTrail(finding.filePath).includes(area));
+        return nested.length ? summarize(nested) : undefined;
+    }
     if (node.kind === 'file') return node.filePath ? catalog.byFile.get(node.filePath) : undefined;
     return node.graphNode ? catalog.bySymbolId.get(node.graphNode.id) : undefined;
 }

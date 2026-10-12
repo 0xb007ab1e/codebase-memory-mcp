@@ -45,6 +45,34 @@
 }
 .atlas-arch-tab[aria-pressed="true"] { color: var(--atlas-fg); border-bottom-color: var(--atlas-phosphor); }
 .atlas-arch-tab:hover { color: var(--atlas-fg); background: var(--atlas-panel); }
+/* Exploration history belongs to the current scope; tabs only choose a lens. */
+.atlas-arch-tabrow { display: flex; border-bottom: 1px solid var(--atlas-line); margin-bottom: 16px; }
+.atlas-arch-tabrow > .atlas-arch-tabs { flex: 1 1 auto; min-width: 0; border-bottom: 0; margin-bottom: 0; }
+.atlas-arch-context { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }
+.atlas-arch-context > span { max-width: min(32rem, 70vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--atlas-dim); }
+.atlas-arch-history { display: flex; align-items: center; gap: 2px; flex: none; position: relative; }
+.atlas-architecture .atlas-arch-history > button, .atlas-arch-recent > summary {
+    display: grid; place-items: center; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--atlas-dim);
+    width: 32px; height: 32px; min-width: 32px; min-height: 32px; padding: 6px; line-height: 1;
+}
+.atlas-architecture .atlas-arch-history > button:hover:not(:disabled), .atlas-arch-recent > summary:hover { background: var(--atlas-panel-raised); color: var(--atlas-fg); border-color: var(--atlas-line); }
+.atlas-architecture .atlas-arch-history > button:disabled { opacity: 0.28; cursor: default; }
+.atlas-arch-history svg { display: block; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.atlas-arch-history :is(button, summary):focus-visible { outline: 2px solid var(--atlas-phosphor); outline-offset: 2px; }
+.atlas-arch-recent { position: static; }
+.atlas-arch-recent > summary { cursor: pointer; list-style: none; }
+.atlas-arch-recent > summary::-webkit-details-marker { display: none; }
+.atlas-arch-recent-menu {
+    position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; width: min(24rem, calc(100vw - 3rem)); max-height: 20rem; overflow: auto;
+    margin: 0; padding: 6px; list-style: none; border: 1px solid var(--atlas-line); border-radius: 8px; background: var(--atlas-panel); box-shadow: 0 8px 24px #0006;
+}
+.atlas-arch-recent-menu button {
+    width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: 1px; text-align: left;
+    border: 0; border-radius: 6px; background: transparent; color: var(--atlas-fg); padding: 5px 8px;
+}
+.atlas-arch-recent-menu button:hover:not(:disabled) { background: var(--atlas-panel-raised); }
+.atlas-arch-recent-menu button span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--atlas-dim); }
+.atlas-arch-recent-menu button[aria-current="true"] { opacity: 0.6; }
 .atlas-arch-toolbar { margin-bottom: 24px; gap: 10px; }
 .atlas-arch-filter { position: relative; flex: 1; max-width: 370px; }
 .atlas-arch-filter svg { color: var(--atlas-dim); left: 11px; position: absolute; top: 10px; pointer-events: none; }

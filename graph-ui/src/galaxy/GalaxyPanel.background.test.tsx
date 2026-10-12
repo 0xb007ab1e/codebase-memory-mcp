@@ -20,7 +20,10 @@ it('keeps the overall graph after clearing while the code caret stays put, and f
     const props: GalaxyPanelProps = { project: 'sample', visible: true, onOpenNode: vi.fn(), onClearSelection: clear,
         fetch: fetchLayout, focusQualifiedName: 'sample.node1', focusFilePath: 'src/file1.ts', focusSourceRange: { startLine: 1, endLine: 1 } };
     await act(async () => root.render(<GalaxyPanel {...props} />));
-    expect(globalThis.__atlasGalaxy?.highlightedCount).toBe(1);
+    await vi.waitFor(async () => {
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+        expect(globalThis.__atlasGalaxy?.highlightedCount).toBe(1);
+    });
     const fits = globalThis.__atlasGalaxy!.fits;
     const background = [...host.querySelectorAll('button')].find(button => button.textContent === 'Empty canvas')!;
     await act(async () => background.click());
@@ -31,6 +34,31 @@ it('keeps the overall graph after clearing while the code caret stays put, and f
     await act(async () => root.render(<GalaxyPanel {...props} focusSourceRange={{ startLine: 1, endLine: 1 }} />));
     expect(globalThis.__atlasGalaxy?.highlightedCount).toBe(0);
     await act(async () => root.render(<GalaxyPanel {...props} focusQualifiedName="sample.node3" focusFilePath="src/file3.ts" />));
-    expect(globalThis.__atlasGalaxy?.highlightedCount).toBe(1);
+    await vi.waitFor(async () => {
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+        expect(globalThis.__atlasGalaxy?.highlightedCount).toBe(1);
+    });
     expect(globalThis.__atlasGalaxy?.lastTargetQn).toBe('src/file3.ts');
+});
+
+it('returns a standalone hierarchy selection to the overall Galaxy without stale walk prose', async () => {
+    const onSelectionEvidence = vi.fn();
+    const fetchLayout = vi.fn(async () => new Response(JSON.stringify({ nodes, edges: [], total_nodes: nodes.length })));
+    await act(async () => root.render(<GalaxyPanel project="sample" visible workspaceExpanded onOpenNode={vi.fn()} fetch={fetchLayout} onSelectionEvidence={onSelectionEvidence} />));
+    await act(async () => host.querySelector<HTMLInputElement>('[aria-label="Find a graph node"]')!.focus());
+    const select = [...host.querySelectorAll<HTMLButtonElement>('.atlas-galaxy-node-picker button')]
+        .find(button => button.querySelector('strong')?.textContent === 'node1')!;
+    await act(async () => select.click());
+    const evidence = JSON.parse(onSelectionEvidence.mock.lastCall![0].text).evidence;
+    expect(evidence.selected.scope).toMatchObject({ kind: 'node', id: 1, name: 'node1' });
+    expect(evidence.scope).toMatchObject({ depth: 1, direction: 'both', edgeTypes: 'all' });
+    expect(evidence.limitations.state).not.toBe('complete-indexed-scope');
+    await act(async () => host.querySelector<HTMLButtonElement>('[data-mode="hierarchy"]')!.click());
+    expect(globalThis.__atlasGalaxy?.mode).toBe('hierarchy');
+    const all = [...host.querySelectorAll('button')].find(button => button.textContent === 'All graph')!;
+    await act(async () => all.click());
+    expect(globalThis.__atlasGalaxy?.mode).toBe('galaxy');
+    expect(globalThis.__atlasGalaxy?.nodes).toBe(nodes.length);
+    expect(host.textContent).not.toContain('nothing of this walk');
+    expect(onSelectionEvidence).toHaveBeenLastCalledWith(undefined);
 });

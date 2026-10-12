@@ -1,14 +1,26 @@
 export interface BrowserAiSource { text: string; path: string; startLine: number; project: string }
 export interface BrowserAiProgress { file?: string; loaded?: number; total?: number; progress?: number }
 export interface BrowserAiRuntime {
-    prepare(onProgress: (progress: BrowserAiProgress) => void): Promise<void>;
+    /** `cacheOnly` loads from the browser cache and fails rather than download. */
+    prepare(onProgress: (progress: BrowserAiProgress) => void, options?: { cacheOnly?: boolean }): Promise<void>;
     explain(source: BrowserAiSource): Promise<string>;
     dispose(): void;
 }
 export interface BrowserChatMessage { role: 'system' | 'user' | 'assistant'; content: string }
+/** Why generation ended: the model finished, the output budget ran out, or Stop. */
+export type BrowserStopReason = 'eos' | 'length' | 'interrupted';
+export interface BrowserChatOptions {
+    maxOutputTokens?: number;
+    /** Short prose summaries; ordinary chat gets milder repetition controls. */
+    generationProfile?: 'automatic-explanation';
+    /** Called once with the reason before the answer resolves. Never sent to the worker. */
+    onComplete?: (result: { stopReason: BrowserStopReason }) => void;
+}
 export interface BrowserChatRuntime extends BrowserAiRuntime {
     countTokens(messages: readonly BrowserChatMessage[]): Promise<number>;
-    chat(messages: readonly BrowserChatMessage[], onToken: (chunk: string) => void): Promise<string>;
+    chat(messages: readonly BrowserChatMessage[], onToken: (chunk: string) => void, options?: BrowserChatOptions): Promise<string>;
+    /** Device loss can happen while idle. Registration reports an existing fatal fault immediately. */
+    setFatalHandler?(handler: ((error: Error) => void) | undefined): void;
     /** Interrupts generation; the chat promise settles with the partial answer. Keeps the model loaded. */
     stop(): void;
 }

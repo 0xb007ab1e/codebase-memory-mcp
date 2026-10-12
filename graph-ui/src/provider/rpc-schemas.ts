@@ -217,6 +217,12 @@ export interface ProjectEntry {
 
 export interface ListProjectsResult {
     projects: ProjectEntry[];
+    total?: number;
+    returned?: number;
+    offset?: number;
+    limit?: number;
+    hasMore?: boolean;
+    nextOffset?: number;
 }
 
 export interface IndexStatusResult {
@@ -381,7 +387,23 @@ export function readListProjects(value: unknown): ListProjectsResult {
             edges: toOptionalNumber(entry['edges']),
         });
     }
-    return { projects };
+    const result: ListProjectsResult = { projects };
+    for (const key of ['total', 'returned', 'offset', 'limit'] as const) {
+        const value = raw[key];
+        if (value !== undefined) {
+            if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new Error(`Invalid project pagination: ${key}.`);
+            result[key] = value;
+        }
+    }
+    if (raw['has_more'] !== undefined) {
+        if (typeof raw['has_more'] !== 'boolean') throw new Error('Invalid project pagination: has_more.');
+        result.hasMore = raw['has_more'];
+    }
+    if (raw['next_offset'] !== undefined && raw['next_offset'] !== null) {
+        if (typeof raw['next_offset'] !== 'number' || !Number.isSafeInteger(raw['next_offset']) || raw['next_offset'] < 0) throw new Error('Invalid project pagination: next_offset.');
+        result.nextOffset = raw['next_offset'];
+    }
+    return result;
 }
 
 export function readIndexStatus(value: unknown): IndexStatusResult {

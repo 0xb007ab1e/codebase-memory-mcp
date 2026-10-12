@@ -811,6 +811,12 @@ export async function tooltipCover(page, index) {
             if (node === box || box.contains(node) || node.contains(box)) {
                 continue;
             }
+            // Dieselbe Regel wie `rendered` in src/ui/tooltip/Hint.tsx: der Inhalt eines zugeklappten <details> ist nicht zu sehen.
+            const closed = node.closest('details:not([open])');
+            if ((closed !== null && !(closed.querySelector(':scope > summary')?.contains(node) ?? false))
+                || (typeof node.checkVisibility === 'function' && !node.checkVisibility())) {
+                continue;
+            }
             const other = node.getBoundingClientRect();
             if (other.width <= 0 || other.height <= 0) {
                 continue;
