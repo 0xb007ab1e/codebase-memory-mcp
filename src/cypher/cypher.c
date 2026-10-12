@@ -505,6 +505,15 @@ static const cbm_token_t *expect(parser_t *p, cbm_token_type_t type) {
     return NULL;
 }
 
+/* Free the first n entries of a property array and the array itself. */
+static void free_prop_entries(cbm_prop_filter_t *arr, int n) {
+    for (int i = 0; i < n; i++) {
+        safe_str_free(&arr[i].key);
+        safe_str_free(&arr[i].value);
+    }
+    free(arr);
+}
+
 /* Parse inline properties: {key: "value", ...} */
 static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
     *out = NULL;
@@ -521,18 +530,19 @@ static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
     }
 
     while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
+        /* Every failure frees the entries already parsed, not only the array. */
         const cbm_token_t *key = expect(p, TOK_IDENT);
         if (!key) {
-            free(arr);
+            free_prop_entries(arr, n);
             return CBM_NOT_FOUND;
         }
         if (!expect(p, TOK_COLON)) {
-            free(arr);
+            free_prop_entries(arr, n);
             return CBM_NOT_FOUND;
         }
         const cbm_token_t *val = expect(p, TOK_STRING);
         if (!val) {
-            free(arr);
+            free_prop_entries(arr, n);
             return CBM_NOT_FOUND;
         }
 
@@ -540,11 +550,7 @@ static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
             int new_cap = cap * PAIR_LEN;
             void *tmp = realloc(arr, new_cap * sizeof(cbm_prop_filter_t));
             if (!tmp) {
-                for (int i = 0; i < n; i++) {
-                    safe_str_free(&arr[i].key);
-                    safe_str_free(&arr[i].value);
-                }
-                free(arr);
+                free_prop_entries(arr, n);
                 return CBM_NOT_FOUND;
             }
             arr = tmp;
@@ -555,11 +561,7 @@ static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
         if (!new_key || !new_val) {
             safe_str_free(&new_key);
             safe_str_free(&new_val);
-            for (int i = 0; i < n; i++) {
-                safe_str_free(&arr[i].key);
-                safe_str_free(&arr[i].value);
-            }
-            free(arr);
+            free_prop_entries(arr, n);
             return CBM_NOT_FOUND;
         }
         arr[n].key = new_key;
@@ -1864,7 +1866,11 @@ static int parse_return(parser_t *p, cbm_return_clause_t **out) {
     return parse_return_or_with(p, out, false);
 }
 
-/* Parse a single MATCH pattern into pat */
+static void free_pattern(cbm_pattern_t *pat);
+
+/* Parse a single MATCH pattern into pat. On failure pat is freed and zeroed:
+ * the caller counts a pattern only after it parsed, so a partial one would
+ * otherwise leak (a named path "p = (...)" failed this way on every query). */
 static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
     memset(pat, 0, sizeof(*pat));
     int node_cap = CYP_INIT_CAP4;
@@ -1872,8 +1878,11 @@ static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
     pat->nodes = malloc(node_cap * sizeof(cbm_node_pattern_t));
     pat->rels = calloc(rel_cap, sizeof(cbm_rel_pattern_t));
 
+    /* A failed parse_node / parse_rel leaves its element zeroed except for
+     * what it allocated, so counting that element frees its partial state. */
     if (parse_node(p, &pat->nodes[0]) < 0) {
-        return CBM_NOT_FOUND;
+        pat->node_count = SKIP_ONE;
+        goto fail;
     }
     pat->node_count = SKIP_ONE;
 
@@ -1883,7 +1892,8 @@ static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
             pat->rels = safe_realloc(pat->rels, rel_cap * sizeof(cbm_rel_pattern_t));
         }
         if (parse_rel(p, &pat->rels[pat->rel_count]) < 0) {
-            return CBM_NOT_FOUND;
+            pat->rel_count++;
+            goto fail;
         }
         pat->rel_count++;
 
@@ -1892,11 +1902,17 @@ static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
             pat->nodes = safe_realloc(pat->nodes, node_cap * sizeof(cbm_node_pattern_t));
         }
         if (parse_node(p, &pat->nodes[pat->node_count]) < 0) {
-            return CBM_NOT_FOUND;
+            pat->node_count++;
+            goto fail;
         }
         pat->node_count++;
     }
     return 0;
+
+fail:
+    free_pattern(pat);
+    memset(pat, 0, sizeof(*pat));
+    return CBM_NOT_FOUND;
 }
 
 /* Parse UNWIND [...] AS var clause into query */

@@ -1601,8 +1601,12 @@ fuzz:
 	$(MAKE) -f Makefile.cbm build/fuzz/cbm-fuzz BUILD_DIR=build/fuzz \
 		CC=$(FUZZ_CC) CXX=$(FUZZ_CXX) SANITIZE="$(FUZZ_SANITIZE)"
 
+# -fsanitize-link-c++-runtime: the link runs through the C driver, which on
+# Linux leaves out UBSan's C++ runtime, but the C++ objects (preprocessor,
+# simplecpp) carry -fsanitize=vptr checks that need it
+# (__ubsan_vptr_type_cache, __ubsan_handle_dynamic_type_cache_miss).
 $(BUILD_DIR)/cbm-fuzz: $(FUZZ_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -fsanitize=fuzzer -o $@ \
+	$(CC) $(CFLAGS_TEST) -fsanitize=fuzzer -fsanitize-link-c++-runtime -o $@ \
 		$(FUZZ_SRC) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \

@@ -274,11 +274,17 @@ echo "--- Credential pattern detection ---"
 CRED_PATTERNS='password=|secret=|api_key=|apikey=|auth_token=|private_key='
 if grep -iE "$CRED_PATTERNS" "$STRINGS_FILE" > "$SEC_CREDS" 2>/dev/null; then
     # Monaco 0.56.0 quick-input password mode is a boolean/UI property, not a
-    # credential. Reviewed full lines: assets/index-B4p3fUhm.js:938 (15,643
-    # bytes) and :940 (72,461 bytes). These hashes exempt no command or URL.
+    # credential. Reviewed full lines of the graph-ui bundle as CI builds it
+    # since #2068: 15,644 and 72,472 bytes; every match is the input box's
+    # password-mode flag (_password=!1, password=!!e.password,
+    # inputBox.password=this.password, inputBox.password=!1). The same two lines
+    # appear on every platform. These hashes exempt no command or URL.
+    # A rebuilt bundle changes these bytes: the smoke log prints the lines,
+    # re-review them and replace both hashes (the 09-09 pair for
+    # assets/index-B4p3fUhm.js stopped matching with #2068).
     filter_reviewed_lines "$SEC_CREDS" \
-        91e70ce96dc9392c3091e0e06a838ad43a0c625b007e9e2ff6256a6d4824e9f2 \
-        6e393242a92967b3d1bd03420d0bdfc42b80f18407ef393652580483d2177633
+        8b4df6dea02b9433ac5b7ddb9f186c0f38c9f016fa8c610aa9ef987ae4bd81cf \
+        e4ef9bacb65321a35ae24f154aede5ea157d7c2f7e084c1c6adcd4d33b520325
 fi
 if [ -s "$SEC_CREDS" ]; then
     echo "BLOCKED: Credential patterns found in binary:"
