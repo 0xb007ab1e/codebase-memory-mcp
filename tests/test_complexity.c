@@ -67,6 +67,13 @@
  * lsp_resolve.h — re-declared here to avoid pulling that header's statics). */
 extern _Atomic uint64_t g_lsp_tail_lookups;
 extern _Atomic uint64_t g_lsp_tail_candidates;
+/* Infra resolver candidate counters (pass_k8s.c, pass_operator.c,
+ * pass_shell.c, pass_terraform.c). */
+extern _Atomic uint64_t g_k8s_candidates;
+extern _Atomic uint64_t g_op_candidates;
+extern _Atomic uint64_t g_sh_candidates;
+extern _Atomic uint64_t g_tf_candidates;
+extern _Atomic uint64_t g_dk_hub_edges;
 
 /* ── Corpus scale ──────────────────────────────────────────────────────
  * Small on purpose: the gate reads exponents from ratios, not magnitudes.
@@ -166,8 +173,9 @@ static const CxTemplate CX_TEMPLATES[] = {
 };
 enum { CX_TEMPLATE_COUNT = sizeof(CX_TEMPLATES) / sizeof(CX_TEMPLATES[0]) };
 
-/* Fixture-dir provider: tests/fixtures/complexity/<lang-name>/ — every file in
- * it is copied verbatim into each module dir. Lets a new language join the
+/* Fixture-dir provider: tests/fixtures/complexity/<lang-name>/ — every file
+ * and directory in it (dot-names aside) is copied verbatim into each module
+ * dir. Lets a new language join the
  * guard by dropping fixtures, with no edit to this suite. */
 static bool cx_fixture_dir_for(CBMLanguage lang, char *out, size_t cap) {
     const char *name = cbm_language_name(lang);
@@ -203,6 +211,36 @@ static int cx_copy_file(const char *src, const char *dst) {
     return 0;
 }
 
+/* A fixture entry into `dst`: a file, or a directory with its contents. */
+static int cx_copy_entry(const char *src, const char *dst, bool is_dir) {
+    if (!is_dir) {
+        return cx_copy_file(src, dst);
+    }
+    if (th_mkdir_p(dst) != 0) {
+        return -1;
+    }
+    cbm_dir_t *d = cbm_opendir(src);
+    if (!d) {
+        return -1;
+    }
+    int rc = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        if (entry->name[0] == '.') {
+            continue;
+        }
+        char from[1024];
+        char to[1024];
+        snprintf(from, sizeof(from), "%s/%s", src, entry->name);
+        snprintf(to, sizeof(to), "%s/%s", dst, entry->name);
+        if (cx_copy_entry(from, to, entry->is_dir) != 0) {
+            rc = -1;
+        }
+    }
+    cbm_closedir(d);
+    return rc;
+}
+
 /* ── Corpus builder ──────────────────────────────────────────────────── */
 
 static int cx_build_corpus(const char *root, int k_modules) {
@@ -230,15 +268,8 @@ static int cx_build_corpus(const char *root, int k_modules) {
      * k module copies. Distinct paths make distinct modules/QNs, which is all
      * the independence argument needs. */
     for (int lang = 0; lang < CBM_LANG_COUNT; lang++) {
-        bool templated = false;
-        for (int t = 0; t < CX_TEMPLATE_COUNT; t++) {
-            if (CX_TEMPLATES[t].lang == (CBMLanguage)lang) {
-                templated = true;
-            }
-        }
-        if (templated) {
-            continue;
-        }
+        /* a templated language may add fixtures too (Go: the operator
+         * corpus); they land in their own fx_<lang> root */
         char fixdir[512];
         if (!cx_fixture_dir_for((CBMLanguage)lang, fixdir, sizeof(fixdir))) {
             continue;
@@ -261,7 +292,7 @@ static int cx_build_corpus(const char *root, int k_modules) {
                 char src[1024];
                 snprintf(src, sizeof(src), "%s/%s", fixdir, entry->name);
                 snprintf(path, sizeof(path), "%s/%s", dir, entry->name);
-                (void)cx_copy_file(src, path);
+                (void)cx_copy_entry(src, path, entry->is_dir);
             }
         }
         cbm_closedir(d);
@@ -342,6 +373,25 @@ static void cx_pass_sink(const char *line) {
     g_cx_passes[n].ms = atol(ee + 11);
 }
 
+/* Fixture-provided infra corpora (tests/fixtures/complexity/<name>/), scoped
+ * by their copy root: Kubernetes manifests with a kustomization (and a Flux
+ * HelmRelease whose chartRef names an OCIRepository), a Go operator
+ * (controller, API types with +groupName, an embedded CRD, a chart loader), a
+ * shell deploy chain (composite CI action -> make -> scripts -> kubectl / helm
+ * of the copy's own manifests and chart), and Terraform helm_releases (one of
+ * a chart dir of the module, one of an external chart). An API
+ * group/kind is one identity across a repository: copies declaring the same
+ * one ARE joined (a CRD links to every package marking its group), so the
+ * fixtures' CRDs use groups no copy's Go code declares -- the guard measures
+ * accidental growth, not that by-design join. The container layer (Docker)
+ * has Dockerfiles with stage ENV, an ENTRYPOINT script and a compose project
+ * building two components of one repository; an image repository is one
+ * identity too, so every copy's builds of it join one Image -- that join
+ * must stay linear (the component split examines its edges). */
+static const char *const CX_INFRA_DIRS[] = {"fx_Kubernetes", "fx_Go", "fx_Bash", "fx_HCL",
+                                            "fx_Dockerfile"};
+enum { CX_INFRA_COUNT = sizeof(CX_INFRA_DIRS) / sizeof(CX_INFRA_DIRS[0]) };
+
 typedef struct {
     int nodes;
     int edges;
@@ -357,6 +407,13 @@ typedef struct {
     uint64_t fallback_rows;
     uint64_t imp_nodes;       /* symbols scored by the importance pass */
     uint64_t imp_name_visits; /* same-name-group members visited by that pass */
+    uint64_t k8s_candidates;  /* objects the K8s resolvers examined */
+    uint64_t op_candidates;   /* Go types / dirs the operator pass examined */
+    uint64_t sh_candidates;   /* paths / make rules the shell layer examined */
+    uint64_t tf_candidates;   /* blocks the Terraform layer examined */
+    uint64_t dk_hub_edges;    /* Image edges the component split examined */
+    int infra_nodes[CX_INFRA_COUNT];
+    int infra_edges[CX_INFRA_COUNT];
     double wall_s;
 } CxMetrics;
 
@@ -379,6 +436,11 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     uint64_t fb0 = cbm_pp_lsp_linear_fallback_rows();
     uint64_t in0 = atomic_load_explicit(&g_importance_nodes, memory_order_relaxed);
     uint64_t iv0 = atomic_load_explicit(&g_importance_name_visits, memory_order_relaxed);
+    uint64_t kc0 = atomic_load_explicit(&g_k8s_candidates, memory_order_relaxed);
+    uint64_t oc0 = atomic_load_explicit(&g_op_candidates, memory_order_relaxed);
+    uint64_t sc0 = atomic_load_explicit(&g_sh_candidates, memory_order_relaxed);
+    uint64_t fc0 = atomic_load_explicit(&g_tf_candidates, memory_order_relaxed);
+    uint64_t dh0 = atomic_load_explicit(&g_dk_hub_edges, memory_order_relaxed);
 
     atomic_store_explicit(&g_cx_pass_count, 0, memory_order_relaxed);
     cbm_log_set_sink_ex(cx_pass_sink, CBM_LOG_SINK_TEE);
@@ -416,6 +478,11 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     out->imp_nodes = atomic_load_explicit(&g_importance_nodes, memory_order_relaxed) - in0;
     out->imp_name_visits =
         atomic_load_explicit(&g_importance_name_visits, memory_order_relaxed) - iv0;
+    out->k8s_candidates = atomic_load_explicit(&g_k8s_candidates, memory_order_relaxed) - kc0;
+    out->op_candidates = atomic_load_explicit(&g_op_candidates, memory_order_relaxed) - oc0;
+    out->sh_candidates = atomic_load_explicit(&g_sh_candidates, memory_order_relaxed) - sc0;
+    out->tf_candidates = atomic_load_explicit(&g_tf_candidates, memory_order_relaxed) - fc0;
+    out->dk_hub_edges = atomic_load_explicit(&g_dk_hub_edges, memory_order_relaxed) - dh0;
 
     cbm_store_t *s = cbm_store_open_path(db_path);
     if (!s) {
@@ -426,6 +493,10 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     for (int t = 0; t < CX_TEMPLATE_COUNT; t++) {
         out->lang_nodes[t] = cbm_store_count_nodes_scoped(s, project, CX_TEMPLATES[t].dirname);
         out->lang_edges[t] = cbm_store_count_edges_scoped(s, project, CX_TEMPLATES[t].dirname);
+    }
+    for (int i = 0; i < CX_INFRA_COUNT; i++) {
+        out->infra_nodes[i] = cbm_store_count_nodes_scoped(s, project, CX_INFRA_DIRS[i]);
+        out->infra_edges[i] = cbm_store_count_edges_scoped(s, project, CX_INFRA_DIRS[i]);
     }
     cbm_store_close(s);
     return 0;
@@ -525,6 +596,59 @@ TEST(complexity_replicated_modules_scale_linearly) {
         printf("    %-8s nodes %d -> %d (ratio %.2f)\n", CX_TEMPLATES[t].dirname, a->lang_nodes[t],
                b->lang_nodes[t], lr);
         ASSERT_TRUE(lr >= CX_RATIO_LO && lr <= CX_RATIO_HI);
+    }
+    PASS();
+}
+
+/* The infra resolvers (K8s references / selectors / CRDs / chartRefs, the Go
+ * operator's controller kinds, CRD types and loaded charts, the shell layer's
+ * manifest dirs and make rules, Terraform's helm_release blocks) examine
+ * candidates by name. Independent
+ * copies share every name, so a candidate set that is not scoped to the
+ * bundle / package / module grows with the copy count: the examined count
+ * goes ~4x per doubling while the edges stay ~2x. Both are gated, on the
+ * fixture corpora's own subtrees, and neither may be vacuous. */
+TEST(complexity_infra_resolution_is_linear) {
+    if (cx_measure_pair() != 0) {
+        FAIL("failed to build/run the complexity corpus pair");
+    }
+    const CxMetrics *a = &g_cx_base;
+    const CxMetrics *b = &g_cx_doubled;
+    printf("    k8s_candidates %llu -> %llu  op_candidates %llu -> %llu\n",
+           (unsigned long long)a->k8s_candidates, (unsigned long long)b->k8s_candidates,
+           (unsigned long long)a->op_candidates, (unsigned long long)b->op_candidates);
+    ASSERT_GT((long long)a->k8s_candidates, 0);
+    ASSERT_GT((long long)a->op_candidates, 0);
+    double kr = cx_ratio((double)b->k8s_candidates, (double)a->k8s_candidates);
+    double orr = cx_ratio((double)b->op_candidates, (double)a->op_candidates);
+    printf("    k8s_candidates ratio %.2f  op_candidates ratio %.2f\n", kr, orr);
+    ASSERT_TRUE(kr >= CX_RATIO_LO && kr <= CX_RATIO_HI);
+    ASSERT_TRUE(orr >= CX_RATIO_LO && orr <= CX_RATIO_HI);
+    printf("    sh_candidates %llu -> %llu  tf_candidates %llu -> %llu\n",
+           (unsigned long long)a->sh_candidates, (unsigned long long)b->sh_candidates,
+           (unsigned long long)a->tf_candidates, (unsigned long long)b->tf_candidates);
+    ASSERT_GT((long long)a->sh_candidates, 0);
+    ASSERT_GT((long long)a->tf_candidates, 0);
+    double sr = cx_ratio((double)b->sh_candidates, (double)a->sh_candidates);
+    double fr = cx_ratio((double)b->tf_candidates, (double)a->tf_candidates);
+    printf("    sh_candidates ratio %.2f  tf_candidates ratio %.2f\n", sr, fr);
+    ASSERT_TRUE(sr >= CX_RATIO_LO && sr <= CX_RATIO_HI);
+    ASSERT_TRUE(fr >= CX_RATIO_LO && fr <= CX_RATIO_HI);
+    printf("    dk_hub_edges %llu -> %llu\n", (unsigned long long)a->dk_hub_edges,
+           (unsigned long long)b->dk_hub_edges);
+    ASSERT_GT((long long)a->dk_hub_edges, 0);
+    double dr = cx_ratio((double)b->dk_hub_edges, (double)a->dk_hub_edges);
+    printf("    dk_hub_edges ratio %.2f\n", dr);
+    ASSERT_TRUE(dr >= CX_RATIO_LO && dr <= CX_RATIO_HI);
+    for (int i = 0; i < CX_INFRA_COUNT; i++) {
+        ASSERT_GT(a->infra_nodes[i], 0);
+        ASSERT_GT(a->infra_edges[i], 0);
+        double nr = cx_ratio(b->infra_nodes[i], a->infra_nodes[i]);
+        double er = cx_ratio(b->infra_edges[i], a->infra_edges[i]);
+        printf("    %-14s nodes %d -> %d (%.2f)  edges %d -> %d (%.2f)\n", CX_INFRA_DIRS[i],
+               a->infra_nodes[i], b->infra_nodes[i], nr, a->infra_edges[i], b->infra_edges[i], er);
+        ASSERT_TRUE(nr >= CX_RATIO_LO && nr <= CX_RATIO_HI);
+        ASSERT_TRUE(er >= CX_RATIO_LO && er <= CX_RATIO_HI);
     }
     PASS();
 }
@@ -845,6 +969,7 @@ SUITE(complexity) {
     RUN_TEST(complexity_rescript_error_recovery_lexing_is_linear);
     RUN_TEST(complexity_replicated_modules_scale_linearly);
     RUN_TEST(complexity_perfile_registry_work_is_linear);
+    RUN_TEST(complexity_infra_resolution_is_linear);
     RUN_TEST(complexity_importance_scoring_is_linear);
     RUN_TEST(complexity_shared_package_growth_stays_linear);
     RUN_TEST(complexity_throughput_report_written);

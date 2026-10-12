@@ -308,6 +308,11 @@ void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
 typedef struct {
     const char *project_name; /* borrowed from pipeline */
     const char *repo_path;    /* borrowed from pipeline */
+    /* An incremental run: the unchanged files whose earlier run declared
+     * image builds (docker build ...), read again by the shell pass, as
+     * those edges are recomputed whole. Borrowed; NULL in a full run. */
+    const char *const *build_decl_files;
+    int build_decl_count;
     cbm_gbuf_t *gbuf;         /* owned by pipeline */
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
@@ -906,11 +911,6 @@ int cbm_parse_compile_commands(const char *json_data, const char *repo_path, cha
 /* ── Infrascan helpers (pass_infrascan.c) ─────────────────────────── */
 
 /* File identification helpers */
-bool cbm_is_dockerfile(const char *name);
-bool cbm_is_compose_file(const char *name);
-bool cbm_is_cloudbuild_file(const char *name);
-bool cbm_is_env_file(const char *name);
-bool cbm_is_shell_script(const char *name, const char *ext);
 bool cbm_is_kustomize_file(const char *name);
 bool cbm_is_k8s_manifest(const char *name, const char *content);
 
@@ -918,114 +918,24 @@ bool cbm_is_k8s_manifest(const char *name, const char *content);
 bool cbm_is_secret_binding(const char *key, const char *value);
 bool cbm_is_secret_value(const char *value);
 
-/* Clean JSON array brackets from CMD/ENTRYPOINT values.
- * E.g. ["./app", "--flag"] → ./app --flag
- * Writes result to out (up to out_sz). */
-void cbm_clean_json_brackets(const char *s, char *out, size_t out_sz);
-
-/* Key-value pair for environment variables / config entries */
+/* Helm Chart.yaml parse result: chart name + its dependencies (#338). */
+enum { CBM_HELM_NAME_MAX = 128, CBM_HELM_REPO_MAX = 512 };
 typedef struct {
-    char key[CBM_SZ_128];
-    char value[CBM_SZ_512];
-} cbm_env_kv_t;
-
-/* Dockerfile parsing result */
-typedef struct {
-    char base_image[CBM_SZ_256];
-    char stage_images[CBM_SZ_16][CBM_SZ_256];
-    char stage_names[CBM_SZ_16][CBM_SZ_128];
-    int stage_count;
-    char exposed_ports[CBM_SZ_16][CBM_SZ_32];
-    int port_count;
-    cbm_env_kv_t env_vars[CBM_SZ_64];
-    int env_count;
-    char build_args[CBM_SZ_32][CBM_SZ_128];
-    int build_arg_count;
-    char workdir[CBM_SZ_256];
-    char cmd[CBM_SZ_512];
-    char entrypoint[CBM_SZ_512];
-    char healthcheck[CBM_SZ_512];
-    char user[CBM_SZ_64];
-} cbm_dockerfile_result_t;
-
-/* Dotenv parsing result */
-typedef struct {
-    cbm_env_kv_t env_vars[CBM_SZ_64];
-    int env_count;
-} cbm_dotenv_result_t;
-
-/* Shell script parsing result */
-typedef struct {
-    char shebang[CBM_SZ_256];
-    cbm_env_kv_t env_vars[CBM_SZ_64];
-    int env_count;
-    char sources[CBM_SZ_16][CBM_SZ_256];
-    int source_count;
-    char docker_cmds[CBM_SZ_16][CBM_SZ_256];
-    int docker_cmd_count;
-} cbm_shell_result_t;
-
-/* Terraform variable */
-typedef struct {
-    char name[CBM_SZ_128];
-    char type[CBM_SZ_64];
-    char default_val[CBM_SZ_256];
-    char description[CBM_SZ_256];
-} cbm_tf_variable_t;
-
-/* Terraform resource / data source */
-typedef struct {
-    char type[CBM_SZ_128];
-    char name[CBM_SZ_128];
-} cbm_tf_resource_t;
-
-/* Terraform module */
-typedef struct {
-    char tf_name[CBM_SZ_128];
-    char source[CBM_SZ_256];
-} cbm_tf_module_t;
-
-/* Terraform parsing result */
-typedef struct {
-    cbm_tf_resource_t resources[CBM_SZ_32];
-    int resource_count;
-    cbm_tf_variable_t variables[CBM_SZ_32];
-    int variable_count;
-    char outputs[CBM_SZ_32][CBM_SZ_128];
-    int output_count;
-    char providers[CBM_SZ_16][CBM_SZ_128];
-    int provider_count;
-    cbm_tf_module_t modules[CBM_SZ_16];
-    int module_count;
-    cbm_tf_resource_t data_sources[CBM_SZ_16];
-    int data_source_count;
-    char backend[CBM_SZ_128];
-    bool has_locals;
-} cbm_terraform_result_t;
-
-/* Parse a Dockerfile from source text. Returns 0 if parsed, -1 if empty/invalid. */
-int cbm_parse_dockerfile_source(const char *source, cbm_dockerfile_result_t *out);
-
-/* Parse a .env file from source text. Returns 0 if parsed, -1 if empty. */
-int cbm_parse_dotenv_source(const char *source, cbm_dotenv_result_t *out);
-
-/* Parse a shell script from source text. Returns 0 if parsed, -1 if empty. */
-int cbm_parse_shell_source(const char *source, cbm_shell_result_t *out);
-
-/* Parse a Terraform file from source text. Returns 0 if parsed, -1 if empty. */
-int cbm_parse_terraform_source(const char *source, cbm_terraform_result_t *out);
-
-/* Helm Chart.yaml parse result: chart name + dependency chart names (#338). */
-enum { CBM_HELM_MAX_DEPS = 128, CBM_HELM_NAME_MAX = 128 };
+    char name[CBM_HELM_NAME_MAX];
+    char repository[CBM_HELM_REPO_MAX]; /* "" when the entry names none */
+} cbm_helm_dep_t;
 typedef struct {
     char chart_name[CBM_HELM_NAME_MAX];
-    char deps[CBM_HELM_MAX_DEPS][CBM_HELM_NAME_MAX];
+    cbm_helm_dep_t *deps; /* heap-owned; release with cbm_helm_chart_free */
     int dep_count;
+    int dep_cap;
 } cbm_helm_chart_t;
 
-/* Parse a Helm Chart.yaml: top-level `name:` and `dependencies:` list names.
- * Returns 0 if parsed (name or deps found), -1 otherwise. */
+/* Parse a Helm Chart.yaml: top-level `name:` and every `dependencies:` entry's
+ * name and repository. Returns 0 if parsed (name or deps found), -1 otherwise;
+ * either way the caller releases `out` with cbm_helm_chart_free. */
 int cbm_parse_helm_chart(const char *source, cbm_helm_chart_t *out);
+void cbm_helm_chart_free(cbm_helm_chart_t *hc);
 
 /* Build an infrastructure QN. Caller must free the returned string. */
 char *cbm_infra_qn(const char *project_name, const char *rel_path, const char *infra_type,
@@ -1160,6 +1070,116 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project);
 /* Pre-dump pass: config ↔ code linking. */
 int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
 
+/* Go Kubernetes operators (pass_operator.c): controller-runtime controllers
+ * HANDLES the kinds they reconcile, CRDs -> their Go types, //go:embed files.
+ * Runs after USAGE resolution. */
+int cbm_pipeline_pass_operator(cbm_pipeline_ctx_t *ctx);
+
+/* Shell scripts, Make recipes and the commands CI runs (pass_shell.c): a
+ * command that puts manifests, kustomizations or charts on a cluster DEPLOYS
+ * them; one that starts a program by a path, or a script of the repository,
+ * SPAWNS it. Run at the end of the K8s pass, over the same files. */
+void cbm_pipeline_pass_shell(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
+
+/* One command line a CI configuration runs (pass_ci.c). */
+typedef struct {
+    const char *ci;         /* "github-actions" | "prow" */
+    const char *job;        /* the job; NULL: none (a composite action's step) */
+    const char *text;       /* shell text; CBM_SZ_16 zero bytes past len */
+    size_t len;             /* bytes of text */
+    int row;                /* 0-based source row of the text's first line */
+    const char *wd;         /* start directory, repo-relative ("" = root); NULL: unknown */
+    const char *action_dir; /* a composite action's directory; NULL: none */
+    const char **env;       /* name, value pairs (a value NULL: unknown) */
+    int nenv;               /* pairs in env */
+    bool exec;              /* an argv exec'd without a shell, quoted into text */
+} cbm_ci_cmd_t;
+
+typedef void (*cbm_ci_cmd_fn)(const cbm_ci_cmd_t *cmd, void *ud);
+
+/* `rel` is a CI configuration by its path: a GitHub workflow
+ * (.github/workflows/<name>.yml|yaml) or a composite action (action.yml|yaml). */
+bool cbm_ci_path(const char *rel);
+
+/* Hand each command line the CI configuration `rel` (YAML text src) runs to
+ * fn: GitHub Actions run: steps for a workflow or composite action, else
+ * Prow job containers. Strings live in arena `a`. */
+void cbm_ci_commands(CBMArena *a, const char *rel, const char *src, size_t len, cbm_ci_cmd_fn fn,
+                     void *ud);
+
+/* An image a build configuration builds from a Dockerfile (pass_ci.c). */
+typedef struct {
+    const char *via;        /* "skaffold" / "compose" */
+    const char *image;      /* the reference, variables expanded */
+    const char *dockerfile; /* repository path */
+    int line;
+} cbm_build_site_t;
+typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
+
+/* A compose service (pass_ci.c): its image (a reference, variables
+ * expanded; NULL: none or unknown), the Dockerfile its build names
+ * (repository path; NULL: no build, or unknown), the service names its
+ * depends_on and links list, and the names of the environment variables its
+ * environment sets (map keys / list items' names -- never a value), with
+ * their 1-based lines. */
+typedef struct {
+    const char *name;
+    const char *image;
+    const char *dockerfile;
+    const char **deps;
+    int ndeps;
+    const char **env;
+    const int *env_lines;
+    int nenv;
+    int line;
+    int end_line;
+} cbm_compose_service_t;
+typedef void (*cbm_compose_service_fn)(const cbm_compose_service_t *svc, void *ud);
+
+/* Hand fn each service of compose file `rel` (YAML text src; `dotenv` the
+ * project's .env text or NULL). Nothing for a file that is no compose file. */
+void cbm_compose_services(CBMArena *a, const char *rel, const char *src, size_t len,
+                          const char *dotenv, cbm_compose_service_fn fn, void *ud);
+
+/* Whether `rel` names a build configuration: skaffold*.yaml|yml,
+ * [docker-]compose[.x].yaml|yml. */
+bool cbm_build_path(const char *rel);
+
+/* Hand fn each image build configuration `rel` (YAML text src) declares:
+ * skaffold build.artifacts (top level and profiles; the docker builder),
+ * compose services with build and image. `dotenv` (may be NULL): the text of
+ * the compose project's .env, whose variables compose interpolates. */
+void cbm_build_sites(CBMArena *a, const char *rel, const char *src, size_t len, const char *dotenv,
+                     cbm_build_site_fn fn, void *ud);
+
+/* Terraform / OpenTofu modules (pass_terraform.c): a helm_release DEPLOYS its
+ * chart. Run at the end of the K8s pass, over the same files. */
+void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                 int file_count);
+
+/* The Image node of image reference `ref` (its normalised repository:
+ * docker.io for no registry host, library/ for an official image; tag and
+ * digest dropped), made when new; 0 for scratch or no image. */
+int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref);
+
+/* Environment variable `key` that `owner` sets (pass_docker.c): a K8s or
+ * compose Resource for its container `container`, a Dockerfile Module for
+ * its image (container NULL). Makes the container-scoped EnvVar
+ * `<owner QN>#env/<container | ->/<key>` {env_key, scope, container,
+ * source}, owned by the owner's file at `line`, and owner -CONFIGURES
+ * {strategy:env_set, source}-> it. No edge to the global EnvVar of the key:
+ * the same name read elsewhere is another program's. `source` says where the
+ * value comes from; the value is never stored. 0 when `key` is no variable
+ * name ([A-Za-z_][A-Za-z0-9_.-]*). */
+int64_t cbm_pipeline_env_setter(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *owner,
+                                const char *container, const char *key, const char *source,
+                                int line);
+
+/* Container builds (pass_docker.c): a Dockerfile DEPENDS_ON the Images it
+ * builds on (FROM, COPY --from). Run at the end of the K8s pass. */
+void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                              int file_count);
+
 /* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
 int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
 
@@ -1236,25 +1256,13 @@ extern _Atomic uint64_t g_importance_name_visits;
  * closure-delta route actually took that path instead of passing vacuously. */
 extern _Atomic uint64_t g_importance_store_rows;
 
-/* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
-
-typedef struct {
-    char key[CBM_SZ_128];
-    char value[CBM_SZ_512];
-    char file_path[CBM_SZ_256];
-} cbm_env_binding_t;
-
-/* Scan a project directory for environment variable assignments with URL values.
- * Walks the filesystem, scans Dockerfiles, shell scripts, .env, YAML, TOML,
- * Terraform, and .properties files. Filters out secrets.
- * Returns number of bindings written to out (up to max_out).
- * NOTE: this walker currently has no production callers — it is exercised
- * only by tests. The _excluded variant honors discovery exclusions for
- * consistency with the pkgmap/path-alias walks (#792); the plain variant
- * scans unexcluded (NULL exclusion list). */
-int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int max_out);
-int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t *out, int max_out,
-                                       char **excluded_dirs, int excluded_count);
+/* Work counters of the infra resolvers, gated by the complexity suite:
+ * candidate objects the K8s pass examines for references, selectors and
+ * CRDs (pass_k8s.c), and candidate Go types / package dirs the operator pass
+ * examines (pass_operator.c). Independent copies must grow them linearly. */
+extern _Atomic uint64_t g_k8s_candidates;
+extern _Atomic uint64_t g_op_candidates;
+extern _Atomic uint64_t g_sh_candidates;
 
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
@@ -1404,6 +1412,41 @@ int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const ch
 void cbm_delta_free_snapshot(cbm_delta_saved_edge_t *items, int count);
 int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *paths,
                     int path_count);
+/* Delete the project's `label` nodes no edge of `edge_types` (NULL-terminated)
+ * touches as source or target (a Process whose last spawner was purged, an
+ * Image no Dockerfile or workload names any more); returns how many, or -1
+ * on failure. */
+int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const char *label,
+                                const char *const *edge_types);
+/* An Image's build edges (Image -DEPENDS_ON {via:build}-> Dockerfile,
+ * pass_docker.c) belong to the build configuration declaring them, not to
+ * either end: every run recomputes them whole from all build files, the
+ * incremental routes drop the old set first and write the new one even
+ * between pre-existing nodes. */
+#define CBM_BUILD_EDGE_TYPE "DEPENDS_ON"
+#define CBM_BUILD_EDGE_SOURCE "Image"
+
+/* The files whose File node the shell pass marked as running a container
+ * build ({"declares_build":true}), into arena `a`; returns how many, or -1
+ * on failure. */
+int cbm_delta_build_decl_files(cbm_store_t *store, const char *project, CBMArena *a,
+                               const char ***out);
+
+/* The QNs of the component Images a split repository gave its components
+ * (pass_docker.c P4.2b: Images with a `component` property), sorted, into
+ * arena `a`; returns how many, or -1 on failure. A closure repair compares
+ * them with the run's own: references in files it does not repair point at
+ * the old ones. */
+int cbm_delta_image_components(cbm_store_t *store, const char *project, CBMArena *a,
+                               const char ***out);
+
+/* Delete the project's `type` edges whose source node has label `label`;
+ * returns how many, or -1 on failure. */
+int cbm_delta_drop_edges_from_label(cbm_store_t *store, const char *project, const char *type,
+                                    const char *label);
+/* The edges that keep a file-less shared node alive. */
+#define SH_PROCESS_EDGES ((const char *const[]){"SPAWNS", NULL})
+#define DK_IMAGE_EDGES ((const char *const[]){"DEPENDS_ON", "USAGE", NULL})
 /* Pre-seed proxy nodes with their REAL database ids and move the gbuf id
  * watermark above MAX(id); returns that max id, or -1 on failure. */
 int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf);

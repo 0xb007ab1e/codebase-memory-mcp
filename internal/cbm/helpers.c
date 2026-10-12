@@ -1651,7 +1651,29 @@ bool cbm_is_module_level(TSNode node, CBMLanguage lang) {
 // Mirrors Go's fqn.Compute(): project + path_parts_dotted + name
 
 // Internal helper: find extension start in basename (returns length without ext)
+/* A container build file named for its variant ("Dockerfile.debug") keeps
+ * the suffix (no language extension; dropping it gives the variant the QN of
+ * the plain Dockerfile beside it). Mirrors strip_file_extension in
+ * src/pipeline/fqn.c -- both must agree. */
+static bool build_file_variant(const char *s, size_t len) {
+    size_t b = len;
+    while (b > 0 && s[b - SKIP_ONE] != '/') {
+        b--;
+    }
+    static const char *const BASES[] = {"Dockerfile.", "Containerfile."};
+    for (size_t i = 0; i < sizeof(BASES) / sizeof(BASES[0]); i++) {
+        size_t bl = strlen(BASES[i]);
+        if (len - b > bl && strncmp(s + b, BASES[i], bl) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static size_t strip_ext_len(const char *s, size_t len) {
+    if (build_file_variant(s, len)) {
+        return len;
+    }
     for (size_t i = len; i > 0; i--) {
         if (s[i - SKIP_ONE] == '.') {
             /* A dot at the very start of a filename segment (index 0, or right

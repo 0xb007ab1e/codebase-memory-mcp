@@ -3409,6 +3409,609 @@ TEST(pipeline_staged_publish_commits_below_full_sync_issue1419) {
     PASS();
 }
 
+/* Kubernetes inputs reach past their own file: a Service selects a workload
+ * in another file of its bundle, and a kustomization decides the namespace
+ * of every object it builds. The closure repair re-runs the K8s pass over
+ * its plan only, so editing either must still leave the graph a fresh index
+ * builds. */
+static int k8s_inc_index(const char *repo, const char *db) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
+    if (!p) {
+        return -1;
+    }
+    (void)cbm_pipeline_set_project_name(p, "k8sinc");
+    cbm_pipeline_set_persistence(p, false);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+static int k8s_inc_count(const char *db_path, const char *sql) {
+    sqlite3 *db = NULL;
+    int n = -1;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
+            sqlite3_step(stmt) == SQLITE_ROW) {
+            n = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(db);
+    return n;
+}
+
+TEST(incremental_k8s_edits_reach_other_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_k8sinc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "kustomization.yaml", "resources:\n  - svc.yaml\n  - deploy.yaml\n");
+    write_temp_file(tmp, "svc.yaml",
+                    "apiVersion: v1\nkind: Service\nmetadata:\n  name: db\nspec:\n"
+                    "  selector:\n    app: db\n");
+    write_temp_file(tmp, "deploy.yaml",
+                    "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: db\nspec:\n"
+                    "  template:\n    metadata:\n      labels:\n        app: db\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/k8sinc.db", tmp);
+    static const char links[] = "SELECT COUNT(*) FROM edges WHERE type='INFRA_MAPS'";
+    static const char shop[] = "SELECT COUNT(*) FROM nodes WHERE label='Resource' AND "
+                               "json_extract(properties,'$.obj_key')='apps/Deployment/shop/db'";
+
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int links_full = k8s_inc_count(db_path, links);
+    /* the Service's file changes, the Deployment's does not */
+    write_temp_file(tmp, "svc.yaml",
+                    "apiVersion: v1\nkind: Service\nmetadata:\n  name: db\nspec:\n"
+                    "  selector:\n    app: db\n# edited\n");
+    int rc_svc = k8s_inc_index(tmp, db_path);
+    int links_after_svc = k8s_inc_count(db_path, links);
+    /* the build gains a namespace: deploy.yaml's object lives in it now */
+    write_temp_file(tmp, "kustomization.yaml",
+                    "namespace: shop\nresources:\n  - svc.yaml\n  - deploy.yaml\n");
+    int rc_kust = k8s_inc_index(tmp, db_path);
+    int shop_after_kust = k8s_inc_count(db_path, shop);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(links_full, 1);
+    ASSERT_EQ(rc_svc, 0);
+    ASSERT_EQ(links_after_svc, 1);
+    ASSERT_EQ(rc_kust, 0);
+    ASSERT_EQ(shop_after_kust, 1);
+    PASS();
+}
+
+/* A script's deploy commands link nodes of other files (pass_shell.c): the
+ * closure repair re-reads the changed script alone, so editing it must still
+ * leave the edges a fresh index builds. */
+TEST(incremental_shell_deploy_edit_keeps_its_edges) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_shinc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "manifests/app.yaml",
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\n");
+    write_temp_file(tmp, "hack/deploy.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")/..\"\nkubectl apply -f manifests/app.yaml\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/shinc.db", tmp);
+    static const char deploys[] = "SELECT COUNT(*) FROM edges WHERE type='DEPLOYS'";
+
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int deploys_full = k8s_inc_count(db_path, deploys);
+    write_temp_file(tmp, "hack/deploy.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")/..\"\nkubectl apply -f manifests/app.yaml\n"
+                    "# edited\n");
+    int rc_edit = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    int deploys_after = k8s_inc_count(db_path, deploys);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(deploys_full, 1);
+    ASSERT_EQ(rc_edit, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(deploys_after, 1);
+    PASS();
+}
+
+/* Deleting the only file that starts a program leaves no Process node
+ * behind -- a full index never makes one without a SPAWNS edge. One script
+ * (pass_shell.c) and one Python call (pass_spawns.c) go; the program a kept
+ * script starts stays. `legacy`: through the full-load route, else the
+ * closure-repair route. Returns the Process count after the deletion, or -1;
+ * *route: the route taken. */
+static int incremental_spawner_delete(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_spawngc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return -1;
+    }
+    write_temp_file(tmp, "hack/a.sh", "#!/bin/sh\n./bin/tool-a --x\n");
+    write_temp_file(tmp, "hack/b.sh", "#!/bin/sh\n./bin/tool-b\n");
+    write_temp_file(tmp, "app.py",
+                    "import subprocess\n\n\ndef run():\n    subprocess.run([\"tool-c\"])\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/spawngc.db", tmp);
+    static const char processes[] = "SELECT COUNT(*) FROM nodes WHERE label='Process'";
+    int full = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/hack/a.sh", tmp);
+    (void)remove(path);
+    snprintf(path, sizeof(path), "%s/app.py", tmp);
+    (void)remove(path);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    int after = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return full == 3 ? after : -1;
+}
+
+TEST(incremental_deleted_spawner_drops_its_process) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    int left = incremental_spawner_delete(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(left, 1);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    left = incremental_spawner_delete(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(left, 1);
+#endif
+    PASS();
+}
+
+/* Deleting the only Dockerfile naming an image leaves no Image node behind;
+ * the image another Dockerfile still names stays. `legacy`: through the
+ * full-load route, else the closure-repair route. Returns the Image count
+ * after the deletion, or -1; *route: the route taken. */
+static int incremental_dockerfile_delete(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_imagegc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return -1;
+    }
+    write_temp_file(tmp, "a/Dockerfile",
+                    "FROM alpine:3.20\nCOPY --from=docker.io/bitnami/kubectl:1.30 /k /k\n");
+    write_temp_file(tmp, "b/Dockerfile", "FROM alpine:3.19\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/imagegc.db", tmp);
+    static const char images[] = "SELECT COUNT(*) FROM nodes WHERE label='Image'";
+    int full = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, images) : -1;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/a/Dockerfile", tmp);
+    (void)remove(path);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    int after = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, images) : -1;
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return full == 2 ? after : -1;
+}
+
+/* Editing one Dockerfile keeps every image's build edge -- also the one
+ * between nodes that both pre-existed (Image -> the unchanged Dockerfile),
+ * which the incremental routes recompute whole. `legacy`: through the
+ * full-load route, else the closure-repair route. Returns the build edge
+ * count before / after as "full=N inc=M", or NULL; *route: the route taken. */
+static char *incremental_build_keep(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_buildkeep_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    write_temp_file(tmp, "src/web/Dockerfile", "FROM nginx:1.27\n");
+    write_temp_file(tmp, "src/api/Dockerfile", "FROM golang:1.22\n");
+    write_temp_file(tmp, "skaffold.yaml",
+                    "apiVersion: skaffold/v4beta6\nkind: Config\nbuild:\n  artifacts:\n"
+                    "    - image: web\n      context: src/web\n"
+                    "    - image: api\n      context: src/api\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/buildkeep.db", tmp);
+    static const char builds[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id WHERE e.type='DEPENDS_ON' "
+        "AND s.label='Image' AND json_extract(e.properties,'$.via')='build'";
+    int full = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, builds) : -1;
+    write_temp_file(tmp, "src/web/Dockerfile", "FROM nginx:1.27\n# edited\n");
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    char *out = NULL;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "full=%d inc=%d", full, k8s_inc_count(db_path, builds));
+        out = strdup(buf);
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return out;
+}
+
+TEST(incremental_dockerfile_edit_keeps_build_edges) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    char *got = incremental_build_keep(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "full=2 inc=2");
+    free(got);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    got = incremental_build_keep(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "full=2 inc=2");
+    free(got);
+#endif
+    PASS();
+}
+
+/* A compose file's edit replaces its build edges: the renamed image keeps
+ * no edge (nor node), the new one has its edge. `legacy`: through the
+ * full-load route, else the closure-repair route. Returns "old=N new=M"
+ * after the edit, or NULL; *route: the route taken. */
+static char *incremental_compose_edit(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_composeedit_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    write_temp_file(tmp, "src/web/Dockerfile", "FROM nginx:1.27\n");
+    write_temp_file(tmp, "src/api/Dockerfile", "FROM golang:1.22\n");
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  web:\n    image: acme/web-old\n    build: ./src/web\n"
+                    "  api:\n    image: acme/api\n    build: ./src/api\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/composeedit.db", tmp);
+    static const char old_img[] = "SELECT COUNT(*) FROM nodes WHERE label='Image' AND "
+                                  "name='docker.io/acme/web-old'";
+    static const char new_edge[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id WHERE e.type='DEPENDS_ON' "
+        "AND s.name='docker.io/acme/web-new'";
+    if (k8s_inc_index(tmp, db_path) != 0 || k8s_inc_count(db_path, old_img) != 1) {
+        th_rmtree(tmp);
+        return NULL;
+    }
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  web:\n    image: acme/web-new\n    build: ./src/web\n"
+                    "  api:\n    image: acme/api\n    build: ./src/api\n");
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    char *out = NULL;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "old=%d new=%d", k8s_inc_count(db_path, old_img),
+                 k8s_inc_count(db_path, new_edge));
+        out = strdup(buf);
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return out;
+}
+
+TEST(incremental_compose_edit_replaces_build_edges) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    char *got = incremental_compose_edit(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "old=0 new=1");
+    free(got);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    got = incremental_compose_edit(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "old=0 new=1");
+    free(got);
+#endif
+    PASS();
+}
+
+/* Renaming a variable in a compose service's environment (and, with
+ * `dockerfile`, in a Dockerfile's ENV) replaces its container-scoped EnvVar;
+ * the unchanged compose file and Dockerfile keep theirs, once. `legacy`:
+ * through the full-load route, else the closure-repair route (a renamed ENV
+ * is a new Variable name, which the closure route leaves to a full
+ * rebuild). Returns "old=N new=M keep=K", or NULL. */
+static char *incremental_env_edit(bool legacy, bool dockerfile, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_envedit_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    write_temp_file(tmp, "Dockerfile",
+                    dockerfile ? "FROM alpine:3.20\nENV OLD_D=1\n" : "FROM alpine:3.20\nENV KEEP_D=1\n");
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  web:\n    image: acme/web\n    environment:\n      OLD_C: x\n");
+    write_temp_file(tmp, "compose.other.yaml",
+                    "services:\n  api:\n    image: acme/api\n    environment:\n      - KEEP_C\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/envedit.db", tmp);
+    static const char old_q[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='EnvVar' AND name IN ('OLD_C','OLD_D')";
+    static const char new_q[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='CONFIGURES' AND json_extract(e.properties,'$.strategy')='env_set' AND "
+        "t.name IN ('NEW_C','NEW_D')";
+    static const char keep_q[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='CONFIGURES' AND json_extract(e.properties,'$.strategy')='env_set' AND "
+        "t.name IN ('KEEP_C','KEEP_D')";
+    if (k8s_inc_index(tmp, db_path) != 0 || k8s_inc_count(db_path, old_q) != (dockerfile ? 2 : 1) ||
+        k8s_inc_count(db_path, keep_q) != (dockerfile ? 1 : 2)) {
+        th_rmtree(tmp);
+        return NULL;
+    }
+    if (dockerfile) {
+        write_temp_file(tmp, "Dockerfile", "FROM alpine:3.20\nENV NEW_D=1\n");
+    }
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  web:\n    image: acme/web\n    environment:\n      NEW_C: x\n");
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    char *out = NULL;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "old=%d new=%d keep=%d", k8s_inc_count(db_path, old_q),
+                 k8s_inc_count(db_path, new_q), k8s_inc_count(db_path, keep_q));
+        out = strdup(buf);
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return out;
+}
+
+TEST(incremental_env_edit_replaces_scoped_envvars) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    char *got = incremental_env_edit(false, false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "old=0 new=1 keep=2");
+    free(got);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    got = incremental_env_edit(true, false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "old=0 new=1 keep=2");
+    free(got);
+    got = incremental_env_edit(true, true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "old=0 new=2 keep=1");
+    free(got);
+#endif
+    PASS();
+}
+
+/* A repository split by component (pass_docker.c P4.2b). `rename`: component
+ * b becomes bee -- the split changes, and the reference in compose.run.yaml,
+ * a file this run does not repair, must leave the old Image `*-b`: a closure
+ * repair cannot re-point it, so the run rebuilds. Else an edit keeping the
+ * split: a closure repair. Returns "repo=N b=M bimg=K" (runner's references
+ * to the repository Image / to `*-b`, `*-b` Images), or NULL. */
+static char *incremental_image_split(bool rename, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_imagesplit_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    write_temp_file(tmp, "svc/a/Dockerfile", "FROM alpine:3.20\n");
+    write_temp_file(tmp, "svc/b/Dockerfile", "FROM alpine:3.20\n");
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  a:\n    image: acme/demo:1-a\n    build: ./svc/a\n"
+                    "  b:\n    image: acme/demo:1-b\n    build: ./svc/b\n");
+    write_temp_file(tmp, "compose.run.yaml", "services:\n  runner:\n    image: acme/demo:2-b\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/imagesplit.db", tmp);
+    static const char to_repo[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id WHERE e.type='USAGE' AND s.name='Service/runner' AND "
+        "t.name='docker.io/acme/demo'";
+    static const char to_b[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id WHERE e.type='USAGE' AND s.name='Service/runner' AND "
+        "t.name='docker.io/acme/demo:*-b'";
+    static const char b_img[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Image' AND name='docker.io/acme/demo:*-b'";
+    if (k8s_inc_index(tmp, db_path) != 0 || k8s_inc_count(db_path, to_b) != 1) {
+        th_rmtree(tmp);
+        return NULL;
+    }
+    write_temp_file(tmp, "compose.yaml",
+                    rename ? "services:\n  a:\n    image: acme/demo:1-a\n    build: ./svc/a\n"
+                             "  b:\n    image: acme/demo:1-bee\n    build: ./svc/b\n"
+                           : "services:\n  a:\n    image: acme/demo:1-a\n    build: ./svc/a\n"
+                             "    environment:\n      - MODE\n"
+                             "  b:\n    image: acme/demo:1-b\n    build: ./svc/b\n");
+    char *out = NULL;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "repo=%d b=%d bimg=%d", k8s_inc_count(db_path, to_repo),
+                 k8s_inc_count(db_path, to_b), k8s_inc_count(db_path, b_img));
+        out = strdup(buf);
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return out;
+}
+
+TEST(incremental_image_split_change_rebuilds) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    char *got = incremental_image_split(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "repo=1 b=0 bimg=0");
+    free(got);
+    got = incremental_image_split(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "repo=0 b=1 bimg=1");
+    free(got);
+    PASS();
+}
+
+/* A compose project's .env feeds its compose file (variables in image,
+ * build): changing it is no closure repair -- the unchanged compose file's
+ * services would keep the old image. It rebuilds; no stale image remains. */
+TEST(incremental_compose_dotenv_change_rebuilds) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_composeenv_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "src/web/Dockerfile", "FROM nginx:1.27\n");
+    write_temp_file(tmp, ".env", "REG=ghcr.io/old\n");
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  web:\n    image: ${REG}/web\n    build: ./src/web\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/composeenv.db", tmp);
+    static const char old_img[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Image' AND name='ghcr.io/old/web'";
+    static const char new_use[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' AND "
+        "t.name='ghcr.io/new/web'";
+    int full_old = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, old_img) : -1;
+    write_temp_file(tmp, ".env", "REG=ghcr.io/new\n");
+    int rc = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    int after_old = k8s_inc_count(db_path, old_img);
+    int after_new = k8s_inc_count(db_path, new_use);
+    th_rmtree(tmp);
+    ASSERT_EQ(full_old, 1);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(after_old, 0);
+    ASSERT_EQ(after_new, 1);
+    PASS();
+}
+
+/* Editing a Dockerfile keeps the build edge an unchanged script declares
+ * for it: image build edges are recomputed whole, so the files that declared
+ * builds before are read again. `legacy`: through the full-load route, else
+ * the closure-repair route. Returns "full=N inc=M", or NULL. */
+static char *incremental_docker_build_keep(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dockerbuild_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n");
+    write_temp_file(tmp, "build.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\ndocker build -t ghcr.io/acme/svc:1 svc\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/dockerbuild.db", tmp);
+    static const char builds[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id WHERE e.type='DEPENDS_ON' "
+        "AND s.label='Image' AND json_extract(e.properties,'$.tool')='docker-build'";
+    int full = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, builds) : -1;
+    write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n# edited\n");
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    char *out = NULL;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "full=%d inc=%d", full, k8s_inc_count(db_path, builds));
+        out = strdup(buf);
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return out;
+}
+
+TEST(incremental_dockerfile_edit_keeps_docker_build_edges) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    char *got = incremental_docker_build_keep(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "full=1 inc=1");
+    free(got);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    got = incremental_docker_build_keep(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "full=1 inc=1");
+    free(got);
+#endif
+    PASS();
+}
+
+/* Two files build the same image from one Dockerfile: deleting the one
+ * the edge happened to record keeps the edge -- the other file still
+ * declares it, and it is read again (its File node carries the mark). */
+TEST(incremental_second_build_declarer_keeps_the_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_twodecl_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n");
+    write_temp_file(tmp, "a.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+                                 "docker build -t ghcr.io/acme/svc:1 svc\n");
+    write_temp_file(tmp, "b.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+                                 "docker build -t ghcr.io/acme/svc:2 svc\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/twodecl.db", tmp);
+    static const char builds[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id WHERE e.type='DEPENDS_ON' "
+        "AND s.label='Image' AND json_extract(e.properties,'$.tool')='docker-build'";
+    int full = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, builds) : -1;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/a.sh", tmp);
+    (void)remove(path);
+    int rc_a = k8s_inc_index(tmp, db_path);
+    int after_a = k8s_inc_count(db_path, builds);
+    snprintf(path, sizeof(path), "%s/b.sh", tmp);
+    (void)remove(path);
+    int rc_b = k8s_inc_index(tmp, db_path);
+    int after_b = k8s_inc_count(db_path, builds);
+    th_rmtree(tmp);
+    ASSERT_EQ(full, 1);
+    ASSERT_EQ(rc_a, 0);
+    ASSERT_EQ(after_a, 1);
+    ASSERT_EQ(rc_b, 0);
+    ASSERT_EQ(after_b, 0);
+    PASS();
+}
+
+TEST(incremental_deleted_dockerfile_drops_its_image) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    int left = incremental_dockerfile_delete(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(left, 1);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    left = incremental_dockerfile_delete(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(left, 1);
+#endif
+    PASS();
+}
+
 /* SQL DDL becomes first-class Table/View nodes wired into FROM/JOIN lineage,
  * while the shared name registry must NOT leak those relations into other
  * languages' textual resolution: a Python call or identifier sharing the
@@ -9135,6 +9738,137 @@ TEST(pipeline_swift_nested_url_makes_route_issue1892) {
     PASS();
 }
 
+/* HANDLES edges from the function named `source_name` to Routes whose
+ * qualified name equals `route_qn`. */
+static int handles_to_route(cbm_store_t *s, const char *project, const char *source_name,
+                            const char *route_qn) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "HANDLES", &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.qualified_name &&
+            (!source_name || strcmp(source.name, source_name) == 0) &&
+            strcmp(target.qualified_name, route_qn) == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* fastapi (2026-10-05): one binary indexed the same tree to 3,253 or to
+ * 1,119,241 HANDLES edges. A prefix Route took the directory of whichever
+ * registrar's CALLS edge came first (worker order) and linked every decorated
+ * handler under it, with no filter for the root prefix `/`; every infra URL
+ * then copied the handlers of the root route. Now: every registrar counts, a
+ * root mount bridges nothing, and an infra URL matches a root route only of
+ * its own service. */
+TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_routebridge_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    /* two apps mounted at the root and under /api, from two directories */
+    write_temp_file(tmp, "svc/a/main.py",
+                    "from fastapi import FastAPI\n"
+                    "app = FastAPI()\n"
+                    "app.mount(\"/\", None)\n"
+                    "app.mount(\"/api\", None)\n"
+                    "\n"
+                    "@app.get(\"/items\")\n"
+                    "def read_items():\n"
+                    "    return []\n");
+    write_temp_file(tmp, "svc/a/api/routes.py",
+                    "from fastapi import APIRouter\n"
+                    "router = APIRouter()\n"
+                    "\n"
+                    "@router.get(\"/ax\")\n"
+                    "def api_a():\n"
+                    "    return 1\n");
+    write_temp_file(tmp, "svc/b/main.py",
+                    "from fastapi import FastAPI\n"
+                    "app = FastAPI()\n"
+                    "app.mount(\"/\", None)\n"
+                    "app.mount(\"/api\", None)\n"
+                    "app.mount(\"/c\", None)\n"
+                    "\n"
+                    "@app.get(\"/users\")\n"
+                    "def read_users():\n"
+                    "    return []\n");
+    write_temp_file(tmp, "svc/b/api/routes.py",
+                    "from fastapi import APIRouter\n"
+                    "router = APIRouter()\n"
+                    "\n"
+                    "@router.get(\"/by\")\n"
+                    "def api_b():\n"
+                    "    return 2\n");
+    /* a real root handler, and a documentation site's link to a chat server */
+    write_temp_file(tmp, "web/site.py",
+                    "from flask import Flask\n"
+                    "app = Flask(__name__)\n"
+                    "\n"
+                    "@app.route(\"/\")\n"
+                    "def index():\n"
+                    "    return \"ok\"\n"
+                    "\n"
+                    "@app.route(\"/c\")\n"
+                    "def contact():\n"
+                    "    return \"c\"\n");
+    write_temp_file(tmp, "mkdocs.yml",
+                    "site_name: demo\n"
+                    "extra:\n"
+                    "  social:\n"
+                    "    - icon: fontawesome/brands/discord\n"
+                    "      link: https://discord.com/invite/abc123\n"
+                    "    - icon: fontawesome/brands/github\n"
+                    "      link: https://github.com/carol\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/routebridge.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* decorator routes are untouched */
+    ASSERT_EQ(handles_to_route(s, project, "read_items", "__route__GET__/items"), 1);
+    ASSERT_EQ(handles_to_route(s, project, "index", "__route__ANY__/"), 1);
+    /* a root mount names no part of a handler's path: nothing is bridged */
+    ASSERT_EQ(handles_to_route(s, project, "read_items", "__route__ANY__/"), 0);
+    ASSERT_EQ(handles_to_route(s, project, "read_users", "__route__ANY__/"), 0);
+    /* /api is registered from both directories: both api handlers, whatever
+     * order the registrations' CALLS edges landed in */
+    ASSERT_EQ(handles_to_route(s, project, "api_a", "__route__ANY__/api"), 1);
+    ASSERT_EQ(handles_to_route(s, project, "api_b", "__route__ANY__/api"), 1);
+    /* a prefix and a URL path match on whole segments only: `c` is no segment
+     * of svc/b/main.py, and `/c` is no route of github.com/carol */
+    ASSERT_EQ(handles_to_route(s, project, "read_users", "__route__ANY__/c"), 0);
+    ASSERT_EQ(handles_to_route(s, project, "contact", "__route__ANY__/c"), 1);
+    ASSERT_EQ(handles_to_route(s, project, NULL, "__route__infra__https://github.com/carol"), 0);
+    /* the chat link is no route of this repository's root handler */
+    ASSERT_EQ(
+        handles_to_route(s, project, NULL, "__route__infra__https://discord.com/invite/abc123"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(pipeline_swift_http_call_makes_route_issue1892) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_swifthttp_XXXXXX");
@@ -9933,8 +10667,8 @@ static int python_typed_field_scope_case(bool external) {
              "class TestCase:\n    pass\n\n"
              "class Holder:\n    field: %s\n",
              external ? "unittest.TestCase" : "TestCase");
-    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON,
-                                             "proj", "models.py", 0, NULL, NULL);
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "proj",
+                                             "models.py", 0, NULL, NULL);
     cbm_registry_t *reg = cbm_registry_new();
     cbm_gbuf_t *gbuf = cbm_gbuf_new("proj", "/unused");
     CBMArena arena;
@@ -9950,11 +10684,11 @@ static int python_typed_field_scope_case(bool external) {
         const char **keys = NULL;
         const char **vals = NULL;
         int import_count = 0;
-        cbm_pxc_build_import_map(gbuf, "proj", "models.py", CBM_LANG_PYTHON, result, &keys,
-                                 &vals, &import_count);
-        cbm_resolution_t raw = cbm_registry_resolve(
-            reg, external ? "unittest.TestCase" : "TestCase", "proj.models", keys, vals,
-            import_count);
+        cbm_pxc_build_import_map(gbuf, "proj", "models.py", CBM_LANG_PYTHON, result, &keys, &vals,
+                                 &import_count);
+        cbm_resolution_t raw =
+            cbm_registry_resolve(reg, external ? "unittest.TestCase" : "TestCase", "proj.models",
+                                 keys, vals, import_count);
         bool candidate = raw.qualified_name && raw.strategy &&
                          strcmp(raw.qualified_name, "proj.models.TestCase") == 0 &&
                          strcmp(raw.strategy, "same_module") == 0;
@@ -9963,18 +10697,18 @@ static int python_typed_field_scope_case(bool external) {
         cbm_file_info_t files[1] = {{.rel_path = "models.py", .language = CBM_LANG_PYTHON}};
         CBMFileResult *cache[1] = {result};
         int count = 0;
-        defs = cbm_pxc_collect_all_defs(&ctx, &arena, cache, files, 1, "proj", modules, &count,
-                                        NULL);
+        defs =
+            cbm_pxc_collect_all_defs(&ctx, &arena, cache, files, 1, "proj", modules, &count, NULL);
         int holders = 0;
         bool field_ok = false;
         for (int i = 0; defs && i < count; i++) {
             if (defs[i].qualified_name &&
                 strcmp(defs[i].qualified_name, "proj.models.Holder") == 0) {
                 holders++;
-                field_ok = external ? !defs[i].field_defs
-                                    : defs[i].field_defs &&
-                                          strcmp(defs[i].field_defs,
-                                                 "field:proj.models.TestCase") == 0;
+                field_ok = external
+                               ? !defs[i].field_defs
+                               : defs[i].field_defs &&
+                                     strcmp(defs[i].field_defs, "field:proj.models.TestCase") == 0;
             }
         }
         ok = candidate && holders == 1 && field_ok;
@@ -10101,8 +10835,7 @@ TEST(override_explicit_walks_to_nearest_declaring_ancestor) {
     cbm_gbuf_insert_edge(gb, tied, tie_left_mid, "INHERITS", "{}");
 
     /* The separate Go implicit-satisfaction pass owns .go classes. */
-    int64_t go_type =
-        cbm_gbuf_upsert_node(gb, "Struct", "GoType", "m.GoType", "m.go", 1, 5, "{}");
+    int64_t go_type = cbm_gbuf_upsert_node(gb, "Struct", "GoType", "m.GoType", "m.go", 1, 5, "{}");
     int64_t go_process = ovr_method(gb, go_type, "GoType", "process");
     cbm_gbuf_insert_edge(gb, go_type, processor, "IMPLEMENTS", "{}");
 
@@ -13568,49 +14301,6 @@ TEST(compile_commands_parse_invalid) {
 
 /* ── Infrascan: file identification ──────────────────────────────── */
 
-TEST(infra_is_compose_file) {
-    /* Port of TestIsComposeFile (8 cases) */
-    ASSERT(cbm_is_compose_file("docker-compose.yml"));
-    ASSERT(cbm_is_compose_file("docker-compose.yaml"));
-    ASSERT(cbm_is_compose_file("docker-compose.prod.yml"));
-    ASSERT(cbm_is_compose_file("compose.yml"));
-    ASSERT(cbm_is_compose_file("compose.yaml"));
-    ASSERT(!cbm_is_compose_file("mycompose.yml"));
-    ASSERT(!cbm_is_compose_file("docker-compose.txt"));
-    ASSERT(!cbm_is_compose_file("Dockerfile"));
-    PASS();
-}
-
-TEST(infra_is_cloudbuild_file) {
-    /* Port of TestIsCloudbuildFile (5 cases) */
-    ASSERT(cbm_is_cloudbuild_file("cloudbuild.yaml"));
-    ASSERT(cbm_is_cloudbuild_file("cloudbuild.yml"));
-    ASSERT(cbm_is_cloudbuild_file("cloudbuild-prod.yaml"));
-    ASSERT(cbm_is_cloudbuild_file("Cloudbuild.yml"));
-    ASSERT(!cbm_is_cloudbuild_file("build.yaml"));
-    PASS();
-}
-
-TEST(infra_is_shell_script) {
-    /* Port of TestIsShellScript (5 cases) */
-    ASSERT(cbm_is_shell_script("run.sh", ".sh"));
-    ASSERT(cbm_is_shell_script("deploy.bash", ".bash"));
-    ASSERT(cbm_is_shell_script("init.zsh", ".zsh"));
-    ASSERT(!cbm_is_shell_script("main.py", ".py"));
-    ASSERT(!cbm_is_shell_script("Dockerfile", ""));
-    PASS();
-}
-
-TEST(infra_is_dockerfile) {
-    ASSERT(cbm_is_dockerfile("Dockerfile"));
-    ASSERT(cbm_is_dockerfile("dockerfile"));
-    ASSERT(cbm_is_dockerfile("Dockerfile.prod"));
-    ASSERT(cbm_is_dockerfile("app.dockerfile"));
-    ASSERT(!cbm_is_dockerfile("docker-compose.yml"));
-    ASSERT(!cbm_is_dockerfile("main.go"));
-    PASS();
-}
-
 TEST(infra_is_kustomize_file) {
     ASSERT(cbm_is_kustomize_file("kustomization.yaml"));
     ASSERT(cbm_is_kustomize_file("kustomization.yml"));
@@ -13632,36 +14322,6 @@ TEST(infra_is_k8s_manifest) {
     ASSERT(!cbm_is_k8s_manifest("kustomization.yaml", kust));
     ASSERT(!cbm_is_k8s_manifest(NULL, deploy));
     ASSERT(!cbm_is_k8s_manifest("deployment.yaml", NULL));
-    PASS();
-}
-
-TEST(infra_is_env_file) {
-    ASSERT(cbm_is_env_file(".env"));
-    ASSERT(cbm_is_env_file(".env.local"));
-    ASSERT(cbm_is_env_file("prod.env"));
-    ASSERT(!cbm_is_env_file("main.go"));
-    ASSERT(!cbm_is_env_file("env.txt"));
-    PASS();
-}
-
-/* ── Infrascan: cleanJSONBrackets ───────────────────────────────── */
-
-TEST(infra_clean_json_brackets) {
-    /* Port of TestCleanJSONBrackets (4 cases) */
-    char out[256];
-
-    cbm_clean_json_brackets("[\"./server\"]", out, sizeof(out));
-    ASSERT_STR_EQ(out, "./server");
-
-    cbm_clean_json_brackets("[\"python\", \"main.py\"]", out, sizeof(out));
-    ASSERT_STR_EQ(out, "python main.py");
-
-    cbm_clean_json_brackets("./server", out, sizeof(out));
-    ASSERT_STR_EQ(out, "./server");
-
-    cbm_clean_json_brackets("[\"./app\", \"--flag\", \"value\"]", out, sizeof(out));
-    ASSERT_STR_EQ(out, "./app --flag value");
-
     PASS();
 }
 
@@ -13689,395 +14349,6 @@ TEST(infra_secret_detection) {
     PASS();
 }
 
-/* ── Infrascan: Dockerfile parser ───────────────────────────────── */
-
-/* Helper: find env var by key in result */
-static const char *find_env_var(const cbm_env_kv_t *vars, int count, const char *key) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(vars[i].key, key) == 0)
-            return vars[i].value;
-    }
-    return NULL;
-}
-
-/* Helper: check if string array contains value */
-static bool str_array_contains(const char (*arr)[32], int count, const char *val) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(arr[i], val) == 0)
-            return true;
-    }
-    return false;
-}
-
-static bool str_array_128_contains(const char (*arr)[128], int count, const char *val) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(arr[i], val) == 0)
-            return true;
-    }
-    return false;
-}
-
-static bool str_array_256_contains(const char (*arr)[256], int count, const char *val) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(arr[i], val) == 0)
-            return true;
-    }
-    return false;
-}
-
-TEST(infra_parse_dockerfile_multistage) {
-    /* Port of TestParseDockerfile "multi-stage with all directives" */
-    const char *src = "FROM golang:1.23-alpine AS builder\n"
-                      "WORKDIR /app\n"
-                      "ARG SSH_PRIVATE_KEY\n"
-                      "RUN go build -o server .\n"
-                      "\n"
-                      "FROM alpine:3.19\n"
-                      "WORKDIR /usr/app\n"
-                      "ENV PORT=8080\n"
-                      "ENV PYTHONUNBUFFERED=1\n"
-                      "EXPOSE 8080 443\n"
-                      "USER appuser\n"
-                      "CMD [\"./server\"]\n"
-                      "HEALTHCHECK CMD wget http://localhost:8080/health\n";
-
-    cbm_dockerfile_result_t r;
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
-    ASSERT_STR_EQ(r.base_image, "alpine:3.19");
-    ASSERT_EQ(r.stage_count, 2);
-    ASSERT_STR_EQ(r.stage_images[0], "golang:1.23-alpine");
-    ASSERT_STR_EQ(r.stage_images[1], "alpine:3.19");
-    ASSERT(str_array_contains(r.exposed_ports, r.port_count, "8080"));
-    ASSERT(str_array_contains(r.exposed_ports, r.port_count, "443"));
-    ASSERT_STR_EQ(r.workdir, "/usr/app");
-    ASSERT_STR_EQ(r.user, "appuser");
-    ASSERT_STR_EQ(r.cmd, "./server");
-    ASSERT_STR_EQ(r.healthcheck, "wget http://localhost:8080/health");
-
-    ASSERT_NOT_NULL(find_env_var(r.env_vars, r.env_count, "PORT"));
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "PORT"), "8080");
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "PYTHONUNBUFFERED"), "1");
-
-    ASSERT(str_array_128_contains(r.build_args, r.build_arg_count, "SSH_PRIVATE_KEY"));
-
-    PASS();
-}
-
-TEST(infra_parse_dockerfile_entrypoint) {
-    /* Port of TestParseDockerfile "single stage with entrypoint" */
-    const char *src = "FROM python:3.9-slim\n"
-                      "ENTRYPOINT [\"python\", \"main.py\"]\n";
-
-    cbm_dockerfile_result_t r;
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
-    ASSERT_STR_EQ(r.base_image, "python:3.9-slim");
-    ASSERT_STR_EQ(r.entrypoint, "python main.py");
-    ASSERT_EQ(r.stage_count, 1);
-    PASS();
-}
-
-TEST(infra_parse_dockerfile_secret_filtered) {
-    /* Port of TestParseDockerfile "secret env vars filtered" */
-    const char *src = "FROM node:20\n"
-                      "ENV API_KEY=sk-1234567890abcdef12345\n"
-                      "ENV DATABASE_URL=https://db.example.com\n"
-                      "ENV JWT_SECRET=supersecret\n";
-
-    cbm_dockerfile_result_t r;
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
-
-    /* API_KEY and JWT_SECRET should be filtered */
-    ASSERT(find_env_var(r.env_vars, r.env_count, "API_KEY") == NULL);
-    ASSERT(find_env_var(r.env_vars, r.env_count, "JWT_SECRET") == NULL);
-
-    /* DATABASE_URL should remain */
-    ASSERT_NOT_NULL(find_env_var(r.env_vars, r.env_count, "DATABASE_URL"));
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "DATABASE_URL"), "https://db.example.com");
-    PASS();
-}
-
-TEST(infra_parse_dockerfile_expose_protocol) {
-    /* Port of TestParseDockerfile "expose with protocol suffix" */
-    const char *src = "FROM nginx:latest\n"
-                      "EXPOSE 80/tcp 443/tcp\n";
-
-    cbm_dockerfile_result_t r;
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
-    ASSERT(str_array_contains(r.exposed_ports, r.port_count, "80"));
-    ASSERT(str_array_contains(r.exposed_ports, r.port_count, "443"));
-    PASS();
-}
-
-TEST(infra_parse_dockerfile_env_space) {
-    /* Port of TestParseDockerfile "ENV space-separated format" */
-    const char *src = "FROM python:3.9\n"
-                      "ENV PYTHONPATH /usr/app\n";
-
-    cbm_dockerfile_result_t r;
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
-    ASSERT_NOT_NULL(find_env_var(r.env_vars, r.env_count, "PYTHONPATH"));
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "PYTHONPATH"), "/usr/app");
-    PASS();
-}
-
-TEST(infra_parse_dockerfile_empty) {
-    /* Port of TestParseDockerfileEmpty */
-    cbm_dockerfile_result_t r;
-    ASSERT_EQ(cbm_parse_dockerfile_source("# just a comment\n", &r), -1);
-    PASS();
-}
-
-/* ── Infrascan: Dotenv parser ───────────────────────────────────── */
-
-TEST(infra_parse_dotenv) {
-    /* Port of TestParseDotenvFile */
-    const char *src = "# Database config\n"
-                      "DATABASE_HOST=localhost\n"
-                      "DATABASE_PORT=5432\n"
-                      "DATABASE_NAME=mydb\n"
-                      "API_SECRET=should-not-appear\n"
-                      "PLAIN_VALUE=hello world\n";
-
-    cbm_dotenv_result_t r;
-    ASSERT_EQ(cbm_parse_dotenv_source(src, &r), 0);
-
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "DATABASE_HOST"), "localhost");
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "DATABASE_PORT"), "5432");
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "PLAIN_VALUE"), "hello world");
-
-    /* API_SECRET should be filtered */
-    ASSERT(find_env_var(r.env_vars, r.env_count, "API_SECRET") == NULL);
-    PASS();
-}
-
-TEST(infra_parse_dotenv_quoted) {
-    /* Port of TestParseDotenvQuotedValues */
-    const char *src = "KEY1=\"quoted value\"\n"
-                      "KEY2='single quoted'\n";
-
-    cbm_dotenv_result_t r;
-    ASSERT_EQ(cbm_parse_dotenv_source(src, &r), 0);
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "KEY1"), "quoted value");
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "KEY2"), "single quoted");
-    PASS();
-}
-
-/* ── Infrascan: Shell script parser ─────────────────────────────── */
-
-TEST(infra_parse_shell) {
-    /* Port of TestParseShellScript */
-    const char *src = "#!/bin/bash\n"
-                      "set -e\n"
-                      "\n"
-                      "# Configuration\n"
-                      "YOUR_CONTAINER_NAME=\"order-email-extractor-endpoint\"\n"
-                      "DOCKERFILE_PATH=\"/path/to/dockerfile\"\n"
-                      "\n"
-                      "export ENVIRONMENT=\"development\"\n"
-                      "export USE_STACKDRIVER=\"false\"\n"
-                      "\n"
-                      "# Shut down existing containers\n"
-                      "./shut-down-docker-container.sh\n"
-                      "\n"
-                      "docker build -t \"$YOUR_CONTAINER_NAME\" \"$DOCKERFILE_PATH\"\n"
-                      "docker run -d --name \"$YOUR_CONTAINER_NAME\" \"$YOUR_CONTAINER_NAME\"\n"
-                      "docker-compose up -d\n";
-
-    cbm_shell_result_t r;
-    ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
-    ASSERT_STR_EQ(r.shebang, "/bin/bash");
-
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "ENVIRONMENT"), "development");
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "YOUR_CONTAINER_NAME"),
-                  "order-email-extractor-endpoint");
-
-    ASSERT(str_array_256_contains(r.docker_cmds, r.docker_cmd_count, "docker build"));
-    ASSERT(str_array_256_contains(r.docker_cmds, r.docker_cmd_count, "docker run"));
-    ASSERT(str_array_256_contains(r.docker_cmds, r.docker_cmd_count, "docker-compose up"));
-
-    PASS();
-}
-
-TEST(infra_parse_shell_with_source) {
-    /* Port of TestParseShellScriptWithSource */
-    const char *src = "#!/usr/bin/env bash\n"
-                      "source ./config.sh\n"
-                      ". /etc/profile.d/env.sh\n";
-
-    cbm_shell_result_t r;
-    ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
-    ASSERT_STR_EQ(r.shebang, "/usr/bin/env bash");
-    ASSERT(str_array_256_contains(r.sources, r.source_count, "./config.sh"));
-    ASSERT(str_array_256_contains(r.sources, r.source_count, "/etc/profile.d/env.sh"));
-    PASS();
-}
-
-TEST(infra_parse_shell_secret_filtered) {
-    /* Port of TestParseShellScriptSecretFiltered */
-    const char *src = "#!/bin/bash\n"
-                      "export API_SECRET=\"should-not-appear\"\n"
-                      "export DATABASE_URL=\"https://db.example.com\"\n";
-
-    cbm_shell_result_t r;
-    ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
-    ASSERT(find_env_var(r.env_vars, r.env_count, "API_SECRET") == NULL);
-    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "DATABASE_URL"), "https://db.example.com");
-    PASS();
-}
-
-TEST(infra_parse_shell_shebang_only) {
-    /* Port of TestParseShellScriptShebanOnly */
-    const char *src = "#!/bin/bash\n# just comments\n";
-    cbm_shell_result_t r;
-    ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
-    ASSERT_STR_EQ(r.shebang, "/bin/bash");
-    PASS();
-}
-
-TEST(infra_parse_shell_truly_empty) {
-    /* Port of TestParseShellScriptTrulyEmpty */
-    cbm_shell_result_t r;
-    ASSERT_EQ(cbm_parse_shell_source("# no shebang, just comments\n", &r), -1);
-    PASS();
-}
-
-/* ── Infrascan: Terraform parser ────────────────────────────────── */
-
-TEST(infra_parse_terraform_full) {
-    /* Port of TestParseTerraformFile */
-    const char *src = "\n"
-                      "terraform {\n"
-                      "  required_providers {\n"
-                      "    google = {\n"
-                      "      source  = \"hashicorp/google\"\n"
-                      "      version = \"~> 6.35.0\"\n"
-                      "    }\n"
-                      "  }\n"
-                      "  backend \"gcs\" {\n"
-                      "    bucket = \"example-tf\"\n"
-                      "    prefix = \"state\"\n"
-                      "  }\n"
-                      "}\n"
-                      "\n"
-                      "variable \"project_id\" {\n"
-                      "  description = \"The GCP project ID\"\n"
-                      "  type        = string\n"
-                      "  default     = \"example-cloud\"\n"
-                      "}\n"
-                      "\n"
-                      "variable \"region\" {\n"
-                      "  description = \"The region\"\n"
-                      "  type        = string\n"
-                      "}\n"
-                      "\n"
-                      "resource \"google_cloud_run_service\" \"main\" {\n"
-                      "  name     = \"my-service\"\n"
-                      "  location = var.region\n"
-                      "}\n"
-                      "\n"
-                      "resource \"google_compute_address\" \"nat_ip\" {\n"
-                      "  name   = \"nat-ip\"\n"
-                      "  region = var.region\n"
-                      "}\n"
-                      "\n"
-                      "output \"service_url\" {\n"
-                      "  value = google_cloud_run_service.main.status[0].url\n"
-                      "}\n"
-                      "\n"
-                      "data \"google_project\" \"project\" {\n"
-                      "}\n"
-                      "\n"
-                      "module \"vpc\" {\n"
-                      "  source = \"./modules/vpc\"\n"
-                      "}\n"
-                      "\n"
-                      "locals {\n"
-                      "  env = \"prod\"\n"
-                      "}\n";
-
-    cbm_terraform_result_t r;
-    ASSERT_EQ(cbm_parse_terraform_source(src, &r), 0);
-    ASSERT_STR_EQ(r.backend, "gcs");
-
-    /* Resources */
-    ASSERT_EQ(r.resource_count, 2);
-    bool found_cloud_run = false;
-    for (int i = 0; i < r.resource_count; i++) {
-        if (strcmp(r.resources[i].type, "google_cloud_run_service") == 0 &&
-            strcmp(r.resources[i].name, "main") == 0) {
-            found_cloud_run = true;
-        }
-    }
-    ASSERT(found_cloud_run);
-
-    /* Variables */
-    ASSERT_EQ(r.variable_count, 2);
-    bool found_project_id = false;
-    for (int i = 0; i < r.variable_count; i++) {
-        if (strcmp(r.variables[i].name, "project_id") == 0) {
-            ASSERT_STR_EQ(r.variables[i].default_val, "example-cloud");
-            ASSERT_STR_EQ(r.variables[i].type, "string");
-            ASSERT_STR_EQ(r.variables[i].description, "The GCP project ID");
-            found_project_id = true;
-        }
-    }
-    ASSERT(found_project_id);
-
-    /* Outputs */
-    ASSERT_EQ(r.output_count, 1);
-    ASSERT_STR_EQ(r.outputs[0], "service_url");
-
-    /* Data sources */
-    ASSERT_EQ(r.data_source_count, 1);
-    ASSERT_STR_EQ(r.data_sources[0].type, "google_project");
-    ASSERT_STR_EQ(r.data_sources[0].name, "project");
-
-    /* Modules */
-    ASSERT_EQ(r.module_count, 1);
-    ASSERT_STR_EQ(r.modules[0].tf_name, "vpc");
-    ASSERT_STR_EQ(r.modules[0].source, "./modules/vpc");
-
-    /* Locals */
-    ASSERT(r.has_locals);
-
-    PASS();
-}
-
-TEST(infra_parse_terraform_variables_only) {
-    /* Port of TestParseTerraformVariablesOnly — secret default filtered */
-    const char *src = "\n"
-                      "variable \"project_id\" {\n"
-                      "  description = \"The GCP project ID\"\n"
-                      "  type        = string\n"
-                      "  default     = \"example-cloud\"\n"
-                      "}\n"
-                      "\n"
-                      "variable \"secret_key\" {\n"
-                      "  description = \"A secret\"\n"
-                      "  type        = string\n"
-                      "  default     = \"sk-1234567890abcdef12345\"\n"
-                      "}\n";
-
-    cbm_terraform_result_t r;
-    ASSERT_EQ(cbm_parse_terraform_source(src, &r), 0);
-    ASSERT_EQ(r.variable_count, 2);
-
-    /* secret_key default should be filtered */
-    for (int i = 0; i < r.variable_count; i++) {
-        if (strcmp(r.variables[i].name, "secret_key") == 0) {
-            ASSERT_STR_EQ(r.variables[i].default_val, "");
-        }
-    }
-    PASS();
-}
-
-TEST(infra_parse_terraform_empty) {
-    /* Port of TestParseTerraformEmpty */
-    cbm_terraform_result_t r;
-    ASSERT_EQ(cbm_parse_terraform_source("# just comments\n", &r), -1);
-    PASS();
-}
-
 /* ── Helm Chart.yaml dependency parsing (#338) ──────────────────── */
 
 TEST(helm_parse_chart_dependencies_issue338) {
@@ -14096,8 +14367,11 @@ TEST(helm_parse_chart_dependencies_issue338) {
     ASSERT_EQ(cbm_parse_helm_chart(src, &hc), 0);
     ASSERT_STR_EQ(hc.chart_name, "mychart");
     ASSERT_EQ(hc.dep_count, 2);
-    ASSERT_STR_EQ(hc.deps[0], "postgresql");
-    ASSERT_STR_EQ(hc.deps[1], "redis");
+    ASSERT_STR_EQ(hc.deps[0].name, "postgresql");
+    ASSERT_STR_EQ(hc.deps[0].repository, "https://charts.bitnami.com/bitnami");
+    ASSERT_STR_EQ(hc.deps[1].name, "redis");
+    ASSERT_STR_EQ(hc.deps[1].repository, "https://charts.bitnami.com/bitnami");
+    cbm_helm_chart_free(&hc);
     PASS();
 }
 
@@ -14106,6 +14380,50 @@ TEST(helm_parse_chart_no_deps_issue338) {
     ASSERT_EQ(cbm_parse_helm_chart("name: solo\nversion: 0.1.0\n", &hc), 0);
     ASSERT_STR_EQ(hc.chart_name, "solo");
     ASSERT_EQ(hc.dep_count, 0);
+    cbm_helm_chart_free(&hc);
+    PASS();
+}
+
+/* An entry's keys come in any order; lists nested in an entry
+ * (import-values, tags) belong to it and name no dependency of their own. */
+TEST(helm_parse_chart_dependency_entries) {
+    const char *src = "name: app\n"
+                      "dependencies:\n"
+                      "  - repository: file://../common\n"
+                      "    name: common\n"
+                      "    import-values:\n"
+                      "      - child: default.data\n"
+                      "        parent: imported\n"
+                      "      - name: not-a-dependency\n"
+                      "  - name: redis\n"
+                      "    tags:\n"
+                      "      - cache\n";
+    cbm_helm_chart_t hc;
+    ASSERT_EQ(cbm_parse_helm_chart(src, &hc), 0);
+    ASSERT_EQ(hc.dep_count, 2);
+    ASSERT_STR_EQ(hc.deps[0].name, "common");
+    ASSERT_STR_EQ(hc.deps[0].repository, "file://../common");
+    ASSERT_STR_EQ(hc.deps[1].name, "redis");
+    ASSERT_STR_EQ(hc.deps[1].repository, "");
+    cbm_helm_chart_free(&hc);
+    PASS();
+}
+
+/* No dependency count decides what is read: the parser kept 128. */
+TEST(helm_parse_chart_many_dependencies) {
+    enum { DEPS = 130 };
+    char *src = malloc(DEPS * 32 + 64);
+    ASSERT_NOT_NULL(src);
+    int n = snprintf(src, 64, "name: umbrella\ndependencies:\n");
+    for (int i = 0; i < DEPS; i++) {
+        n += snprintf(src + n, 32, "  - name: dep-%03d\n", i);
+    }
+    cbm_helm_chart_t hc;
+    ASSERT_EQ(cbm_parse_helm_chart(src, &hc), 0);
+    free(src);
+    ASSERT_EQ(hc.dep_count, DEPS);
+    ASSERT_STR_EQ(hc.deps[DEPS - 1].name, "dep-129");
+    cbm_helm_chart_free(&hc);
     PASS();
 }
 
@@ -14557,50 +14875,6 @@ TEST(infra_qn_helper) {
     PASS();
 }
 
-/* ── Infrascan integration tests ────────────────────────────────── */
-
-TEST(infra_pipeline_integration) {
-    /* Port of TestPassInfraFilesIntegration (Dockerfile + .env parts).
-     * Tests parse functions on source text (pipeline infrascan pass not
-     * wired yet — compose YAML also blocked on YAML parser). */
-
-    /* Parse Dockerfile */
-    cbm_dockerfile_result_t dr;
-    ASSERT_EQ(cbm_parse_dockerfile_source("FROM alpine:3.19\nEXPOSE 8080\n", &dr), 0);
-    ASSERT_STR_EQ(dr.base_image, "alpine:3.19");
-    ASSERT_GTE(dr.port_count, 1);
-
-    /* Parse .env */
-    cbm_dotenv_result_t er;
-    ASSERT_EQ(cbm_parse_dotenv_source("APP_PORT=8080\nDEBUG=true\n", &er), 0);
-    ASSERT_GTE(er.env_count, 1);
-    /* APP_PORT should be present */
-    bool found_port = false;
-    for (int i = 0; i < er.env_count; i++) {
-        if (strcmp(er.env_vars[i].key, "APP_PORT") == 0 &&
-            strcmp(er.env_vars[i].value, "8080") == 0)
-            found_port = true;
-    }
-    ASSERT_TRUE(found_port);
-
-    PASS();
-}
-
-TEST(infra_pipeline_idempotent) {
-    /* Port of TestPassInfraFilesIdempotent:
-     * Parsing same source twice should produce identical results. */
-    const char *src = "FROM alpine:3.19\nEXPOSE 8080\nENV PORT=8080\n";
-    cbm_dockerfile_result_t r1, r2;
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r1), 0);
-    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r2), 0);
-
-    ASSERT_STR_EQ(r1.base_image, r2.base_image);
-    ASSERT_EQ(r1.port_count, r2.port_count);
-    ASSERT_EQ(r1.env_count, r2.env_count);
-
-    PASS();
-}
-
 /* ── K8s / Kustomize extraction tests ──────────────────────────── */
 
 TEST(k8s_extract_kustomize) {
@@ -14665,15 +14939,8 @@ TEST(k8s_extract_manifest_no_name) {
 }
 
 TEST(k8s_extract_manifest_multidoc) {
-    /* Two-document YAML separated by "---".
-     * extract_k8s_manifest contains a "break" after the first successful push,
-     * so it processes only the first document that has both kind and
-     * metadata.name.  This test pins that behaviour: the first document's
-     * resource must be present and no crash must occur.
-     *
-     * Note: with some tree-sitter YAML grammar versions the root stream may
-     * expose both documents as siblings; the break still fires after the first
-     * successful def push, so defs.count must be exactly 1. */
+    /* Two-document YAML separated by "---": every document is an object, with
+     * the identity QN <file-base>::<group>/<Kind>/<declared ns or ->/<name>. */
     const char *src = "apiVersion: apps/v1\n"
                       "kind: Deployment\n"
                       "metadata:\n"
@@ -14687,22 +14954,29 @@ TEST(k8s_extract_manifest_multidoc) {
                                         "k8s/multi.yaml", 0, NULL, NULL);
     ASSERT(r != NULL);
     ASSERT(!r->has_error);
-    /* First document's resource must be present */
-    int found = 0;
+    int deploy = 0;
+    int svc = 0;
     for (int i = 0; i < r->defs.count; i++) {
-        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Resource") == 0 &&
-            r->defs.items[i].name && strcmp(r->defs.items[i].name, "Deployment/my-app") == 0) {
-            found = 1;
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->label || strcmp(d->label, "Resource") != 0 || !d->name || !d->qualified_name) {
+            continue;
+        }
+        if (strcmp(d->name, "Deployment/my-app") == 0 &&
+            strcmp(d->qualified_name, "myproj.k8s.multi.yaml::apps/Deployment/-/my-app") == 0) {
+            deploy++;
+        }
+        if (strcmp(d->name, "Service/my-svc") == 0 &&
+            strcmp(d->qualified_name, "myproj.k8s.multi.yaml::core/Service/-/my-svc") == 0) {
+            svc++;
         }
     }
-    ASSERT(found);
-    /* At least one def, no more than one (only first document processed) */
-    ASSERT(r->defs.count >= 1);
+    ASSERT_EQ(deploy, 1);
+    ASSERT_EQ(svc, 1);
     cbm_free_result(r);
     PASS();
 }
 
-/* ── Envscan tests (port of envscan_test.go) ───────────────────── */
+/* ── Temp-file fixture helpers ───────────────────────────────────── */
 
 /* Helper: write a file inside a temp dir */
 static void write_temp_file(const char *dir, const char *name, const char *content) {
@@ -14948,349 +15222,6 @@ TEST(pipeline_nested_fixture_graph_has_endpoints) {
     ASSERT_TRUE(expected_call);
     ASSERT_FALSE(forbidden_call);
     ASSERT_EQ(cleanup_rc, 0);
-    PASS();
-}
-
-/* Helper: find binding by key in results */
-static const cbm_env_binding_t *find_binding_by_key(const cbm_env_binding_t *bindings, int count,
-                                                    const char *key) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(bindings[i].key, key) == 0)
-            return &bindings[i];
-    }
-    return NULL;
-}
-
-/* Helper: find binding by value in results */
-static int has_binding_value(const cbm_env_binding_t *bindings, int count, const char *value) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(bindings[i].value, value) == 0)
-            return 1;
-    }
-    return 0;
-}
-
-TEST(envscan_dockerfile_env_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_dock_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "Dockerfile",
-                    "FROM python:3.9-slim\n"
-                    "ENV ORDER_URL=https://api.example.com/api/orders\n"
-                    "ENV DB_HOST=localhost\n"
-                    "ARG WEBHOOK_URL=https://hooks.example.com/webhook\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "ORDER_URL"));
-    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "ORDER_URL")->value,
-                  "https://api.example.com/api/orders");
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "WEBHOOK_URL"));
-    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "WEBHOOK_URL")->value,
-                  "https://hooks.example.com/webhook");
-    /* DB_HOST=localhost is NOT a URL → should be absent */
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "DB_HOST") == NULL);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_shell_env_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sh_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "setup.sh",
-                    "#!/bin/bash\n"
-                    "export DB_URL=\"https://db.example.com/api/sync\"\n"
-                    "APP_NAME=\"my-service\"\n"
-                    "CALLBACK_URL=https://hooks.example.com/notify\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "DB_URL"));
-    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "DB_URL")->value,
-                  "https://db.example.com/api/sync");
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CALLBACK_URL"));
-    /* APP_NAME is NOT a URL → absent */
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "APP_NAME") == NULL);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_env_file_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_env_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, ".env",
-                    "\nAPI_URL=https://api.example.com/v1\n"
-                    "DEBUG=true\n"
-                    "SERVICE_URL=https://service.example.com/api\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "API_URL"));
-    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "API_URL")->value,
-                  "https://api.example.com/v1");
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "SERVICE_URL"));
-    /* DEBUG=true is NOT a URL */
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "DEBUG") == NULL);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_toml_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_toml_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "config.toml",
-                    "[service]\n"
-                    "base_url = \"https://api.example.com\"\n"
-                    "name = \"my-service\"\n"
-                    "callback_url = \"https://hooks.example.com/notify\"\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "base_url"));
-    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "base_url")->value,
-                  "https://api.example.com");
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "callback_url"));
-    /* name="my-service" is NOT a URL */
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "name") == NULL);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_yaml_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_yaml_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "config.yaml",
-                    "service:\n"
-                    "  service_url: \"https://api.internal.com/api/process\"\n"
-                    "  timeout: 30\n"
-                    "  callback_url: \"https://hooks.internal.com/callback\"\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "service_url"));
-    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "service_url")->value,
-                  "https://api.internal.com/api/process");
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "callback_url"));
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_terraform_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_tf_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "variables.tf",
-                    "variable \"webhook_url\" {\n"
-                    "  description = \"Webhook endpoint\"\n"
-                    "  default     = \"https://api.example.com/webhook\"\n"
-                    "}\n\n"
-                    "variable \"region\" {\n"
-                    "  default = \"us-east-1\"\n"
-                    "}\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_GTE(count, 1);
-    ASSERT_TRUE(has_binding_value(bindings, count, "https://api.example.com/webhook"));
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_properties_urls) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_prop_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "app.properties",
-                    "api.url=https://api.example.com/health\n"
-                    "app.name=myapp\n"
-                    "service.endpoint=https://service.example.com/api\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_TRUE(has_binding_value(bindings, count, "https://api.example.com/health"));
-    ASSERT_TRUE(has_binding_value(bindings, count, "https://service.example.com/api"));
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_secret_key_exclusion) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_skey_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "Dockerfile",
-                    "FROM node:18\n"
-                    "ENV SECRET_TOKEN=https://api.example.com/api\n"
-                    "ENV API_KEY=https://api.example.com/v1\n"
-                    "ENV PASSWORD=https://auth.example.com/login\n"
-                    "ENV NORMAL_URL=https://api.example.com/orders\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    /* Secret keys should be excluded */
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "SECRET_TOKEN") == NULL);
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "API_KEY") == NULL);
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "PASSWORD") == NULL);
-    /* Normal key should be present */
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "NORMAL_URL"));
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_secret_value_exclusion) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sval_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(
-        tmpdir, "deploy.sh",
-        "#!/bin/bash\n"
-        "export GH_URL=\"https://ghp_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE@github.com/repo\"\n"
-        "export NORMAL_ENDPOINT=\"https://api.example.com/orders\"\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    /* ghp_ token URL should be excluded */
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "GH_URL") == NULL);
-    /* Normal URL should be present */
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "NORMAL_ENDPOINT"));
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_secret_file_exclusion) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sfile_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    /* Secret file should be skipped */
-    write_temp_file(tmpdir, "credentials.sh",
-                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
-    /* Normal file should be scanned */
-    write_temp_file(tmpdir, "setup.sh",
-                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    /* Should find binding from setup.sh but not credentials.sh */
-    int from_credentials = 0;
-    int from_setup = 0;
-    for (int i = 0; i < count; i++) {
-        if (strcmp(bindings[i].file_path, "credentials.sh") == 0)
-            from_credentials = 1;
-        if (strcmp(bindings[i].file_path, "setup.sh") == 0)
-            from_setup = 1;
-    }
-    ASSERT_EQ(from_credentials, 0);
-    ASSERT_EQ(from_setup, 1);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_skips_ignored_dirs) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_ign_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    static const char ignored_content[] =
-        "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n";
-    write_temp_file(tmpdir, ".git/config.sh", ignored_content);
-    write_temp_file(tmpdir, "node_modules/pkg/config.sh", ignored_content);
-    bool git_written = fixture_file_matches(TH_PATH(tmpdir, ".git/config.sh"), ignored_content);
-    bool module_written =
-        fixture_file_matches(TH_PATH(tmpdir, "node_modules/pkg/config.sh"), ignored_content);
-
-    /* File at root level should be scanned */
-    write_temp_file(tmpdir, "deploy.sh",
-                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    int from_git = 0, from_nm = 0, from_root = 0;
-    for (int i = 0; i < count; i++) {
-        if (strncmp(bindings[i].file_path, ".git/", 5) == 0)
-            from_git = 1;
-        if (strncmp(bindings[i].file_path, "node_modules/", 13) == 0)
-            from_nm = 1;
-        if (strcmp(bindings[i].file_path, "deploy.sh") == 0)
-            from_root = 1;
-    }
-    ASSERT_TRUE(git_written);
-    ASSERT_TRUE(module_written);
-    ASSERT_EQ(from_git, 0);
-    ASSERT_EQ(from_nm, 0);
-    ASSERT_EQ(from_root, 1);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-TEST(envscan_non_url_values_skipped) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_nurl_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    write_temp_file(tmpdir, "Dockerfile",
-                    "FROM python:3.9\n"
-                    "ENV APP_NAME=my-service\n"
-                    "ENV PORT=8080\n"
-                    "ENV DEBUG=true\n"
-                    "ENV LOG_LEVEL=info\n");
-    write_temp_file(tmpdir, "config.sh",
-                    "#!/bin/bash\n"
-                    "export REGION=\"us-east-1\"\n"
-                    "export COUNT=42\n");
-
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-
-    ASSERT_EQ(count, 0);
-
-    th_rmtree(tmpdir);
     PASS();
 }
 
@@ -15634,40 +15565,6 @@ TEST(pkgmap_scan_repo_honors_discovery_exclusions) {
     ASSERT_TRUE(pkg_entries_has_name(&entries, "@org/app"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "@org/vendored"));
     cbm_pkg_entries_free(&entries);
-
-    th_rmtree(tmpdir);
-    PASS();
-}
-
-/* The env-URL walk must honor discovery exclusions the same way (#792).
- * Control run first via the NULL-exclusion wrapper so the exclusion
- * assertion cannot pass vacuously. */
-TEST(envscan_walk_honors_discovery_exclusions) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_excl_XXXXXX");
-    if (!cbm_mkdtemp(tmpdir))
-        FAIL("tmpdir");
-
-    char dir[512];
-    snprintf(dir, sizeof(dir), "%s/big_generated", tmpdir);
-    cbm_mkdir(dir);
-
-    write_temp_file(tmpdir, "deploy.sh",
-                    "#!/bin/bash\nexport CONTROL_URL=\"https://api.example.com/v1\"\n");
-    write_temp_file(tmpdir, "big_generated/env.sh",
-                    "#!/bin/bash\nexport EXCLUDED_URL=\"https://excluded.example.com/v1\"\n");
-
-    /* Control: the NULL-exclusion wrapper sees both bindings. */
-    cbm_env_binding_t bindings[32];
-    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CONTROL_URL"));
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "EXCLUDED_URL"));
-
-    /* With big_generated excluded, its binding must disappear. */
-    char *excluded[] = {(char *)"big_generated"};
-    count = cbm_scan_project_env_urls_excluded(tmpdir, bindings, 32, excluded, 1);
-    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CONTROL_URL"));
-    ASSERT_TRUE(find_binding_by_key(bindings, count, "EXCLUDED_URL") == NULL);
 
     th_rmtree(tmpdir);
     PASS();
@@ -16925,9 +16822,10 @@ TEST(incremental_k8s_manifest_indexed) {
     PASS();
 }
 
-TEST(incremental_kustomize_module_indexed) {
+TEST(incremental_kustomize_entries_indexed) {
     /* Verifies that a kustomization.yaml added after the initial full index
-     * gets a Module node via the incremental k8s pass. */
+     * is indexed incrementally: its entry becomes an IMPORTS edge to the
+     * manifest it names. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_kust_incr_XXXXXX");
     if (!cbm_mkdtemp(tmpdir)) {
@@ -16968,20 +16866,27 @@ TEST(incremental_kustomize_module_indexed) {
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
-    /* Verify Module node created for the kustomization overlay */
+    /* Verify the overlay's entry was resolved: kustomization.yaml IMPORTS deploy.yaml */
     cbm_store_t *s = cbm_store_open_path(dbpath);
     ASSERT_NOT_NULL(s);
-    cbm_node_t *nodes = NULL;
-    int count = 0;
-    cbm_store_find_nodes_by_label(s, project, "Module", &nodes, &count);
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, "IMPORTS", &edges, &edge_count);
     bool found_kust = false;
-    for (int i = 0; i < count; i++) {
-        if (nodes[i].properties_json && strstr(nodes[i].properties_json, "kustomize")) {
-            found_kust = true;
-            break;
+    for (int i = 0; i < edge_count && !found_kust; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            found_kust = src.file_path && strcmp(src.file_path, "kustomization.yaml") == 0 &&
+                         tgt.file_path && strcmp(tgt.file_path, "deploy.yaml") == 0;
         }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
     }
-    cbm_store_free_nodes(nodes, count);
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
     cbm_store_close(s);
     ASSERT_TRUE(found_kust);
 
@@ -17419,31 +17324,6 @@ TEST(coupling_single_file_commit) {
     cbm_change_coupling_t results[16];
     int n = cbm_compute_change_coupling(commits, 2, results, 16);
     ASSERT_EQ(n, 0);
-    PASS();
-}
-
-TEST(clean_json_brackets_array) {
-    /* JSON array → space-joined */
-    char out[256];
-    cbm_clean_json_brackets("[\"./app\", \"--flag\"]", out, sizeof(out));
-    ASSERT_TRUE(strstr(out, "./app") != NULL);
-    ASSERT_TRUE(strstr(out, "--flag") != NULL);
-    PASS();
-}
-
-TEST(clean_json_brackets_plain) {
-    /* Plain string → unchanged */
-    char out[256];
-    cbm_clean_json_brackets("./app --flag", out, sizeof(out));
-    ASSERT_STR_EQ(out, "./app --flag");
-    PASS();
-}
-
-TEST(clean_json_brackets_empty) {
-    /* Empty string → empty output */
-    char out[256];
-    cbm_clean_json_brackets("", out, sizeof(out));
-    ASSERT_STR_EQ(out, "");
     PASS();
 }
 
@@ -20349,6 +20229,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
+    RUN_TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
     RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin);
@@ -20449,60 +20330,20 @@ SUITE(pipeline) {
     RUN_TEST(compile_commands_parse_empty);
     RUN_TEST(compile_commands_parse_invalid);
     /* Infrascan helpers */
-    RUN_TEST(infra_is_compose_file);
-    RUN_TEST(infra_is_cloudbuild_file);
-    RUN_TEST(infra_is_shell_script);
-    RUN_TEST(infra_is_dockerfile);
     RUN_TEST(infra_is_kustomize_file);
     RUN_TEST(infra_is_k8s_manifest);
-    RUN_TEST(infra_is_env_file);
-    RUN_TEST(infra_clean_json_brackets);
     RUN_TEST(infra_secret_detection);
-    /* Infrascan: Dockerfile parser */
-    RUN_TEST(infra_parse_dockerfile_multistage);
-    RUN_TEST(infra_parse_dockerfile_entrypoint);
-    RUN_TEST(infra_parse_dockerfile_secret_filtered);
-    RUN_TEST(infra_parse_dockerfile_expose_protocol);
-    RUN_TEST(infra_parse_dockerfile_env_space);
-    RUN_TEST(infra_parse_dockerfile_empty);
-    /* Infrascan: Dotenv parser */
-    RUN_TEST(infra_parse_dotenv);
-    RUN_TEST(infra_parse_dotenv_quoted);
-    /* Infrascan: Shell script parser */
-    RUN_TEST(infra_parse_shell);
-    RUN_TEST(infra_parse_shell_with_source);
-    RUN_TEST(infra_parse_shell_secret_filtered);
-    RUN_TEST(infra_parse_shell_shebang_only);
-    RUN_TEST(infra_parse_shell_truly_empty);
-    /* Infrascan: Terraform parser */
-    RUN_TEST(infra_parse_terraform_full);
-    RUN_TEST(infra_parse_terraform_variables_only);
-    RUN_TEST(infra_parse_terraform_empty);
     RUN_TEST(helm_parse_chart_dependencies_issue338);
     RUN_TEST(helm_parse_chart_no_deps_issue338);
+    RUN_TEST(helm_parse_chart_dependency_entries);
+    RUN_TEST(helm_parse_chart_many_dependencies);
     /* Infrascan: QN helper */
     RUN_TEST(infra_qn_helper);
-    /* Infrascan: pipeline integration */
-    RUN_TEST(infra_pipeline_integration);
-    RUN_TEST(infra_pipeline_idempotent);
     /* K8s / Kustomize extraction */
     RUN_TEST(k8s_extract_kustomize);
     RUN_TEST(k8s_extract_manifest);
     RUN_TEST(k8s_extract_manifest_no_name);
     RUN_TEST(k8s_extract_manifest_multidoc);
-    /* Env URL scanning */
-    RUN_TEST(envscan_dockerfile_env_urls);
-    RUN_TEST(envscan_shell_env_urls);
-    RUN_TEST(envscan_env_file_urls);
-    RUN_TEST(envscan_toml_urls);
-    RUN_TEST(envscan_yaml_urls);
-    RUN_TEST(envscan_terraform_urls);
-    RUN_TEST(envscan_properties_urls);
-    RUN_TEST(envscan_secret_key_exclusion);
-    RUN_TEST(envscan_secret_value_exclusion);
-    RUN_TEST(envscan_secret_file_exclusion);
-    RUN_TEST(envscan_skips_ignored_dirs);
-    RUN_TEST(envscan_non_url_values_skipped);
     /* SwiftPM Package.swift manifest resolution (issue #551 item 1) */
     RUN_TEST(pkgmap_swift_targets_registers_module);
     RUN_TEST(pkgmap_swift_products_do_not_register_alias);
@@ -20517,7 +20358,6 @@ SUITE(pipeline) {
     /* Discovery-exclusion plumbing in auxiliary repo walks (#792) */
     RUN_TEST(pipeline_relpath_excluded_boundary);
     RUN_TEST(pkgmap_scan_repo_honors_discovery_exclusions);
-    RUN_TEST(envscan_walk_honors_discovery_exclusions);
     /* Function registry / resolver */
     RUN_TEST(registry_resolve_single_candidate);
     RUN_TEST(registry_fuzzy_nonexistent);
@@ -20569,7 +20409,7 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
     RUN_TEST(incremental_k8s_manifest_indexed);
-    RUN_TEST(incremental_kustomize_module_indexed);
+    RUN_TEST(incremental_kustomize_entries_indexed);
     /* Resource management & internal helper tests */
     RUN_TEST(pipeline_empty_path);
     RUN_TEST(pipeline_project_name_content);
@@ -20618,9 +20458,6 @@ SUITE(pipeline) {
     RUN_TEST(coupling_empty_commits);
     RUN_TEST(coupling_single_file_commit);
     /* JSON bracket cleaning */
-    RUN_TEST(clean_json_brackets_array);
-    RUN_TEST(clean_json_brackets_plain);
-    RUN_TEST(clean_json_brackets_empty);
     /* FQN computation */
     RUN_TEST(fqn_compute_basic);
     RUN_TEST(fqn_compute_strips_ext);
@@ -20662,6 +20499,17 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_downgrade_preserves_scope_and_artifact_across_change_noop_delete);
     RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
     RUN_TEST(pipeline_staged_publish_commits_below_full_sync_issue1419);
+    RUN_TEST(incremental_k8s_edits_reach_other_files);
+    RUN_TEST(incremental_shell_deploy_edit_keeps_its_edges);
+    RUN_TEST(incremental_deleted_spawner_drops_its_process);
+    RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
+    RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);
+    RUN_TEST(incremental_compose_edit_replaces_build_edges);
+    RUN_TEST(incremental_env_edit_replaces_scoped_envvars);
+    RUN_TEST(incremental_image_split_change_rebuilds);
+    RUN_TEST(incremental_compose_dotenv_change_rebuilds);
+    RUN_TEST(incremental_dockerfile_edit_keeps_docker_build_edges);
+    RUN_TEST(incremental_second_build_declarer_keeps_the_edge);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);

@@ -31,7 +31,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
-/* Read an entire file into a malloc'd buffer. Returns NULL on failure. */
+/* Read an entire file into a core-owned buffer (class extract; release with
+ * cbm_free(CBM_MEM_CLASS_EXTRACT, ...)). Returns NULL on failure. */
 static char *pkgmap_read_file(const char *path, int *out_len) {
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
@@ -44,7 +45,7 @@ static char *pkgmap_read_file(const char *path, int *out_len) {
         (void)fclose(f);
         return NULL;
     }
-    char *buf = (char *)malloc((size_t)size + SKIP_ONE);
+    char *buf = (char *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)size + SKIP_ONE);
     if (!buf) {
         (void)fclose(f);
         return NULL;
@@ -1201,7 +1202,7 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         if (cbm_pkgmap_try_parse(name, rel_path, source, source_len, entries)) {
             parsed++;
         }
-        free(source);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     }
     cbm_closedir(dir);
     return parsed;
@@ -1247,7 +1248,7 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
             continue;
         }
         cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries);
-        free(source);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     }
 
     CBMHashTable *map = cbm_pkgmap_build(&entries, SKIP_ONE, project_name);
@@ -1282,7 +1283,7 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
             continue;
         }
         cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries);
-        free(source);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     }
 
     int from_walk = cbm_pkgmap_scan_repo(repo_path, &entries, excluded_dirs, excluded_count);
@@ -2213,6 +2214,63 @@ cbm_psr4_member_t cbm_pipeline_psr4_member_qn(const cbm_gbuf_t *gbuf, const char
     return *out_qn ? CBM_PSR4_MEMBER_RESOLVED : CBM_PSR4_MEMBER_UNRESOLVED;
 }
 
+/* A kustomization entry naming a remote base -- a URL, a go-getter host path,
+ * an ssh remote or a `?ref=` pin -- lies outside the repository. */
+static bool kustomize_remote_entry(const char *entry) {
+    static const char *const hosts[] = {"github.com/", "gitlab.com/", "bitbucket.org/", "git@",
+                                        NULL};
+    if (strstr(entry, "://") || strstr(entry, "?ref=") || strstr(entry, ".git/")) {
+        return true;
+    }
+    for (int i = 0; hosts[i]; i++) {
+        if (strncmp(entry, hosts[i], strlen(hosts[i])) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool kustomize_file_label(const char *label) {
+    return label && (strcmp(label, "Module") == 0 || strcmp(label, "File") == 0);
+}
+
+/* A kustomization entry is a path relative to the kustomization's own
+ * directory -- a manifest file or a directory -- or a remote base; it never
+ * names a symbol. Resolve it exactly or not at all: the name-guess strategies
+ * bound a remote base's URL segment `deploy` to a shell function, component
+ * paths to Go structs, and an entry's basename to a same-named file beside
+ * the importer. */
+static const cbm_gbuf_node_t *resolve_kustomize_entry(const cbm_pipeline_ctx_t *ctx,
+                                                      const char *source_rel, const char *entry) {
+    if (!entry[0] || kustomize_remote_entry(entry)) {
+        return NULL;
+    }
+    /* "x.yaml" and "./x.yaml" name the same file; make every entry relative. */
+    bool dotted = entry[0] == '.' && (entry[1] == '/' || (entry[1] == '.' && entry[2] == '/'));
+    char rel[PKGMAP_PATH_BUF];
+    snprintf(rel, sizeof(rel), "%s%s", dotted ? "" : "./", entry);
+    char *path = cbm_pipeline_resolve_relative_import(source_rel, rel);
+    if (!path) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *found = NULL;
+    char *qn = cbm_pipeline_fqn_module(ctx->project_name, path);
+    const cbm_gbuf_node_t *n = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+    free(qn);
+    if (n && kustomize_file_label(n->label)) {
+        found = n;
+    } else {
+        char *fqn = cbm_pipeline_fqn_folder(ctx->project_name, path);
+        n = fqn ? cbm_gbuf_find_by_qn(ctx->gbuf, fqn) : NULL;
+        free(fqn);
+        if (n && n->label && strcmp(n->label, "Folder") == 0) {
+            found = n;
+        }
+    }
+    free(path);
+    return found;
+}
+
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
@@ -2220,6 +2278,18 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                                                         CBMHashTable *namespace_map) {
     if (!ctx || !imp || !imp->module_path) {
         return NULL;
+    }
+
+    /* The importing file's language gates the strategies below. */
+    const char *src_base = source_rel ? source_rel : "";
+    for (const char *pb = src_base; *pb; pb++) {
+        if (*pb == '/' || *pb == '\\') {
+            src_base = pb + SKIP_ONE;
+        }
+    }
+    const CBMLanguage src_lang = cbm_language_for_filename(src_base);
+    if (src_lang == CBM_LANG_KUSTOMIZE) {
+        return resolve_kustomize_entry(ctx, source_rel, imp->module_path);
     }
 
     /* Prefer exact header-file nodes for C/C++ includes so same-stem source or
@@ -2283,13 +2353,6 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     /* Name-guess fallbacks below (Strategy 1b sibling-file, Strategy 3
      * symbol-name) are gated per importing-file language — see
      * cbm_import_symbol_fallback_allowed (#1934). */
-    const char *src_base = source_rel ? source_rel : "";
-    for (const char *pb = src_base; *pb; pb++) {
-        if (*pb == '/' || *pb == '\\') {
-            src_base = pb + SKIP_ONE;
-        }
-    }
-    const CBMLanguage src_lang = cbm_language_for_filename(src_base);
     const bool symbol_fallback_allowed = cbm_import_symbol_fallback_allowed(src_lang);
 
     /* Strategy 1b: sibling-file resolution for build/markup grammars whose

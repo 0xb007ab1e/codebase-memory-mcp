@@ -1371,9 +1371,11 @@ TEST(mcp_metadata_byte_budget) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
     /* Seed discovery and independent pagination have a reviewed budget:
-     * 20 KiB overall; only detect_changes may exceed the 3200-byte per-tool
+     * 21 KiB overall (raised from 20 KiB for the infra filters and the
+     * topology/deploy/run trace modes: one usage hint per mode keeps them
+     * findable); only detect_changes may exceed the 3200-byte per-tool
      * ceiling, with its own 4096-byte bound. */
-    ASSERT_LT((int)strlen(json), 20 * 1024);
+    ASSERT_LT((int)strlen(json), 21 * 1024);
 
     yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
     ASSERT_NOT_NULL(doc);
