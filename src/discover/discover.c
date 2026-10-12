@@ -14,15 +14,21 @@
 #include "cbm.h" // CBMLanguage, CBM_LANG_COUNT, CBM_LANG_JSON
 
 #include "foundation/constants.h"
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/hash_table.h"
 #include "foundation/limits.h"
 #include "foundation/mem_core.h"
 #include "foundation/str_util.h"
+#include "foundation/subprocess.h"
 #include "foundation/workspace.h"
 #include "foundation/platform.h"
+#include "mcp/test_impact_engine.h" // cbm_test_impact_find_git
 #ifdef _WIN32
 #include "foundation/win_utf8.h"
+#include <io.h> // _close
+#else
+#include <unistd.h> // close
 #endif
 #include <ctype.h>
 #include <stdint.h> // int64_t
@@ -1369,53 +1375,60 @@ static void tracked_free(discover_tracked_t *tracked) {
     memset(tracked, 0, sizeof(*tracked));
 }
 
-/* The whole `git ls-files -z` output for repo_path (paths relative to it),
- * NUL-terminated; NULL when git cannot run or fails. */
-static char *tracked_read(const char *repo_path, size_t *length) {
-    *length = 0;
-    if (!cbm_validate_shell_path_arg(repo_path)) {
+/* The bytes of the capture file at path, NUL-terminated; NULL on any failure. */
+static char *tracked_slurp(const char *path, size_t *length) {
+    int64_t size = cbm_file_size(path);
+    if (size < 0 || (uint64_t)size >= SIZE_MAX) {
         return NULL;
     }
-#ifdef _WIN32
-    const char *null_dev = "NUL";
-#else
-    const char *null_dev = "/dev/null";
-#endif
-    char cmd[CBM_SZ_4K + CBM_SZ_64];
-    int n = snprintf(cmd, sizeof(cmd), "git -C \"%s\" ls-files -z 2>%s", repo_path, null_dev);
-    if (n < 0 || (size_t)n >= sizeof(cmd)) {
-        return NULL;
+    char *buffer = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)size + SKIP_ONE);
+    FILE *fp = buffer ? cbm_fopen(path, "rb") : NULL;
+    bool ok = fp && fread(buffer, 1, (size_t)size, fp) == (size_t)size;
+    if (fp) {
+        (void)fclose(fp);
     }
-    FILE *fp = cbm_popen_git(cmd);
-    if (!fp) {
-        return NULL;
-    }
-    size_t capacity = CBM_SZ_64K;
-    size_t used = 0;
-    char *buffer = cbm_alloc(CBM_MEM_CLASS_OTHER, capacity);
-    while (buffer) {
-        if (capacity - used < CBM_SZ_4K) {
-            char *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, buffer, capacity * 2);
-            if (!grown) {
-                cbm_free(CBM_MEM_CLASS_OTHER, buffer);
-                buffer = NULL;
-                break;
-            }
-            buffer = grown;
-            capacity *= 2;
-        }
-        size_t got = fread(buffer + used, 1, capacity - used - SKIP_ONE, fp);
-        if (got == 0) {
-            break;
-        }
-        used += got;
-    }
-    if (cbm_pclose(fp) != 0 || !buffer) {
+    if (!ok) {
         cbm_free(CBM_MEM_CLASS_OTHER, buffer);
         return NULL;
     }
-    buffer[used] = '\0';
-    *length = used;
+    buffer[size] = '\0';
+    *length = (size_t)size;
+    return buffer;
+}
+
+/* The whole `git ls-files -z` output for repo_path (paths relative to it),
+ * NUL-terminated; NULL when git cannot run or fails. Git runs without a
+ * shell: the repository path is one argv entry, and the child environment
+ * drops repository-local variables so an inherited GIT_DIR cannot redirect -C. */
+static char *tracked_read(const char *repo_path, size_t *length) {
+    *length = 0;
+    char git[CBM_SZ_4K];
+    char capture[CBM_SZ_4K];
+    int n = snprintf(capture, sizeof(capture), "%s/cbm-discover-git-XXXXXX", cbm_tmpdir());
+    if (!cbm_test_impact_find_git(git, sizeof(git)) || n <= 0 || (size_t)n >= sizeof(capture)) {
+        return NULL;
+    }
+    int fd = cbm_mkstemp(capture);
+    if (fd < 0) {
+        return NULL;
+    }
+#ifdef _WIN32
+    (void)_close(fd);
+#else
+    (void)close(fd);
+#endif
+    const char *argv[] = {git,        "-C", repo_path, "-c", "core.fsmonitor=false",
+                          "ls-files", "-z", NULL};
+    cbm_proc_opts_t opts = {.bin = git,
+                            .argv = argv,
+                            .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
+                            .strip_git_repo_env = true,
+                            .stdout_file = capture};
+    cbm_proc_result_t result = {0};
+    bool ran = cbm_subprocess_run(&opts, &result) == 0 && result.outcome == CBM_PROC_CLEAN &&
+               result.exit_code == 0;
+    char *buffer = ran ? tracked_slurp(capture, length) : NULL;
+    (void)cbm_unlink(capture);
     return buffer;
 }
 
