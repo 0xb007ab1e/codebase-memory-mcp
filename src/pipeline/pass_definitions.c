@@ -735,9 +735,17 @@ bool cbm_pipeline_coverage_marker_test_join(CBMFileResult *aggregate, const CBMF
  * class independently (preserving the upstream parser behavior), then compose
  * every extracted carrier into one result for the normal registry/call/usage/
  * semantic passes. */
-CBMFileResult *cbm_pipeline_extract_objectscript_export(
+static CBM_TLS cbm_objectscript_export_extractor_t objectscript_export_test_extractor;
+
+void cbm_pipeline_set_objectscript_export_extractor_for_tests(
+    cbm_objectscript_export_extractor_t extractor) {
+    objectscript_export_test_extractor = extractor;
+}
+
+CBMFileResult *cbm_pipeline_extract_objectscript_export_with_timeout(
     const char *source, int source_len, const char *project_name, const char *rel_path,
-    const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table) {
+    const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table,
+    int64_t timeout_micros) {
     CBMArena export_arena;
     cbm_arena_init(&export_arena);
     int class_count = 0;
@@ -767,10 +775,13 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export(
     }
     aggregate->cached_lang = CBM_LANG_OBJECTSCRIPT_UDL;
 
+    cbm_objectscript_export_extractor_t extract = objectscript_export_test_extractor
+                                                      ? objectscript_export_test_extractor
+                                                      : cbm_extract_file_ex;
     for (int ci = 0; ci < class_count; ci++) {
-        CBMFileResult *part = cbm_extract_file_ex(
-            udl_strings[ci], (int)strlen(udl_strings[ci]), CBM_LANG_OBJECTSCRIPT_UDL, project_name,
-            rel_path, CBM_EXTRACT_BUDGET, NULL, NULL, macro_table, return_type_table);
+        CBMFileResult *part = extract(udl_strings[ci], (int)strlen(udl_strings[ci]),
+                                      CBM_LANG_OBJECTSCRIPT_UDL, project_name, rel_path,
+                                      timeout_micros, NULL, NULL, macro_table, return_type_table);
         if (!part) {
             continue;
         }
@@ -818,6 +829,14 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export(
     aggregate->imports_count = aggregate->imports.count;
     cbm_arena_destroy(&export_arena);
     return aggregate;
+}
+
+CBMFileResult *cbm_pipeline_extract_objectscript_export(
+    const char *source, int source_len, const char *project_name, const char *rel_path,
+    const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table) {
+    return cbm_pipeline_extract_objectscript_export_with_timeout(
+        source, source_len, project_name, rel_path, macro_table, return_type_table,
+        CBM_EXTRACT_BUDGET);
 }
 
 #undef OBJECTSCRIPT_EXPORT_APPEND_ARRAY

@@ -1157,7 +1157,7 @@ static bool find_in_path(const char *name, char *out, size_t out_sz) {
 }
 
 const char *cbm_find_cli(const char *name, const char *home_dir) {
-    static char buf[CLI_BUF_512];
+    static CBM_TLS char buf[CLI_BUF_512];
     if (!name || !name[0]) {
         return "";
     }
