@@ -457,10 +457,11 @@ static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, c
 
 /* Insert an edge, splicing the call-site line (,"line":N) in before the closing
  * brace when one was captured. Mirrors finalize_and_emit() on the parallel path
- * so CALLS edges carry their source line regardless of resolution path. Restricted
- * to CALLS: route/config edge props feed full-only predump passes
- * (create_route_nodes/create_data_flows), so altering them desyncs full vs
- * incremental indexing. */
+ * so CALLS edges carry their source line regardless of resolution path. Line and
+ * args here are restricted to CALLS; HTTP_CALLS / ASYNC_CALLS props are finished
+ * by the parallel formatter itself (emit_http_async_edge), because route/service
+ * edge props feed full-only predump passes (create_route_nodes /
+ * create_data_flows) and must not differ between the two passes. */
 /* Append a ,"args":[{"i":0,"e":"<expr>","v":"<value>"},...] field onto a CALLS
  * edge's JSON props (the props buffer ends in '}'). The sequential pass omitted
  * this, so data_flow mode had no argument expressions to surface for small
@@ -585,8 +586,10 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
      * emit_http_async_service_edge: the old single format string closed the
      * method value's quote but not the broker's, emitting
      * "broker":"bullmq} on EVERY brokered ASYNC_CALLS edge — and its fixup
-     * only handled truncation, which never fires in the normal case (#898). */
-    char props[CBM_SZ_512];
+     * only handled truncation, which never fires in the normal case (#898).
+     * The call's args and the closing brace come from the parallel path's own
+     * formatter, so a service edge is byte-identical whichever pass emits it. */
+    char props[CBM_SZ_2K];
     int n = snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"", esc_callee,
                      esc_url);
     if (method && n > 0 && (size_t)n < sizeof(props)) {
@@ -595,11 +598,8 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     if (broker && n > 0 && (size_t)n < sizeof(props)) {
         n += snprintf(props + n, sizeof(props) - (size_t)n, ",\"broker\":\"%s\"", broker);
     }
-    if (n > 0 && (size_t)n < sizeof(props) - 1) {
-        props[n] = '}';
-        props[n + 1] = '\0';
-    }
-    calls_emit_edge(ctx->gbuf, source->id, route_id, edge_type, props, sizeof(props), call);
+    cbm_pipeline_close_call_props(props, n, call, false);
+    cbm_gbuf_insert_edge(ctx->gbuf, source->id, route_id, edge_type, props);
 }
 
 /* Classify a resolved call and emit the appropriate edge. */

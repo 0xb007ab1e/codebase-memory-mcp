@@ -663,6 +663,12 @@ bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *proje
                                        const char **imp_vals, int imp_count, const CBMCall *call,
                                        char *out, size_t out_sz);
 
+/* Finish a call edge's props: `props` is a CBM_SZ_2K buffer holding `n` bytes
+ * of an unclosed JSON object. Appends the call's ,"args":[...] (and, when
+ * `with_line`, its ,"line":N), then the closing brace. The one formatter
+ * behind both passes' HTTP_CALLS / ASYNC_CALLS props (pass_parallel.c). */
+void cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool with_line);
+
 /* A spawn site (pass_spawns.c): the API the call names and the program it
  * starts (CBM_SPAWN_DYNAMIC when not a literal). */
 typedef struct {

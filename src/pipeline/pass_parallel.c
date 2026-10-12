@@ -2248,13 +2248,13 @@ static const char *find_route_path_in_args(const CBMCall *call, const char **out
     return found;
 }
 
-/* Build props JSON, append args, close brace, emit edge. */
-static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
-                              const char *edge_type, char *props, int n, const CBMCall *call) {
+/* Append the call's args (and, for CALLS, its line) to props and close the
+ * brace. Shared with the sequential pass, whose service edges must carry the
+ * same bytes (pass_calls.c emit_http_async_edge). */
+void cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool with_line) {
     if (n > 0 && (size_t)n < CBM_SZ_2K - PP_ESC_SPACE) {
         size_t pos = append_args_json(props, CBM_SZ_2K, (size_t)n, call);
-        if (call->start_line > 0 && strcmp(edge_type, "CALLS") == 0 &&
-            pos < CBM_SZ_2K - PP_LINE_MARGIN) {
+        if (with_line && call->start_line > 0 && pos < CBM_SZ_2K - PP_LINE_MARGIN) {
             int ln = snprintf(props + pos, CBM_SZ_2K - pos, ",\"line\":%d", call->start_line);
             if (ln > 0) {
                 pos += (size_t)ln;
@@ -2265,6 +2265,12 @@ static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
             props[pos + SKIP_ONE] = '\0';
         }
     }
+}
+
+/* Build props JSON, append args, close brace, emit edge. */
+static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
+                              const char *edge_type, char *props, int n, const CBMCall *call) {
+    cbm_pipeline_close_call_props(props, n, call, strcmp(edge_type, "CALLS") == 0);
     cbm_gbuf_insert_edge(gbuf, src_id, tgt_id, edge_type, props);
 }
 
