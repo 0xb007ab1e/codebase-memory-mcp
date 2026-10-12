@@ -3075,6 +3075,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
     bool lsp_exact_idx_complete = true;
     bool lsp_legacy_idx_complete = true;
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
+    /* Names this file's imports bind onto external libraries, built on the
+     * first unresolved call that asks (see pass_calls.c). */
+    cbm_external_import_index_t ext_imports = {0};
     if (result->calls.count > 0 && result->resolved_calls.count > 0) {
         uint32_t capacity = (uint32_t)result->resolved_calls.count * 2u + 16u;
         lsp_exact_idx = cbm_ht_create(capacity);
@@ -3411,6 +3414,24 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                     emit_http_async_service_edge(ws->local_edge_buf, source_node, call, &fake_res,
                                                  CBM_SVC_HTTP, u);
                 }
+            } else {
+                /* A callee an import binds to an external client library
+                 * (`send` under `from paho.mqtt import publish as send`):
+                 * spelled through its import, then classified. MUST match
+                 * pass_calls.c. */
+                char spelled[CBM_SZ_512];
+                cbm_svc_kind_t isvc = cbm_pipeline_external_import_service(
+                    &ext_imports, rc->main_gbuf, rc->project_name, rel, lang, &result->imports,
+                    call, spelled, sizeof(spelled));
+                if (isvc != CBM_SVC_NONE) {
+                    CBMCall through = *call;
+                    through.callee_name = spelled;
+                    cbm_resolution_t imp_res = {.qualified_name = spelled,
+                                                .confidence = PP_HALF_CONF,
+                                                .strategy = "import_binding"};
+                    emit_http_async_service_edge(ws->local_edge_buf, source_node, &through,
+                                                 &imp_res, isvc, through.first_string_arg);
+                }
             }
             continue;
         }
@@ -3498,6 +3519,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         cbm_ht_foreach(lsp_legacy_idx, lsp_idx_free_key, NULL);
         cbm_ht_free(lsp_legacy_idx);
     }
+    cbm_pipeline_external_import_index_free(&ext_imports);
     cbm_pipeline_lsp_field_index_free(&field_index);
 }
 

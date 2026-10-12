@@ -1978,7 +1978,7 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
     size_t str_def_profile = 0, str_def_lists = 0, str_def_fp = 0, str_def_misc = 0;
     size_t str_call_names = 0, str_call_enclosing = 0, str_call_args = 0;
     size_t str_usage_names = 0, str_usage_enclosing = 0, str_rw = 0, str_typeref = 0;
-    size_t str_resolved = 0, str_source = 0, str_module = 0;
+    size_t str_resolved = 0, str_source = 0, str_module = 0, str_imports = 0;
     for (int i = 0; i < file_count; i++) {
         const CBMFileResult *r = cache ? cache[i] : NULL;
         if (!r) {
@@ -2070,6 +2070,12 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
             str_typeref += census_len(r->type_refs.items[t].type_name) +
                            census_len(r->type_refs.items[t].enclosing_func_qn);
         }
+        for (int m = 0; m < r->imports.count; m++) {
+            const CBMImport *imp = &r->imports.items[m];
+            /* A non-aliased named import's member IS its local name string. */
+            str_imports += census_len(imp->local_name) + census_len(imp->module_path) +
+                           (imp->member != imp->local_name ? census_len(imp->member) : 0);
+        }
         for (int q = 0; q < r->resolved_calls.count; q++) {
             const CBMResolvedCall *rc = &r->resolved_calls.items[q];
             str_resolved += census_len(rc->caller_qn) + census_len(rc->callee_qn) +
@@ -2102,10 +2108,11 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
     cbm_log_info("extract.census.def_strings_mb", "tag", tag, "v", line);
     snprintf(line, sizeof(line),
              "call_names=%lu call_enclosing=%lu call_args=%lu usage_names=%lu "
-             "usage_enclosing=%lu rw=%lu type_refs=%lu resolved=%lu source=%lu module=%lu",
+             "usage_enclosing=%lu rw=%lu type_refs=%lu resolved=%lu source=%lu module=%lu "
+             "imports=%lu",
              MB(str_call_names), MB(str_call_enclosing), MB(str_call_args), MB(str_usage_names),
              MB(str_usage_enclosing), MB(str_rw), MB(str_typeref), MB(str_resolved), MB(str_source),
-             MB(str_module));
+             MB(str_module), MB(str_imports));
     cbm_log_info("extract.census.ref_strings_mb", "tag", tag, "v", line);
 #undef MB
 }

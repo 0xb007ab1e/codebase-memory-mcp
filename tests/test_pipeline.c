@@ -10360,6 +10360,183 @@ TEST(pipeline_relative_folded_wrapper_url_candidates) {
     PASS();
 }
 
+/* HTTP_CALLS + ASYNC_CALLS edges out of the function `source_name`. */
+static int service_edges_from(cbm_store_t *s, const char *project, const char *source_name) {
+    static const char *const types[] = {"HTTP_CALLS", "ASYNC_CALLS"};
+    int matches = 0;
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_type(s, project, types[t], &edges, &edge_count) !=
+            CBM_STORE_OK) {
+            return -1;
+        }
+        for (int i = 0; i < edge_count; i++) {
+            cbm_node_t source = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK &&
+                source.name && strcmp(source.name, source_name) == 0) {
+                matches++;
+            }
+            cbm_node_free_fields(&source);
+        }
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* IMPORTS edges out of `file_path` that bind `local_name`; -1 on a failed query. */
+static int imports_binding_count(cbm_store_t *s, const char *project, const char *file_path,
+                                 const char *local_name) {
+    static const char sql[] =
+        "SELECT count(*) FROM edges e JOIN nodes f ON f.id=e.source_id WHERE e.project=?1 "
+        "AND e.type='IMPORTS' AND f.file_path=?2 AND json_extract(e.properties,'$.local_name')=?3";
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *st = NULL;
+    if (!db || sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    int count = -1;
+    if (sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_text(st, 2, file_path, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_text(st, 3, local_name, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        count = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return count;
+}
+
+/* A call through an import of an EXTERNAL client library is that library's
+ * call: `fetchIt` from `{ get as fetchIt } from 'axios'` is a typed GET,
+ * `http_post` from `from requests import post as http_post` a typed POST,
+ * `emitIt` from `{ publish as emitIt } from 'mqtt'` a publish. Precision
+ * controls, each with no HTTP_CALLS/ASYNC_CALLS edge:
+ *   - urljoin from urllib.parse: an HTTP library's helper, not a request;
+ *   - lodash's `get`, json's `dumps`: libraries no service pattern knows;
+ *   - `send` defined in the importing module shadows
+ *     `from paho.mqtt import publish as send`; `relay` rebound as a parameter
+ *     shadows `... as relay` (a name no project function has, so only the
+ *     parameter binding stands between the call and the import);
+ *   - `httpx` is a PROJECT package here: its import is materialized (the
+ *     precondition is asserted), so a call it cannot resolve stays unresolved
+ *     instead of becoming the external httpx.post.
+ * Both resolvers: sequential and parallel (> 50 files). */
+TEST(pipeline_external_import_binding_controls_sequential_parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_extimport_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(
+        tmp, "src/ext_http.ts",
+        "import { get as fetchIt } from 'axios';\n"
+        "import { get as lodashGet } from 'lodash';\n"
+        "import { publish as emitIt } from 'mqtt';\n"
+        "export function viaAxiosAlias(): unknown { return fetchIt('/api/alias-get'); }\n"
+        "export function viaLodashAlias(o: object): unknown {\n"
+        "  return lodashGet(o, '/api/lodash');\n"
+        "}\n"
+        "export function viaMqtt(): void { emitIt('tenant/ts', 'payload'); }\n");
+    write_temp_file(tmp, "src/ext_py.py",
+                    "from requests import post as http_post\n"
+                    "from urllib.parse import urljoin\n"
+                    "from json import dumps as publish_json\n"
+                    "from paho.mqtt import publish as send\n"
+                    "def py_post():\n    return http_post('/api/py-post')\n"
+                    "def join_url(base):\n    return urljoin(base, '/static/asset.css')\n"
+                    "def join_abs(name):\n    return urljoin('https://example.com/assets/', name)\n"
+                    "def to_json():\n    return publish_json('/tenant/json')\n"
+                    "def send(topic, payload):\n    return topic\n"
+                    "def shadowed():\n    return send('tenant/shadow', 'payload')\n");
+    write_temp_file(tmp, "src/ext_param.py",
+                    "from paho.mqtt import publish as relay\n"
+                    "def param_shadow(relay):\n    return relay('tenant/param', 'payload')\n");
+    write_temp_file(tmp, "httpx/__init__.py", "def get(url):\n    return url\n");
+    write_temp_file(tmp, "src/proj_client.py",
+                    "from httpx import post as hx_post\n"
+                    "def proj_post():\n    return hx_post('/api/project')\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/padding%d.ts", i);
+        snprintf(body, sizeof(body), "export function padding%d() { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    static const char *const silent[] = {"viaLodashAlias", "join_url",     "join_abs", "to_json",
+                                         "shadowed",       "param_shadow", "proj_post"};
+    enum { SILENT = sizeof(silent) / sizeof(silent[0]) };
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    int run_rc[2] = {-1, -1};
+    bool opened[2] = {false, false};
+    int typed_get[2] = {-1, -1};
+    int typed_post[2] = {-1, -1};
+    int published[2] = {-1, -1};
+    int shadow_calls[2] = {-1, -1};
+    int project_import[2] = {-1, -1};
+    int silent_edges[2][SILENT];
+    for (int mode = 0; mode < 2; mode++) {
+        for (int i = 0; i < SILENT; i++) {
+            silent_edges[mode][i] = -1;
+        }
+        if (mode == 0) {
+            cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+        } else {
+            cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+            cbm_setenv("CBM_WORKERS", "4", 1);
+        }
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/extimport_%d.db", tmp, mode);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        run_rc[mode] = p ? cbm_pipeline_run(p) : -1;
+        const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        opened[mode] = s != NULL;
+        if (s && project) {
+            typed_get[mode] = http_calls_to_route(s, project, "viaAxiosAlias", "__route__GET__");
+            typed_post[mode] = http_calls_to_route(s, project, "py_post", "__route__POST__");
+            published[mode] = named_edge_count(s, project, "ASYNC_CALLS", "viaMqtt", "tenant/ts");
+            shadow_calls[mode] = named_edge_count(s, project, "CALLS", "shadowed", "send");
+            project_import[mode] =
+                imports_binding_count(s, project, "src/proj_client.py", "hx_post");
+            for (int i = 0; i < SILENT; i++) {
+                silent_edges[mode][i] = service_edges_from(s, project, silent[i]);
+            }
+        }
+        if (s) {
+            cbm_store_close(s);
+        }
+        cbm_pipeline_free(p);
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    for (int mode = 0; mode < 2; mode++) {
+        ASSERT_EQ(run_rc[mode], 0);
+        ASSERT_TRUE(opened[mode]);
+        ASSERT_EQ(typed_get[mode], 1);
+        ASSERT_EQ(typed_post[mode], 1);
+        ASSERT_EQ(published[mode], 1);
+        ASSERT_GTE(shadow_calls[mode], 1);
+        ASSERT_GTE(project_import[mode], 1);
+        for (int i = 0; i < SILENT; i++) {
+            ASSERT_EQ(silent_edges[mode][i], 0);
+        }
+    }
+    PASS();
+}
+
 /* ── Git history pass tests ─────────────────────────────────────── */
 
 TEST(githistory_is_trackable) {
@@ -21472,6 +21649,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_url_constant_folding_http_calls_issue706_1147);
     RUN_TEST(pipeline_folded_topics_preserve_identity_sequential_parallel);
     RUN_TEST(pipeline_relative_folded_wrapper_url_candidates);
+    RUN_TEST(pipeline_external_import_binding_controls_sequential_parallel);
     /* Git history pass */
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);
