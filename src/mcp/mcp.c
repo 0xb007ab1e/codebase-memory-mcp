@@ -548,6 +548,8 @@ static const tool_def_t TOOLS[] = {
      "\"Name override; Non-ASCII bytes are encoded; unsafe characters normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write .codebase-memory/graph.db.zst.\"},"
+     "\"doc_candidates\":{\"type\":\"boolean\",\"description\":"
+     "\"Doc-code candidates; default: the doc_candidates setting (on).\"},"
      "\"async\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Start the index in the background and return immediately; it keeps running if this "
      "call is cancelled or times out. Not with status or cross-repo-intelligence. Refused for a "
@@ -11738,14 +11740,32 @@ static bool resolve_session_repo_path(cbm_mcp_server_t *srv, char **repo_path) {
     return true;
 }
 
+/* doc_candidates for one index: an explicit boolean argument wins, else the
+ * doc_candidates setting (default on). The parent resolves it once and passes
+ * the decided value on, so a daemon job or supervised worker gets it as an
+ * argument instead of reading a config of its own. */
+static bool index_doc_candidates_enabled(cbm_mcp_server_t *srv, const char *args) {
+    yyjson_doc *doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    yyjson_val *val = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "doc_candidates") : NULL;
+    bool explicit_value = val && yyjson_is_bool(val);
+    bool enabled = explicit_value ? yyjson_get_bool(val) : true;
+    yyjson_doc_free(doc);
+    if (!explicit_value && srv && srv->config) {
+        enabled = cbm_config_get_bool(srv->config, CBM_CONFIG_DOC_CANDIDATES, true);
+    }
+    return enabled;
+}
+
 /* Preserve every index option while replacing all caller-supplied repo_path
  * keys with the one canonical path that was actually authorized. A non-empty
  * project_name likewise replaces any caller "name" (#2134: the project key the
  * parent resolved for this root travels to the daemon job / worker verbatim,
- * so lease key and written index cannot diverge). */
+ * so lease key and written index cannot diverge). doc_candidates is replaced
+ * by the value the parent resolved. */
 static char *index_args_with_repo_path(const char *args, const char *canonical_repo_path,
                                        const char *project_name,
-                                       const cbm_index_resource_policy_t *policy) {
+                                       const cbm_index_resource_policy_t *policy,
+                                       bool doc_candidates) {
     if (!args || !canonical_repo_path || !policy) {
         return NULL;
     }
@@ -11783,9 +11803,13 @@ static char *index_args_with_repo_path(const char *args, const char *canonical_r
     while (has_name && yyjson_mut_obj_get(copy_root, "name")) {
         (void)yyjson_mut_obj_remove_key(copy_root, "name");
     }
+    while (yyjson_mut_obj_get(copy_root, "doc_candidates")) {
+        (void)yyjson_mut_obj_remove_key(copy_root, "doc_candidates");
+    }
     if ((has_name && !yyjson_mut_obj_add_strcpy(copy, copy_root, "name", project_name)) ||
         !yyjson_mut_obj_add_strcpy(copy, copy_root, "repo_path", canonical_repo_path) ||
-        !cbm_mcp_index_policy_add_to_args(copy, copy_root, policy)) {
+        !cbm_mcp_index_policy_add_to_args(copy, copy_root, policy) ||
+        !yyjson_mut_obj_add_bool(copy, copy_root, "doc_candidates", doc_candidates)) {
         yyjson_mut_doc_free(copy);
         return NULL;
     }
@@ -12151,12 +12175,13 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         index_args_free(repo_path, mode_str, name_override);
         return cbm_mcp_text_result(policy_error, true);
     }
+    bool doc_candidates = index_doc_candidates_enabled(srv, args);
 
     /* A daemon session delegates the one physical write to its shared job
      * registry only after path canonicalization and workspace authorization. */
     if (srv->index_executor) {
-        char *worker_args =
-            index_args_with_repo_path(args, repo_path, name_override, &resource_policy);
+        char *worker_args = index_args_with_repo_path(args, repo_path, name_override,
+                                                      &resource_policy, doc_candidates);
         char *coordinated = worker_args ? srv->index_executor(srv->index_executor_context,
                                                               repo_path, worker_args, async_mode)
                                         : NULL;
@@ -12184,8 +12209,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * installs the same guard before running the in-process pipeline. A marked
      * host fails closed if preparation or worker startup cannot complete. */
     if (cbm_index_supervisor_should_wrap()) {
-        char *worker_args =
-            index_args_with_repo_path(args, repo_path, name_override, &resource_policy);
+        char *worker_args = index_args_with_repo_path(args, repo_path, name_override,
+                                                      &resource_policy, doc_candidates);
         if (!worker_args) {
             free(mutation_project);
             index_args_free(repo_path, mode_str, name_override);
@@ -12249,6 +12274,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     free(name_override);
     cbm_pipeline_set_persistence(p, persistence);
     cbm_pipeline_set_resource_policy(p, &resource_policy);
+    cbm_pipeline_set_doc_candidates_enabled(p, doc_candidates);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
 
@@ -19957,6 +19983,7 @@ static void *autoindex_thread(void *arg) {
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
         return NULL;
     }
+    cbm_pipeline_set_doc_candidates_enabled(p, index_doc_candidates_enabled(srv, NULL));
 
     /* Block until any concurrent pipeline finishes */
     cbm_pipeline_lock();

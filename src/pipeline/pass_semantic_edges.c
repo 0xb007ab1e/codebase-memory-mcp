@@ -3029,6 +3029,12 @@ static void phase6c_doc_sections(cbm_pipeline_ctx_t *ctx, const cbm_sem_func_t *
     if (!corpus || func_count <= 0) {
         return;
     }
+    /* doc_candidates off: no scoring and no rows (the scoring grows with
+     * sections x functions; on the Linux kernel it is ~174 s of the index). */
+    if (!cbm_pipeline_doc_candidates_enabled(ctx->pipeline)) {
+        cbm_log_info("pass.semantic.doc_candidates", "skipped", "doc_candidates_off");
+        return;
+    }
     const cbm_gbuf_node_t **found = NULL;
     int nsec = 0;
     if (cbm_gbuf_find_by_label(gbuf, "Section", &found, &nsec) != 0 || nsec == 0) {

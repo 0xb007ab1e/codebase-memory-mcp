@@ -278,6 +278,8 @@ struct cbm_pipeline {
      * cbm_pipeline_free). NULL when the pass found none or did not run. */
     cbm_doc_candidate_t *doc_candidates;
     int doc_candidate_count;
+    /* doc_candidates setting off (calloc'd false = on, the default). */
+    bool doc_candidates_off;
 
     /* Deterministic test-only seam at the final publication boundary. Kept
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
@@ -872,6 +874,16 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->persistence = enabled;
     }
+}
+
+void cbm_pipeline_set_doc_candidates_enabled(cbm_pipeline_t *p, bool enabled) {
+    if (p) {
+        p->doc_candidates_off = !enabled;
+    }
+}
+
+bool cbm_pipeline_doc_candidates_enabled(const cbm_pipeline_t *p) {
+    return !p || !p->doc_candidates_off;
 }
 
 void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p,
