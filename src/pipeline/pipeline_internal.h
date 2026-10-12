@@ -18,6 +18,7 @@
 #include "git/git_context.h"
 #include "foundation/hash_table.h"
 #include "spawn_patterns.h"
+#include "service_patterns.h" /* cbm_svc_kind_t */
 #include "cbm.h"
 #include "lsp/php_lsp.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
@@ -668,6 +669,42 @@ bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *proje
  * `with_line`, its ,"line":N), then the closing brace. The one formatter
  * behind both passes' HTTP_CALLS / ASYNC_CALLS props (pass_parallel.c). */
 void cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool with_line);
+
+/* Per-file index of the names a file's imports bind onto EXTERNAL modules:
+ * local name -> the binding import. Built lazily, on the first call that
+ * asks, from the file's extraction imports and its IMPORTS edges; one hash
+ * lookup per call after that. Zero-initialize, pass to
+ * cbm_pipeline_external_import_service for every call of ONE file, then
+ * release with cbm_pipeline_external_import_index_free. */
+typedef struct {
+    CBMHashTable *by_local;
+    bool built;
+} cbm_external_import_index_t;
+
+void cbm_pipeline_external_import_index_free(cbm_external_import_index_t *index);
+
+/* A call no project symbol resolved, whose callee is bound by an import of an
+ * EXTERNAL library: `send(...)` under `from paho.mqtt import publish as send`,
+ * `navigate(...)` under `import { get as navigate } from 'axios'`. Spells the
+ * callee as its import makes it (paho.mqtt.publish, axios.get), runs the
+ * service patterns on that name, and returns CBM_SVC_HTTP or CBM_SVC_ASYNC
+ * (writing the spelled name to `spelled`) for an HTTP request -- the spelled
+ * name ends in a request verb, so urllib.parse.urljoin is none -- with a URL
+ * argument, or a messaging call with a URL or topic argument; CBM_SVC_NONE
+ * otherwise.
+ *
+ * Only adds what the resolvers had no answer for: a project import (one an
+ * IMPORTS edge materialized, or a relative path), a name bound by two
+ * different imports, a Python callee rebound as a parameter, and every call
+ * the route-suffix and global-fetch fallbacks already own are left alone.
+ * Python and JS/TS today; a language plugs in with its binding rule in
+ * pass_calls.c. Both call resolvers call this, so they cannot diverge. */
+cbm_svc_kind_t cbm_pipeline_external_import_service(cbm_external_import_index_t *index,
+                                                    const cbm_gbuf_t *gbuf, const char *project,
+                                                    const char *rel, CBMLanguage lang,
+                                                    const CBMImportArray *imports,
+                                                    const CBMCall *call, char *spelled,
+                                                    size_t spelled_sz);
 
 /* A spawn site (pass_spawns.c): the API the call names and the program it
  * starts (CBM_SPAWN_DYNAMIC when not a literal). */

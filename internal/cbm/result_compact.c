@@ -294,6 +294,7 @@ static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
         for (int i = 0; i < argc && call->args; i++) {
             cr_str(c, &call->args[i].expr);
             cr_str(c, &call->args[i].value);
+            cr_str(c, &call->args[i].url_value);
             cr_str(c, &call->args[i].keyword);
         }
     } else if (c->phase == CR_COPY) {
@@ -315,6 +316,7 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     for (int i = 0; i < r->imports.count && r->imports.items; i++) {
         cr_str(c, &r->imports.items[i].local_name);
         cr_str(c, &r->imports.items[i].module_path);
+        cr_str(c, &r->imports.items[i].member);
     }
     cr_array(c, (void **)&r->usages.items, r->usages.count, sizeof(CBMUsage));
     for (int i = 0; i < r->usages.count && r->usages.items; i++) {

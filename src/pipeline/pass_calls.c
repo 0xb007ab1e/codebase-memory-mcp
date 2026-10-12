@@ -379,6 +379,185 @@ bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *proje
     return n > 0 && (size_t)n < out_sz;
 }
 
+/* ── Calls through an import of an external library ─────────────────
+ * See cbm_pipeline_external_import_service in pipeline_internal.h. */
+
+/* Index value for a name no external binding may answer for: a project or
+ * relative import, or a name two imports bind differently. */
+static const char pc_import_blocked[] = "";
+
+static bool pc_external_import_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+           lang == CBM_LANG_TSX;
+}
+
+/* Whether an import can name an external module at all: a relative path
+ * never does, nor (JS/TS) an absolute path or a project-root alias. */
+static bool pc_import_may_be_external(CBMLanguage lang, const CBMImport *imp) {
+    const char *m = imp->module_path;
+    if (!m || !m[0] || m[0] == '.' || strstr(m, " as ")) {
+        return false;
+    }
+    if (lang == CBM_LANG_PYTHON) {
+        return true;
+    }
+    return m[0] != '/' && m[0] != '~' && m[0] != '#' && strncmp(m, "@/", PAIR_LEN) != 0;
+}
+
+/* Two imports bind the same name to the same thing. */
+static bool pc_same_binding(const CBMImport *a, const CBMImport *b) {
+    return a->is_default == b->is_default && strcmp(a->module_path, b->module_path) == 0 &&
+           (a->member == b->member ||
+            (a->member && b->member && strcmp(a->member, b->member) == 0));
+}
+
+/* The callee as its import makes it; false when the import adds nothing to
+ * the callee's own spelling.
+ *   Python binds `local` to module_path: `from m import x as y` and
+ *   `import m.x as y` both store y -> m.x, so `y.f` is m.x.f. A plain
+ *   `import a.b` binds the root `a` and the callee already spells its path.
+ *   JS/TS: a named import binds the module's member, alias or not
+ *   (`navigate` under `import { get as navigate } from 'axios'` is
+ *   axios.get); a default or namespace import binds the module itself, so
+ *   `ax.get` is axios.get. */
+static bool pc_spell_through_import(CBMLanguage lang, const CBMImport *imp, const char *callee,
+                                    size_t root_len, char *out, size_t out_sz) {
+    static const char node_scheme[] = "node:";
+    const char *module = imp->module_path;
+    const char *rest = callee + root_len;
+    int n;
+    if (lang == CBM_LANG_PYTHON) {
+        size_t local_len = strlen(imp->local_name);
+        if (strncmp(module, imp->local_name, local_len) == 0 &&
+            (module[local_len] == '\0' || module[local_len] == '.')) {
+            return false;
+        }
+        n = snprintf(out, out_sz, "%s%s", module, rest);
+    } else {
+        if (strncmp(module, node_scheme, sizeof(node_scheme) - SKIP_ONE) == 0) {
+            module += sizeof(node_scheme) - SKIP_ONE;
+        }
+        n = imp->member ? snprintf(out, out_sz, "%s.%s%s", module, imp->member, rest)
+                        : snprintf(out, out_sz, "%s%s", module, rest);
+    }
+    return n > 0 && (size_t)n < out_sz;
+}
+
+/* Index every name the file's imports bind; then block each one an IMPORTS
+ * edge materialized (a project module, whatever its spelling) and each one
+ * bound twice to different things. */
+static void pc_external_import_index_build(cbm_external_import_index_t *index,
+                                           const cbm_gbuf_t *gbuf, const char *project,
+                                           const char *rel, CBMLanguage lang,
+                                           const CBMImportArray *imports) {
+    index->built = true;
+    if (!imports || imports->count <= 0) {
+        return;
+    }
+    index->by_local = cbm_ht_create((uint32_t)imports->count * PAIR_LEN + CBM_SZ_8);
+    if (!index->by_local) {
+        return;
+    }
+    void *blocked = (void *)pc_import_blocked;
+    for (int i = 0; i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (!imp->local_name || !imp->local_name[0]) {
+            continue;
+        }
+        const CBMImport *prev = cbm_ht_get(index->by_local, imp->local_name);
+        bool external = pc_import_may_be_external(lang, imp);
+        if (!prev) {
+            cbm_ht_set(index->by_local, imp->local_name, external ? (void *)imp : blocked);
+        } else if ((const void *)prev != blocked && (!external || !pc_same_binding(prev, imp))) {
+            cbm_ht_set(index->by_local, imp->local_name, blocked);
+        }
+    }
+    const cbm_gbuf_node_t *file_node = pc_find_by_computed_qn(gbuf, project, rel, "__file__");
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (!file_node || cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges,
+                                                         &edge_count) != 0) {
+        return;
+    }
+    static const char key_open[] = "\"local_name\":\"";
+    for (int i = 0; i < edge_count; i++) {
+        const char *start =
+            edges[i]->properties_json ? strstr(edges[i]->properties_json, key_open) : NULL;
+        const char *end = start ? strchr(start + sizeof(key_open) - SKIP_ONE, '"') : NULL;
+        if (!end) {
+            continue;
+        }
+        start += sizeof(key_open) - SKIP_ONE;
+        char local[CBM_SZ_256];
+        size_t len = (size_t)(end - start);
+        if (len == 0 || len >= sizeof(local)) {
+            continue;
+        }
+        memcpy(local, start, len);
+        local[len] = '\0';
+        const char *key = cbm_ht_get_key(index->by_local, local);
+        if (key) {
+            cbm_ht_set(index->by_local, key, blocked);
+        }
+    }
+}
+
+void cbm_pipeline_external_import_index_free(cbm_external_import_index_t *index) {
+    if (!index) {
+        return;
+    }
+    if (index->by_local) {
+        cbm_ht_free(index->by_local);
+    }
+    index->by_local = NULL;
+    index->built = false;
+}
+
+cbm_svc_kind_t cbm_pipeline_external_import_service(cbm_external_import_index_t *index,
+                                                    const cbm_gbuf_t *gbuf, const char *project,
+                                                    const char *rel, CBMLanguage lang,
+                                                    const CBMImportArray *imports,
+                                                    const CBMCall *call, char *spelled,
+                                                    size_t spelled_sz) {
+    const char *callee = call ? call->callee_name : NULL;
+    const char *u = call ? call->first_string_arg : NULL;
+    if (!index || !gbuf || !spelled || spelled_sz == 0 || !callee || !callee[0] || !u || !u[0] ||
+        !pc_external_import_lang(lang) || call->requires_lsp_resolution ||
+        (lang == CBM_LANG_PYTHON && call->callee_is_locally_bound) ||
+        cbm_service_pattern_route_method(callee) != NULL ||
+        cbm_service_pattern_is_global_fetch(callee)) {
+        return CBM_SVC_NONE;
+    }
+    const char *dot = strchr(callee, '.');
+    size_t root_len = dot ? (size_t)(dot - callee) : strlen(callee);
+    char root[CBM_SZ_256];
+    if (root_len == 0 || root_len >= sizeof(root)) {
+        return CBM_SVC_NONE;
+    }
+    memcpy(root, callee, root_len);
+    root[root_len] = '\0';
+    if (!index->built) {
+        pc_external_import_index_build(index, gbuf, project, rel, lang, imports);
+    }
+    const CBMImport *imp = index->by_local ? cbm_ht_get(index->by_local, root) : NULL;
+    if (!imp || (const void *)imp == (const void *)pc_import_blocked ||
+        !pc_spell_through_import(lang, imp, callee, root_len, spelled, spelled_sz)) {
+        spelled[0] = '\0';
+        return CBM_SVC_NONE;
+    }
+    cbm_svc_kind_t svc = cbm_service_pattern_match(spelled);
+    bool is_url = u[0] == '/' || strstr(u, "://") != NULL;
+    bool is_topic = svc == CBM_SVC_ASYNC && strlen(u) > PAIR_LEN;
+    /* An HTTP library also exports helpers that take a URL without sending
+     * one (urllib.parse.urljoin): only a request verb is a request. */
+    bool is_request = svc == CBM_SVC_HTTP && cbm_service_pattern_http_method(spelled) != NULL;
+    if ((is_request && is_url) || (svc == CBM_SVC_ASYNC && (is_url || is_topic))) {
+        return svc;
+    }
+    spelled[0] = '\0';
+    return CBM_SVC_NONE;
+}
+
 /* Handle a route registration call: create Route node + HANDLES edge.
  * route_mount is the framework mount of the registering file ("/api" for a
  * Laravel 11+ `withRouting(api: ...)` file, #1146) or "". */
@@ -672,7 +851,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count, CBMLanguage lang,
                                const CBMImportArray *imports, const char *route_mount,
-                               const cbm_php_vendor_names_t *php_vendor) {
+                               const cbm_php_vendor_names_t *php_vendor,
+                               cbm_external_import_index_t *ext_imports) {
     const CBMResolvedCallArray *lsp_calls = &result->resolved_calls;
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
     if (!source_node) {
@@ -861,6 +1041,23 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                 emit_http_async_edge(ctx, call, source_node, NULL, &svc_res, esvc, false);
                 return SKIP_ONE;
             }
+        }
+        /* A callee an import binds to an external client library
+         * (`send` under `from paho.mqtt import publish as send`): spelled
+         * through its import, then classified. MUST match pass_parallel.c. */
+        char spelled[CBM_SZ_512];
+        cbm_svc_kind_t isvc =
+            cbm_pipeline_external_import_service(ext_imports, ctx->gbuf, ctx->project_name, rel,
+                                                 lang, imports, call, spelled, sizeof(spelled));
+        if (isvc != CBM_SVC_NONE) {
+            CBMCall through = *call;
+            through.callee_name = spelled;
+            cbm_resolution_t imp_res = {.qualified_name = spelled,
+                                        .confidence = PC_SVC_PATTERN_CONF,
+                                        .strategy = "import_binding",
+                                        .candidate_count = 0};
+            emit_http_async_edge(ctx, &through, source_node, NULL, &imp_res, isvc, false);
+            return SKIP_ONE;
         }
         return 0;
     }
@@ -1173,6 +1370,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                                      sizeof(route_mount));
 
         /* Resolve each call */
+        cbm_external_import_index_t ext_imports = {0};
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
             if (!call->callee_name) {
@@ -1181,12 +1379,13 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             total_calls++;
             if (resolve_single_call(ctx, call, result, rel, module_qn, imp_keys, imp_vals,
                                     imp_count, files[i].language, &result->imports, route_mount,
-                                    &php_vendor)) {
+                                    &php_vendor, &ext_imports)) {
                 resolved++;
             } else {
                 unresolved++;
             }
         }
+        cbm_pipeline_external_import_index_free(&ext_imports);
 
         free(module_qn);
         cbm_pipeline_php_vendor_names_free(&php_vendor);
