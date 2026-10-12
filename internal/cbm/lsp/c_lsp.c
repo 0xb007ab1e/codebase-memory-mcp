@@ -5334,6 +5334,22 @@ static bool c_process_configured_test_body(CLSPContext *ctx, TSNode scope) {
     return true;
 }
 
+// #946: a macro-wrapped definition (`Cls::__API_HOOK(Spawn)`, `FNAME(first)`) is
+// named by the macro's argument, keeping any class qualifier: replace the last
+// `::` segment of the walked name (or the whole unqualified name) with it, the
+// same name cbm_resolve_c_declarator_name_node gives the def.
+static char *c_macro_wrapped_func_name(CLSPContext *ctx, char *func_name, TSNode macro_arg) {
+    char *arg = c_node_text(ctx, macro_arg);
+    if (!func_name || !arg || !arg[0])
+        return func_name;
+    const char *last_sep = NULL;
+    for (const char *p = strstr(func_name, "::"); p; p = strstr(p + 2, "::"))
+        last_sep = p;
+    if (!last_sep)
+        return arg;
+    return cbm_arena_sprintf(ctx->arena, "%.*s::%s", (int)(last_sep - func_name), func_name, arg);
+}
+
 static void c_process_function(CLSPContext *ctx, TSNode func_node) {
     if (c_process_configured_test_body(ctx, func_node))
         return;
@@ -5346,6 +5362,7 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
     const char *saved_class_qn = ctx->enclosing_class_qn;
     const char *saved_func_qn = ctx->enclosing_func_qn;
     TSNode params_node = (TSNode){0};
+    TSNode macro_arg = (TSNode){0};
 
     // Navigate declarator to find name and parameters
     TSNode cur = decl;
@@ -5366,6 +5383,12 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
                 func_name = c_node_text(ctx, real);
                 break;
             }
+            /* #946: the nested declarator is a macro call. These parameters are
+             * the real ones; step past the macro's own argument list to the
+             * (possibly class-qualified) macro name, which still scopes it. */
+            macro_arg = cbm_c_macro_wrapped_name_node(cur);
+            if (!ts_node_is_null(macro_arg))
+                fdecl = ts_node_child_by_field_name(fdecl, "declarator", 10);
             cur = fdecl;
             continue;
         }
@@ -5425,6 +5448,8 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
         }
         break;
     }
+    if (!ts_node_is_null(macro_arg))
+        func_name = c_macro_wrapped_func_name(ctx, func_name, macro_arg);
 
     // A keyword "name" is an error-recovery artifact (see cbm_c_reserved_func_name):
     // the def extractor mints no node for it, so no caller QN may name it either.
