@@ -5389,6 +5389,45 @@ static int where_forms_agree(cbm_store_t *s, const char *const *forms, int form_
     return 0;
 }
 
+/* The early WHERE pass (execute_single) binds only the first MATCH alias, so
+ * an operand on the second alias is UNKNOWN there and must neither decide nor
+ * be dropped from a chain: three and more operands put it on a chain link and
+ * not only on the chain's head. The rows are the full evaluation's; an early
+ * pass that read UNKNOWN as false, or let a later operand overwrite it, would
+ * prune the HandleOrder seed and lose them. */
+TEST(cypher_chain_with_unbound_alias_keeps_seed) {
+    cbm_store_t *s = setup_cypher_store();
+
+    /* OR, UNKNOWN first: only HandleOrder -> LogError has a target without "Order". */
+    static const char *const log_error[] = {"LogError"};
+    ASSERT_EQ(assert_name_set(s,
+                              "MATCH (a:Function)-[:CALLS]->(b:Function) WHERE NOT b.name CONTAINS "
+                              "\"Order\" OR a.name = \"NoSuchA\" OR a.name = \"NoSuchB\" "
+                              "RETURN b.name",
+                              log_error, 1),
+              0);
+
+    /* XOR, UNKNOWN in the middle: F ^ T ^ F holds for HandleOrder -> LogError only. */
+    ASSERT_EQ(assert_name_set(s,
+                              "MATCH (a:Function)-[:CALLS]->(b:Function) WHERE a.name = "
+                              "\"NoSuchA\" XOR b.name = \"LogError\" XOR a.name = \"NoSuchB\" "
+                              "RETURN b.name",
+                              log_error, 1),
+              0);
+
+    /* AND, UNKNOWN first and a definite operand last: HandleOrder's two calls. */
+    static const char *const handle_order_calls[] = {"LogError", "ValidateOrder"};
+    ASSERT_EQ(assert_name_set(s,
+                              "MATCH (a:Function)-[:CALLS]->(b:Function) WHERE b.name <> "
+                              "\"SubmitOrder\" AND a.name <> \"NoSuchA\" AND a.name = "
+                              "\"HandleOrder\" RETURN b.name",
+                              handle_order_calls, 2),
+              0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* A chain and the same expression written out with parentheses, in both
  * associations, must agree row for row. The operands include a property the
  * `main` node does not have: file_path reads as the empty string there, so
@@ -5781,6 +5820,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_long_or_chain_evaluates);
     RUN_TEST(cypher_long_and_chain_evaluates);
     RUN_TEST(cypher_mixed_chain_matches_nested_form);
+    RUN_TEST(cypher_chain_with_unbound_alias_keeps_seed);
     RUN_TEST(cypher_many_union_branches);
     RUN_TEST(cypher_fifty_union_branches);
 }

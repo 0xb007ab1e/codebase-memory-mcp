@@ -2886,6 +2886,31 @@ static cyp_partial_t eval_condition_partial(const cbm_condition_t *c, binding_t 
     return eval_condition(c, b) ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
 }
 
+static cyp_partial_t partial_xor(cyp_partial_t l, cyp_partial_t r) {
+    if (l == CYP_PARTIAL_UNKNOWN || r == CYP_PARTIAL_UNKNOWN) {
+        return CYP_PARTIAL_UNKNOWN;
+    }
+    return l != r ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
+}
+
+/* Combine the running value of an AND / OR / XOR chain with its next operand. */
+static cyp_partial_t partial_combine(cbm_expr_type_t type, cyp_partial_t acc, cyp_partial_t v) {
+    if (type == EXPR_AND) {
+        return partial_and(acc, v);
+    }
+    if (type == EXPR_OR) {
+        return partial_or(acc, v);
+    }
+    return partial_xor(acc, v);
+}
+
+/* Same walk as eval_expr: recurses into NOT and into each operand, and follows
+ * a chain of one operator (linked along the right child, see expr_chain_link)
+ * in a loop, so a chain's length never becomes stack depth. This runs on every
+ * seed row of execute_single, so it sees every WHERE chain the parser accepts.
+ * The operands are read in the order of the nested form `a OP (b OP (c ...))`,
+ * with its short-circuits: AND stops at the first definite false, OR at the
+ * first definite true, and XOR reads every operand. */
 static cyp_partial_t eval_expr_partial(const cbm_expr_t *e, // NOLINT(misc-no-recursion)
                                        binding_t *b) {
     if (!e) {
@@ -2894,32 +2919,33 @@ static cyp_partial_t eval_expr_partial(const cbm_expr_t *e, // NOLINT(misc-no-re
     if (e->type == EXPR_CONDITION) {
         return eval_condition_partial(&e->cond, b);
     }
-    cyp_partial_t left = eval_expr_partial(e->left, b);
     if (e->type == EXPR_NOT) {
-        if (left == CYP_PARTIAL_UNKNOWN) {
+        cyp_partial_t child = eval_expr_partial(e->left, b);
+        if (child == CYP_PARTIAL_UNKNOWN) {
             return CYP_PARTIAL_UNKNOWN;
         }
-        return left == CYP_PARTIAL_TRUE ? CYP_PARTIAL_FALSE : CYP_PARTIAL_TRUE;
+        return child == CYP_PARTIAL_TRUE ? CYP_PARTIAL_FALSE : CYP_PARTIAL_TRUE;
     }
-    /* Same short-circuits as eval_expr: a definite left decides AND / OR. */
-    if (e->type == EXPR_AND && left == CYP_PARTIAL_FALSE) {
-        return CYP_PARTIAL_FALSE;
+    /* AND / OR / XOR. A right child that is not a link of the same operator is
+     * the chain's last operand; one that is a parenthesised group of the same
+     * operator is read as more links, which the operator's associativity
+     * (three-valued as well) makes the same value. */
+    const cbm_expr_type_t type = e->type;
+    cyp_partial_t acc = eval_expr_partial(e->left, b);
+    const cbm_expr_t *rest = e->right;
+    for (;;) {
+        if ((type == EXPR_AND && acc == CYP_PARTIAL_FALSE) ||
+            (type == EXPR_OR && acc == CYP_PARTIAL_TRUE)) {
+            return acc;
+        }
+        bool linked = rest && rest->type == type;
+        cyp_partial_t v = eval_expr_partial(linked ? rest->left : rest, b);
+        acc = partial_combine(type, acc, v);
+        if (!linked) {
+            return acc;
+        }
+        rest = rest->right;
     }
-    if (e->type == EXPR_OR && left == CYP_PARTIAL_TRUE) {
-        return CYP_PARTIAL_TRUE;
-    }
-    cyp_partial_t right = eval_expr_partial(e->right, b);
-    if (e->type == EXPR_AND) {
-        return partial_and(left, right);
-    }
-    if (e->type == EXPR_OR) {
-        return partial_or(left, right);
-    }
-    /* EXPR_XOR */
-    if (left == CYP_PARTIAL_UNKNOWN || right == CYP_PARTIAL_UNKNOWN) {
-        return CYP_PARTIAL_UNKNOWN;
-    }
-    return left != right ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
 }
 
 static cyp_partial_t eval_where_partial(const cbm_where_clause_t *w, binding_t *b) {

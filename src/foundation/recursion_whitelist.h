@@ -11,10 +11,7 @@
  *
  * Cypher expression walkers (bounded by the same parse depth; each follows
  * an operator chain in a loop and recurses only into the operands):
- *   - eval_expr, cypher_expr_selectivity
- *
- * Cypher partial evaluator (bounded by WHERE clause depth ~5):
- *   - eval_expr_partial
+ *   - eval_expr, eval_expr_partial, cypher_expr_selectivity
  *
  * Glob pattern matcher (bounded by pattern nesting ~3):
  *   - glob_match, glob_match_star, glob_match_doublestar
