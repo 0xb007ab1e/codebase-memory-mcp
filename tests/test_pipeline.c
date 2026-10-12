@@ -21273,7 +21273,7 @@ static int calls_args_overlong_probe(void) {
     expr[LONG_LEN] = '\0';
     memset(value, 'b', LONG_LEN);
     value[LONG_LEN] = '\0';
-    CBMCallArg args[2] = {{"x", NULL, NULL, 0}, {expr, value, NULL, 1}};
+    CBMCallArg args[2] = {{"x", NULL, NULL, 0, NULL}, {expr, value, NULL, 1, NULL}};
     CBMCall call = {0};
     call.callee_name = "sink";
     call.args = args;
