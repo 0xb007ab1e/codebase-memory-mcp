@@ -2500,6 +2500,18 @@ static const char *closure_k8s_decline(cbm_store_t *store, const char *project,
     return NULL;
 }
 
+/* A Python file whose namespace metadata changed, or is unreadable, declines
+ * the closure before any hash cutoff: its importers' bindings follow the
+ * namespace order. A deleted file passes NULL for fresh_json. */
+static const char *closure_python_namespace_decline(const char *stored_json,
+                                                    const char *fresh_json) {
+    int change = cbm_lsp_surface_python_change(stored_json, fresh_json);
+    if (change < 0) {
+        return "python_namespace_metadata_invalid";
+    }
+    return change > 0 ? "python_namespace_changed" : NULL;
+}
+
 /* Decide whether this manifest delta is closure-repairable, and if so build
  * the plan. Returns 1 with *plan filled, or 0 (decline → FULL) with the
  * reason logged. Every early exit declines; nothing here mutates state. */
@@ -2708,7 +2720,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     body_targets = dep_targets + n_changed + n_deleted;
     int dep_target_count = 0;
-    for (int i = 0; i < n_changed; i++) {
+    /* The first file that declines the closure stops both loops; the one exit
+     * below releases dep_targets and the row index for every reason. */
+    const char *why = NULL;
+    for (int i = 0; i < n_changed && !why; i++) {
         const cbm_lsp_surface_row_t *stored_row = cbm_ht_get(rows_by_path, changed_paths[i]);
         const cbm_lsp_surface_row_t *fresh_row = NULL;
         for (int j = 0; j < probe_count; j++) {
@@ -2718,19 +2733,12 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             }
         }
         if (!stored_row || !fresh_row) {
-            free(dep_targets);
-            cbm_ht_free(rows_by_path);
-            decline = "missing_surface_row";
-            goto done;
+            why = "missing_surface_row";
+            break;
         }
-        int python_change =
-            cbm_lsp_surface_python_change(stored_row->defs_json, fresh_row->defs_json);
-        if (python_change != 0) {
-            free(dep_targets);
-            cbm_ht_free(rows_by_path);
-            decline = python_change < 0 ? "python_namespace_metadata_invalid"
-                                        : "python_namespace_changed";
-            goto done;
+        why = closure_python_namespace_decline(stored_row->defs_json, fresh_row->defs_json);
+        if (why) {
+            break;
         }
         if (strcmp(stored_row->surface_sha, fresh_row->surface_sha) == 0) {
             /* body edit: the file re-resolves, and of the others only the
@@ -2739,38 +2747,25 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             continue;
         }
         bool added = false;
-        const char *why = NULL;
         if (surface_added_names(stored_row->defs_json, fresh_row->defs_json, &added) != 0 ||
             added) {
             why = "added_definition_names";
         } else if (!doc_scope_repairable(stored_row->defs_json, fresh_row->defs_json,
                                          removed_names)) {
             why = "doc_scope_changed";
+        } else {
+            n_surface_changed++;
+            dep_targets[dep_target_count++] = changed_paths[i];
         }
-        if (why) {
-            free(dep_targets);
-            cbm_ht_free(rows_by_path);
-            decline = why;
-            goto done;
-        }
-        n_surface_changed++;
-        dep_targets[dep_target_count++] = changed_paths[i];
     }
     bool gone_scope_changed = false; /* a deleted file takes its declarations along */
-    for (int i = 0; i < n_deleted; i++) {
-        const cbm_lsp_surface_row_t *stored_row =
-            cbm_ht_get(rows_by_path, changed_paths[n_changed + i]);
-        int python_change =
-            cbm_lsp_surface_python_change(stored_row ? stored_row->defs_json : NULL, NULL);
-        if (python_change != 0) {
-            free(dep_targets);
-            cbm_ht_free(rows_by_path);
-            decline = python_change < 0 ? "python_namespace_metadata_invalid"
-                                        : "python_namespace_changed";
-            goto done;
+    for (int i = 0; i < n_deleted && !why; i++) {
+        const cbm_lsp_surface_row_t *gone = cbm_ht_get(rows_by_path, changed_paths[n_changed + i]);
+        why = closure_python_namespace_decline(gone ? gone->defs_json : NULL, NULL);
+        if (why) {
+            break;
         }
         dep_targets[dep_target_count++] = changed_paths[n_changed + i];
-        const cbm_lsp_surface_row_t *gone = cbm_ht_get(rows_by_path, changed_paths[n_changed + i]);
         if (gone && !doc_scope_repairable(gone->defs_json, NULL, removed_names)) {
             gone_scope_changed = true;
         }
@@ -2782,14 +2777,18 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
      * target, so the documents with edges into a body-edited file re-resolve
      * too (added to the closure below). */
     bool dep_failed =
-        (dep_target_count > 0 &&
-         cbm_store_get_dependent_files(store, project, dep_targets, dep_target_count, &dependents,
-                                       &dependent_count) != CBM_STORE_OK) ||
-        (body_target_count > 0 &&
-         cbm_store_get_dependent_files(store, project, body_targets, body_target_count, &line_docs,
-                                       &line_doc_count) != CBM_STORE_OK);
+        !why && ((dep_target_count > 0 &&
+                  cbm_store_get_dependent_files(store, project, dep_targets, dep_target_count,
+                                                &dependents, &dependent_count) != CBM_STORE_OK) ||
+                 (body_target_count > 0 &&
+                  cbm_store_get_dependent_files(store, project, body_targets, body_target_count,
+                                                &line_docs, &line_doc_count) != CBM_STORE_OK));
     free(dep_targets); /* body_targets with it */
     body_targets = NULL;
+    if (why) {
+        decline = why;
+        goto done;
+    }
     if (dep_failed) {
         decline = "dependent_query_failed";
         goto done;
