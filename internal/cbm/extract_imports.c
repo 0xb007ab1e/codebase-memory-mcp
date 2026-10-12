@@ -550,6 +550,43 @@ static bool py_ns_class_safe(PyNamespaceBuilder *b, TSNode node) {
     return safe;
 }
 
+/* One imported name of an import statement: `import a.b [as c]` binds the root
+ * `a` (or the alias), `from m import x [as y]` binds `x` (or the alias), and
+ * `from m import *` is a star. False for an unsupported child or a failed copy. */
+static bool py_ns_import_fact(PyNamespaceBuilder *b, TSNode child, bool from,
+                              const char *module_name, uint32_t level, CBMPyNamespaceFact *out) {
+    const char *kind = ts_node_type(child);
+    CBMPyNamespaceFact f = {.kind = from ? CBM_PY_NS_IMPORT_NAME : CBM_PY_NS_IMPORT_MODULE,
+                            .module_name = module_name,
+                            .relative_level = level};
+    if (from && strcmp(kind, "wildcard_import") == 0) {
+        f.kind = CBM_PY_NS_IMPORT_STAR;
+        *out = f;
+        return true;
+    }
+    bool alias = strcmp(kind, "aliased_import") == 0;
+    if (!alias && strcmp(kind, "dotted_name") != 0 && strcmp(kind, "identifier") != 0)
+        return false;
+    TSNode name = alias ? ts_node_child_by_field_name(child, TS_FIELD("name")) : child;
+    const char *imported = py_ns_name(b, name, !from);
+    if (!imported)
+        return false;
+    if (from)
+        f.member_name = imported;
+    else
+        f.module_name = imported;
+    if (alias) {
+        f.local_name = py_ns_name(b, ts_node_child_by_field_name(child, TS_FIELD("alias")), false);
+    } else if (from) {
+        f.local_name = imported;
+    } else {
+        f.local_name = py_ns_copy(b, imported, strcspn(imported, "."));
+        f.flags = CBM_PY_NS_IMPORT_BINDS_ROOT;
+    }
+    *out = f;
+    return f.local_name != NULL;
+}
+
 static bool py_ns_import(PyNamespaceBuilder *b, TSNode node, bool from) {
     TSNode module = from ? ts_node_child_by_field_name(node, TS_FIELD("module_name")) : (TSNode){0};
     const char *module_name = NULL;
@@ -573,47 +610,12 @@ static bool py_ns_import(PyNamespaceBuilder *b, TSNode node, bool from) {
     if (ts_tree_cursor_goto_first_child(&cursor)) {
         do {
             TSNode child = ts_tree_cursor_current_node(&cursor);
-            if (!ts_node_is_named(child) || (from && child.id == module.id) ||
+            /* a plain import has no module node: the null node equals no child */
+            if (!ts_node_is_named(child) || ts_node_eq(child, module) ||
                 strcmp(ts_node_type(child), "comment") == 0)
                 continue;
-            const char *kind = ts_node_type(child);
-            CBMPyNamespaceFact f = {.kind = from ? CBM_PY_NS_IMPORT_NAME : CBM_PY_NS_IMPORT_MODULE,
-                                    .module_name = module_name,
-                                    .relative_level = level};
-            if (from && strcmp(kind, "wildcard_import") == 0) {
-                f.kind = CBM_PY_NS_IMPORT_STAR;
-            } else {
-                bool alias = strcmp(kind, "aliased_import") == 0;
-                TSNode name = alias ? ts_node_child_by_field_name(child, TS_FIELD("name")) : child;
-                if (!alias && strcmp(kind, "dotted_name") != 0 && strcmp(kind, "identifier") != 0) {
-                    ok = false;
-                    break;
-                }
-                const char *imported = py_ns_name(b, name, !from);
-                if (!imported) {
-                    ok = false;
-                    break;
-                }
-                if (from)
-                    f.member_name = imported;
-                else
-                    f.module_name = imported;
-                if (alias) {
-                    f.local_name =
-                        py_ns_name(b, ts_node_child_by_field_name(child, TS_FIELD("alias")), false);
-                } else if (from) {
-                    f.local_name = imported;
-                } else {
-                    size_t n = strcspn(imported, ".");
-                    f.local_name = py_ns_copy(b, imported, n);
-                    f.flags = CBM_PY_NS_IMPORT_BINDS_ROOT;
-                }
-                if (!f.local_name) {
-                    ok = false;
-                    break;
-                }
-            }
-            if (!py_ns_push(b, f)) {
+            CBMPyNamespaceFact f;
+            if (!py_ns_import_fact(b, child, from, module_name, level, &f) || !py_ns_push(b, f)) {
                 ok = false;
                 break;
             }
@@ -630,8 +632,10 @@ static bool py_ns_all_literal(PyNamespaceBuilder *b, TSNode node, CBMPyNamespace
     const char *kind = ts_node_type(node);
     if (strcmp(kind, "list") != 0 && strcmp(kind, "tuple") != 0)
         return false;
+    /* One bound for both limits, on every platform: the names are counted in an
+     * int, and count * sizeof(*names) <= INT_MAX fits even a 32-bit size_t. */
     uint32_t count = ts_node_named_child_count(node);
-    if (count > INT_MAX || (size_t)count > SIZE_MAX / sizeof(*fact->names)) {
+    if (count > INT_MAX / sizeof(*fact->names)) {
         b->failure = CBM_PY_NS_FAILURE_LIMIT;
         return false;
     }
