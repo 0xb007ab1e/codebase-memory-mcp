@@ -5001,9 +5001,12 @@ static bool php_vendor_extracted_sites(void) {
                     continue;
                 if (file == 4) {
                     const char *arg = i == 0 ? "/api/vendor-health" : "vendor-orders";
-                    const char *alias = i == 0 ? "GuzzleClient" : "KafkaProducer";
+                    const char *alias = i == 0 ? "GuzzleClient::" : "KafkaProducer::";
+                    /* The extractor names a scoped call by its method alone
+                     * (it keeps only a literal `Route::` scope, #952), so the
+                     * aliased scope is proven on the occurrence text. */
                     if (!c->first_string_arg || strcmp(c->first_string_arg, arg) != 0 ||
-                        !strstr(c->callee_name, alias))
+                        strncmp(source + c->site_start_byte, alias, strlen(alias)) != 0)
                         continue;
                 }
                 count++;
@@ -5032,9 +5035,23 @@ static bool php_vendor_service_edge(const cbm_gbuf_t *gb, const char *type, cons
 
 static void php_vendor_edge_fp(const cbm_gbuf_edge_t *edge, void *ud) {
     if (strcmp(edge->type, "CALLS") == 0 || strcmp(edge->type, "USAGE") == 0 ||
-        strcmp(edge->type, "INHERITS") == 0 || strcmp(edge->type, "IMPORTS") == 0 ||
-        strcmp(edge->type, "HTTP_CALLS") == 0 || strcmp(edge->type, "ASYNC_CALLS") == 0)
+        strcmp(edge->type, "INHERITS") == 0 || strcmp(edge->type, "IMPORTS") == 0) {
         fp_visit_edge(edge, ud);
+    } else if (strcmp(edge->type, "HTTP_CALLS") == 0 || strcmp(edge->type, "ASYNC_CALLS") == 0) {
+        /* The parallel emitter appends the call's "args" member last; the
+         * sequential one leaves route/service props without it by design
+         * (pass_calls.c calls_emit_edge: those props feed full-only passes).
+         * Every other property, and the edge itself, must still agree. */
+        const char *props = edge->properties_json ? edge->properties_json : "";
+        const char *args = strstr(props, ",\"args\":[");
+        char trimmed[2048];
+        cbm_gbuf_edge_t copy = *edge;
+        if (args) {
+            snprintf(trimmed, sizeof(trimmed), "%.*s}", (int)(args - props), props);
+            copy.properties_json = trimmed;
+        }
+        fp_visit_edge(&copy, ud);
+    }
 }
 
 /* 1 when the graph holds no vendor-named edge and every control edge. */
