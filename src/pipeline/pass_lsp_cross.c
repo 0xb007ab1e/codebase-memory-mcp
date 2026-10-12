@@ -1246,6 +1246,45 @@ void cbm_pxc_thread_scratch_end(void) {
  * resolved very many cross-calls turned the whole append into O(n^2) and could
  * peg a core for minutes (observed: an index hung in pxc_append_results/strcmp).
  * The key strings live in a scratch arena that is destroyed after the table. */
+/* Replace the records of `src`'s exact parser occurrence with `src`. The
+ * occurrence keeps ONE record: every earlier record there is superseded by
+ * the same evidence, and rewriting each of them would leave identical copies
+ * that the dedup table in pxc_append_results only indexes, never collapses. */
+static void pxc_supersede_occurrence(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
+                                     const CBMResolvedCall *src) {
+    bool replaced = false;
+    int kept = 0;
+    for (int i = 0; i < dst_calls->count; i++) {
+        const CBMResolvedCall *cur = &dst_calls->items[i];
+        bool same_site = cur->caller_qn && cur->kind == src->kind &&
+                         cur->site_start_byte == src->site_start_byte &&
+                         cur->site_end_byte == src->site_end_byte &&
+                         cur->source_origin == src->source_origin &&
+                         strcmp(cur->caller_qn, src->caller_qn) == 0;
+        if (same_site && replaced) {
+            continue; /* dropped: the occurrence already holds the evidence */
+        }
+        if (kept != i) {
+            dst_calls->items[kept] = *cur;
+        }
+        CBMResolvedCall *dst = &dst_calls->items[kept++];
+        if (!same_site) {
+            continue;
+        }
+        replaced = true;
+        dst->caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
+        dst->callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
+        dst->strategy = cbm_arena_strdup(dst_arena, src->strategy);
+        dst->confidence = src->confidence;
+        dst->reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
+        dst->kind = src->kind;
+        dst->site_start_byte = src->site_start_byte;
+        dst->site_end_byte = src->site_end_byte;
+        dst->source_origin = src->source_origin;
+    }
+    dst_calls->count = kept;
+}
+
 static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
                                const CBMResolvedCallArray *src_out) {
     if (!dst_calls || !src_out)
@@ -1271,25 +1310,7 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
             !src->caller_qn || !src->callee_qn || src->site_end_byte <= src->site_start_byte) {
             continue;
         }
-        for (int i = 0; i < dst_calls->count; i++) {
-            CBMResolvedCall *dst = &dst_calls->items[i];
-            if (!dst->caller_qn || dst->kind != src->kind ||
-                dst->site_start_byte != src->site_start_byte ||
-                dst->site_end_byte != src->site_end_byte ||
-                dst->source_origin != src->source_origin ||
-                strcmp(dst->caller_qn, src->caller_qn) != 0) {
-                continue;
-            }
-            dst->caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
-            dst->callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
-            dst->strategy = cbm_arena_strdup(dst_arena, src->strategy);
-            dst->confidence = src->confidence;
-            dst->reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
-            dst->kind = src->kind;
-            dst->site_start_byte = src->site_start_byte;
-            dst->site_end_byte = src->site_end_byte;
-            dst->source_origin = src->source_origin;
-        }
+        pxc_supersede_occurrence(dst_arena, dst_calls, src);
     }
 
     for (int i = 0; i < dst_calls->count; i++) {
