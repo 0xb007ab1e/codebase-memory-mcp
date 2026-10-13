@@ -1111,13 +1111,9 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, qn_name);
     }
     /* Java/Go: directory-based module so this enclosing-func QN matches the def
-     * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality).
-     * C-family platform variants share their platform-neutral QN — the same
-     * rule extract_func_def applies, so in-body calls source to the def. */
-    const char *qn = cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, qn_name,
-                                                 ctx->language);
-    return cbm_platform_variant_qn(ctx->arena, ctx->language, ctx->project, ctx->rel_path, qn_name,
-                                   qn, node);
+     * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality). */
+    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, qn_name,
+                                       ctx->language);
 }
 
 // Compute class QN for scope tracking.

@@ -6609,14 +6609,6 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
      * proj.myapp.db.Func, not proj.myapp.db.conn.Func). Other langs unchanged. */
     def.qualified_name =
         cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, qn_name, ctx->language);
-    /* C-family platform variants (foo_win.c / foo_posix.c, src/unix/ vs
-     * src/win/): an external-linkage file-scope function takes its
-     * platform-neutral QN, so its variants are one definition. The call-scope
-     * twin in extract_unified.c applies the same rule. */
-    if (!ctx->enclosing_class_qn) {
-        def.qualified_name = cbm_platform_variant_qn(a, ctx->language, ctx->project, ctx->rel_path,
-                                                     qn_name, def.qualified_name, node);
-    }
     /* A free function declared inside a namespace (C++/C#/PHP) is qualified by
      * the namespace scope the def walk carries (enclosing_class_qn was extended
      * by is_namespace_scope_kind), so `ns::serialize` is `proj.file.ns.serialize`
@@ -6713,6 +6705,16 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             def.label = "Method";
             def.parent_class = class_qn;
         }
+    }
+
+    /* C-family platform variants (foo_win.c / foo_posix.c, src/unix/ vs
+     * src/win/): an external-linkage file-scope function keeps its path QN and
+     * carries its platform-neutral QN as the key that relates its variants
+     * (the node's `variant_key`). NULL for anything scoped, static, or in a
+     * path without a platform token. */
+    if (!ctx->enclosing_class_qn) {
+        def.variant_key = cbm_platform_neutral_qn(a, ctx->language, ctx->project, ctx->rel_path,
+                                                  qn_name, def.qualified_name, node);
     }
 
     // Pony: fun/be/new (method/constructor/ffi_method) live in pony_func_types,

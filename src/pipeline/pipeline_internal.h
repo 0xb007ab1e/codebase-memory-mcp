@@ -1398,7 +1398,10 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      diagrams are Diagram/DiagramElement nodes with DIAGRAM_ARROW edges;
  *      OpenAPI operations are Routes; a Markdown section's text keeps a
  *      diagram fence's labels instead of its syntax, and its candidates
- *      carry the p of its diagrams' kind family. */
+ *      carry the p of its diagrams' kind family; a non-static file-scope
+ *      C/C++/CUDA/ObjC function in a platform file or directory (foo_win.c,
+ *      src/unix/) keeps its path QN and carries a `variant_key` property
+ *      (its platform-neutral QN) that relates its platform variants. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 7 };
 
 typedef struct {

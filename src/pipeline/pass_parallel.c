@@ -539,9 +539,10 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
     size_t pos = (size_t)n;
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
-    /* Right after the docstring: the buffer is sized for exactly these two
-     * uncapped fields (pp_props_buf), so neither can be squeezed out. */
+    /* Right after the docstring: the buffer is sized for exactly these three
+     * uncapped fields (pp_props_buf), so none can be squeezed out. */
     append_json_raw(buf, bufsize, &pos, "variants", def->variants);
+    append_json_string(buf, bufsize, &pos, "variant_key", def->variant_key);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
     append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
     append_json_string(buf, bufsize, &pos, "parent_class", def->parent_class);
@@ -731,10 +732,10 @@ typedef struct {
 enum { PP_OVERSIZED_WARN_MAX = 32 };
 
 /* A def's properties buffer: CBM_SZ_2K for every other field plus the whole
- * serialized docstring and variants fields, which have no length cap (a field
- * that does not fit is dropped whole). Returns `stack` for a def with neither,
- * or when the larger buffer cannot be allocated. Twin of pass_definitions.c --
- * keep both in sync. */
+ * serialized docstring, variants and variant_key fields, which have no length
+ * cap (a field that does not fit is dropped whole). Returns `stack` for a def
+ * with none of them, or when the larger buffer cannot be allocated. Twin of
+ * pass_definitions.c -- keep both in sync. */
 static char *pp_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
     size_t need = *size;
     if (def->docstring && def->docstring[0]) {
@@ -742,6 +743,10 @@ static char *pp_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
     }
     if (def->variants && def->variants[0]) {
         need += strlen("variants") + strlen(def->variants) + PP_JSON_FIELD_OVERHEAD;
+    }
+    if (def->variant_key && def->variant_key[0]) {
+        need +=
+            strlen("variant_key") + pp_json_escaped_len(def->variant_key) + PP_JSON_FIELD_OVERHEAD;
     }
     if (need == *size) {
         return stack;
