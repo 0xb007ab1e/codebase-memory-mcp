@@ -1,8 +1,11 @@
-"""One build-backed exception for an installed, unshipped optional package.
+"""Build evidence for the UI browser pack: what ships is exactly the bundler output.
 
-Keep the production dependency inventory conservative. Only the reviewed
-Transformers browser build may omit this exact native image-processing package;
-missing evidence, upgrades, new payloads, or stale builds fail closed.
+There are NO license exceptions. Every package in the production dependency
+tree must carry an allow-listed license whether or not it reaches the bundle
+(license-gate-check-npm.py); this module only proves the bundle itself: every
+asset is inventoried bundler output, and neither sharp nor Node inference code
+is in the app or worker graph. Missing evidence, new payloads or stale builds
+fail closed.
 """
 import hashlib
 import json
@@ -11,7 +14,6 @@ import re
 import sys
 
 
-OPTIONAL_PACKAGE = ("@img/sharp-wasm32", "0.35.0")
 BROWSER_ENTRY = "node_modules/@huggingface/transformers/dist/transformers.web.js"
 # Transformers 4.2.0's published browser distribution contains the upstream
 # empty `ignore-modules:sharp` stub. Updating it requires a new source review.
@@ -30,21 +32,8 @@ def checked_path(root, name):
     return root.joinpath(*path.parts)
 
 
-def verified_browser_exclusions(ui_dir, packages):
-    if OPTIONAL_PACKAGE not in packages:
-        return set()
-    try:
-        meta = json.loads((Path(ui_dir) / "node_modules/@img/sharp-wasm32/package.json").read_text())
-        if (meta["name"], meta["version"]) != OPTIONAL_PACKAGE:
-            raise ValueError("optional package identity changed")
-    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("optional package identity is unavailable") from exc
-    validate_browser_build(ui_dir)
-    return {OPTIONAL_PACKAGE}
-
-
 def validate_browser_build(ui_dir):
-    """Also check build evidence on hosts where the optional package is absent."""
+    """Raise ValueError unless the current app + worker build evidence holds."""
     root = Path(ui_dir)
     try:
         proof = json.loads((root / ".vite/license-build.json").read_text())
