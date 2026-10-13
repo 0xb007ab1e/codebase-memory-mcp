@@ -2319,12 +2319,16 @@ static bool application_index_args_add_policy(cbm_daemon_application_t *applicat
     cbm_index_resource_policy_t policy;
     char error[CBM_SZ_256] = {0};
     bool loaded = cbm_config_load_index_policy(config, &policy, error, sizeof(error));
+    /* The worker reads no config: a doc_candidates setting the user set
+     * travels with the request; unset, the worker's index mode decides. */
+    bool doc_candidates_encoded =
+        !loaded || cbm_mcp_index_doc_candidates_add_to_args(document, root, config);
     cbm_config_close(owned_config);
     if (!loaded) {
         cbm_log_error("daemon.index.policy", "error", error);
         return false;
     }
-    return cbm_mcp_index_policy_add_to_args(document, root, &policy);
+    return doc_candidates_encoded && cbm_mcp_index_policy_add_to_args(document, root, &policy);
 }
 
 static char *application_auto_index_args(cbm_daemon_application_t *application,

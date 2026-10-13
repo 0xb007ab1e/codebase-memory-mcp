@@ -21343,7 +21343,7 @@ static int doc_candidate_row_count(cbm_store_t *s) {
 
 /* doc_candidates off: the same repository indexed with the switch off has no
  * candidate rows and exactly the nodes and edges of the default run, which has
- * candidates (the default is on). */
+ * candidates (the default is on in full mode). */
 TEST(pipeline_doc_candidates_off_stores_none_and_keeps_graph) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_doccand_off_XXXXXX");
@@ -21444,6 +21444,187 @@ TEST(pipeline_doc_candidates_off_clears_rows_on_delta) {
     cbm_pipeline_incremental_test_reset_faults();
     PASS();
 }
+
+/* One index run of the doc-candidate fixture in tmp into db. set < 0 leaves
+ * doc_candidates unset (the index mode decides); 0 / 1 set it explicitly. */
+typedef struct {
+    bool enabled_before; /* the switch as the pipeline reports it before the run */
+    int rows;            /* doc_link_candidates rows; -1 on an error */
+    int sem;             /* SEMANTICALLY_RELATED edges */
+    int sim;             /* SIMILAR_TO edges */
+    int nodes;
+    int edges;
+} doc_mode_run_t;
+
+static doc_mode_run_t doc_candidates_mode_run(const char *tmp, const char *db,
+                                              cbm_index_mode_t mode, int set) {
+    doc_mode_run_t r = {.rows = -1};
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, mode);
+    if (!p) {
+        return r;
+    }
+    if (set >= 0) {
+        cbm_pipeline_set_doc_candidates_enabled(p, set == 1);
+    }
+    r.enabled_before = cbm_pipeline_doc_candidates_enabled(p);
+    /* A threshold low enough that the fixture's near-duplicates relate, so
+     * the SEMANTICALLY_RELATED count shows whether the edge phases ran. */
+    cbm_setenv("CBM_SEMANTIC_THRESHOLD", "0.3", 1);
+    int rc = cbm_pipeline_run(p);
+    cbm_unsetenv("CBM_SEMANTIC_THRESHOLD");
+    char project[512];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db) : NULL;
+    if (!s) {
+        return r;
+    }
+    r.rows = doc_candidate_row_count(s);
+    r.sem = cbm_store_count_edges_by_type(s, project, "SEMANTICALLY_RELATED");
+    r.sim = cbm_store_count_edges_by_type(s, project, "SIMILAR_TO");
+    r.nodes = cbm_store_count_nodes(s, project);
+    r.edges = cbm_store_count_edges(s, project);
+    cbm_store_close(s);
+    return r;
+}
+
+/* doc_candidates unset: the index mode decides -- a full index stores
+ * candidate rows, moderate and fast store none. Moderate still runs the
+ * semantic pass (its SEMANTICALLY_RELATED edges), only without the doc
+ * phase. Each run writes a fresh database outside the indexed tree. */
+TEST(pipeline_doc_candidates_default_follows_mode) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_doccand_mode_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_doc_candidate_fixture(tmp);
+    char dbdir[256];
+    snprintf(dbdir, sizeof(dbdir), "/tmp/cbm_doccand_mdb_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(dbdir));
+    char db_full[512];
+    char db_moderate[512];
+    char db_fast[512];
+    snprintf(db_full, sizeof(db_full), "%s/full.db", dbdir);
+    snprintf(db_moderate, sizeof(db_moderate), "%s/moderate.db", dbdir);
+    snprintf(db_fast, sizeof(db_fast), "%s/fast.db", dbdir);
+
+    doc_mode_run_t full = doc_candidates_mode_run(tmp, db_full, CBM_MODE_FULL, -1);
+    doc_mode_run_t moderate = doc_candidates_mode_run(tmp, db_moderate, CBM_MODE_MODERATE, -1);
+    doc_mode_run_t fast = doc_candidates_mode_run(tmp, db_fast, CBM_MODE_FAST, -1);
+    th_rmtree(tmp);
+    th_rmtree(dbdir);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    ASSERT_TRUE(full.enabled_before);
+    ASSERT_GT(full.rows, 0);
+    ASSERT_FALSE(moderate.enabled_before);
+    ASSERT_EQ(moderate.rows, 0);
+    ASSERT_GT(moderate.sem, 0);
+    ASSERT_FALSE(fast.enabled_before);
+    ASSERT_EQ(fast.rows, 0);
+    ASSERT_EQ(fast.sem, 0);
+    PASS();
+}
+
+/* An explicit doc_candidates wins over the mode in both directions: full +
+ * off stores none, moderate + on and fast + on store rows. Fast keeps its
+ * contract -- the doc-only semantic pass adds no SEMANTICALLY_RELATED or
+ * SIMILAR_TO edge, and the graph is exactly fast's default graph. */
+TEST(pipeline_doc_candidates_explicit_wins_over_mode) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_doccand_expl_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_doc_candidate_fixture(tmp);
+    char dbdir[256];
+    snprintf(dbdir, sizeof(dbdir), "/tmp/cbm_doccand_edb_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(dbdir));
+    char db_full_off[512];
+    char db_moderate_on[512];
+    char db_fast_on[512];
+    char db_fast[512];
+    snprintf(db_full_off, sizeof(db_full_off), "%s/full_off.db", dbdir);
+    snprintf(db_moderate_on, sizeof(db_moderate_on), "%s/moderate_on.db", dbdir);
+    snprintf(db_fast_on, sizeof(db_fast_on), "%s/fast_on.db", dbdir);
+    snprintf(db_fast, sizeof(db_fast), "%s/fast.db", dbdir);
+
+    doc_mode_run_t full_off = doc_candidates_mode_run(tmp, db_full_off, CBM_MODE_FULL, 0);
+    doc_mode_run_t moderate_on = doc_candidates_mode_run(tmp, db_moderate_on, CBM_MODE_MODERATE, 1);
+    doc_mode_run_t fast_on = doc_candidates_mode_run(tmp, db_fast_on, CBM_MODE_FAST, 1);
+    doc_mode_run_t fast = doc_candidates_mode_run(tmp, db_fast, CBM_MODE_FAST, -1);
+    th_rmtree(tmp);
+    th_rmtree(dbdir);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    ASSERT_FALSE(full_off.enabled_before);
+    ASSERT_EQ(full_off.rows, 0);
+    ASSERT_TRUE(moderate_on.enabled_before);
+    ASSERT_GT(moderate_on.rows, 0);
+    ASSERT_GT(moderate_on.sem, 0);
+    ASSERT_TRUE(fast_on.enabled_before);
+    ASSERT_GT(fast_on.rows, 0);
+    ASSERT_EQ(fast_on.sem, 0);
+    ASSERT_EQ(fast_on.sim, 0);
+    ASSERT_EQ(fast.rows, 0);
+    ASSERT_GT(fast.nodes, 0);
+    ASSERT_EQ(fast_on.nodes, fast.nodes);
+    ASSERT_EQ(fast_on.edges, fast.edges);
+    PASS();
+}
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+/* The incremental legacy-partial route mirrors the full path: a fast reindex
+ * with doc_candidates explicitly on recomputes candidate rows over the
+ * rehydrated project and still adds no SEMANTICALLY_RELATED / SIMILAR_TO
+ * edge. */
+TEST(pipeline_doc_candidates_fast_on_legacy_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_doccand_finc_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_doc_candidate_fixture(tmp);
+    char dbdir[256];
+    snprintf(dbdir, sizeof(dbdir), "/tmp/cbm_doccand_fidb_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(dbdir));
+    char db[512];
+    snprintf(db, sizeof(db), "%s/fast.db", dbdir);
+
+    doc_mode_run_t first = doc_candidates_mode_run(tmp, db, CBM_MODE_FAST, -1);
+    char edited[512];
+    snprintf(edited, sizeof(edited), "%s/User_config.go", tmp);
+    FILE *ef = cbm_fopen(edited, "a");
+    ASSERT_NOT_NULL(ef);
+    (void)fputs("\n// edited after the first index\n", ef);
+    (void)fclose(ef);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_incremental_test_force_legacy_partial_once();
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_doc_candidates_enabled(p, true);
+    cbm_setenv("CBM_SEMANTIC_THRESHOLD", "0.3", 1);
+    int rc = cbm_pipeline_run(p);
+    cbm_unsetenv("CBM_SEMANTIC_THRESHOLD");
+    ASSERT_EQ(rc, 0);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    char project[512];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    int rows = doc_candidate_row_count(s);
+    int sem = cbm_store_count_edges_by_type(s, project, "SEMANTICALLY_RELATED");
+    int sim = cbm_store_count_edges_by_type(s, project, "SIMILAR_TO");
+    cbm_store_close(s);
+    th_rmtree(tmp);
+    th_rmtree(dbdir);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    ASSERT_EQ(first.rows, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_GT(rows, 0);
+    ASSERT_EQ(sem, 0);
+    ASSERT_EQ(sim, 0);
+    PASS();
+}
+#endif
 
 /* One Python family per subject: parse / load / validate / write, each with
  * a docstring, so the functions' corpus has the subject words to match. */
@@ -22870,6 +23051,11 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_doc_candidates_published_and_kept_by_delta);
     RUN_TEST(pipeline_doc_candidates_off_stores_none_and_keeps_graph);
     RUN_TEST(pipeline_doc_candidates_off_clears_rows_on_delta);
+    RUN_TEST(pipeline_doc_candidates_default_follows_mode);
+    RUN_TEST(pipeline_doc_candidates_explicit_wins_over_mode);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    RUN_TEST(pipeline_doc_candidates_fast_on_legacy_incremental);
+#endif
     RUN_TEST(pipeline_doc_candidates_skip_exact_links_and_use_format_curves);
     RUN_TEST(pipeline_doc_candidates_home_position_and_kinds);
     RUN_TEST(pipeline_doc_candidates_diagram_family_curves);

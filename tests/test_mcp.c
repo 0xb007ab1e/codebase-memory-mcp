@@ -15371,9 +15371,10 @@ static int doccand_index(cbm_mcp_server_t *srv, const char *cache, const char *r
     return ok ? doccand_rows(cache) : -1;
 }
 
-/* index_repository doc_candidates: an explicit false stores no candidate
- * rows; without the argument the doc_candidates setting decides (default on,
- * off stores none); an explicit true wins over the setting. */
+/* index_repository doc_candidates (full mode): an explicit false stores no
+ * candidate rows; without the argument a set doc_candidates setting decides
+ * (unset: the mode decides, on in full; off stores none); an explicit true
+ * wins over the setting. */
 TEST(tool_index_repository_doc_candidates_switch) {
     char repo[256];
     snprintf(repo, sizeof(repo), "/tmp/cbm-doccand-repo-XXXXXX");
@@ -15407,6 +15408,162 @@ TEST(tool_index_repository_doc_candidates_switch) {
     ASSERT_GT(setting_default, 0);
     ASSERT_EQ(setting_off, 0);
     ASSERT_GT(explicit_on, 0);
+    PASS();
+}
+
+/* Moderate mode: without an argument or a set doc_candidates setting the
+ * mode decides (off: no rows); an explicit true and a setting set to true
+ * each turn it on; an unparseable setting is not a choice and leaves the
+ * mode default. */
+TEST(tool_index_repository_doc_candidates_follow_mode) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-doccand-mrepo-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-doccand-mcache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    doccand_fixture(repo);
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    int moderate_default = doccand_index(srv, cache, repo, ",\"mode\":\"moderate\"");
+    int moderate_on =
+        doccand_index(srv, cache, repo, ",\"mode\":\"moderate\",\"doc_candidates\":true");
+    cbm_config_set(cfg, CBM_CONFIG_DOC_CANDIDATES, "true");
+    int moderate_setting_on = doccand_index(srv, cache, repo, ",\"mode\":\"moderate\"");
+    cbm_config_set(cfg, CBM_CONFIG_DOC_CANDIDATES, "maybe");
+    int moderate_setting_garbage = doccand_index(srv, cache, repo, ",\"mode\":\"moderate\"");
+    int full_setting_garbage = doccand_index(srv, cache, repo, "");
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_rmtree(cache);
+    th_rmtree(repo);
+    ASSERT_EQ(moderate_default, 0);
+    ASSERT_GT(moderate_on, 0);
+    ASSERT_GT(moderate_setting_on, 0);
+    ASSERT_EQ(moderate_setting_garbage, 0);
+    ASSERT_GT(full_setting_garbage, 0);
+    PASS();
+}
+
+/* The worker arguments a daemon session hands its index executor. */
+typedef struct {
+    char *args;
+    int calls;
+} doccand_executor_capture_t;
+
+static char *doccand_capture_executor(void *context, const char *repo_path, const char *args_json,
+                                      bool async) {
+    (void)repo_path;
+    (void)async;
+    doccand_executor_capture_t *capture = context;
+    free(capture->args);
+    capture->args = args_json ? strdup(args_json) : NULL;
+    capture->calls++;
+    return cbm_mcp_text_result("{\"status\":\"indexed\"}", false);
+}
+
+/* The doc_candidates key of captured worker args: 1 true, 0 false, -1 absent,
+ * -2 not a single boolean (or unparseable args). */
+static int doccand_forwarded(const doccand_executor_capture_t *capture) {
+    yyjson_doc *doc = capture->args ? yyjson_read(capture->args, strlen(capture->args), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    if (!root || !yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
+        return -2;
+    }
+    int keys = 0;
+    int value = -1;
+    size_t idx;
+    size_t max;
+    yyjson_val *key;
+    yyjson_val *val;
+    yyjson_obj_foreach(root, idx, max, key, val) {
+        if (strcmp(yyjson_get_str(key), "doc_candidates") == 0) {
+            keys++;
+            value = yyjson_is_bool(val) ? (yyjson_get_bool(val) ? 1 : 0) : -2;
+        }
+    }
+    yyjson_doc_free(doc);
+    return keys > 1 ? -2 : value;
+}
+
+static int doccand_forward_call(cbm_mcp_server_t *srv, doccand_executor_capture_t *capture,
+                                const char *repo, const char *extra) {
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"%s}", repo, extra);
+    free(capture->args);
+    capture->args = NULL;
+    int before = capture->calls;
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    free(resp);
+    return capture->calls == before + 1 ? doccand_forwarded(capture) : -3;
+}
+
+/* A daemon session forwards doc_candidates only when it is explicit: an
+ * argument (caller duplicates replaced by the one resolved value) or a
+ * setting the user set to a boolean. Otherwise no key reaches the worker and
+ * the worker's pipeline lets the index mode decide. */
+TEST(tool_index_repository_doc_candidates_forwarded_only_when_explicit) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-doccand-frepo-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-doccand-fcache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+    doccand_executor_capture_t capture = {0};
+    cbm_mcp_server_set_index_executor(srv, doccand_capture_executor, &capture);
+
+    int unset = doccand_forward_call(srv, &capture, repo, "");
+    int unset_moderate = doccand_forward_call(srv, &capture, repo, ",\"mode\":\"moderate\"");
+    int arg_off = doccand_forward_call(srv, &capture, repo, ",\"doc_candidates\":false");
+    int arg_on_fast =
+        doccand_forward_call(srv, &capture, repo, ",\"mode\":\"fast\",\"doc_candidates\":true");
+    int arg_not_bool = doccand_forward_call(srv, &capture, repo, ",\"doc_candidates\":\"yes\"");
+    cbm_config_set(cfg, CBM_CONFIG_DOC_CANDIDATES, "true");
+    int setting_on = doccand_forward_call(srv, &capture, repo, ",\"mode\":\"fast\"");
+    int arg_over_setting = doccand_forward_call(srv, &capture, repo, ",\"doc_candidates\":false");
+    cbm_config_set(cfg, CBM_CONFIG_DOC_CANDIDATES, "off");
+    int setting_off = doccand_forward_call(srv, &capture, repo, "");
+    cbm_config_set(cfg, CBM_CONFIG_DOC_CANDIDATES, "maybe");
+    int setting_garbage = doccand_forward_call(srv, &capture, repo, "");
+    cbm_config_delete(cfg, CBM_CONFIG_DOC_CANDIDATES);
+    int setting_reset = doccand_forward_call(srv, &capture, repo, "");
+
+    cbm_mcp_server_free(srv);
+    free(capture.args);
+    cbm_config_close(cfg);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_rmtree(cache);
+    th_rmtree(repo);
+    ASSERT_EQ(unset, -1);
+    ASSERT_EQ(unset_moderate, -1);
+    ASSERT_EQ(arg_off, 0);
+    ASSERT_EQ(arg_on_fast, 1);
+    ASSERT_EQ(arg_not_bool, -1);
+    ASSERT_EQ(setting_on, 1);
+    ASSERT_EQ(arg_over_setting, 0);
+    ASSERT_EQ(setting_off, 0);
+    ASSERT_EQ(setting_garbage, -1);
+    ASSERT_EQ(setting_reset, -1);
     PASS();
 }
 
@@ -24689,6 +24846,8 @@ SUITE(mcp) {
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_resolves_root_path_from_project_name_issue1211);
     RUN_TEST(tool_index_repository_doc_candidates_switch);
+    RUN_TEST(tool_index_repository_doc_candidates_follow_mode);
+    RUN_TEST(tool_index_repository_doc_candidates_forwarded_only_when_explicit);
     RUN_TEST(tool_index_repository_unknown_project_name_still_requires_repo_path);
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
     RUN_TEST(index_repository_relative_path_uses_explicit_session_root);

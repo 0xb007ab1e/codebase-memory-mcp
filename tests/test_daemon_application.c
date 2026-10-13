@@ -2810,6 +2810,79 @@ TEST(daemon_application_programmatic_index_injects_resource_policy) {
     ASSERT_TRUE(stopped);
     PASS();
 }
+
+/* The doc_candidates key a programmatic (UI / watcher) index hands its worker
+ * with the setting stored as value (NULL: unset): 1 true, 0 false, -1 absent,
+ * -2 on a failure. */
+static int app_programmatic_index_doc_candidates(const char *value) {
+    /* th_mktempdir returns one static buffer: copy each path. */
+    char *made = th_mktempdir("cbm_app_doccand_root");
+    char *root = made ? strdup(made) : NULL;
+    made = th_mktempdir("cbm_app_doccand_cache");
+    char *cache = made ? strdup(made) : NULL;
+    cbm_config_t *stored_config = cache ? cbm_config_open(cache) : NULL;
+    bool configured =
+        root && stored_config &&
+        (!value || cbm_config_set(stored_config, CBM_CONFIG_DOC_CANDIDATES, value) == 0);
+
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.allow_completion, true);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {
+        .config = stored_config,
+        .worker_ops = &worker_ops,
+    };
+    cbm_daemon_application_t *application = configured ? cbm_daemon_application_new(&config) : NULL;
+    int index_rc =
+        application ? cbm_daemon_application_index(application, "doccand-programmatic", root) : -1;
+    int forwarded = -2;
+    if (index_rc == 0 && app_wait_for_atomic_bool(&fake.args_captured[0], true)) {
+        const char *args = fake.args_json[0];
+        yyjson_doc *document = args ? yyjson_read(args, strlen(args), 0) : NULL;
+        yyjson_val *args_root = document ? yyjson_doc_get_root(document) : NULL;
+        yyjson_val *doc_candidates = args_root && yyjson_is_obj(args_root)
+                                         ? yyjson_obj_get(args_root, "doc_candidates")
+                                         : NULL;
+        forwarded = !args_root                        ? -2
+                    : !doc_candidates                 ? -1
+                    : !yyjson_is_bool(doc_candidates) ? -2
+                    : yyjson_get_bool(doc_candidates) ? 1
+                                                      : 0;
+        yyjson_doc_free(document);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+
+    cbm_daemon_application_free(application);
+    cbm_config_close(stored_config);
+    th_cleanup(root);
+    th_cleanup(cache);
+    free(root);
+    free(cache);
+    return stopped ? forwarded : -2;
+}
+
+/* A doc_candidates setting the user set reaches a programmatic index's
+ * worker, which has no config of its own; unset (or unparseable) it is not
+ * forwarded, so the worker's index mode decides. */
+TEST(daemon_application_programmatic_index_forwards_set_doc_candidates) {
+    int unset = app_programmatic_index_doc_candidates(NULL);
+    int off = app_programmatic_index_doc_candidates("false");
+    int on = app_programmatic_index_doc_candidates("on");
+    int garbage = app_programmatic_index_doc_candidates("maybe");
+    ASSERT_EQ(unset, -1);
+    ASSERT_EQ(off, 0);
+    ASSERT_EQ(on, 1);
+    ASSERT_EQ(garbage, -1);
+    PASS();
+}
 TEST(daemon_application_auto_index_honors_tracked_file_limit) {
     app_env_backup_t cache_environment;
     bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
@@ -6852,6 +6925,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_unnamed_status_keeps_path_derived_key_issue2134);
     RUN_TEST(daemon_application_unnamed_async_and_status_refuse_ambiguous_root_issue2134);
     RUN_TEST(daemon_application_programmatic_index_injects_resource_policy);
+    RUN_TEST(daemon_application_programmatic_index_forwards_set_doc_candidates);
     RUN_TEST(daemon_application_auto_index_honors_tracked_file_limit);
     RUN_TEST(daemon_application_auto_index_file_count_handles_literal_metacharacter_path);
     RUN_TEST(daemon_application_auto_index_file_count_supports_non_git_roots);

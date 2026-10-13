@@ -7461,18 +7461,29 @@ const char *cbm_config_get(cbm_config_t *cfg, const char *key, const char *defau
     return result;
 }
 
-bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val) {
+bool cbm_config_get_bool_set(cbm_config_t *cfg, const char *key, bool *value) {
     const char *val = cbm_config_get(cfg, key, NULL);
     if (!val) {
-        return default_val;
-    }
-    if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcmp(val, "on") == 0) {
-        return true;
-    }
-    if (strcmp(val, "false") == 0 || strcmp(val, "0") == 0 || strcmp(val, "off") == 0) {
         return false;
     }
-    return default_val;
+    bool parsed;
+    if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcmp(val, "on") == 0) {
+        parsed = true;
+    } else if (strcmp(val, "false") == 0 || strcmp(val, "0") == 0 || strcmp(val, "off") == 0) {
+        parsed = false;
+    } else {
+        return false;
+    }
+    if (value) {
+        *value = parsed;
+    }
+    return true;
+}
+
+bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val) {
+    bool value = default_val;
+    (void)cbm_config_get_bool_set(cfg, key, &value);
+    return value;
 }
 
 int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val) {
@@ -7574,6 +7585,9 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_AUTO_INDEX, "false", "Enable auto-indexing on MCP session start"},
     {CBM_CONFIG_AUTO_INDEX_LIMIT, "50000", "Max files for auto-indexing new projects"},
     {CBM_CONFIG_AUTO_WATCH, "true", "Register background git watcher on session connect"},
+    /* Unset: the index mode decides (cbm_pipeline_doc_candidates_enabled). */
+    {CBM_CONFIG_DOC_CANDIDATES, "auto",
+     "Doc-code candidates: auto = on for full, off for moderate/fast; true/false forces"},
     {CBM_CONFIG_WATCHER_ENABLED, "true",
      "Run the background watcher thread (auto-reindex); false to disable"},
     {CBM_CONFIG_WATCH_NON_GIT, "false",
