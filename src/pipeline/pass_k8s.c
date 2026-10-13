@@ -551,9 +551,11 @@ static bool k8s_cluster_scoped(const char *kind) {
  * "::": `<group>/<Kind>/<declared namespace or ->/<name>` (IDENTITY.md).
  * `obj_key` is the logical identity: the namespace it lives in, `_` for a
  * cluster-scoped kind, `?` when the deploy decides; `effective_ns` (when
- * not NULL) is the namespace a kustomize build gives it. NULL for a QN
- * without a well-formed key (the caller keeps the plain source tag). */
-static char *k8s_resource_props(const char *qn, const char *effective_ns) {
+ * not NULL) is the namespace a kustomize build gives it. `version` (NULL or
+ * "": none) is the version of its apiVersion, which the key leaves out. NULL
+ * for a QN without a well-formed key (the caller keeps the plain source
+ * tag). */
+static char *k8s_resource_props(const char *qn, const char *effective_ns, const char *version) {
     enum { K8S_KEY_PARTS = 4, K8S_ESC = 6 * K8S_LABEL_LEN };
     const char *key = qn ? strstr(qn, "::") : NULL;
     if (!key) {
@@ -580,25 +582,43 @@ static char *k8s_resource_props(const char *qn, const char *effective_ns) {
                             : effective_ns           ? effective_ns
                             : ns[0]                  ? ns
                                                      : "?";
-    char esc[K8S_KEY_PARTS + SKIP_ONE][K8S_ESC];
+    char esc[K8S_KEY_PARTS + PAIR_LEN][K8S_ESC];
     cbm_json_escape(esc[0], K8S_ESC, group);
     cbm_json_escape(esc[1], K8S_ESC, kind);
     cbm_json_escape(esc[2], K8S_ESC, ns);
     cbm_json_escape(esc[3], K8S_ESC, name);
     cbm_json_escape(esc[4], K8S_ESC, effective);
-    size_t n = K8S_KEY_PARTS * K8S_ESC + K8S_ESC + CBM_SZ_256;
+    cbm_json_escape(esc[5], K8S_ESC, version ? version : "");
+    size_t n = K8S_KEY_PARTS * K8S_ESC + PAIR_LEN * K8S_ESC + CBM_SZ_256;
     char *props = cbm_alloc(CBM_MEM_CLASS_OTHER, n);
     if (!props) {
         return NULL;
     }
     int w =
         snprintf(props, n, "{\"source\":\"k8s\",\"group\":\"%s\",\"kind\":\"%s\"", esc[0], esc[1]);
+    if (esc[5][0]) {
+        w += snprintf(props + w, n - (size_t)w, ",\"version\":\"%s\"", esc[5]);
+    }
     if (ns[0]) {
         w += snprintf(props + w, n - (size_t)w, ",\"namespace\":\"%s\"", esc[2]);
     }
     snprintf(props + w, n - (size_t)w, ",\"obj_key\":\"%s/%s/%s/%s\"}", esc[0], esc[1], esc[4],
              esc[3]);
     return props;
+}
+
+/* The string property `key` of node `n` (as k8s_resource_props writes it:
+ * no escapes inside) into `out`, "" when it has none. */
+static void k8s_node_prop(const cbm_gbuf_node_t *n, const char *key, char *out, size_t out_sz) {
+    out[0] = '\0';
+    char head[CBM_SZ_64];
+    snprintf(head, sizeof(head), "\"%s\":\"", key);
+    const char *v = n->properties_json ? strstr(n->properties_json, head) : NULL;
+    if (v) {
+        v += strlen(head);
+        const char *e = strchr(v, '"');
+        snprintf(out, out_sz, "%.*s", e ? (int)(e - v) : 0, v);
+    }
 }
 
 static void k8s_records_free(k8s_record_array_t *recs) {
@@ -677,6 +697,7 @@ typedef struct {
     int file_n;
     int file_cap;
     bool referenced; /* included by another kustomization */
+    bool component;  /* `kind: Component`: patches the build including it */
 } k8s_kust_t;
 
 typedef struct {
@@ -720,33 +741,47 @@ static bool k8s_grow(void **items, int *cap, int count, size_t elem) {
     return true;
 }
 
-/* The top-level `namespace:` of a kustomization, NULL when it sets none. */
-static char *k8s_kustomize_namespace(const char *source) {
-    for (const char *p = source; p && *p;) {
+/* The value of a kustomization's top-level `key:` line into `val`; false
+ * when it has none, or an empty one. */
+static bool k8s_kustomize_top(const char *source, const char *key, char *val, size_t val_sz) {
+    char head[CBM_SZ_64];
+    int hl = snprintf(head, sizeof(head), "%s:", key);
+    for (const char *p = source; p && *p && hl > 0;) {
         const char *eol = strchr(p, '\n');
         size_t len = eol ? (size_t)(eol - p) : strlen(p);
-        if (strncmp(p, "namespace:", K8S_SLEN("namespace:")) == 0) {
+        if (strncmp(p, head, (size_t)hl) == 0) {
             char line[CBM_SZ_512];
             snprintf(line, sizeof(line), "%.*s", (int)len, p);
-            char key[64];
-            char val[K8S_LABEL_LEN];
-            if (k8s_split_kv(line, key, sizeof(key), val, sizeof(val)) && val[0]) {
-                return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, val);
-            }
-            return NULL;
+            char k[CBM_SZ_64];
+            return k8s_split_kv(line, k, sizeof(k), val, val_sz) && val[0];
         }
         p = eol ? eol + SKIP_ONE : NULL;
     }
-    return NULL;
+    return false;
 }
 
-static void k8s_kusts_push(k8s_kusts_t *ks, const char *path, char *ns) {
+/* The top-level `namespace:` of a kustomization, NULL when it sets none. */
+static char *k8s_kustomize_namespace(const char *source) {
+    char val[K8S_LABEL_LEN];
+    return k8s_kustomize_top(source, "namespace", val, sizeof(val))
+               ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, val)
+               : NULL;
+}
+
+/* A kustomize component (`kind: Component`), whose patches act on the build
+ * of each kustomization including it. */
+static bool k8s_kustomize_component(const char *source) {
+    char val[K8S_LABEL_LEN];
+    return k8s_kustomize_top(source, "kind", val, sizeof(val)) && strcmp(val, "Component") == 0;
+}
+
+static void k8s_kusts_push(k8s_kusts_t *ks, const char *path, char *ns, bool component) {
     if (!k8s_grow((void **)&ks->items, &ks->cap, ks->count, sizeof(*ks->items))) {
         cbm_free(CBM_MEM_CLASS_OTHER, ns);
         return;
     }
-    ks->items[ks->count++] =
-        (k8s_kust_t){.path = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, path), .ns = ns};
+    ks->items[ks->count++] = (k8s_kust_t){
+        .path = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, path), .ns = ns, .component = component};
 }
 
 static void k8s_kusts_free(k8s_kusts_t *ks) {
@@ -820,6 +855,12 @@ static void k8s_kusts_wire(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, CBMHashTabl
             continue;
         }
         k8s_kust_t *kust = &ks->items[k - SKIP_ONE];
+        /* a patch file (`patches`, `patchesStrategicMerge`) is no member of
+         * the build: its documents change objects, they are none */
+        const char *props = edges[i]->properties_json;
+        if (props && strstr(props, "\"local_name\":\"patches")) {
+            continue;
+        }
         int kid = tgt->label && strcmp(tgt->label, "Folder") == 0
                       ? k8s_kust_in_dir(by_path, tgt->file_path)
                       : k8s_kust_at(by_path, tgt->file_path);
@@ -1104,7 +1145,9 @@ static void k8s_apply_effective_namespaces(cbm_pipeline_ctx_t *ctx, k8s_bundles_
         if (!any_set) {
             continue; /* no build sets a namespace: the declared one stands */
         }
-        char *props = k8s_resource_props(n->qualified_name, agree ? eff : "?");
+        char version[K8S_LABEL_LEN];
+        k8s_node_prop(n, "version", version, sizeof(version));
+        char *props = k8s_resource_props(n->qualified_name, agree ? eff : "?", version);
         if (props) {
             (void)cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)n, props);
             cbm_free(CBM_MEM_CLASS_OTHER, props);
@@ -1170,6 +1213,19 @@ typedef struct {
     char *container; /* NULL: unnamed */
 } k8s_img_t;
 
+/* A patch a kustomization states (extract_k8s.c PATCH fact): what it names
+ * in the kustomization's build. */
+typedef struct {
+    char *kust;    /* the kustomization file */
+    char *path;    /* the patch file (repository path), NULL: inline */
+    char *kind;    /* kind / group / version / name / ns named, NULL: any; */
+    char *group;   /*   kind and name both NULL: the documents of the */
+    char *version; /*   patch file name them */
+    char *name;
+    char *ns;
+    int line;
+} k8s_patch_t;
+
 typedef struct {
     k8s_ref_t *refs;
     int ref_n;
@@ -1192,6 +1248,9 @@ typedef struct {
     k8s_env_t *envs;
     int env_n;
     int env_cap;
+    k8s_patch_t *patches;
+    int patch_n;
+    int patch_cap;
 } k8s_facts_t;
 
 static void k8s_facts_free(k8s_facts_t *f) {
@@ -1226,6 +1285,17 @@ static void k8s_facts_free(k8s_facts_t *f) {
         cbm_free(CBM_MEM_CLASS_OTHER, f->envs[i].key);
         cbm_free(CBM_MEM_CLASS_OTHER, f->envs[i].container);
     }
+    for (int i = 0; i < f->patch_n; i++) {
+        k8s_patch_t *p = &f->patches[i];
+        cbm_free(CBM_MEM_CLASS_OTHER, p->kust);
+        cbm_free(CBM_MEM_CLASS_OTHER, p->path);
+        cbm_free(CBM_MEM_CLASS_OTHER, p->kind);
+        cbm_free(CBM_MEM_CLASS_OTHER, p->group);
+        cbm_free(CBM_MEM_CLASS_OTHER, p->version);
+        cbm_free(CBM_MEM_CLASS_OTHER, p->name);
+        cbm_free(CBM_MEM_CLASS_OTHER, p->ns);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, f->patches);
     cbm_free(CBM_MEM_CLASS_OTHER, f->envs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->hrs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->srcs);
@@ -2293,7 +2363,12 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, c
             continue;
         }
 
-        char *props = k8s_resource_props(def->qualified_name, NULL);
+        const char *version = NULL; /* extract_k8s.c: the one extra property */
+        if (def->extra_props && def->extra_props[0] && def->extra_props[SKIP_ONE] &&
+            strcmp(def->extra_props[0], "version") == 0) {
+            version = def->extra_props[SKIP_ONE];
+        }
+        char *props = k8s_resource_props(def->qualified_name, NULL, version);
         int64_t node_id = cbm_gbuf_upsert_node(
             ctx->gbuf, "Resource", def->name, def->qualified_name, rel_path, (int)def->start_line,
             (int)def->end_line, props ? props : "{\"source\":\"k8s\"}");
@@ -2808,9 +2883,14 @@ static void k8s_prep_file(const k8s_prep_job_t *job, int i, k8s_prep_t *out) {
         out->source = k8s_read_file(path, &out->src_len);
         out->kind = out->source ? K8S_DEP : K8S_SKIP;
     } else if (lang == CBM_LANG_KUSTOMIZE) {
-        /* Its `namespace:` is the namespace of the objects it builds. */
+        /* Its `namespace:` is the namespace of the objects it builds; its
+         * patches (PATCH facts) change some of them. */
         out->source = k8s_read_file(path, &out->src_len);
         out->kind = out->source ? K8S_KUSTOMIZE : K8S_SKIP;
+        if (out->source) {
+            out->res = cbm_extract_file(out->source, out->src_len, CBM_LANG_KUSTOMIZE,
+                                        ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL, NULL);
+        }
     } else if (lang == CBM_LANG_YAML || lang == CBM_LANG_K8S) {
         /* Read source once to classify (and reuse for uncached extraction). */
         out->source = k8s_read_file(path, &out->src_len);
@@ -3377,6 +3457,314 @@ static void k8s_link_envs(cbm_pipeline_ctx_t *ctx, const k8s_facts_t *f) {
     }
 }
 
+/* ── Kustomize patches (PHASE 5) ───────────────────────────────────── */
+
+static char *k8s_dup_opt(const char *s) {
+    return s ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, s) : NULL;
+}
+
+/* Keep a kustomization's PATCH facts, each patch file as a repository path
+ * (one that leaves the repository, or a URL, names no file of it). */
+static void k8s_patches_keep(k8s_facts_t *f, const char *kust, const CBMFileResult *res) {
+    char dir[CBM_SZ_1K];
+    k8s_dirname(kust, dir, sizeof(dir));
+    for (int i = 0; res && i < res->k8s_facts.count; i++) {
+        const CBMK8sFact *x = &res->k8s_facts.items[i];
+        char path[CBM_SZ_1K];
+        if (x->fact != CBM_K8S_FACT_PATCH) {
+            continue;
+        }
+        if (x->path) {
+            char joined[CBM_SZ_2K];
+            snprintf(joined, sizeof(joined), "%s%s%s", dir, dir[0] ? "/" : "", x->path);
+            if (!k8s_norm_dir(joined, path, sizeof(path))) {
+                continue;
+            }
+        }
+        if (!k8s_grow((void **)&f->patches, &f->patch_cap, f->patch_n, sizeof(*f->patches))) {
+            continue;
+        }
+        f->patches[f->patch_n++] =
+            (k8s_patch_t){.kust = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, kust),
+                          .path = x->path ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, path) : NULL,
+                          .kind = k8s_dup_opt(x->kind),
+                          .group = k8s_dup_opt(x->group),
+                          .version = k8s_dup_opt(x->version),
+                          .name = k8s_dup_opt(x->name),
+                          .ns = k8s_dup_opt(x->ns),
+                          .line = x->line};
+    }
+}
+
+static int k8s_cmp_patch(const void *a, const void *b) {
+    const k8s_patch_t *x = a;
+    const k8s_patch_t *y = b;
+    int c = strcmp(x->kust, y->kust);
+    return c ? c : (x->line > y->line) - (x->line < y->line);
+}
+
+/* A Resource's kind and name, from its node name "Kind/name". */
+static bool k8s_kind_name(const cbm_gbuf_node_t *n, char *kind, size_t kind_sz, const char **name) {
+    const char *slash = n->name ? strchr(n->name, '/') : NULL;
+    if (!slash) {
+        return false;
+    }
+    snprintf(kind, kind_sz, "%.*s", (int)(slash - n->name), n->name);
+    *name = slash + SKIP_ONE;
+    return true;
+}
+
+/* What a patch names: kind / group / version / name / ns (NULL: any). A
+ * name compares as text: a target's is a regular expression in kustomize,
+ * which an object name (DNS characters, `.` matching itself) meets as text
+ * alone -- a pattern (`web-.*`) names nothing here. */
+typedef struct {
+    const char *kind;
+    const char *group;
+    const char *version;
+    const char *name;
+    const char *ns;
+} k8s_want_t;
+
+/* Is Resource `t` what `w` names? A namespace meets the target's declared
+ * one or its effective one. */
+static bool k8s_patch_meets(const cbm_gbuf_node_t *t, const k8s_want_t *w) {
+    char tkind[K8S_LABEL_LEN];
+    const char *tname = NULL;
+    if (!t->label || strcmp(t->label, "Resource") != 0 ||
+        !k8s_kind_name(t, tkind, sizeof(tkind), &tname)) {
+        return false;
+    }
+    if (w->kind && strcmp(w->kind, tkind) != 0) {
+        return false;
+    }
+    if (w->name && strcmp(w->name, tname) != 0) {
+        return false;
+    }
+    char prop[K8S_LABEL_LEN];
+    if (w->group) {
+        k8s_node_prop(t, "group", prop, sizeof(prop));
+        if (strcmp(w->group, prop) != 0) {
+            return false;
+        }
+    }
+    if (w->version) {
+        k8s_node_prop(t, "version", prop, sizeof(prop));
+        if (strcmp(w->version, prop) != 0) {
+            return false;
+        }
+    }
+    if (w->ns) {
+        char decl[K8S_LABEL_LEN];
+        k8s_declared_ns(t->qualified_name, decl, sizeof(decl));
+        k8s_effective_ns(t, prop, sizeof(prop));
+        return strcmp(w->ns, decl) == 0 || strcmp(w->ns, prop) == 0;
+    }
+    return true;
+}
+
+static void k8s_patch_edge(cbm_pipeline_ctx_t *ctx, int64_t src, int64_t tgt,
+                           const k8s_patch_t *p) {
+    if (src <= 0 || tgt <= 0 || src == tgt) {
+        return;
+    }
+    char ek[CBM_SZ_2K];
+    char ep[CBM_SZ_2K];
+    cbm_json_escape(ek, (int)sizeof(ek), p->kust);
+    cbm_json_escape(ep, (int)sizeof(ep), p->path ? p->path : "inline");
+    char props[CBM_SZ_4K + CBM_SZ_1K];
+    snprintf(props, sizeof(props),
+             "{\"via\":\"patch\",\"kustomization\":\"%s\",\"patch\":\"%s\",\"line\":%d}", ek, ep,
+             p->line);
+    cbm_gbuf_insert_edge(ctx->gbuf, src, tgt, "OVERRIDE", props);
+}
+
+/* The build a patch acts in: its manifests, their Resources by name
+ * (`names`: "Kind/name" -> ids, this build's only -- a repository-wide name
+ * would visit every copy of a name for every patch, quadratic in copies) and
+ * every Resource by file. */
+typedef struct {
+    cbm_pipeline_ctx_t *ctx;
+    const k8s_paths_t *files;
+    CBMHashTable *names;
+    CBMHashTable *by_file;
+} k8s_build_t;
+
+/* Draw `p` from `src` to each object of the build `w` names. A named kind
+ * is looked up by name, anything else walks the build. */
+static void k8s_patch_targets(const k8s_build_t *b, const k8s_patch_t *p, int64_t src,
+                              const k8s_want_t *w) {
+    cbm_gbuf_t *gb = b->ctx->gbuf;
+    if (w->kind && w->name) {
+        char key[CBM_SZ_1K];
+        snprintf(key, sizeof(key), "%s/%s", w->kind, w->name);
+        const k8s_ids_t *ids = cbm_ht_get(b->names, key);
+        for (int i = 0; ids && i < ids->count; i++) {
+            const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(gb, ids->items[i]);
+            atomic_fetch_add_explicit(&g_k8s_candidates, SKIP_ONE, memory_order_relaxed);
+            if (t && k8s_patch_meets(t, w)) {
+                k8s_patch_edge(b->ctx, src, t->id, p);
+            }
+        }
+        return;
+    }
+    for (int f = 0; f < b->files->count; f++) {
+        const k8s_ids_t *objs = cbm_ht_get(b->by_file, b->files->items[f]);
+        for (int o = 0; objs && o < objs->count; o++) {
+            const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(gb, objs->items[o]);
+            atomic_fetch_add_explicit(&g_k8s_candidates, SKIP_ONE, memory_order_relaxed);
+            if (t && k8s_patch_meets(t, w)) {
+                k8s_patch_edge(b->ctx, src, t->id, p);
+            }
+        }
+    }
+}
+
+/* The File node of `path` (a kustomization, a patch file: the node kustomize
+ * IMPORTS leave from), 0 when none. */
+static int64_t k8s_file_of(cbm_pipeline_ctx_t *ctx, const char *path) {
+    const cbm_gbuf_node_t *n = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
+    return n ? n->id : 0;
+}
+
+/* Patch `p` in build `b`: a path patch without a target -- each of its
+ * documents to the object of the same group, kind and name (and namespace,
+ * when it declares one); otherwise from its documents -- a file of none (a
+ * JSON6902 operation list): from its File; inline: from the kustomization's
+ * File `kust_file` -- to what it names. */
+static void k8s_patch_in_build(const k8s_build_t *b, const k8s_patch_t *p, int64_t kust_file) {
+    const k8s_ids_t *docs = p->path ? cbm_ht_get(b->by_file, p->path) : NULL;
+    if (!p->kind && !p->name) {
+        for (int d = 0; docs && d < docs->count; d++) {
+            const cbm_gbuf_node_t *doc = cbm_gbuf_find_by_id(b->ctx->gbuf, docs->items[d]);
+            char kind[K8S_LABEL_LEN];
+            char group[K8S_LABEL_LEN];
+            char ns[K8S_LABEL_LEN];
+            const char *name = NULL;
+            if (!doc || !k8s_kind_name(doc, kind, sizeof(kind), &name)) {
+                continue;
+            }
+            k8s_node_prop(doc, "group", group, sizeof(group));
+            k8s_declared_ns(doc->qualified_name, ns, sizeof(ns));
+            k8s_want_t w = {kind, group[0] ? group : NULL, NULL, name, ns[0] ? ns : NULL};
+            k8s_patch_targets(b, p, doc->id, &w);
+        }
+        return;
+    }
+    k8s_want_t w = {p->kind, p->group, p->version, p->name, p->ns};
+    if (docs && docs->count > 0) {
+        for (int d = 0; d < docs->count; d++) {
+            k8s_patch_targets(b, p, docs->items[d], &w);
+        }
+    } else {
+        k8s_patch_targets(b, p, p->path ? k8s_file_of(b->ctx, p->path) : kust_file, &w);
+    }
+}
+
+/* The builds the patches of kustomization `k` act in, into `out`: its own;
+ * a component's are those of each kustomization including it (`inc`: the
+ * includers of every kustomization, by index). */
+static void k8s_patch_builds(const k8s_kusts_t *ks, const k8s_ints_t *inc, int k, k8s_ints_t *out) {
+    out->count = 0;
+    if (!ks->items[k].component) {
+        if (k8s_grow((void **)&out->items, &out->cap, out->count, sizeof(int))) {
+            out->items[out->count++] = k;
+        }
+        return;
+    }
+    for (int i = 0; i < inc[k].count; i++) {
+        if (k8s_grow((void **)&out->items, &out->cap, out->count, sizeof(int))) {
+            out->items[out->count++] = inc[k].items[i];
+        }
+    }
+}
+
+/* Kustomize patches -> OVERRIDE {via: patch, kustomization, patch, line},
+ * child -> base: each patch against the build of the kustomization stating
+ * it, a component's against the build of each kustomization including it
+ * (the component's own resources are part of that build). */
+static void k8s_link_patches(cbm_pipeline_ctx_t *ctx, const k8s_kusts_t *ks, k8s_facts_t *f) {
+    if (f->patch_n == 0 || ks->count == 0) {
+        return;
+    }
+    CBMHashTable *by_path = cbm_ht_create(0);
+    CBMHashTable *by_file = cbm_ht_create(0);
+    int *seen = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)ks->count * sizeof(int));
+    k8s_ints_t *inc = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)ks->count * sizeof(*inc));
+    const cbm_gbuf_node_t **res = NULL;
+    int res_n = 0;
+    if (by_path && by_file && seen && inc &&
+        cbm_gbuf_find_by_label(ctx->gbuf, "Resource", &res, &res_n) == 0) {
+        for (int i = 0; i < res_n; i++) {
+            if (res[i]->file_path) {
+                k8s_index_add(by_file, res[i]->file_path, res[i]->id);
+            }
+        }
+        for (int i = 0; i < ks->count; i++) {
+            cbm_ht_set(by_path, ks->items[i].path, (void *)(intptr_t)(i + SKIP_ONE));
+            for (int c = 0; c < ks->items[i].kid_n; c++) {
+                k8s_ints_t *v = &inc[ks->items[i].kids[c]];
+                if (k8s_grow((void **)&v->items, &v->cap, v->count, sizeof(int))) {
+                    v->items[v->count++] = i;
+                }
+            }
+        }
+        k8s_qsort(f->patches, (size_t)f->patch_n, sizeof(*f->patches), k8s_cmp_patch);
+        k8s_ints_t builds = {0};
+        int mark = 0;
+        for (int i = 0; i < f->patch_n;) {
+            int j = i;
+            while (j < f->patch_n && strcmp(f->patches[j].kust, f->patches[i].kust) == 0) {
+                j++;
+            }
+            int k = k8s_kust_at(by_path, f->patches[i].kust) - SKIP_ONE;
+            int64_t kust_file = 0;
+            if (k >= 0) {
+                k8s_patch_builds(ks, inc, k, &builds);
+                kust_file = k8s_file_of(ctx, ks->items[k].path);
+            }
+            for (int bi = 0; k >= 0 && bi < builds.count; bi++) {
+                k8s_paths_t files = {0};
+                k8s_kust_closure(ks, builds.items[bi], seen, ++mark, &files);
+                k8s_paths_sort_unique(&files);
+                CBMHashTable *names = cbm_ht_create(0);
+                for (int x = 0; names && x < files.count; x++) {
+                    const k8s_ids_t *objs = cbm_ht_get(by_file, files.items[x]);
+                    for (int o = 0; objs && o < objs->count; o++) {
+                        const cbm_gbuf_node_t *n = cbm_gbuf_find_by_id(ctx->gbuf, objs->items[o]);
+                        if (n && n->name) {
+                            k8s_index_add(names, n->name, n->id);
+                        }
+                    }
+                }
+                k8s_build_t b = {ctx, &files, names, by_file};
+                for (int q = i; names && q < j; q++) {
+                    k8s_patch_in_build(&b, &f->patches[q], kust_file);
+                }
+                if (names) {
+                    cbm_ht_foreach(names, k8s_free_ids_entry, NULL);
+                    cbm_ht_free(names);
+                }
+                cbm_free(CBM_MEM_CLASS_OTHER, (void *)files.items);
+            }
+            i = j;
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, builds.items);
+    }
+    for (int i = 0; inc && i < ks->count; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, inc[i].items);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, inc);
+    cbm_free(CBM_MEM_CLASS_OTHER, seen);
+    if (by_file) {
+        cbm_ht_foreach(by_file, k8s_free_ids_entry, NULL);
+        cbm_ht_free(by_file);
+    }
+    if (by_path) {
+        cbm_ht_free(by_path);
+    }
+}
+
 static void k8s_link_deploys(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundles_t *b,
                              const k8s_facts_t *f) {
     if (f->dep_n == 0 && f->hr_n == 0 && f->src_n == 0) {
@@ -3528,7 +3916,9 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                     helm_count++;
                     break;
                 case K8S_KUSTOMIZE:
-                    k8s_kusts_push(&kusts, rel, k8s_kustomize_namespace(p->source));
+                    k8s_kusts_push(&kusts, rel, k8s_kustomize_namespace(p->source),
+                                   k8s_kustomize_component(p->source));
+                    k8s_patches_keep(&facts, rel, p->res);
                     break;
                 case K8S_MANIFEST:
                     handle_k8s_manifest(ctx, rel, p->source, p->res, &recs, &facts);
@@ -3567,6 +3957,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_link_deploys(ctx, &kusts, &bundles, &facts);
     k8s_link_images(ctx, &facts);
     k8s_link_envs(ctx, &facts);
+    k8s_link_patches(ctx, &kusts, &facts);
     k8s_facts_free(&facts);
     k8s_records_free(&recs);
     /* Link `file://` chart dependencies now that every Chart.yaml is read,

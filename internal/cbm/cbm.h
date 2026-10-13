@@ -719,7 +719,14 @@ typedef struct {
  *     (NULL: unnamed) from image `name` (a literal reference); via "container".
  *   CBM_K8S_FACT_ENV: object def_index sets environment variable `name` in
  *     its container `container` (NULL: unnamed) at `line`; via = where the
- *     value comes from ("value", or the valueFrom kind) -- never the value. */
+ *     value comes from ("value", or the valueFrom kind) -- never the value.
+ *   CBM_K8S_FACT_PATCH: a kustomization's `patches` entry at `line` patches
+ *     the objects of its build named by kind / group / version / name / ns
+ *     (any NULL: any) -- its `target`, else an inline patch document's own
+ *     kind / group / name / ns; `path` is
+ *     the patch file (as written, relative to the kustomization), NULL for an
+ *     inline patch. kind and name both NULL: the patch file's documents name
+ *     them. def_index -1: the kustomization itself is the source. */
 typedef enum {
     CBM_K8S_FACT_REF = 0,
     CBM_K8S_FACT_CRD,
@@ -727,7 +734,8 @@ typedef enum {
     CBM_K8S_FACT_ROUTE,
     CBM_K8S_FACT_SOURCE,
     CBM_K8S_FACT_IMAGE,
-    CBM_K8S_FACT_ENV
+    CBM_K8S_FACT_ENV,
+    CBM_K8S_FACT_PATCH
 } CBMK8sFactKind;
 typedef struct {
     CBMK8sFactKind fact;
@@ -739,7 +747,10 @@ typedef struct {
     const char *edge;
     const char *route;
     const char *container;
-    const char *key; /* CONNECTS_TO: the environment variable addressing it */
+    const char *key;     /* CONNECTS_TO: the environment variable addressing it */
+    const char *group;   /* PATCH: the API group named ("core"), NULL: any */
+    const char *version; /* PATCH: the API version named, NULL: any */
+    const char *path;    /* PATCH: the patch file, NULL: inline */
     int line;
 } CBMK8sFact;
 

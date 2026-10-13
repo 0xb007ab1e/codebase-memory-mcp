@@ -1495,8 +1495,10 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      image_ignore). A workload or compose service CONNECTS_TO the Service
  *      its environment addresses (extract_k8s.c, pass_docker.c). A script's
  *      curl / wget HTTP_CALLS the Route of the URL it states (pass_shell.c).
- *      An index built before holds none of them, so it rebuilds once on
- *      upgrade. */
+ *      A kustomize patch OVERRIDEs the objects of its build it changes, its
+ *      file an IMPORTS of the kustomization; a Resource keeps the version of
+ *      its apiVersion (extract_k8s.c, pass_k8s.c). An index built before
+ *      holds none of them, so it rebuilds once on upgrade. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
 
 typedef struct {

@@ -2581,6 +2581,126 @@ TEST(probe_env_address_connects_to_its_service) {
     PASS();
 }
 
+/* Every kustomize patch edge as "<source file> <source label> -> <target>
+ * @<target file>", then "patch imports <n>" (IMPORTS of patch files), "maps
+ * into patches <n>" (INFRA_MAPS into a patch file's documents) and "version
+ * <v>" (base/deploy.yaml's Resource), "odd version <v>" (other/odd.yaml's:
+ * none without one, missing without the Resource). */
+static char *gpf_patches(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.label || ' -> ' || t.name || ' @' || t.file_path AS x FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+            "e.type='OVERRIDE' AND json_extract(e.properties,'$.via')='patch' ORDER BY x)), '') "
+            "|| char(10) || 'patch imports ' || (SELECT COUNT(*) FROM edges e WHERE e.project=?1 "
+            "AND e.type='IMPORTS' AND json_extract(e.properties,'$.local_name')='patches') || "
+            "char(10) || 'maps into patches ' || (SELECT COUNT(*) FROM edges e JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND e.type='INFRA_MAPS' AND t.file_path LIKE "
+            "'overlays/%') || char(10) || 'version ' || coalesce((SELECT "
+            "json_extract(properties,'$.version') FROM nodes WHERE project=?1 AND "
+            "label='Resource' AND file_path='base/deploy.yaml'), '-') || char(10) || "
+            "'odd version ' || coalesce((SELECT coalesce(json_extract(properties,'$.version'), "
+            "'none') FROM nodes WHERE project=?1 AND label='Resource' AND "
+            "file_path='other/odd.yaml'), 'missing')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A kustomization's patches OVERRIDE the objects of its build they change,
+ * child -> base: a patch file's documents the objects of the same kind and
+ * name; an inline patch (from the kustomization) the object its document
+ * names (a `${VAR}` name as written); a JSON6902 operation file (from the
+ * file) the objects its target selects -- group and version included; a
+ * component's the objects of the build including it; a kind alone every
+ * object of that kind. Never: an object outside the build, one the patch
+ * does not name (another name, group, version or namespace), a component
+ * nothing includes, a label selector (not evaluated). A patch file is an import of
+ * the kustomization, never a member of its build (a Service selects no patch
+ * document). A Resource keeps the version of its apiVersion; a bare group
+ * (`apiVersion: example.io`) has none. */
+TEST(probe_kustomize_patches_override_their_base) {
+    static const GpfFile files[] = {
+        {"base/kustomization.yaml", "resources:\n- deploy.yaml\n- svc.yaml\n- cm.yaml\n"},
+        {"base/cm.yaml",
+         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ${APP}-config\n  namespace: app\n"},
+        {"base/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: app\nspec:\n"
+         "  template:\n    metadata:\n      labels:\n        app: web\n"},
+        {"base/svc.yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: app\n"
+                          "spec:\n  selector:\n    app: web\n"},
+        {"overlays/prod/kustomization.yaml",
+         "namespace: app\nresources:\n- ../../base\ncomponents:\n- ../../components/extra\n"
+         "patches:\n"
+         "- path: patch-deploy.yaml\n"
+         "- path: ns-patch.yaml\n"
+         "- path: all.yaml\n  target:\n    kind: Service\n"
+         "- patch: |-\n    apiVersion: v1\n    kind: Service\n    metadata:\n      name: web\n"
+         "    spec:\n      type: NodePort\n"
+         "- path: ops.yaml\n  target:\n    kind: Deployment\n    name: web\n"
+         "- path: ops-v2.yaml\n  target:\n    group: apps\n    version: v2\n    kind: Deployment\n"
+         "- path: ops-batch.yaml\n  target:\n    group: batch\n    kind: Deployment\n"
+         "- path: sel.yaml\n  target:\n    kind: Deployment\n    labelSelector: tier=none\n"
+         "- path: cm-patch.yaml\n"
+         "- patch: |-\n    apiVersion: apps/v1\n    kind: Deployment\n    metadata:\n"
+         "      name: missing\n"},
+        {"overlays/prod/ops-batch.yaml", "- op: replace\n  path: /spec/replicas\n  value: 5\n"},
+        {"overlays/prod/ns-patch.yaml",
+         "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: elsewhere\n"},
+        {"overlays/prod/all.yaml", "- op: add\n  path: /metadata/labels/tier\n  value: front\n"},
+        {"overlays/prod/sel.yaml", "- op: replace\n  path: /spec/replicas\n  value: 6\n"},
+        {"overlays/prod/cm-patch.yaml",
+         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ${APP}-config\n  namespace: app\n"
+         "data:\n  k: v\n"},
+        {"overlays/prod/patch-deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: app\nspec:\n"
+         "  template:\n    metadata:\n      labels:\n        app: web\n"},
+        {"overlays/prod/ops.yaml", "- op: replace\n  path: /spec/replicas\n  value: 3\n"},
+        {"overlays/prod/ops-v2.yaml", "- op: replace\n  path: /spec/replicas\n  value: 4\n"},
+        {"components/extra/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1alpha1\nkind: Component\npatches:\n"
+         "- patch: |-\n    apiVersion: apps/v1\n    kind: Deployment\n    metadata:\n"
+         "      name: web\n      namespace: app\n"},
+        {"components/unused/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1alpha1\nkind: Component\npatches:\n"
+         "- patch: |-\n    apiVersion: v1\n    kind: Service\n    metadata:\n      name: web\n"},
+        {"other/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: app\n"},
+        {"other/odd.yaml", "apiVersion: example.io\nkind: Thing\nmetadata:\n  name: odd\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_patches(files, n);
+    static const char want[] =
+        "components/extra/kustomization.yaml File -> Deployment/web @base/deploy.yaml\n"
+        "overlays/prod/all.yaml File -> Service/web @base/svc.yaml\n"
+        "overlays/prod/cm-patch.yaml Resource -> ConfigMap/${APP}-config @base/cm.yaml\n"
+        "overlays/prod/kustomization.yaml File -> Service/web @base/svc.yaml\n"
+        "overlays/prod/ops.yaml File -> Deployment/web @base/deploy.yaml\n"
+        "overlays/prod/patch-deploy.yaml Resource -> Deployment/web @base/deploy.yaml\n"
+        "patch imports 8\n"
+        "maps into patches 0\n"
+        "version v1\n"
+        "odd version none";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "patches got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("kustomize patch edges");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
  * "edgeless routes <n>": the Route nodes no edge touches. */
 static char *gpf_script_http(const GpfFile *files, int nfiles) {
@@ -5016,6 +5136,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_container_env_joins_its_own_image_readers);
     RUN_TEST(probe_env_address_connects_to_its_service);
     RUN_TEST(probe_script_http_request_calls_its_route);
+    RUN_TEST(probe_kustomize_patches_override_their_base);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);

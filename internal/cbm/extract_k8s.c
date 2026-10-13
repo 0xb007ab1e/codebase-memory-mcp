@@ -15,6 +15,7 @@
 #include "helpers.h"
 #include "tree_sitter/api.h"
 #include "foundation/constants.h"
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -22,6 +23,7 @@
 /* Local constants. */
 enum {
     K8S_BUF_SIZE = 256,
+    K8S_PROPS_KV = 3, /* extra_props: one key, its value, the NULL end */
 };
 
 // ---------------------------------------------------------------------------
@@ -217,6 +219,240 @@ static TSNode unwrap_pair_value(TSNode pair) {
     return val_node;
 }
 
+// ---------------------------------------------------------------------------
+// Kustomize patches
+// ---------------------------------------------------------------------------
+
+// One `patches` entry of a kustomization (the kustomize v5 mapping form). The
+// patch file of `path` is an import (local name "patches"); what the entry
+// patches is a PATCH fact the K8s pass resolves in the kustomization's build:
+// its `target`, else each document of an inline `patch`; a path patch
+// without a target names the objects of its own documents, which the pass
+// reads from the patch file's Resources. A target the pass cannot evaluate
+// (a label or annotation selector) names nothing.
+
+typedef struct {
+    const char *kind;
+    const char *group;
+    const char *version;
+    const char *name;
+    const char *ns;
+    bool selector; /* labelSelector / annotationSelector */
+} kust_target_t;
+
+static void kust_target(CBMExtractCtx *ctx, TSNode map, kust_target_t *t) {
+    CBMArena *a = ctx->arena;
+    k8s_kids_t pairs = k8s_kids(map);
+    TSNode pair;
+    while (k8s_kid(&pairs, false, &pair)) {
+        if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
+            continue;
+        }
+        const char *key = get_scalar_text(a, ts_node_named_child(pair, 0), ctx->source);
+        TSNode v = unwrap_pair_value(pair);
+        const char *val = key && !ts_node_is_null(v) ? get_scalar_text(a, v, ctx->source) : NULL;
+        if (!val || !val[0]) {
+            continue;
+        }
+        if (strcmp(key, "kind") == 0) {
+            t->kind = val;
+        } else if (strcmp(key, "group") == 0) {
+            t->group = val;
+        } else if (strcmp(key, "version") == 0) {
+            t->version = val;
+        } else if (strcmp(key, "name") == 0) {
+            t->name = val;
+        } else if (strcmp(key, "namespace") == 0) {
+            t->ns = val;
+        } else if (strcmp(key, "labelSelector") == 0 || strcmp(key, "annotationSelector") == 0) {
+            t->selector = true;
+        }
+    }
+}
+
+// The block mapping a sequence item holds, null when it holds none (a
+// string entry, which emit_kustomize_sequence imports).
+static TSNode kust_item_mapping(TSNode item) {
+    TSNode v = first_content_child(item);
+    if (!ts_node_is_null(v) && strcmp(ts_node_type(v), "block_node") == 0) {
+        v = first_content_child(v);
+    }
+    if (ts_node_is_null(v) || strcmp(ts_node_type(v), "block_mapping") != 0) {
+        TSNode null_node = {0};
+        return null_node;
+    }
+    return v;
+}
+
+// The text of an inline patch: a block scalar's lines after its header line
+// (`|`, `|-`, `|2`...), or a one-line scalar.
+static const char *kust_inline_text(CBMExtractCtx *ctx, TSNode v) {
+    if (strcmp(ts_node_type(v), "block_scalar") == 0) {
+        const char *raw = cbm_node_text(ctx->arena, v, ctx->source);
+        const char *nl = raw ? strchr(raw, '\n') : NULL;
+        return nl ? nl + SKIP_ONE : NULL;
+    }
+    return get_scalar_text(ctx->arena, v, ctx->source);
+}
+
+// One line of an inline patch: its indent and `key: value` (the value
+// unquoted, a trailing comment dropped); false for a blank or comment line.
+static bool kust_line(const char *p, size_t len, int *indent, char *key, size_t ksz, char *val,
+                      size_t vsz) {
+    size_t i = 0;
+    while (i < len && p[i] == ' ') {
+        i++;
+    }
+    if (i == len || p[i] == '#') {
+        return false;
+    }
+    *indent = (int)i;
+    size_t k = i;
+    while (k < len && p[k] != ':') {
+        k++;
+    }
+    snprintf(key, ksz, "%.*s", (int)(k - i), p + i);
+    val[0] = '\0';
+    size_t s = k < len ? k + SKIP_ONE : len;
+    while (s < len && p[s] == ' ') {
+        s++;
+    }
+    size_t e = s;
+    while (e < len && !(p[e] == '#' && p[e - SKIP_ONE] == ' ')) {
+        e++;
+    }
+    while (e > s && (p[e - SKIP_ONE] == ' ' || p[e - SKIP_ONE] == '\r')) {
+        e--;
+    }
+    if (e - s >= PAIR_LEN && (p[s] == '"' || p[s] == '\'') && p[e - SKIP_ONE] == p[s]) {
+        s++;
+        e--;
+    }
+    snprintf(val, vsz, "%.*s", (int)(e - s), p + s);
+    return true;
+}
+
+// Each document of an inline patch with a kind and a metadata.name: a PATCH
+// fact naming that object -- its kind, the group of its apiVersion ("core"
+// for the core group, as on a Resource), its name and namespace. A JSON6902
+// operation list names nothing.
+static const char KUST_DOC_END[] = "---";
+
+static void kust_inline_facts(CBMExtractCtx *ctx, const char *text, CBMK8sFact base) {
+    CBMArena *a = ctx->arena;
+    CBMK8sFact f = base;
+    int top = -1;  /* indent of the document's keys */
+    int meta = -1; /* indent of metadata's keys, -1: not inside metadata */
+    bool in_meta = false;
+    for (const char *p = text; p;) {
+        const char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        size_t b = strspn(p, " ");
+        bool doc_end = b + strlen(KUST_DOC_END) <= len &&
+                       strncmp(p + b, KUST_DOC_END, strlen(KUST_DOC_END)) == 0;
+        int ind = 0;
+        char key[K8S_BUF_SIZE];
+        char val[K8S_BUF_SIZE];
+        if (!doc_end && kust_line(p, len, &ind, key, sizeof(key), val, sizeof(val))) {
+            if (top < 0) {
+                top = ind;
+            }
+            if (ind == top) {
+                in_meta = strcmp(key, "metadata") == 0 && !val[0];
+                meta = -1;
+                if (strcmp(key, "kind") == 0 && val[0]) {
+                    f.kind = cbm_arena_strdup(a, val);
+                } else if (strcmp(key, "apiVersion") == 0 && val[0]) {
+                    const char *slash = strchr(val, '/');
+                    f.group = slash ? cbm_arena_strndup(a, val, (size_t)(slash - val)) : "core";
+                }
+            } else if (in_meta && ind > top) {
+                meta = meta < 0 ? ind : meta;
+                if (ind == meta && strcmp(key, "name") == 0 && val[0]) {
+                    f.name = cbm_arena_strdup(a, val);
+                } else if (ind == meta && strcmp(key, "namespace") == 0 && val[0]) {
+                    f.ns = cbm_arena_strdup(a, val);
+                }
+            }
+        }
+        if (doc_end || !eol) {
+            if (f.kind && f.name) {
+                cbm_k8sfact_push(&ctx->result->k8s_facts, a, f);
+            }
+            f = base;
+            top = -1;
+            in_meta = false;
+        }
+        p = eol ? eol + SKIP_ONE : NULL;
+    }
+}
+
+// The mapping entries of a kustomization's `patches` list.
+static void emit_kustomize_patches(CBMExtractCtx *ctx, TSNode seq) {
+    CBMArena *a = ctx->arena;
+    k8s_kids_t items = k8s_kids(seq);
+    TSNode item;
+    while (k8s_kid(&items, false, &item)) {
+        TSNode map = strcmp(ts_node_type(item), "block_sequence_item") == 0
+                         ? kust_item_mapping(item)
+                         : (TSNode){0};
+        if (ts_node_is_null(map)) {
+            continue;
+        }
+        const char *path = NULL;
+        const char *inline_text = NULL;
+        kust_target_t t = {0};
+        bool has_target = false;
+        k8s_kids_t pairs = k8s_kids(map);
+        TSNode pair;
+        while (k8s_kid(&pairs, false, &pair)) {
+            if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
+                continue;
+            }
+            const char *key = get_scalar_text(a, ts_node_named_child(pair, 0), ctx->source);
+            TSNode v = unwrap_pair_value(pair);
+            if (!key || ts_node_is_null(v)) {
+                continue;
+            }
+            if (strcmp(key, "path") == 0) {
+                path = get_scalar_text(a, v, ctx->source);
+            } else if (strcmp(key, "patch") == 0) {
+                inline_text = kust_inline_text(ctx, v);
+            } else if (strcmp(key, "target") == 0 &&
+                       strcmp(ts_node_type(v), "block_mapping") == 0) {
+                kust_target(ctx, v, &t);
+                has_target = true;
+            }
+        }
+        if (path && path[0]) {
+            CBMImport imp = {.local_name = cbm_arena_strdup(a, "patches"),
+                             .module_path = cbm_arena_strdup(a, path)};
+            cbm_imports_push(&ctx->result->imports, a, imp);
+        }
+        CBMK8sFact base = {.fact = CBM_K8S_FACT_PATCH,
+                           .def_index = -1,
+                           .via = "patch",
+                           .edge = "OVERRIDE",
+                           .path = path && path[0] ? path : NULL,
+                           .line = (int)ts_node_start_point(item).row + TS_LINE_OFFSET};
+        if (has_target) {
+            if (!t.selector && (t.kind || t.name)) {
+                CBMK8sFact f = base;
+                f.kind = t.kind;
+                f.group = t.group;
+                f.version = t.version;
+                f.name = t.name;
+                f.ns = t.ns;
+                cbm_k8sfact_push(&ctx->result->k8s_facts, a, f);
+            }
+        } else if (inline_text) {
+            kust_inline_facts(ctx, inline_text, base);
+        } else if (base.path) {
+            cbm_k8sfact_push(&ctx->result->k8s_facts, a, base);
+        }
+    }
+}
+
 // Process a single block_mapping_pair for kustomize list keys.
 static void process_kustomize_pair(CBMExtractCtx *ctx, TSNode pair) {
     if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
@@ -236,6 +472,9 @@ static void process_kustomize_pair(CBMExtractCtx *ctx, TSNode pair) {
         return;
     }
     emit_kustomize_sequence(ctx, val_node, key_text);
+    if (strcmp(key_text, "patches") == 0) {
+        emit_kustomize_patches(ctx, val_node);
+    }
 }
 
 // Emit a "Class" def named after the document's `kind` scalar. A kustomization
@@ -1349,6 +1588,21 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         def.file_path = ctx->rel_path;
         def.start_line = ts_node_start_point(mapping).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(mapping).row + TS_LINE_OFFSET;
+        // The version of its apiVersion (`v1beta2` of cluster.x-k8s.io/v1beta2,
+        // `v1` of v1), which the QN leaves out (one object across versions); a
+        // bare group without one (`apiVersion: example.io`) has none.
+        const char *slash = strchr(id.api_version, '/');
+        const char *version = slash ? slash + SKIP_ONE : id.api_version;
+        bool versioned = slash || (version[0] == 'v' && isdigit((unsigned char)version[1]));
+        if (version[0] && versioned && id.api_version[0] != '<') {
+            const char **kv = (const char **)cbm_arena_alloc(a, K8S_PROPS_KV * sizeof(char *));
+            if (kv) {
+                kv[0] = "version";
+                kv[SKIP_ONE] = cbm_arena_strdup(a, version);
+                kv[PAIR_LEN] = NULL;
+                def.extra_props = kv;
+            }
+        }
         cbm_defs_push(&ctx->result->defs, a, def);
         k8s_emit_facts(ctx, mapping, group, id.kind, ctx->result->defs.count - SKIP_ONE);
     }
