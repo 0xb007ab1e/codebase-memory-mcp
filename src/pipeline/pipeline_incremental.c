@@ -2098,7 +2098,9 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
         return rc < 0 ? rc : CBM_NOT_FOUND;
     }
 
-    /* SIMILAR_TO + SEMANTICALLY_RELATED edges only in moderate/full modes */
+    /* SIMILAR_TO + SEMANTICALLY_RELATED edges only in moderate/full modes.
+     * Fast mode runs the semantic pass only for doc -> code candidates
+     * (doc_candidates explicitly on), doc-only: no edges. */
     if (ctx->mode <= CBM_MODE_MODERATE) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         rc = cbm_pipeline_pass_similarity(ctx);
@@ -2107,7 +2109,8 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
         if (rc < 0 || cbm_pipeline_check_cancel(ctx)) {
             return rc < 0 ? rc : CBM_NOT_FOUND;
         }
-
+    }
+    if (ctx->mode <= CBM_MODE_MODERATE || cbm_pipeline_doc_candidates_enabled(ctx->pipeline)) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         rc = cbm_pipeline_pass_semantic_edges(ctx);
         cbm_log_info("pass.timing", "pass", "incr_semantic_edges", "elapsed_ms",

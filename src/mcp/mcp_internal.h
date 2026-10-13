@@ -54,6 +54,12 @@ bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *not
 bool cbm_mcp_index_policy_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                       const cbm_index_resource_policy_t *policy);
 
+/* Encode a doc_candidates setting the user set to a boolean on an internal
+ * worker request (the worker reads no config). Unset or unparseable adds no
+ * key, so the worker's index mode decides. False only when encoding fails. */
+bool cbm_mcp_index_doc_candidates_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                              struct cbm_config *config);
+
 enum { CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT = 50000 };
 
 /* Count indexable files with the pipeline's native full-mode discovery policy,

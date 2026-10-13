@@ -181,6 +181,13 @@ void cbm_pipeline_unlock(void) {
 
 /* ── Internal state ──────────────────────────────────────────────── */
 
+/* doc_candidates: unset (the mode decides), or explicitly on / off. */
+typedef enum {
+    PIPELINE_DOC_CANDIDATES_BY_MODE = 0,
+    PIPELINE_DOC_CANDIDATES_ON,
+    PIPELINE_DOC_CANDIDATES_OFF,
+} pipeline_doc_candidates_t;
+
 struct cbm_pipeline {
     cbm_pipeline_frozen_t *frozen; /* NULL for every ordinary caller */
     char *repo_path;
@@ -278,8 +285,9 @@ struct cbm_pipeline {
      * cbm_pipeline_free). NULL when the pass found none or did not run. */
     cbm_doc_candidate_t *doc_candidates;
     int doc_candidate_count;
-    /* doc_candidates setting off (calloc'd false = on, the default). */
-    bool doc_candidates_off;
+    /* The doc_candidates choice. Unset (calloc'd) lets the index mode
+     * decide: on for full, off for moderate and fast. */
+    pipeline_doc_candidates_t doc_candidates_choice;
 
     /* Deterministic test-only seam at the final publication boundary. Kept
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
@@ -878,12 +886,22 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
 
 void cbm_pipeline_set_doc_candidates_enabled(cbm_pipeline_t *p, bool enabled) {
     if (p) {
-        p->doc_candidates_off = !enabled;
+        p->doc_candidates_choice =
+            enabled ? PIPELINE_DOC_CANDIDATES_ON : PIPELINE_DOC_CANDIDATES_OFF;
     }
 }
 
+/* Unset: the mode decides. p->mode is the effective mode -- a run promoted to
+ * an existing index's fuller coverage scores candidates like that index. No
+ * pipeline (a pass driven directly) keeps the pass's historic on. */
 bool cbm_pipeline_doc_candidates_enabled(const cbm_pipeline_t *p) {
-    return !p || !p->doc_candidates_off;
+    if (!p) {
+        return true;
+    }
+    if (p->doc_candidates_choice != PIPELINE_DOC_CANDIDATES_BY_MODE) {
+        return p->doc_candidates_choice == PIPELINE_DOC_CANDIDATES_ON;
+    }
+    return p->mode == CBM_MODE_FULL;
 }
 
 void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p,
@@ -2152,26 +2170,44 @@ static void log_result_arenas(const char *tag, CBMFileResult **cache, int file_c
     log_result_census(tag, cache, file_count);
 }
 
+/* Which modes run a predump pass. */
+typedef enum {
+    PREDUMP_EVERY_MODE,
+    PREDUMP_SKIP_FAST,
+    /* Fast mode runs it only for doc -> code candidates (doc_candidates
+     * explicitly on); the semantic pass then emits no edges (doc-only). */
+    PREDUMP_FAST_DOC_CANDIDATES,
+} predump_gate_t;
+
+static bool predump_pass_runs(const cbm_pipeline_t *p, predump_gate_t gate) {
+    /* Compare explicitly against FAST rather than `> MODERATE` so a heavier
+     * mode with a larger value is never mistaken for a lighter one. */
+    if (p->mode != CBM_MODE_FAST || gate == PREDUMP_EVERY_MODE) {
+        return true;
+    }
+    return gate == PREDUMP_FAST_DOC_CANDIDATES && cbm_pipeline_doc_candidates_enabled(p);
+}
+
 /* Results are gone after resolve; so is the store. Logs what spill did. */
 static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
         predump_pass_fn fn;
         const char *name;
-        bool moderate_only; /* true = skip in fast mode */
+        predump_gate_t gate;
     } passes[] = {
-        {predump_deco, "decorator_tags", false},
-        {predump_cfg, "configlink", false},
-        {predump_operator, "operator", false},
-        {predump_doclinks, "doclinks", false},
-        {predump_route, "route_match", false},
-        {predump_ensemble, "ensemble_routing", false},
-        {predump_sim, "similarity", true},
-        {predump_sem, "semantic_edges", true},
-        {predump_complexity, "complexity", false},
+        {predump_deco, "decorator_tags", PREDUMP_EVERY_MODE},
+        {predump_cfg, "configlink", PREDUMP_EVERY_MODE},
+        {predump_operator, "operator", PREDUMP_EVERY_MODE},
+        {predump_doclinks, "doclinks", PREDUMP_EVERY_MODE},
+        {predump_route, "route_match", PREDUMP_EVERY_MODE},
+        {predump_ensemble, "ensemble_routing", PREDUMP_EVERY_MODE},
+        {predump_sim, "similarity", PREDUMP_SKIP_FAST},
+        {predump_sem, "semantic_edges", PREDUMP_FAST_DOC_CANDIDATES},
+        {predump_complexity, "complexity", PREDUMP_EVERY_MODE},
         /* Importance runs LAST: it reads CALLS/USAGE (extraction) and TESTS
          * (pass_tests, which run_post_extraction runs before this loop), so
          * every edge type its score depends on already exists here. */
-        {predump_importance, "importance", false},
+        {predump_importance, "importance", PREDUMP_EVERY_MODE},
     };
     /* Derived from the table, never hand-written. A hand-written count that
      * lags a newly appended entry silently skips the LAST pass while every
@@ -2180,11 +2216,7 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     enum { PREDUMP_PASS_COUNT = (int)(sizeof(passes) / sizeof(passes[0])) };
     struct timespec t;
     for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
-        /* "moderate_only" passes (similarity/semantic edges) run in FULL,
-         * MODERATE and ADVANCED — they are skipped only in FAST. Compare
-         * explicitly against FAST rather than `> MODERATE` so ADVANCED
-         * (numerically 3) is not mistaken for a lighter mode than FULL. */
-        if (passes[i].moderate_only && p->mode == CBM_MODE_FAST) {
+        if (!predump_pass_runs(p, passes[i].gate)) {
             continue;
         }
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);

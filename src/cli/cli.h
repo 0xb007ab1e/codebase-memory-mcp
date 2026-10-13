@@ -434,6 +434,11 @@ const char *cbm_config_get(cbm_config_t *cfg, const char *key, const char *defau
 /* Get a config value as bool. "true"/"1"/"on" → true. */
 bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val);
 
+/* A key the user set to a boolean ("true"/"1"/"on", "false"/"0"/"off"):
+ * true, with *value. Unset or unparseable: false, *value untouched -- the
+ * caller's own default applies (cbm_config_get_bool's reading). */
+bool cbm_config_get_bool_set(cbm_config_t *cfg, const char *key, bool *value);
+
 /* Get a config value as int. Returns default_val if not found or invalid. */
 int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val);
 
