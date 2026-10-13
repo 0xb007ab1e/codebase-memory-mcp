@@ -7424,6 +7424,71 @@ TEST(extract_c_clean_file_no_recovery_duplicates_issue961) {
     PASS();
 }
 
+/* True when `qn` carries the token-joined spelling of the `box<int, 2>`
+ * template-id that the preprocessed buffer used to produce. */
+static bool qn_has_token_spaced_box(const char *qn) {
+    return qn && (strstr(qn, "box <") || strstr(qn, "< int") || strstr(qn, "int ,"));
+}
+
+/* dotnet/runtime vxsort shape (src/coreclr/gc/vxsort/smallsort/
+ * bitonic_sort.*.generated.h): methods of an explicit specialization
+ * `template<> struct bitonic<int64_t, AVX2>` carry an attribute macro defined in
+ * another header (INLINE / NOINLINE), so the raw parse has ERROR regions on the
+ * method lines and the #961 rescue re-extracts them from the preprocessed
+ * buffer. That buffer used to join every token with one space, spelling the
+ * scope `box < int , 2 >` where the raw pass spells `box<int, 2>`; the QN dedup
+ * (strcmp) missed, so every method got a second node and the CALLS split across
+ * both. One definition, one spelling, on every path. */
+TEST(extract_cpp_template_specialization_preprocessed_qn_single_spelling) {
+    CBMFileResult *r = extract("#ifndef BOX_H\n"
+                               "#define BOX_H\n"
+                               "namespace ns {\n"
+                               "template <typename T, int M> struct box {\n"
+                               "    static void sort(T *p);\n"
+                               "};\n"
+                               "template<> struct box<int, 2> {\n"
+                               "    static INLINE void first(int *p) { p[0] = 0; }\n"
+                               "    static INLINE void second(int *p) { first(p); }\n"
+                               "};\n"
+                               "}\n"
+                               "#endif\n",
+                               CBM_LANG_CPP, "t", "box.h");
+    ASSERT_NOT_NULL(r);
+    int first_count = 0;
+    int second_count = 0;
+    const char *first_qn = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (qn_has_token_spaced_box(d->qualified_name)) {
+            fprintf(stderr, "  [tmplqn] FAIL token-spaced def QN: %s\n", d->qualified_name);
+        }
+        ASSERT_FALSE(qn_has_token_spaced_box(d->qualified_name));
+        if (d->name && strcmp(d->name, "first") == 0) {
+            first_count++;
+            first_qn = d->qualified_name;
+        }
+        if (d->name && strcmp(d->name, "second") == 0) {
+            second_count++;
+        }
+    }
+    ASSERT_EQ(first_count, 1);
+    ASSERT_EQ(second_count, 1);
+    ASSERT_NOT_NULL(first_qn);
+    ASSERT_NOT_NULL(strstr(first_qn, "ns.box<int, 2>.first"));
+    /* Call scopes and LSP-resolved endpoints name the same single spelling, so
+     * no CALLS edge lands on (or starts from) a phantom second node. */
+    for (int i = 0; i < r->calls.count; i++) {
+        ASSERT_FALSE(qn_has_token_spaced_box(r->calls.items[i].enclosing_func_qn));
+    }
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        ASSERT_FALSE(qn_has_token_spaced_box(rc->caller_qn));
+        ASSERT_FALSE(qn_has_token_spaced_box(rc->callee_qn));
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* #1989: build-system export macros (UE "<MOD>_API", CMake generate_export_header
  * "<lib>_EXPORT") are empty on the real compile line but opaque to tree-sitter,
  * so `class MOD_API Foo` misparses. The preprocessed second pass predefines the
@@ -12359,6 +12424,7 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);
     RUN_TEST(extract_c_ifdef_split_brace_after_include_remapped_issue949);
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
+    RUN_TEST(extract_cpp_template_specialization_preprocessed_qn_single_spelling);
     RUN_TEST(extract_cpp_export_macro_class_recovery_issue1989);
     RUN_TEST(extract_cpp_export_macro_struct_recovery_issue1989);
     RUN_TEST(extract_cpp_export_macro_enum_recovery_issue1989);
