@@ -2081,6 +2081,420 @@ static bool cbm_remap_preprocessed_def(CBMDefinition *def, const CBMPreprocessed
     return true;
 }
 
+/* ── One definition, two parses: which copy the rescue keeps ──────────────
+ *
+ * The #961/#1989 rescue re-extracts definitions from the preprocessed parse to
+ * recover what the raw parse LOST. When an expanded def d and a raw def r sit
+ * at the same site (same label, name and start line, cbm_raw_def_same_site)
+ * but carry different QNs, the two parses scoped ONE definition differently,
+ * and adopting d minted a second node for it. One decision, in the rescue:
+ *
+ *   - By default the RAW copy wins and d is not adopted. The expanded parse is
+ *     no better judge of scope: it nests utilcode.h's classes inside
+ *     CUnorderedArrayWithAllocator, puts rapidjson reader.h's StackStream and
+ *     NumberStream specializations at file scope instead of inside
+ *     GenericReader, and picks one of the `namespace SVR` / `namespace WKS`
+ *     branches of coreclr gc's #ifdef. What the expanded pass gave d's QN
+ *     (call and usage scopes, resolved targets, members only it saw) moves to
+ *     r's QN (cbm_requalify_result).
+ *   - EXCEPT when r's enclosing scope exists only because of a raw ERROR
+ *     region the expanded parse resolved (cbm_misnested_raw_twin). A
+ *     macro-generated body (`struct s { mixed_members };`, the kernel's
+ *     lib/tests/randstruct_kunit.c) keeps the raw field list from closing, and
+ *     every later struct of the file nests inside it; the expanded parse gets
+ *     them flat. Then d REPLACES r, and whatever carried r's QN or sat under it
+ *     (Fields, nested definitions, call/usage scopes, resolved member
+ *     references) moves to d's QN (cbm_requalify_result). Every condition is
+ *     required:
+ *       - d lies in a raw ERROR region;
+ *       - r's QN is d's scope plus at least one more segment: the raw parse
+ *         nested the definition DEEPER under the same outer scope;
+ *       - r's immediate raw parent p is a raw type definition whose span holds
+ *         r, and the expanded parse has p too (same label, name and start
+ *         line) but closes it BEFORE d starts;
+ *       - a raw ERROR region lies between p's opening and d: the raw parse
+ *         lost p's closing brace there;
+ *       - the original text closes p's braces on exactly the line where the
+ *         expanded parse closes p (comments, literals and directive lines
+ *         skipped): the source itself ends p there, so no expanded error
+ *         closed p early (a local expanded error, such as an attribute macro
+ *         the expanded pass does not know, leaves that intact).
+ *     A real nested type keeps its nesting: the expanded parse still holds it
+ *     inside p, so r is not replaced, and r's own QN follows p's move. */
+/* Per expanded def of the rescue: CBM_PP_DEF_UNMAPPED, CBM_PP_DEF_NO_TWIN, or
+ * the index of the raw def it replaces. */
+enum { CBM_PP_DEF_UNMAPPED = -2, CBM_PP_DEF_NO_TWIN = -1 };
+
+typedef struct {
+    const CBMDefinition *defs; /* raw defs [0, raw_count), expanded [raw_count, count) */
+    int raw_count;
+    int count;
+    const int *pp_state;                 /* one per expanded def */
+    const cbm_error_regions_t *raw_regs; /* original lines */
+    const char *source;                  /* the original file */
+    int source_len;
+} cbm_twin_ctx_t;
+
+/* The losing copy's QN and the winner's. raw_wins: the expanded copy lost (the
+ * default); otherwise a mis-nested raw twin lost to its flat expanded copy. */
+typedef struct {
+    const char *from;
+    const char *to;
+    bool raw_wins;
+} cbm_requalify_rule_t;
+
+/* Record that `from` now names `to`, allocating room for one rule per expanded
+ * def (`cap`) on first use; an allocation failure only skips the move. */
+static void cbm_requalify_push(cbm_requalify_rule_t **rules, int *n, int cap, const char *from,
+                               const char *to, bool raw_wins) {
+    if (!from || !to || strcmp(from, to) == 0 || *n >= cap) {
+        return;
+    }
+    if (!*rules) {
+        *rules = (cbm_requalify_rule_t *)cbm_calloc(CBM_MEM_CLASS_EXTRACT,
+                                                    (size_t)cap * sizeof(cbm_requalify_rule_t));
+        if (!*rules) {
+            return;
+        }
+    }
+    (*rules)[(*n)++] = (cbm_requalify_rule_t){from, to, raw_wins};
+}
+
+/* True when raw def `r` and the remapped expanded def `d` are one definition's
+ * site: same label and name, starting on the same original line. */
+static bool cbm_raw_def_same_site(const CBMDefinition *r, const CBMDefinition *d) {
+    return r->name && d->name && r->label && d->label && r->start_line == d->start_line &&
+           strcmp(r->name, d->name) == 0 && strcmp(r->label, d->label) == 0;
+}
+
+/* True when another raw def of a different label already holds raw def j's
+ * QN. A raw copy that lost its scope can collide with a misparsed raw def of
+ * that name (coreclr inc/holder.h: Class `AddressInitHolder` outside its
+ * `BaseWrapper` scope vs the raw parse's FORCEINLINE constructor read as a
+ * Function), and the graph keeps one node per QN -- "raw wins" would then
+ * keep neither the class nor its correctly scoped expanded copy. */
+static bool cbm_raw_qn_held_by_other_label(const CBMDefinition *defs, int count, int j) {
+    const CBMDefinition *r = &defs[j];
+    if (!r->qualified_name || !r->label) {
+        return false;
+    }
+    for (int k = 0; k < count; k++) {
+        const CBMDefinition *o = &defs[k];
+        if (k != j && o->qualified_name && o->label &&
+            strcmp(o->qualified_name, r->qualified_name) == 0 && strcmp(o->label, r->label) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cbm_regions_overlap(const cbm_error_regions_t *regs, uint32_t lo, uint32_t hi) {
+    for (int i = 0; i < regs->count; i++) {
+        if (regs->starts[i] <= hi && regs->ends[i] >= lo) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* `qn` (length `len`) is `<scope>.<name>`; returns the scope length, or 0. */
+static size_t cbm_qn_scope_len(const char *qn, size_t len, const char *name, size_t name_len) {
+    if (len <= name_len + 1 || qn[len - name_len - 1] != '.' ||
+        strcmp(qn + len - name_len, name) != 0) {
+        return 0;
+    }
+    return len - name_len - 1;
+}
+
+/* The raw type def whose QN is `r`'s scope (`scope_len` bytes of r's QN) and
+ * whose span holds r, or NULL. */
+static const CBMDefinition *cbm_misnested_raw_parent(const CBMDefinition *defs, int raw_count,
+                                                     const CBMDefinition *r, size_t scope_len) {
+    for (int k = 0; k < raw_count; k++) {
+        const CBMDefinition *p = &defs[k];
+        if (p != r && p->qualified_name && p->name && cbm_def_label_is_type(p->label) &&
+            p->start_line <= r->start_line && p->end_line >= r->end_line &&
+            strncmp(p->qualified_name, r->qualified_name, scope_len) == 0 &&
+            p->qualified_name[scope_len] == '\0') {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+/* Index just past a preprocessor directive starting at `i` (its continuation
+ * lines included), and the lines it spans added to *line. */
+static int cbm_skip_directive(const char *src, int len, int i, uint32_t *line) {
+    while (i < len) {
+        if (src[i] != '\n') {
+            i++;
+            continue;
+        }
+        int b = i - 1;
+        if (b >= 0 && src[b] == '\r') {
+            b--;
+        }
+        (*line)++;
+        i++;
+        if (b < 0 || src[b] != '\\') {
+            break;
+        }
+    }
+    return i;
+}
+
+/* Index just past a comment or a string/character literal starting at `i`
+ * (lines it spans added to *line), or `i` when none starts there. */
+static int cbm_skip_comment_or_literal(const char *src, int len, int i, uint32_t *line) {
+    if (src[i] == '/' && i + 1 < len && src[i + 1] == '/') {
+        while (i < len && src[i] != '\n') {
+            i++;
+        }
+        return i;
+    }
+    if (src[i] == '/' && i + 1 < len && src[i + 1] == '*') {
+        for (i += 2; i < len && !(src[i] == '*' && i + 1 < len && src[i + 1] == '/'); i++) {
+            *line += src[i] == '\n';
+        }
+        return i + 2;
+    }
+    if (src[i] == '"' || src[i] == '\'') {
+        char quote = src[i];
+        for (i++; i < len && src[i] != quote && src[i] != '\n'; i++) {
+            i += src[i] == '\\';
+        }
+        return i + 1;
+    }
+    return i;
+}
+
+/* True when the ORIGINAL text, read from the start of `start_line`, opens a
+ * brace and closes it again exactly on `end_line`: the source itself ends the
+ * definition there. Comments, literals and directive lines are skipped. */
+static bool cbm_source_braces_close_on(const char *src, int len, uint32_t start_line,
+                                       uint32_t end_line) {
+    uint32_t line = 1;
+    int i = 0;
+    for (; i < len && line < start_line; i++) {
+        line += src[i] == '\n';
+    }
+    int depth = 0;
+    bool line_start = true;
+    while (i < len && line <= end_line) {
+        if (line_start) {
+            int k = i;
+            while (k < len && (src[k] == ' ' || src[k] == '\t')) {
+                k++;
+            }
+            if (k < len && src[k] == '#') {
+                i = cbm_skip_directive(src, len, k, &line);
+                continue;
+            }
+            line_start = false;
+        }
+        int next = cbm_skip_comment_or_literal(src, len, i, &line);
+        if (next != i) {
+            i = next;
+            continue;
+        }
+        if (src[i] == '\n') {
+            line++;
+            line_start = true;
+        } else if (src[i] == '{') {
+            depth++;
+        } else if (src[i] == '}' && --depth <= 0) {
+            return depth == 0 && line == end_line;
+        }
+        i++;
+    }
+    return false;
+}
+
+/* True when raw parent `rp` encloses the expanded def at `di` only because of
+ * a raw ERROR region: the raw parse failed between rp's opening and that def,
+ * and the expanded parse has rp too but closes it before the def starts, on
+ * the line where the original text closes it. */
+static bool cbm_raw_parent_is_error_artifact(const cbm_twin_ctx_t *c, const CBMDefinition *rp,
+                                             int di) {
+    const CBMDefinition *d = &c->defs[di];
+    if (!cbm_regions_overlap(c->raw_regs, rp->start_line, d->start_line)) {
+        return false;
+    }
+    for (int e = c->raw_count; e < c->count; e++) {
+        const CBMDefinition *ep = &c->defs[e];
+        if (c->pp_state[e - c->raw_count] != CBM_PP_DEF_UNMAPPED &&
+            ep->start_line == rp->start_line && ep->end_line < d->start_line && ep->name &&
+            ep->label && strcmp(ep->name, rp->name) == 0 && strcmp(ep->label, rp->label) == 0 &&
+            cbm_source_braces_close_on(c->source, c->source_len, ep->start_line, ep->end_line)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Index of the raw def that the expanded def at `di` replaces under the rule
+ * above, or CBM_PP_DEF_NO_TWIN. */
+static int cbm_misnested_raw_twin(const cbm_twin_ctx_t *c, int di) {
+    const CBMDefinition *d = &c->defs[di];
+    if (!d->name || !d->label || !d->qualified_name || d->qn_sig_off ||
+        !cbm_regions_overlap(c->raw_regs, d->start_line, d->end_line)) {
+        return CBM_PP_DEF_NO_TWIN;
+    }
+    size_t name_len = strlen(d->name);
+    size_t d_scope =
+        cbm_qn_scope_len(d->qualified_name, strlen(d->qualified_name), d->name, name_len);
+    if (d_scope == 0) {
+        return CBM_PP_DEF_NO_TWIN;
+    }
+    for (int j = 0; j < c->raw_count; j++) {
+        const CBMDefinition *r = &c->defs[j];
+        if (!cbm_raw_def_same_site(r, d) || !r->qualified_name || r->qn_sig_off) {
+            continue;
+        }
+        size_t r_scope =
+            cbm_qn_scope_len(r->qualified_name, strlen(r->qualified_name), d->name, name_len);
+        /* Deeper under d's own scope: "<d scope>.<at least one segment>". */
+        if (r_scope <= d_scope + 1 || r->qualified_name[d_scope] != '.' ||
+            strncmp(r->qualified_name, d->qualified_name, d_scope) != 0) {
+            continue;
+        }
+        const CBMDefinition *rp = cbm_misnested_raw_parent(c->defs, c->raw_count, r, r_scope);
+        if (rp && cbm_raw_parent_is_error_artifact(c, rp, di)) {
+            return j;
+        }
+    }
+    return CBM_PP_DEF_NO_TWIN;
+}
+
+/* Remap every expanded def [raw_count, count) to original lines and find the
+ * raw twin each one replaces: pp_state[i - raw_count] becomes
+ * CBM_PP_DEF_UNMAPPED, CBM_PP_DEF_NO_TWIN or the twin's raw index. Returns the
+ * number of twins found. */
+static int cbm_prepare_preprocessed_defs(CBMFileResult *result, int raw_count,
+                                         const CBMPreprocessedSource *pp,
+                                         const cbm_error_regions_t *raw_regs, const char *source,
+                                         int source_len, int *pp_state) {
+    int count = result->defs.count;
+    CBMDefinition *defs = result->defs.items;
+    for (int i = raw_count; i < count; i++) {
+        pp_state[i - raw_count] =
+            cbm_remap_preprocessed_def(&defs[i], pp) ? CBM_PP_DEF_NO_TWIN : CBM_PP_DEF_UNMAPPED;
+    }
+    cbm_twin_ctx_t ctx = {defs, raw_count, count, pp_state, raw_regs, source, source_len};
+    int twins = 0;
+    for (int i = raw_count; i < count; i++) {
+        if (pp_state[i - raw_count] == CBM_PP_DEF_UNMAPPED) {
+            continue;
+        }
+        int twin = cbm_misnested_raw_twin(&ctx, i);
+        if (twin >= 0) {
+            pp_state[i - raw_count] = twin;
+            twins++;
+        }
+    }
+    return twins;
+}
+
+/* `qn` with the longest rule prefix ("<from>" or "<from>.<rest>") replaced
+ * by that rule's "<to>"; `qn` itself when no rule applies. With
+ * `replacements_only`, raw_wins rules are not applied. */
+static const char *cbm_requalify_qn(CBMArena *a, const char *qn, const cbm_requalify_rule_t *rules,
+                                    int rule_count, bool replacements_only) {
+    if (!qn) {
+        return qn;
+    }
+    int best = -1;
+    size_t best_len = 0;
+    for (int i = 0; i < rule_count; i++) {
+        if (!rules[i].from || (replacements_only && rules[i].raw_wins)) {
+            continue;
+        }
+        size_t len = strlen(rules[i].from);
+        if (len > best_len && strncmp(qn, rules[i].from, len) == 0 &&
+            (qn[len] == '\0' || qn[len] == '.')) {
+            best = i;
+            best_len = len;
+        }
+    }
+    if (best < 0) {
+        return qn;
+    }
+    const char *moved = cbm_arena_sprintf(a, "%s%s", rules[best].to, qn + best_len);
+    return moved ? moved : qn;
+}
+
+/* Move everything the losing copies owned to the winners' QNs: definitions
+ * nested under them (Fields, nested types, expanded-only members) and every
+ * scope or target QN the result carries (call and usage scopes, resolved
+ * callers and targets), so no child and no edge is left on a QN with no node.
+ * A losing expanded QN that a kept definition still carries (a raw def at
+ * another site, a second expanded copy) leaves nothing dangling and does not
+ * move. A raw winner can itself sit under a mis-nested twin that moved: its
+ * final QN is resolved first. */
+static void cbm_requalify_result(CBMArena *a, CBMFileResult *r, cbm_requalify_rule_t *rules,
+                                 int n) {
+    for (int i = 0; i < n; i++) {
+        for (int k = 0; rules[i].raw_wins && k < r->defs.count; k++) {
+            const char *kept = r->defs.items[k].qualified_name;
+            if (kept && strcmp(kept, rules[i].from) == 0) {
+                rules[i].from = NULL;
+                break;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (rules[i].from && rules[i].raw_wins) {
+            rules[i].to = cbm_requalify_qn(a, rules[i].to, rules, n, true);
+        }
+    }
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        d->qualified_name = cbm_requalify_qn(a, d->qualified_name, rules, n, false);
+        d->parent_class = cbm_requalify_qn(a, d->parent_class, rules, n, false);
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        c->enclosing_func_qn = cbm_requalify_qn(a, c->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->usages.count; i++) {
+        CBMUsage *u = &r->usages.items[i];
+        u->enclosing_func_qn = cbm_requalify_qn(a, u->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->throws.count; i++) {
+        CBMThrow *t = &r->throws.items[i];
+        t->enclosing_func_qn = cbm_requalify_qn(a, t->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->rw.count; i++) {
+        CBMReadWrite *w = &r->rw.items[i];
+        w->enclosing_func_qn = cbm_requalify_qn(a, w->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->type_refs.count; i++) {
+        CBMTypeRef *t = &r->type_refs.items[i];
+        t->enclosing_func_qn = cbm_requalify_qn(a, t->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->env_accesses.count; i++) {
+        CBMEnvAccess *e = &r->env_accesses.items[i];
+        e->enclosing_func_qn = cbm_requalify_qn(a, e->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->type_assigns.count; i++) {
+        CBMTypeAssign *t = &r->type_assigns.items[i];
+        t->enclosing_func_qn = cbm_requalify_qn(a, t->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->string_refs.count; i++) {
+        CBMStringRef *s = &r->string_refs.items[i];
+        s->enclosing_func_qn = cbm_requalify_qn(a, s->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->channels.count; i++) {
+        CBMChannel *c = &r->channels.items[i];
+        c->enclosing_func_qn = cbm_requalify_qn(a, c->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        CBMResolvedCall *c = &r->resolved_calls.items[i];
+        c->caller_qn = cbm_requalify_qn(a, c->caller_qn, rules, n, false);
+        c->callee_qn = cbm_requalify_qn(a, c->callee_qn, rules, n, false);
+    }
+}
+
 static void cbm_subtract_recovered_regions(cbm_error_regions_t *regs, const CBMDefArray *defs,
                                            const char *src, int src_len) {
     if (regs->count <= 0) {
@@ -3682,6 +4096,29 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                 superseded =
                                     (char *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, (size_t)defs_before);
                             }
+                            /* Remap every expanded def up front and find the
+                             * mis-nested raw twins that flat expanded copies
+                             * replace (cbm_misnested_raw_twin). A twin is
+                             * dropped only once its replacement is adopted. */
+                            /* Counted through the context the extraction
+                             * appended to (pp_ctx.result is `result`). */
+                            int pp_count = pp_ctx.result->defs.count - defs_before;
+                            int *pp_state = pp_count > 0
+                                                ? (int *)cbm_calloc(CBM_MEM_CLASS_EXTRACT,
+                                                                    (size_t)pp_count * sizeof(int))
+                                                : NULL;
+                            int twin_count = pp_state ? cbm_prepare_preprocessed_defs(
+                                                            result, defs_before, preprocessed,
+                                                            &raw_regs, source, source_len, pp_state)
+                                                      : 0;
+                            char *misnested =
+                                twin_count > 0
+                                    ? (char *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, (size_t)defs_before)
+                                    : NULL;
+                            /* Losing copy -> winner, one per expanded def at
+                             * most (cbm_requalify_push allocates on use). */
+                            cbm_requalify_rule_t *requalify = NULL;
+                            int requalify_count = 0;
                             /* #1989: spans of defs already adopted from the
                              * expanded tree. A def nested inside one of these
                              * (an inline method of a rescued class) was dropped
@@ -3699,7 +4136,12 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                 CBMDefinition *d = &result->defs.items[i];
                                 bool adopt = false;
                                 int supersede_j = -1;
-                                if (cbm_remap_preprocessed_def(d, preprocessed)) {
+                                int pp_twin =
+                                    pp_state ? pp_state[i - defs_before] : CBM_PP_DEF_NO_TWIN;
+                                bool mapped = pp_state
+                                                  ? pp_twin != CBM_PP_DEF_UNMAPPED
+                                                  : cbm_remap_preprocessed_def(d, preprocessed);
+                                if (mapped) {
                                     for (int rj = 0; rj < raw_regs.count && !adopt; rj++) {
                                         if (d->start_line <= raw_regs.ends[rj] &&
                                             d->end_line >= raw_regs.starts[rj]) {
@@ -3800,11 +4242,41 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                         }
                                         adopt = false;
                                     }
+                                    /* Same site, different QN: one definition the
+                                     * two parses scoped differently. The raw copy
+                                     * wins, unless it is the mis-nested twin this
+                                     * def replaces (cbm_misnested_raw_twin) or its
+                                     * QN is already another label's
+                                     * (cbm_raw_qn_held_by_other_label); what the
+                                     * expanded pass gave this copy's QN moves to
+                                     * the raw one. */
+                                    if (adopt && j != pp_twin &&
+                                        cbm_raw_def_same_site(&result->defs.items[j], d) &&
+                                        !cbm_raw_qn_held_by_other_label(result->defs.items,
+                                                                        defs_before, j)) {
+                                        adopt = false;
+                                        cbm_requalify_push(&requalify, &requalify_count, pp_count,
+                                                           d->qualified_name,
+                                                           result->defs.items[j].qualified_name,
+                                                           true);
+                                    }
                                 }
                                 if (adopt) {
                                     if (supersede_j >= 0 && supersede_j < defs_before &&
                                         superseded) {
                                         superseded[supersede_j] = 1;
+                                    }
+                                    /* The flat copy replaces its mis-nested raw
+                                     * twin; what sat under the twin's QN moves
+                                     * to this one below. Without room for that
+                                     * move the twin stays. */
+                                    if (pp_twin >= 0 && misnested && !misnested[pp_twin]) {
+                                        int moves = requalify_count;
+                                        cbm_requalify_push(
+                                            &requalify, &requalify_count, pp_count,
+                                            result->defs.items[pp_twin].qualified_name,
+                                            d->qualified_name, false);
+                                        misnested[pp_twin] = (char)(requalify_count > moves);
                                     }
                                     /* Phantom-artifact suppression (#1989): on the
                                      * raw tree `class MOD_API Foo : public Base
@@ -3843,10 +4315,11 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                     result->defs.items[w++] = *d;
                                 }
                             }
-                            if (superseded) {
+                            if (superseded || misnested) {
                                 int rw = 0;
                                 for (int j = 0; j < defs_before; j++) {
-                                    if (!superseded[j]) {
+                                    if (!(superseded && superseded[j]) &&
+                                        !(misnested && misnested[j])) {
                                         result->defs.items[rw++] = result->defs.items[j];
                                     }
                                 }
@@ -3860,6 +4333,12 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                 cbm_free(CBM_MEM_CLASS_EXTRACT, superseded);
                             }
                             result->defs.count = w;
+                            if (requalify_count > 0) {
+                                cbm_requalify_result(a, result, requalify, requalify_count);
+                            }
+                            cbm_free(CBM_MEM_CLASS_EXTRACT, misnested);
+                            cbm_free(CBM_MEM_CLASS_EXTRACT, requalify);
+                            cbm_free(CBM_MEM_CLASS_EXTRACT, pp_state);
                         }
                     }
 
