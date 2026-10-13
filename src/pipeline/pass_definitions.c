@@ -424,9 +424,15 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     size_t props_size = sizeof(stack);
     char *props = pd_props_buf(def, stack, &props_size);
     build_def_props(props, props_size, def);
-    int64_t node_id = cbm_gbuf_upsert_node(
-        ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
-        def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
+    const char *def_rel = def->file_path ? def->file_path : rel;
+    char marked[CBM_SZ_4K];
+    const char *qn = def->label && strcmp(def->label, "Module") == 0
+                         ? cbm_stem_marks_module_qn(ctx->stem_marks, def->qualified_name, def_rel,
+                                                    lang, marked, sizeof(marked))
+                         : def->qualified_name;
+    int64_t node_id =
+        cbm_gbuf_upsert_node(ctx->gbuf, def->label ? def->label : "Function", def->name, qn,
+                             def_rel, (int)def->start_line, (int)def->end_line, props);
     if (props != stack) {
         cbm_free(CBM_MEM_CLASS_GBUF_STRING, props);
     }
