@@ -8193,6 +8193,156 @@ TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
     PASS();
 }
 
+/* A C caller of a header function that shares its name with a struct member
+ * elsewhere (kernel: include/linux/mm.h put_page beside the arm64
+ * kvm_pgtable_mm_ops.put_page member). pad_files pushes the run past
+ * MIN_FILES_FOR_PARALLEL for the parallel twin. */
+static void write_c_header_namesake_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "include/linux/mm.h",
+                    "struct page;\n"
+                    "static inline void put_page(struct page *page)\n"
+                    "{\n"
+                    "\t(void)page;\n"
+                    "}\n");
+    write_temp_file(tmp, "arch/arm64/include/asm/kvm_pgtable.h",
+                    "struct kvm_pgtable_mm_ops {\n"
+                    "\tvoid (*put_page)(void *addr);\n"
+                    "};\n");
+    write_temp_file(tmp, "arch/arm64/kernel/elfcore.c",
+                    "#include <linux/mm.h>\n"
+                    "#include <asm/kvm_pgtable.h>\n"
+                    "int mte_dump_tag_range(struct page *page)\n"
+                    "{\n"
+                    "\tput_page(page);\n"
+                    "\treturn 0;\n"
+                    "}\n");
+    write_temp_file(tmp, "drivers/net/rx.c",
+                    "#include <linux/mm.h>\n"
+                    "void recv_buffer_free(struct page *page)\n"
+                    "{\n"
+                    "\tput_page(page);\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.c", i);
+        snprintf(body, sizeof(body), "int filler%d(void) { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+/* CALLS edges from the nodes named src_name into nodes named tgt_name that
+ * carry tgt_label: the name-only probes cannot tell the header Function from
+ * its struct-member namesake. */
+static int labelled_call_count(cbm_store_t *s, const char *project, const char *src_name,
+                               const char *tgt_name, const char *tgt_label) {
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    int n = 0;
+    cbm_store_find_nodes_by_name(s, project, src_name, &srcs, &sc);
+    cbm_store_find_nodes_by_name(s, project, tgt_name, &tgts, &tc);
+    for (int i = 0; i < sc; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec; j++) {
+            for (int k = 0; k < tc; k++) {
+                if (edges[j].target_id == tgts[k].id && tgts[k].label &&
+                    strcmp(tgts[k].label, tgt_label) == 0) {
+                    n++;
+                }
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (srcs) {
+        cbm_store_free_nodes(srcs, sc);
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return n;
+}
+
+TEST(pipeline_c_call_reaches_header_function_beside_field) {
+    /* 2026-10-13 kernel audit: `put_page(page)` 345 -> 9 callers. The struct
+     * member in the short-name registry makes the bare name two candidates,
+     * so the lookup answers by suffix_match; .h is C++ in the extension table
+     * and the #725 guard dropped the C caller's edge as cross-language.
+     * Reproduce-first: RED before the fix. Sequential-path twin. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_c_hdr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_c_header_namesake_fixture(tmp, 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/c_hdr.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Both namesakes must exist for the probe to mean anything. */
+    ASSERT_GTE(fixture_node_count(s, project, "include/linux/mm.h", "put_page", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page",
+                                  "Field"),
+               1);
+    ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Function"), 1);
+    ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Function"), 1);
+    /* A bare C call never names the struct member. */
+    ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Field"), 0);
+    ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Field"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_c_call_reaches_header_function_beside_field_parallel) {
+    /* Parallel twin: the kernel resolves through pass_parallel.c, which asks
+     * the same #725 guard. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_c_hdrp_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_c_header_namesake_fixture(tmp, 52);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/c_hdrp.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_GTE(fixture_node_count(s, project, "include/linux/mm.h", "put_page", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page",
+                                  "Field"),
+               1);
+    ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Function"), 1);
+    ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Function"), 1);
+    ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Field"), 0);
+    ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Field"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* True when a node named src_name has an edge of edge_type to the Field
  * `field` OWNED BY `owner` (qualified name ends in ".owner.field"). The
  * name-only cross_file_edge_exists cannot tell two same-named fields apart,
@@ -22443,6 +22593,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
+    RUN_TEST(pipeline_c_call_reaches_header_function_beside_field);
+    RUN_TEST(pipeline_c_call_reaches_header_function_beside_field_parallel);
     RUN_TEST(pipeline_c_member_access_binds_field_by_object_type);
     RUN_TEST(pipeline_c_member_access_binds_field_by_object_type_parallel);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);

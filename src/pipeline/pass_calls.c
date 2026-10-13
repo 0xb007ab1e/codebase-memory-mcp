@@ -967,8 +967,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                     lang, lsp->strategy, lsp->callee_qn, ctx->project_name);
     cbm_resolution_t res = {0};
     if (!rust_external && !php_vendor_call) {
-        res = cbm_registry_resolve_lang(ctx->registry, call->callee_name, module_qn, imp_keys,
-                                        imp_vals, imp_count, lang);
+        res = cbm_registry_resolve_call_lang(ctx->registry, call->callee_name, module_qn, imp_keys,
+                                             imp_vals, imp_count, lang);
         /* Cross-language veto: a name-only guess never binds another
          * language's symbol (a JS app.get must not become Python's
          * builtins.dict.get). The vetoed answer becomes EMPTY here, before
