@@ -37,7 +37,7 @@ The native C backend exposes 17 MCP tools and supports 45 automatic or condition
   <img src="docs/images/lens-overview.gif" alt="CBM Lens Beta architecture walkthrough: zoom into the source folders of this repository, open src/pipeline, select artifact.c and open its source" width="1000">
 </p>
 
-**Galaxy.** Explore the code knowledge graph in 3D. The recording searches `cbm_pipeline_run`, follows its outgoing calls one layer further, switches to the hierarchy and shows the path to `cbm_store_check_integrity`. Edge pulses show relationship direction; they do not represent live execution. [Still image](docs/images/lens-galaxy.png).
+**Galaxy.** Explore the code knowledge graph in 3D. The recording searches `cbm_pipeline_run`, follows its outgoing calls one layer further, switches to the hierarchy and shows the path to `cbm_store_check_integrity`. Edge pulses show relationship direction; they do not represent live execution. [Current still: two dependency layers around `cbm_max_file_bytes`](docs/images/lens-galaxy.jpg).
 
 <p align="center">
   <img src="docs/images/lens-galaxy.gif" alt="Code knowledge graph in CBM Lens Beta Galaxy: search a function, expand its outgoing calls, switch to the hierarchy and follow a path" width="1000">
@@ -45,7 +45,7 @@ The native C backend exposes 17 MCP tools and supports 45 automatic or condition
 
 **Explore.** Browse files in an IDE-style workspace, read syntax-highlighted source in Monaco, and keep the code graph alongside it. File impact shows what depends on the open file, and Code details shows the callers and calls of the symbol under the caret. Select code to [ask the local chat about it](#chat-with-your-codebase-locally).
 
-<p align="center"><img src="docs/images/lens-explore.png" alt="CBM Lens Beta Explore: file tree, the C source of fqn.c in the Monaco reader with its file impact, and the code graph of the file" width="1000"></p>
+<p align="center"><img src="docs/images/lens-explore.jpg" alt="CBM Lens Beta Explore: limits.c in the source reader beside its file impact summary and direct graph dependencies" width="1000"></p>
 
 <details>
 <summary>More views: system structure and behavior</summary>
@@ -58,7 +58,7 @@ The native C backend exposes 17 MCP tools and supports 45 automatic or condition
 
 </details>
 
-These captures use public source from this repository at `4d9592b5`. See [capture details](docs/images/README.md) for the indexed scope and recording setup.
+These captures show CBM Lens Beta on 12–13 October 2026, using public source from this repository. See [capture details](docs/images/README.md) for each capture's build, indexed scope and recording setup.
 
 ## Why codebase-memory-mcp
 
