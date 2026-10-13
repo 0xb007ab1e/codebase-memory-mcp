@@ -1493,8 +1493,10 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      image reference says its container (USAGE {ref:image, container}) and
  *      a Dockerfile's Module its image's files (image_context, image_files,
  *      image_ignore). A workload or compose service CONNECTS_TO the Service
- *      its environment addresses (extract_k8s.c, pass_docker.c). An index
- *      built before holds none of them, so it rebuilds once on upgrade. */
+ *      its environment addresses (extract_k8s.c, pass_docker.c). A script's
+ *      curl / wget HTTP_CALLS the Route of the URL it states (pass_shell.c).
+ *      An index built before holds none of them, so it rebuilds once on
+ *      upgrade. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
 
 typedef struct {
@@ -1591,6 +1593,10 @@ int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *
  * on failure. */
 int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const char *label,
                                 const char *const *edge_types);
+/* Delete the project's `label` nodes that carry no file and that no edge of
+ * any type touches (a Route whose last caller and handler were purged);
+ * returns how many, or -1 on failure. */
+int cbm_delta_drop_edgeless(cbm_store_t *store, const char *project, const char *label);
 /* An Image's build edges (Image -DEPENDS_ON {via:build}-> Dockerfile,
  * pass_docker.c) belong to the build configuration declaring them, not to
  * either end: every run recomputes them whole from all build files, the

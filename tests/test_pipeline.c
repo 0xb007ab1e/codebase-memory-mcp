@@ -3587,6 +3587,49 @@ TEST(incremental_deleted_spawner_drops_its_process) {
     PASS();
 }
 
+/* Deleting the only script requesting a URL leaves no Route behind -- a full
+ * index never makes one without an edge; the Route a kept script requests
+ * stays. `legacy`: through the full-load route, else closure repair. Returns
+ * the Route count after the deletion, or -1; *route: the route taken. */
+static int incremental_caller_delete(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_routegc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return -1;
+    }
+    write_temp_file(tmp, "hack/a.sh", "#!/bin/sh\ncurl -fsSL https://dl.example.com/a.tgz\n");
+    write_temp_file(tmp, "hack/b.sh", "#!/bin/sh\nwget https://dl.example.com/b.tgz\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/routegc.db", tmp);
+    static const char routes[] = "SELECT COUNT(*) FROM nodes WHERE label='Route'";
+    int full = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, routes) : -1;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/hack/a.sh", tmp);
+    (void)remove(path);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#endif
+    int after = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, routes) : -1;
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return full == 2 ? after : -1;
+}
+
+TEST(incremental_deleted_caller_drops_its_route) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    int left = incremental_caller_delete(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(left, 1);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    left = incremental_caller_delete(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(left, 1);
+#endif
+    PASS();
+}
+
 /* Deleting the only Dockerfile naming an image leaves no Image node behind;
  * the image another Dockerfile still names stays. `legacy`: through the
  * full-load route, else the closure-repair route. Returns the Image count
@@ -4854,6 +4897,39 @@ TEST(incremental_env_join_repair_keeps_unchanged_pairs) {
     ASSERT_EQ(far_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     ASSERT_EQ(far_joins, 3);
     ASSERT_EQ(far_mode_conf, 1);
+    PASS();
+}
+
+/* A script's request to a compose service keeps the host in its Route on a
+ * repair as in a full run: the repair holds the compose services already
+ * (a full run makes them after the scripts), yet only a Kubernetes Service
+ * of the repository makes a Route path-only. */
+TEST(incremental_script_request_to_compose_service_keeps_host) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_composeurl_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    closure_probe_repo(tmp);
+    write_temp_file(tmp, "compose.yaml", "services:\n  web:\n    image: acme/web:1\n");
+    write_temp_file(tmp, "hack/ping.sh", "#!/bin/sh\ncurl http://web:3000/x\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/composeurl.db", tmp);
+    static const char kept[] = "SELECT COUNT(*) FROM nodes WHERE label='Route' AND "
+                               "qualified_name='__route__GET__http://web:3000/y'";
+    static const char bare[] = "SELECT COUNT(*) FROM nodes WHERE label='Route' AND "
+                               "qualified_name LIKE '__route__GET__/%'";
+    int full_rc = stem_index(tmp, db);
+    write_temp_file(tmp, "hack/ping.sh", "#!/bin/sh\ncurl http://web:3000/y\n");
+    int inc_rc = stem_index(tmp, db);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    int inc_kept = k8s_inc_count(db, kept);
+    int inc_bare = k8s_inc_count(db, bare);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full_rc, 0);
+    ASSERT_EQ(inc_rc, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(inc_kept, 1);
+    ASSERT_EQ(inc_bare, 0);
     PASS();
 }
 
@@ -23400,6 +23476,8 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_k8s_edits_reach_other_files);
     RUN_TEST(incremental_shell_deploy_edit_keeps_its_edges);
     RUN_TEST(incremental_deleted_spawner_drops_its_process);
+    RUN_TEST(incremental_deleted_caller_drops_its_route);
+    RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);
     RUN_TEST(incremental_compose_edit_replaces_build_edges);

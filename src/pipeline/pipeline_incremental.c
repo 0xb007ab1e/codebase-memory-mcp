@@ -3351,9 +3351,11 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     cbm_log_info("delta.patch_done", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
     /* The proxy buffer holds no edges, so only the patched staging graph can
      * tell a Process node no SPAWNS reaches any more (its last spawner was
-     * purged), or an Image nothing builds on, builds or runs. */
+     * purged), an Image nothing builds on, builds or runs, or a file-less
+     * Route no caller or handler is left on. */
     if (cbm_delta_drop_unreferenced(staging, project, "Process", SH_PROCESS_EDGES) < 0 ||
-        cbm_delta_drop_unreferenced(staging, project, "Image", DK_IMAGE_EDGES) < 0) {
+        cbm_delta_drop_unreferenced(staging, project, "Image", DK_IMAGE_EDGES) < 0 ||
+        cbm_delta_drop_edgeless(staging, project, "Route") < 0) {
         goto out;
     }
 
@@ -3986,9 +3988,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
          * pass_shell.c), an Image only through its DEPENDS_ON / USAGE edges
          * (pass_docker.c); neither carries a file: when the last file naming
          * one is gone, nothing else removes it -- a full index never makes
-         * it. This buffer holds the whole graph. */
+         * it. Nor a file-less Route (a call site's, pass_calls.c,
+         * pass_shell.c) without its last caller and handler. This buffer
+         * holds the whole graph. */
         (void)cbm_gbuf_delete_unreferenced(existing, "Process", SH_PROCESS_EDGES);
         (void)cbm_gbuf_delete_unreferenced(existing, "Image", DK_IMAGE_EDGES);
+        (void)cbm_gbuf_delete_edgeless(existing, "Route");
         phase_rc = run_postpasses(&ctx, changed_files, ci, project, true);
     }
 

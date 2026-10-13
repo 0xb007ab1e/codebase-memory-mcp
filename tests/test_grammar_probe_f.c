@@ -2581,6 +2581,108 @@ TEST(probe_env_address_connects_to_its_service) {
     PASS();
 }
 
+/* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
+ * "edgeless routes <n>": the Route nodes no edge touches. */
+static char *gpf_script_http(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "t.qualified_name AS x FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND e.type='HTTP_CALLS' AND "
+            "json_extract(e.properties,'$.via') IN ('curl','wget') ORDER BY x)), '') || char(10) "
+            "|| 'edgeless routes ' || (SELECT COUNT(*) FROM nodes r WHERE r.project=?1 AND "
+            "r.label='Route' AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id=r.id OR "
+            "e.source_id=r.id))";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A script's curl / wget of a URL it states HTTP_CALLS the Route of it, with
+ * the method its flags give (-X, a body POST, -T PUT, -I HEAD, -G GET,
+ * wget --post-data POST): a Kubernetes Service of the repository by the path
+ * alone (`api`, `api.default.svc.cluster.local`), where that service's
+ * handler meets it; any other host -- a download, a domain under the
+ * service's name, localhost even beside a Service named so -- with the host
+ * kept, and no path-only Route made for it. Constant words resolve
+ * (`v${VER}`), unknown parts are `{}`, also in an unquoted word the grammar
+ * splits; never a proxy's or referer's URL, and never the user info or the
+ * query (a token) in the graph. */
+TEST(probe_script_http_request_calls_its_route) {
+    static const GpfFile files[] = {
+        {"k8s/api.yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: api\n"},
+        {"k8s/localhost.yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: localhost\n"},
+        {"dl.sh",
+         "#!/bin/bash\nVER=1.2.3\n"
+         "curl -fsSL https://github.com/x/y/releases/download/v1/tool.tgz -o tool.tgz\n"
+         "curl -X POST -d '{}' \"http://api:8080/v1/items?token=s3cr3t-token\"\n"
+         "wget --post-data=x https://user:pw-secret@dl.example.com/a/b\n"
+         "curl -I https://example.com/head\n"
+         "curl -x http://proxy.local:3128 https://example.org/target\n"
+         "curl -LO \"https://dl.example.com/v${VER}/x-${VER}.tgz\"\n"
+         "curl \"https://dl.example.com/r/${UNKNOWN}/y.tgz\"\n"
+         "curl http://localhost:9090/metrics\n"
+         "curl -G -d q=1 https://example.com/search\n"
+         "curl --request DELETE https://example.com/item/1\n"
+         "curl -fsSLO https://dl.example.com/u/$OS-$ARCH.tgz\n"
+         "curl -LO https://dl.example.com/j/`uname`.tgz\n"
+         "curl -LO https://dl.example.com/q/${VER}$OS.tgz\n"
+         "curl https://api.example.com/v1/ping\n"
+         "curl http://api.default.svc.cluster.local:8080/health\n"
+         "curl \"https://${HOST}/api/x\"\n"},
+        {"Makefile", "TOOL_VERSION=0.1.1\nARCH=amd64\n"
+                     "install:\n\tcurl -sSL https://get.example.com/install.sh | sh\n"
+                     "bin/tool:\n\tcurl -sLo \"bin/tool\" https://dl.example.com/t/v$(TOOL_VERSION)/"
+                     "tool_v$(TOOL_VERSION)_$(OS)_$(ARCH)\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_script_http(files, n);
+    static const char want[] =
+        "Makefile __route__GET__https://dl.example.com/t/v0.1.1/tool_v0.1.1_{}_amd64\n"
+        "Makefile __route__GET__https://get.example.com/install.sh\n"
+        "dl.sh __route__DELETE__https://example.com/item/1\n"
+        "dl.sh __route__GET__/health\n"
+        "dl.sh __route__GET__http://localhost:9090/metrics\n"
+        "dl.sh __route__GET__https://api.example.com/v1/ping\n"
+        "dl.sh __route__GET__https://dl.example.com/j/{}.tgz\n"
+        "dl.sh __route__GET__https://dl.example.com/q/{}{}.tgz\n"
+        "dl.sh __route__GET__https://dl.example.com/r/{}/y.tgz\n"
+        "dl.sh __route__GET__https://dl.example.com/u/{}-{}.tgz\n"
+        "dl.sh __route__GET__https://dl.example.com/v1.2.3/x-1.2.3.tgz\n"
+        "dl.sh __route__GET__https://example.com/search\n"
+        "dl.sh __route__GET__https://example.org/target\n"
+        "dl.sh __route__GET__https://github.com/x/y/releases/download/v1/tool.tgz\n"
+        "dl.sh __route__HEAD__https://example.com/head\n"
+        "dl.sh __route__POST__/v1/items\n"
+        "dl.sh __route__POST__https://dl.example.com/a/b\n"
+        "edgeless routes 0";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "script http got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("script HTTP_CALLS edge set");
+    }
+    free(got);
+    static const char *const values[] = {"s3cr3t-token", "pw-secret", "proxy.local"};
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        int hits = gpf_graph_mentions(files, n, values[i]);
+        if (hits != 0) {
+            fprintf(stderr, "value %s: %d graph mentions\n", values[i], hits);
+            FAIL("a credential, token or proxy reached the graph");
+        }
+    }
+    PASS();
+}
+
 /* A variable a container sets joins the readers of its name inside the files
  * its own image is built from: the K8s container's image (two containers,
  * two images), built by compose from a Dockerfile; the stages the last one
@@ -4913,6 +5015,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_container_env_sets_scoped_envvars);
     RUN_TEST(probe_container_env_joins_its_own_image_readers);
     RUN_TEST(probe_env_address_connects_to_its_service);
+    RUN_TEST(probe_script_http_request_calls_its_route);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
