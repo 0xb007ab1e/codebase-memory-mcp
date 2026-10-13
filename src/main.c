@@ -974,9 +974,9 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
             return SKIP_ONE;
         }
         args_json = heap_args;
-    } else if (cbm_cli_args_from_stdin_allowed(tool_name, cli_isatty(0) != 0)) {
+    } else if (cbm_cli_args_from_stdin_allowed(tool_name, cbm_cli_stdin_kind(0))) {
         /* piped stdin (UTF-8 clean, no shell quoting): cli <tool> < args.json.
-         * Gated (#1359): a tool that declares no arguments must not read a pipe
+         * Gated (#1359): a call complete without arguments must not read a pipe
          * nobody is going to write to or close — see the WHY on the predicate. */
         heap_args = cli_slurp_stream(stdin);
         if (heap_args && heap_args[0]) {
