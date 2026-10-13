@@ -1497,7 +1497,8 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      curl / wget HTTP_CALLS the Route of the URL it states (pass_shell.c).
  *      A kustomize patch OVERRIDEs the objects of its build it changes, its
  *      file an IMPORTS of the kustomization; a Resource keeps the version of
- *      its apiVersion (extract_k8s.c, pass_k8s.c). An index built before
+ *      its apiVersion; a kustomization DEPLOYS the charts it inflates
+ *      (helmCharts) (extract_k8s.c, pass_k8s.c). An index built before
  *      holds none of them, so it rebuilds once on upgrade. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
 

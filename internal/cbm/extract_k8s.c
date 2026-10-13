@@ -453,6 +453,64 @@ static void emit_kustomize_patches(CBMExtractCtx *ctx, TSNode seq) {
     }
 }
 
+// The `helmCharts` list of a kustomization: each chart it inflates into its
+// build is a DEPLOY fact (via "kustomize") the K8s pass draws to that chart;
+// its values file an import (local name "valuesFile").
+static void emit_kustomize_charts(CBMExtractCtx *ctx, TSNode seq) {
+    CBMArena *a = ctx->arena;
+    k8s_kids_t items = k8s_kids(seq);
+    TSNode item;
+    while (k8s_kid(&items, false, &item)) {
+        TSNode map = strcmp(ts_node_type(item), "block_sequence_item") == 0
+                         ? kust_item_mapping(item)
+                         : (TSNode){0};
+        if (ts_node_is_null(map)) {
+            continue;
+        }
+        CBMK8sFact f = {.fact = CBM_K8S_FACT_DEPLOY,
+                        .def_index = -1,
+                        .via = "kustomize",
+                        .edge = "DEPLOYS",
+                        .line = (int)ts_node_start_point(item).row + TS_LINE_OFFSET};
+        k8s_kids_t pairs = k8s_kids(map);
+        TSNode pair;
+        while (k8s_kid(&pairs, false, &pair)) {
+            if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
+                continue;
+            }
+            const char *key = get_scalar_text(a, ts_node_named_child(pair, 0), ctx->source);
+            TSNode v = unwrap_pair_value(pair);
+            const char *val =
+                key && !ts_node_is_null(v) ? get_scalar_text(a, v, ctx->source) : NULL;
+            if (!val || !val[0]) {
+                continue;
+            }
+            if (strcmp(key, "name") == 0) {
+                f.name = val;
+            } else if (strcmp(key, "repo") == 0) {
+                f.url = val;
+            } else if (strcmp(key, "version") == 0) {
+                f.version = val;
+            } else if (strcmp(key, "releaseName") == 0) {
+                f.release = val;
+            } else if (strcmp(key, "namespace") == 0) {
+                f.ns = val;
+            } else if (strcmp(key, "valuesFile") == 0) {
+                f.path = val;
+            }
+        }
+        if (!f.name) {
+            continue;
+        }
+        if (f.path) {
+            CBMImport imp = {.local_name = cbm_arena_strdup(a, "valuesFile"),
+                             .module_path = cbm_arena_strdup(a, f.path)};
+            cbm_imports_push(&ctx->result->imports, a, imp);
+        }
+        cbm_k8sfact_push(&ctx->result->k8s_facts, a, f);
+    }
+}
+
 // Process a single block_mapping_pair for kustomize list keys.
 static void process_kustomize_pair(CBMExtractCtx *ctx, TSNode pair) {
     if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
@@ -463,12 +521,18 @@ static void process_kustomize_pair(CBMExtractCtx *ctx, TSNode pair) {
         return;
     }
     const char *key_text = get_scalar_text(ctx->arena, key_node, ctx->source);
-    if (!key_text || !is_kustomize_list_key(key_text)) {
+    if (!key_text) {
         return;
     }
-
     TSNode val_node = unwrap_pair_value(pair);
     if (ts_node_is_null(val_node) || strcmp(ts_node_type(val_node), "block_sequence") != 0) {
+        return;
+    }
+    if (strcmp(key_text, "helmCharts") == 0) {
+        emit_kustomize_charts(ctx, val_node);
+        return;
+    }
+    if (!is_kustomize_list_key(key_text)) {
         return;
     }
     emit_kustomize_sequence(ctx, val_node, key_text);

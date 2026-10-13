@@ -2701,6 +2701,69 @@ TEST(probe_kustomize_patches_override_their_base) {
     PASS();
 }
 
+/* Every kustomize chart deploy as "<source file> <source label> -> <target
+ * label>/<target name> <properties less line>", then "values imports <n>". */
+static char *gpf_kcharts(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.label || ' -> ' || t.label || '/' || t.name || ' ' || json_remove(e.properties, "
+            "'$.line') AS x FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND e.type='DEPLOYS' AND "
+            "json_extract(e.properties,'$.via')='helmcharts' ORDER BY x)), '') || char(10) || "
+            "'values imports ' || (SELECT COUNT(*) FROM edges e WHERE e.project=?1 AND "
+            "e.type='IMPORTS' AND json_extract(e.properties,'$.local_name')='valuesFile')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A chart a kustomization inflates (`helmCharts`) DEPLOYS from that
+ * kustomization -- its Kustomization Resource, else (no `kind:` line) its
+ * File -- to the shared external Chart of the name, keeping repository,
+ * version, release, namespace and values file; two kustomizations of one
+ * chart share it. A chart name with a path names nothing; a values file
+ * outside the repository is not kept; one inside is an import. */
+TEST(probe_kustomize_helm_charts_deploy_their_chart) {
+    static const GpfFile files[] = {
+        {"obs/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nhelmCharts:\n"
+         "- name: loki\n  repo: https://grafana.github.io/helm-charts\n  version: 6.46.0\n"
+         "  releaseName: logs\n  namespace: obs\n  valuesFile: values.yaml\n"
+         "- name: org/thing\n  repo: https://example.com/charts\n"},
+        {"obs/values.yaml", "loki:\n  auth_enabled: false\n"},
+        {"plain/kustomization.yaml",
+         "helmCharts:\n- name: loki\n  repo: oci://registry.example.com/charts\n"
+         "  valuesFile: ../../../../outside.yaml\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_kcharts(files, n);
+    static const char want[] =
+        "obs/kustomization.yaml Resource -> Chart/loki {\"via\":\"helmcharts\",\"external\":true,"
+        "\"chart\":\"loki\",\"url\":\"https://grafana.github.io/helm-charts\",\"version\":\"6.46.0\","
+        "\"release\":\"logs\",\"namespace\":\"obs\",\"values\":\"obs/values.yaml\"}\n"
+        "plain/kustomization.yaml File -> Chart/loki {\"via\":\"helmcharts\",\"external\":true,"
+        "\"chart\":\"loki\",\"url\":\"oci://registry.example.com/charts\"}\n"
+        "values imports 1";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "kustomize charts got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("kustomize chart deploys");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
  * "edgeless routes <n>": the Route nodes no edge touches. */
 static char *gpf_script_http(const GpfFile *files, int nfiles) {
@@ -5137,6 +5200,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_env_address_connects_to_its_service);
     RUN_TEST(probe_script_http_request_calls_its_route);
     RUN_TEST(probe_kustomize_patches_override_their_base);
+    RUN_TEST(probe_kustomize_helm_charts_deploy_their_chart);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);

@@ -1226,6 +1226,18 @@ typedef struct {
     int line;
 } k8s_patch_t;
 
+/* A chart a kustomization inflates into its build (`helmCharts`). */
+typedef struct {
+    char *kust;    /* the kustomization file */
+    char *chart;   /* the chart name */
+    char *url;     /* its repository, NULL when unset */
+    char *version; /* NULL when unset */
+    char *release; /* the release name, NULL when unset */
+    char *ns;      /* the release namespace, NULL when unset */
+    char *values;  /* the values file (repository path), NULL when none */
+    int line;
+} k8s_kchart_t;
+
 typedef struct {
     k8s_ref_t *refs;
     int ref_n;
@@ -1251,6 +1263,9 @@ typedef struct {
     k8s_patch_t *patches;
     int patch_n;
     int patch_cap;
+    k8s_kchart_t *kcharts;
+    int kchart_n;
+    int kchart_cap;
 } k8s_facts_t;
 
 static void k8s_facts_free(k8s_facts_t *f) {
@@ -1296,6 +1311,17 @@ static void k8s_facts_free(k8s_facts_t *f) {
         cbm_free(CBM_MEM_CLASS_OTHER, p->ns);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, f->patches);
+    for (int i = 0; i < f->kchart_n; i++) {
+        k8s_kchart_t *c = &f->kcharts[i];
+        cbm_free(CBM_MEM_CLASS_OTHER, c->kust);
+        cbm_free(CBM_MEM_CLASS_OTHER, c->chart);
+        cbm_free(CBM_MEM_CLASS_OTHER, c->url);
+        cbm_free(CBM_MEM_CLASS_OTHER, c->version);
+        cbm_free(CBM_MEM_CLASS_OTHER, c->release);
+        cbm_free(CBM_MEM_CLASS_OTHER, c->ns);
+        cbm_free(CBM_MEM_CLASS_OTHER, c->values);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, f->kcharts);
     cbm_free(CBM_MEM_CLASS_OTHER, f->envs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->hrs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->srcs);
@@ -3423,6 +3449,45 @@ static void k8s_link_chart_refs(k8s_dep_link_t *l, const k8s_hr_t *oci) {
     }
 }
 
+/* `, "<key>":"<val>"` (escaped) at out + *w when `val` is set. */
+static void k8s_prop_add(char *out, size_t out_sz, int *w, const char *key, const char *val) {
+    if (!val || *w < 0 || (size_t)*w >= out_sz) {
+        return;
+    }
+    char esc[CBM_SZ_1K];
+    cbm_json_escape(esc, (int)sizeof(esc), val);
+    *w += snprintf(out + *w, out_sz - (size_t)*w, ",\"%s\":\"%s\"", key, esc);
+}
+
+/* A chart a kustomization inflates (`helmCharts`) is deployed with its
+ * build: DEPLOYS {via: helmcharts, external, chart, url, version, release,
+ * namespace, values, line} from the kustomization (its Kustomization
+ * Resource, else its File -- the unit a Flux / Argo deploy reaches) to the
+ * shared external Chart of that name. */
+static void k8s_link_kcharts(k8s_dep_link_t *l, const k8s_facts_t *f) {
+    for (int i = 0; i < f->kchart_n; i++) {
+        const k8s_kchart_t *c = &f->kcharts[i];
+        if (!c->chart || strchr(c->chart, '/') || strchr(c->chart, '$')) {
+            continue;
+        }
+        int64_t src = k8s_first_id(l->kusts, c->kust);
+        src = src > 0 ? src : k8s_first_id(l->files, c->kust);
+        char props[CBM_SZ_4K];
+        int w = snprintf(props, sizeof(props), "{\"via\":\"helmcharts\",\"external\":true");
+        k8s_prop_add(props, sizeof(props), &w, "chart", c->chart);
+        k8s_prop_add(props, sizeof(props), &w, "url", c->url);
+        k8s_prop_add(props, sizeof(props), &w, "version", c->version);
+        k8s_prop_add(props, sizeof(props), &w, "release", c->release);
+        k8s_prop_add(props, sizeof(props), &w, "namespace", c->ns);
+        k8s_prop_add(props, sizeof(props), &w, "values", c->values);
+        if (w < 0 || (size_t)w >= sizeof(props) - CBM_SZ_32) {
+            continue;
+        }
+        snprintf(props + w, sizeof(props) - (size_t)w, ",\"line\":%d}", c->line);
+        k8s_deploys_edge(l, src, k8s_external_chart(l, c->chart, c->kust), props);
+    }
+}
+
 /* A container image an object runs: USAGE {ref:image, container} to its
  * Image node -- the node a Dockerfile building or building on that image
  * joins; the container names whose environment runs it. */
@@ -3463,25 +3528,50 @@ static char *k8s_dup_opt(const char *s) {
     return s ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, s) : NULL;
 }
 
-/* Keep a kustomization's PATCH facts, each patch file as a repository path
- * (one that leaves the repository, or a URL, names no file of it). */
-static void k8s_patches_keep(k8s_facts_t *f, const char *kust, const CBMFileResult *res) {
+/* The repository path of `rel`, relative to directory `dir`; false when it
+ * leaves the repository (or is a URL). */
+static bool k8s_repo_path(const char *dir, const char *rel, char *out, size_t out_sz) {
+    char joined[CBM_SZ_2K];
+    snprintf(joined, sizeof(joined), "%s%s%s", dir, dir[0] ? "/" : "", rel);
+    return k8s_norm_dir(joined, out, out_sz);
+}
+
+static void k8s_kchart_keep(k8s_facts_t *f, const char *kust, const CBMK8sFact *x,
+                            const char *values) {
+    if (!k8s_grow((void **)&f->kcharts, &f->kchart_cap, f->kchart_n, sizeof(*f->kcharts))) {
+        return;
+    }
+    f->kcharts[f->kchart_n++] = (k8s_kchart_t){.kust = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, kust),
+                                               .chart = k8s_dup_opt(x->name),
+                                               .url = k8s_dup_opt(x->url),
+                                               .version = k8s_dup_opt(x->version),
+                                               .release = k8s_dup_opt(x->release),
+                                               .ns = k8s_dup_opt(x->ns),
+                                               .values = k8s_dup_opt(values),
+                                               .line = x->line};
+}
+
+/* Keep a kustomization's facts: its patches (PATCH) and the charts it
+ * inflates (DEPLOY via "kustomize"), each file as a repository path -- a
+ * patch file outside the repository (or a URL) names no file of it, a values
+ * file there is left out. */
+static void k8s_kustomize_keep(k8s_facts_t *f, const char *kust, const CBMFileResult *res) {
     char dir[CBM_SZ_1K];
     k8s_dirname(kust, dir, sizeof(dir));
     for (int i = 0; res && i < res->k8s_facts.count; i++) {
         const CBMK8sFact *x = &res->k8s_facts.items[i];
-        char path[CBM_SZ_1K];
-        if (x->fact != CBM_K8S_FACT_PATCH) {
+        bool chart = x->fact == CBM_K8S_FACT_DEPLOY && x->via && strcmp(x->via, "kustomize") == 0;
+        if (x->fact != CBM_K8S_FACT_PATCH && !chart) {
             continue;
         }
-        if (x->path) {
-            char joined[CBM_SZ_2K];
-            snprintf(joined, sizeof(joined), "%s%s%s", dir, dir[0] ? "/" : "", x->path);
-            if (!k8s_norm_dir(joined, path, sizeof(path))) {
-                continue;
-            }
+        char path[CBM_SZ_1K];
+        bool in_repo = x->path && k8s_repo_path(dir, x->path, path, sizeof(path));
+        if (chart) {
+            k8s_kchart_keep(f, kust, x, in_repo ? path : NULL);
+            continue;
         }
-        if (!k8s_grow((void **)&f->patches, &f->patch_cap, f->patch_n, sizeof(*f->patches))) {
+        if ((x->path && !in_repo) ||
+            !k8s_grow((void **)&f->patches, &f->patch_cap, f->patch_n, sizeof(*f->patches))) {
             continue;
         }
         f->patches[f->patch_n++] =
@@ -3767,7 +3857,7 @@ static void k8s_link_patches(cbm_pipeline_ctx_t *ctx, const k8s_kusts_t *ks, k8s
 
 static void k8s_link_deploys(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundles_t *b,
                              const k8s_facts_t *f) {
-    if (f->dep_n == 0 && f->hr_n == 0 && f->src_n == 0) {
+    if (f->dep_n == 0 && f->hr_n == 0 && f->src_n == 0 && f->kchart_n == 0) {
         return;
     }
     k8s_dep_link_t l = {.ctx = ctx,
@@ -3840,6 +3930,9 @@ static void k8s_link_deploys(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundl
     }
     for (int s = 0; l.files && l.charts && s < f->src_n; s++) {
         k8s_link_chart_refs(&l, &f->srcs[s]);
+    }
+    if (l.files && l.kusts) {
+        k8s_link_kcharts(&l, f);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)members.items);
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)units.items);
@@ -3918,7 +4011,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                 case K8S_KUSTOMIZE:
                     k8s_kusts_push(&kusts, rel, k8s_kustomize_namespace(p->source),
                                    k8s_kustomize_component(p->source));
-                    k8s_patches_keep(&facts, rel, p->res);
+                    k8s_kustomize_keep(&facts, rel, p->res);
                     break;
                 case K8S_MANIFEST:
                     handle_k8s_manifest(ctx, rel, p->source, p->res, &recs, &facts);

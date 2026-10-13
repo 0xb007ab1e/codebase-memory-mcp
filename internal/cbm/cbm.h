@@ -708,7 +708,10 @@ typedef struct {
  *   CBM_K8S_FACT_CRD: the CRD def_index declares kind `kind` in group `name`.
  *   CBM_K8S_FACT_DEPLOY: object def_index (a Flux Kustomization, an Argo
  *     Application) deploys the repository directory `name` into namespace
- *     `ns` (NULL: the objects' own); via "flux" / "argo".
+ *     `ns` (NULL: the objects' own); via "flux" / "argo". via "kustomize"
+ *     (def_index -1: the kustomization itself): a `helmCharts` entry
+ *     inflates chart `name` of repository `url` at `version` as release
+ *     `release` into namespace `ns`, with values file `path`.
  *   CBM_K8S_FACT_ROUTE: object def_index (an Ingress, an HTTPRoute) exposes
  *     `route` ("<host or *><path>") and sends it to the kind/ns/name backend
  *     (name NULL: none); via "ingress" / "httproute".
@@ -751,6 +754,8 @@ typedef struct {
     const char *group;   /* PATCH: the API group named ("core"), NULL: any */
     const char *version; /* PATCH: the API version named, NULL: any */
     const char *path;    /* PATCH: the patch file, NULL: inline */
+    const char *url;     /* DEPLOY (kustomize): the chart repository */
+    const char *release; /* DEPLOY (kustomize): the release name */
     int line;
 } CBMK8sFact;
 
