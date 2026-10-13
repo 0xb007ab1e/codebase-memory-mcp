@@ -3524,11 +3524,18 @@ TEST(incremental_shell_deploy_edit_keeps_its_edges) {
 
 /* Deleting the only file that starts a program leaves no Process node
  * behind -- a full index never makes one without a SPAWNS edge. One script
- * (pass_shell.c) and one Python call (pass_spawns.c) go; the program a kept
- * script starts stays. `legacy`: through the full-load route, else the
- * closure-repair route. Returns the Process count after the deletion, or -1;
- * *route: the route taken. */
-static int incremental_spawner_delete(bool legacy, cbm_incremental_route_t *route) {
+ * (pass_shell.c) and one Python call (pass_spawns.c) start programs; the
+ * program a kept script starts stays.
+ * - `legacy`: both go at once, through the full-load route.
+ * - otherwise in two steps: the script alone goes through closure repair,
+ *   then the Python file, whose deletion the Python namespace admission
+ *   declines (a deleted module's names leave its importers' namespaces), so
+ *   it takes the full route.
+ * Returns the Process count after the last deletion, or -1. *route: the route
+ * of the first (or only) step; *after_script and *python_route: the count and
+ * the route after the script-only step and the Python step (two-step mode). */
+static int incremental_spawner_delete(bool legacy, cbm_incremental_route_t *route,
+                                      int *after_script, cbm_incremental_route_t *python_route) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_spawngc_XXXXXX");
     if (!cbm_mkdtemp(tmp)) {
@@ -3545,28 +3552,35 @@ static int incremental_spawner_delete(bool legacy, cbm_incremental_route_t *rout
     char path[512];
     snprintf(path, sizeof(path), "%s/hack/a.sh", tmp);
     (void)remove(path);
+    if (!legacy) {
+        *after_script =
+            k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
+        *route = cbm_pipeline_incremental_test_last_route();
+    }
     snprintf(path, sizeof(path), "%s/app.py", tmp);
     (void)remove(path);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     if (legacy) {
         cbm_pipeline_incremental_test_force_legacy_partial_once();
     }
-#else
-    (void)legacy;
 #endif
     int after = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
-    *route = cbm_pipeline_incremental_test_last_route();
+    *(legacy ? route : python_route) = cbm_pipeline_incremental_test_last_route();
     th_rmtree(tmp);
     return full == 3 ? after : -1;
 }
 
 TEST(incremental_deleted_spawner_drops_its_process) {
     cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
-    int left = incremental_spawner_delete(false, &route);
+    cbm_incremental_route_t python_route = CBM_INCREMENTAL_ROUTE_NONE;
+    int after_script = -1;
+    int left = incremental_spawner_delete(false, &route, &after_script, &python_route);
     ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(after_script, 2); /* tool-a gone; tool-b and tool-c stay */
+    ASSERT_EQ(python_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     ASSERT_EQ(left, 1);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-    left = incremental_spawner_delete(true, &route);
+    left = incremental_spawner_delete(true, &route, &after_script, &python_route);
     ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
     ASSERT_EQ(left, 1);
 #endif
