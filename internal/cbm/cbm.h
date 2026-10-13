@@ -713,8 +713,8 @@ typedef struct {
  *   CBM_K8S_FACT_SOURCE: object def_index (a Flux OCIRepository) fetches
  *     from the URL `name`; a HelmRelease whose chartRef names it deploys the
  *     chart there.
- *   CBM_K8S_FACT_IMAGE: object def_index runs a container of image `name`
- *     (a literal reference); via "container".
+ *   CBM_K8S_FACT_IMAGE: object def_index runs its container `container`
+ *     (NULL: unnamed) from image `name` (a literal reference); via "container".
  *   CBM_K8S_FACT_ENV: object def_index sets environment variable `name` in
  *     its container `container` (NULL: unnamed) at `line`; via = where the
  *     value comes from ("value", or the valueFrom kind) -- never the value. */

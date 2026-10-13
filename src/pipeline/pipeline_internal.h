@@ -349,6 +349,37 @@ typedef struct {
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
 void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
 
+/* The env join's inputs held by the unchanged files of an incremental
+ * repair (pass_envjoin.c), read from the store before the K8s pass; ids are
+ * the stored rows, i.e. the repair buffer's proxies. */
+typedef struct {
+    int64_t node;      /* a Dockerfile Module */
+    const char *path;  /* its file */
+    const char *props; /* its properties (image_files, image_ignore) */
+} cbm_envjoin_set_row_t;
+
+typedef struct {
+    int64_t owner; /* USAGE {ref:image} source */
+    int64_t image; /* its Image */
+    const char *props;
+} cbm_envjoin_img_row_t;
+
+typedef struct {
+    int64_t reader; /* CONFIGURES {strategy:env_access} source */
+    const char *file;
+    const char *key; /* the global EnvVar's name */
+} cbm_envjoin_reader_row_t;
+
+typedef struct {
+    CBMArena arena; /* owns every string and array */
+    cbm_envjoin_set_row_t *sets;
+    int set_count;
+    cbm_envjoin_img_row_t *imgs;
+    int img_count;
+    cbm_envjoin_reader_row_t *readers;
+    int reader_count;
+} cbm_envjoin_base_t;
+
 /* Shared context passed to each pass function.
  * Derived from cbm_pipeline_t fields during run. */
 typedef struct {
@@ -397,6 +428,10 @@ typedef struct {
     /* Stem collisions of the discovered files: which Module definitions take
      * `qn#ext`. Borrowed for the extraction phase; NULL elsewhere. */
     const cbm_stem_marks_t *stem_marks;
+
+    /* An incremental repair: the env join's inputs held by the unchanged
+     * files (pass_envjoin.c). Borrowed; NULL in a full run. */
+    const cbm_envjoin_base_t *envjoin_base;
 
     /* Sequential cross-LSP registry arena. The lsp_cross pass builds its
      * shared per-language registries here; resolved_calls entries may BORROW
@@ -1289,6 +1324,16 @@ int64_t cbm_pipeline_env_setter(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *
 void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                               int file_count);
 
+/* The env join (pass_envjoin.c): a container's EnvVar CONFIGURES {strategy:
+ * env_read} each reader of its name inside the files the container's image
+ * is built from. Recomputes every such edge; after the Docker pass. Returns
+ * how many. */
+int cbm_pipeline_env_join(cbm_pipeline_ctx_t *ctx);
+
+/* Whether a Dockerfile Module's properties (image_files) copy `path` into
+ * the image, ignore patterns aside. */
+bool cbm_envjoin_props_hold(const char *props, const char *path);
+
 /* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
 int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
 
@@ -1439,8 +1484,15 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      spelled `proj.pkg.foo/`, or, where the directory is a Java/Go package,
  *      the file's Module is `proj.pkg.foo#sh`. The Module the Folder used to
  *      swallow is a node again. An index built before holds neither, so it
+ *      rebuilds once on upgrade.
+ *   9: a container's variable reaches its program: the EnvVar a container
+ *      sets CONFIGURES {strategy:env_read} the readers of its name inside the
+ *      files the container's image is built from (pass_envjoin.c); a K8s
+ *      image reference says its container (USAGE {ref:image, container}) and
+ *      a Dockerfile's Module its image's files (image_context, image_files,
+ *      image_ignore). An index built before holds none of them, so it
  *      rebuilds once on upgrade. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 8 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -1543,6 +1595,22 @@ int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const c
  * between pre-existing nodes. */
 #define CBM_BUILD_EDGE_TYPE "DEPENDS_ON"
 #define CBM_BUILD_EDGE_SOURCE "Image"
+/* The env join's edges (EnvVar -CONFIGURES {strategy:env_read}-> reader,
+ * pass_envjoin.c) likewise: no other producer draws CONFIGURES from an
+ * EnvVar, every run recomputes them whole. */
+#define CBM_ENVJOIN_EDGE_TYPE "CONFIGURES"
+#define CBM_ENVJOIN_EDGE_SOURCE "EnvVar"
+
+/* The env join's inputs the store holds (the unchanged files of a closure
+ * repair, read after the purge), into `out` (its arena owns them); 0, or -1
+ * on failure. cbm_envjoin_base_free releases it. */
+int cbm_delta_envjoin_base(cbm_store_t *store, const char *project, cbm_envjoin_base_t *out);
+void cbm_envjoin_base_free(cbm_envjoin_base_t *b);
+/* 1 when a stored image copies one of `paths` (a deletion then changes
+ * which context the Dockerfile's sources resolve in), 0 when none, -1 on
+ * failure. */
+int cbm_delta_image_holds_any(cbm_store_t *store, const char *project, const char *const *paths,
+                              int path_count);
 
 /* The files whose File node the shell pass marked as running a container
  * build ({"declares_build":true}), into arena `a`; returns how many, or -1

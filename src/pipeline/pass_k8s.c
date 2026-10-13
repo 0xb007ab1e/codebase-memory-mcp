@@ -1161,6 +1161,13 @@ typedef struct {
     int line;
 } k8s_env_t;
 
+/* A container image an object runs, and the container running it. */
+typedef struct {
+    int64_t node;
+    char *image;
+    char *container; /* NULL: unnamed */
+} k8s_img_t;
+
 typedef struct {
     k8s_ref_t *refs;
     int ref_n;
@@ -1177,7 +1184,7 @@ typedef struct {
     k8s_hr_t *srcs; /* an OCIRepository (node) and the URL it fetches (chart) */
     int src_n;
     int src_cap;
-    k8s_hr_t *imgs; /* an object (node) and a container image it runs (chart) */
+    k8s_img_t *imgs;
     int img_n;
     int img_cap;
     k8s_env_t *envs;
@@ -1208,7 +1215,8 @@ static void k8s_facts_free(k8s_facts_t *f) {
         cbm_free(CBM_MEM_CLASS_OTHER, f->srcs[i].chart);
     }
     for (int i = 0; i < f->img_n; i++) {
-        cbm_free(CBM_MEM_CLASS_OTHER, f->imgs[i].chart);
+        cbm_free(CBM_MEM_CLASS_OTHER, f->imgs[i].image);
+        cbm_free(CBM_MEM_CLASS_OTHER, f->imgs[i].container);
     }
     for (int i = 0; i < f->env_n; i++) {
         cbm_free(CBM_MEM_CLASS_OTHER, f->envs[i].key);
@@ -1297,8 +1305,9 @@ static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64
             }
         } else if (x->fact == CBM_K8S_FACT_IMAGE) {
             if (x->name && k8s_grow((void **)&f->imgs, &f->img_cap, f->img_n, sizeof(*f->imgs))) {
-                f->imgs[f->img_n++] =
-                    (k8s_hr_t){node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name), NULL};
+                f->imgs[f->img_n++] = (k8s_img_t){
+                    node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name),
+                    x->container ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->container) : NULL};
             }
         } else if (x->fact == CBM_K8S_FACT_ENV) {
             if (x->name && k8s_grow((void **)&f->envs, &f->env_cap, f->env_n, sizeof(*f->envs))) {
@@ -3317,19 +3326,24 @@ static void k8s_link_chart_refs(k8s_dep_link_t *l, const k8s_hr_t *oci) {
     }
 }
 
-/* A container image an object runs: USAGE {ref:image} to its Image node --
- * the node a Dockerfile building or building on that image joins. */
+/* A container image an object runs: USAGE {ref:image, container} to its
+ * Image node -- the node a Dockerfile building or building on that image
+ * joins; the container names whose environment runs it. */
 static void k8s_link_images(cbm_pipeline_ctx_t *ctx, const k8s_facts_t *f) {
     for (int i = 0; i < f->img_n; i++) {
-        int64_t img = cbm_pipeline_image_node(ctx, f->imgs[i].chart);
+        const k8s_img_t *im = &f->imgs[i];
+        int64_t img = cbm_pipeline_image_node(ctx, im->image);
         if (img <= 0) {
             continue;
         }
         char esc[CBM_SZ_1K];
-        cbm_json_escape(esc, (int)sizeof(esc), f->imgs[i].chart);
+        cbm_json_escape(esc, (int)sizeof(esc), im->image);
+        char cesc[CBM_SZ_512];
+        cbm_json_escape(cesc, (int)sizeof(cesc), im->container ? im->container : "-");
         char props[CBM_SZ_2K];
-        snprintf(props, sizeof(props), "{\"ref\":\"image\",\"image\":\"%s\"}", esc);
-        cbm_gbuf_insert_edge(ctx->gbuf, f->imgs[i].node, img, "USAGE", props);
+        snprintf(props, sizeof(props), "{\"ref\":\"image\",\"image\":\"%s\",\"container\":\"%s\"}",
+                 esc, cesc);
+        cbm_gbuf_insert_edge(ctx->gbuf, im->node, img, "USAGE", props);
     }
 }
 
@@ -3548,6 +3562,8 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     cbm_pipeline_pass_shell(ctx, files, file_count);
     cbm_pipeline_pass_terraform(ctx, files, file_count);
     cbm_pipeline_pass_docker(ctx, files, file_count);
+    /* The variables a container sets, to the readers in its own image. */
+    (void)cbm_pipeline_env_join(ctx);
 
     cbm_log_info("pass.done", "pass", "k8s", "manifests", itoa_k8s(manifest_count));
     (void)helm_count;

@@ -2461,6 +2461,95 @@ TEST(probe_container_env_sets_scoped_envvars) {
     PASS();
 }
 
+/* Every env join edge (CONFIGURES {strategy:env_read}) as
+ * "<setter file> <container>/<name> -> <reader file>", then the containers
+ * the image references name: "#image_containers=...". */
+static char *gpf_env_joins(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT DISTINCT s.file_path "
+            "|| ' ' || substr(s.qualified_name, instr(s.qualified_name, '#env/') + 5) || ' -> ' "
+            "|| t.file_path AS x FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND e.type='CONFIGURES' AND "
+            "json_extract(e.properties,'$.strategy')='env_read' ORDER BY x)), '') || char(10) || "
+            "'#image_containers=' || coalesce((SELECT group_concat(c, ',') FROM (SELECT "
+            "json_extract(e.properties,'$.container') AS c FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id WHERE e.project=?1 AND e.type='USAGE' AND s.file_path='k8s/shop.yaml' "
+            "AND json_extract(e.properties,'$.ref')='image' ORDER BY c)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A variable a container sets joins the readers of its name inside the files
+ * its own image is built from: the K8s container's image (two containers,
+ * two images), built by compose from a Dockerfile; the stages the last one
+ * copies from; a JSON-form COPY opening with `/` and a COPY with a trailing
+ * blank before a comment (both lost by the grammar); a context the sources
+ * exist under (the repository root for side/, web/ for web/). Never: the same
+ * name in another container's image, a file the context's .dockerignore
+ * drops, a test file, or a reader in no image. */
+TEST(probe_container_env_joins_its_own_image_readers) {
+    static const GpfFile files[] = {
+        {"k8s/shop.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: shop\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: web\n          image: acme/web:1\n"
+         "          env:\n            - name: PORT\n              value: \"8080\"\n"
+         "            - name: MODE\n              value: prod\n"
+         "        - name: side\n          image: acme/side:2\n          env:\n"
+         "            - name: PORT\n              value: \"9090\"\n"},
+        {"compose.yaml", "services:\n  web:\n    image: acme/web:1\n    build: ./web\n"
+                         "    environment:\n      API_KEY: k\n"
+                         "  side:\n    image: acme/side:2\n    build:\n      context: .\n"
+                         "      dockerfile: side/Dockerfile\n"},
+        {"web/Dockerfile", "FROM node:20 AS build\nCOPY src ./src \n# a comment after a blank\n"
+                           "RUN npm ci\nFROM node:20-slim\nCOPY --from=build /src /app/src\n"
+                           "COPY [\"/lib/\", \"/app/lib/\"]\nCOPY gen ./gen\n"
+                           "CMD [\"node\", \"src/server.js\"]\n"},
+        {"web/.dockerignore", "gen/skip.js\n"},
+        {"web/src/server.js", "const port = process.env.PORT;\nconst mode = process.env.MODE;\n"
+                              "const key = process.env.API_KEY;\n"},
+        {"web/src/server.test.js", "const p = process.env.PORT;\n"},
+        {"web/lib/conf.js", "module.exports = process.env.MODE;\n"},
+        {"web/gen/a.js", "exports.m = process.env.MODE;\n"},
+        {"web/gen/skip.js", "exports.m = process.env.MODE;\n"},
+        {"side/Dockerfile", "FROM golang:1.22 AS build\nCOPY side/main.go shared/util.go /src/\n"
+                            "RUN go build -o /app /src\nFROM alpine:3.20\n"
+                            "COPY --from=build /app /app\nENTRYPOINT [\"/app\"]\n"},
+        {"side/main.go", "package main\n\nimport \"os\"\n\nfunc main() { _ = os.Getenv(\"PORT\") }\n"},
+        {"shared/util.go", "package shared\n\nimport \"os\"\n\n"
+                           "func Port() string { return os.Getenv(\"PORT\") }\n"},
+        {"other/main.go", "package main\n\nimport \"os\"\n\n"
+                          "func main() { _ = os.Getenv(\"PORT\"); _ = os.Getenv(\"MODE\") }\n"}};
+    char *got = gpf_env_joins(files, (int)(sizeof(files) / sizeof(files[0])));
+    static const char want[] = "compose.yaml web/API_KEY -> web/src/server.js\n"
+                               "k8s/shop.yaml side/PORT -> shared/util.go\n"
+                               "k8s/shop.yaml side/PORT -> side/main.go\n"
+                               "k8s/shop.yaml web/MODE -> web/gen/a.js\n"
+                               "k8s/shop.yaml web/MODE -> web/lib/conf.js\n"
+                               "k8s/shop.yaml web/MODE -> web/src/server.js\n"
+                               "k8s/shop.yaml web/PORT -> web/src/server.js\n"
+                               "#image_containers=side,web";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "env joins got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("env_read edge set");
+    }
+    free(got);
+    PASS();
+}
+
 #define GPF_CM(name) "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " name "\n"
 #define GPF_KUST "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
 
@@ -4733,6 +4822,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_compose_services_are_resources);
     RUN_TEST(probe_shell_docker_builds_build_images);
     RUN_TEST(probe_container_env_sets_scoped_envvars);
+    RUN_TEST(probe_container_env_joins_its_own_image_readers);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);

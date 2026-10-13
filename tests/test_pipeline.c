@@ -4779,6 +4779,84 @@ TEST(incremental_stem_mark_deletion_rebuilds) {
     PASS();
 }
 
+/* The env join on a closure repair: a reader file edited, the join edges of
+ * the files the repair leaves alone come back from the store (their setters,
+ * image references and readers are proxies there), the edited file's are
+ * recomputed -- the same set a full build gives. */
+TEST(incremental_env_join_repair_keeps_unchanged_pairs) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_envjoin_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    closure_probe_repo(tmp);
+    write_temp_file(tmp, "k8s/shop.yaml",
+                    "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: shop\nspec:\n"
+                    "  template:\n    spec:\n      containers:\n        - name: web\n"
+                    "          image: acme/web:1\n          env:\n            - name: PORT\n"
+                    "              value: \"8080\"\n            - name: MODE\n"
+                    "              value: prod\n");
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  web:\n    image: acme/web:1\n    build: ./web\n");
+    write_temp_file(tmp, "web/Dockerfile",
+                    "FROM node:20\nCOPY src ./src\nCOPY lib ./lib\nCMD [\"node\", \"src/server.js\"]\n");
+    write_temp_file(tmp, "web/src/server.js",
+                    "const port = process.env.PORT;\nconst mode = process.env.MODE;\n");
+    write_temp_file(tmp, "web/lib/conf.js", "module.exports = process.env.MODE;\n");
+    write_temp_file(tmp, "web/lib/more.js", "module.exports = process.env.PORT;\n");
+    write_temp_file(tmp, "misc/other.sh", "#!/bin/sh\nother() {\n  echo other\n}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/envjoin.db", tmp);
+    static const char joins[] = "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                "WHERE e.type='CONFIGURES' AND s.label='EnvVar'";
+#define ENVJOIN_PAIR(key, file)                                                                    \
+    "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "               \
+    "t.id=e.target_id WHERE e.type='CONFIGURES' AND s.label='EnvVar' AND s.qualified_name LIKE "   \
+    "'%#env/web/" key "' AND t.file_path='" file "'"
+    static const char mode_server[] = ENVJOIN_PAIR("MODE", "web/src/server.js");
+    static const char mode_conf[] = ENVJOIN_PAIR("MODE", "web/lib/conf.js");
+    static const char port_server[] = ENVJOIN_PAIR("PORT", "web/src/server.js");
+    static const char port_more[] = ENVJOIN_PAIR("PORT", "web/lib/more.js");
+#undef ENVJOIN_PAIR
+
+    int full_rc = stem_index(tmp, db);
+    int full_joins = k8s_inc_count(db, joins);
+    int full_mode_server = k8s_inc_count(db, mode_server);
+
+    write_temp_file(tmp, "web/src/server.js", "const port = process.env.PORT;\n");
+    int inc_rc = stem_index(tmp, db);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    int inc_joins = k8s_inc_count(db, joins);
+    int inc_mode_server = k8s_inc_count(db, mode_server);
+    int inc_mode_conf = k8s_inc_count(db, mode_conf);
+    int inc_port_server = k8s_inc_count(db, port_server);
+    int inc_port_more = k8s_inc_count(db, port_more);
+
+    /* a repair far from every image: each join edge joins two files the
+     * repair leaves alone, and is written again although both ends are
+     * pre-existing rows */
+    write_temp_file(tmp, "misc/other.sh", "#!/bin/sh\nother() {\n  echo changed\n}\n");
+    int far_rc = stem_index(tmp, db);
+    cbm_incremental_route_t far_route = cbm_pipeline_incremental_test_last_route();
+    int far_joins = k8s_inc_count(db, joins);
+    int far_mode_conf = k8s_inc_count(db, mode_conf);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full_rc, 0);
+    ASSERT_EQ(full_joins, 4);
+    ASSERT_EQ(full_mode_server, 1);
+    ASSERT_EQ(inc_rc, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(inc_joins, 3);
+    ASSERT_EQ(inc_mode_server, 0);
+    ASSERT_EQ(inc_mode_conf, 1);
+    ASSERT_EQ(inc_port_server, 1);
+    ASSERT_EQ(inc_port_more, 1);
+    ASSERT_EQ(far_rc, 0);
+    ASSERT_EQ(far_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(far_joins, 3);
+    ASSERT_EQ(far_mode_conf, 1);
+    PASS();
+}
+
 TEST(pipeline_closure_repair_budget_declines_to_full) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_budget_XXXXXX");
@@ -23339,6 +23417,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_closure_repair_added_name_declines_to_full);
     RUN_TEST(pipeline_closure_repair_new_file_declines_to_full);
     RUN_TEST(incremental_stem_mark_deletion_rebuilds);
+    RUN_TEST(incremental_env_join_repair_keeps_unchanged_pairs);
     RUN_TEST(pipeline_closure_repair_budget_declines_to_full);
     RUN_TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API

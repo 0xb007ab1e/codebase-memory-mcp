@@ -404,8 +404,15 @@ static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
     }
     bool root_control = (!rel_dir || !rel_dir[0]) && (strcmp(name, ".cbmignore") == 0 ||
                                                       strcmp(name, ".codebase-memory.json") == 0);
-    bool control =
-        strcmp(name, ".gitignore") == 0 || root_control || semantic_manifest_package_control(name);
+    /* A build context's ignore file (or BuildKit's <Dockerfile>.dockerignore)
+     * shapes which files an image holds (pass_docker.c image_ignore), and
+     * discovery indexes neither. */
+    static const char DOCKERIGNORE[] = ".dockerignore";
+    size_t nl = strlen(name);
+    bool dockerignore = nl >= sizeof(DOCKERIGNORE) - SKIP_ONE &&
+                        strcmp(name + nl - (sizeof(DOCKERIGNORE) - SKIP_ONE), DOCKERIGNORE) == 0;
+    bool control = strcmp(name, ".gitignore") == 0 || root_control ||
+                   semantic_manifest_package_control(name) || dockerignore;
     return info.is_regular && control ? semantic_manifest_add(builder, project, rel_path, abs_path)
                                       : 0;
 }
@@ -2509,6 +2516,27 @@ static const char *closure_k8s_decline(cbm_store_t *store, const char *project,
     return NULL;
 }
 
+/* The env join (pass_envjoin.c) reads each image's files from its
+ * Dockerfile's Module, stored with the ignore patterns of its context: an
+ * ignore file changing, or a deletion of a file an image copies (which
+ * context a Dockerfile's sources resolve in can follow it), declines to the
+ * full rebuild. Adding a file declines already. Returns the reason, or NULL. */
+static const char *closure_envjoin_decline(cbm_store_t *store, const char *project, char **paths,
+                                           int n_changed, int n_deleted) {
+    for (int i = 0; i < n_changed + n_deleted; i++) {
+        const char *slash = strrchr(paths[i], '/');
+        const char *base = slash ? slash + SKIP_ONE : paths[i];
+        size_t bl = strlen(base);
+        size_t sl = strlen(".dockerignore");
+        if (bl >= sl && strcmp(base + bl - sl, ".dockerignore") == 0) {
+            return "dockerignore_changed";
+        }
+    }
+    int held = cbm_delta_image_holds_any(store, project, (const char *const *)paths + n_changed,
+                                         n_deleted);
+    return held > 0 ? "image_file_deleted" : held < 0 ? "image_lookup_failed" : NULL;
+}
+
 /* rel's directory prefix of len bytes as the plain Folder QN, in the arena. */
 static char *closure_prefix_folder_qn(CBMArena *a, const char *project, const char *rel,
                                       size_t len) {
@@ -2711,6 +2739,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     decline =
         closure_stem_mark_decline(project, files, file_count, changed_paths + n_changed, n_deleted);
+    if (decline) {
+        goto done;
+    }
+    decline = closure_envjoin_decline(store, project, changed_paths, n_changed, n_deleted);
     if (decline) {
         goto done;
     }
@@ -3014,6 +3046,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
      * collisions of the whole discovered set, as in a full run. */
     cbm_stem_marks_t stem_marks;
     cbm_stem_marks_init(&stem_marks, project, files, file_count);
+    /* The env join's inputs in the files the repair leaves alone. */
+    cbm_envjoin_base_t envjoin_base = {0};
+    cbm_arena_init_lazy(&envjoin_base.arena, CBM_SZ_4K);
     cbm_doclink_scope_t *doc_base = NULL;
     int doc_base_count = 0;
     cbm_doc_link_row_t *doc_fresh = NULL;
@@ -3076,7 +3111,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         goto out;
     }
     int64_t max_db_id = cbm_delta_preseed(staging, project, gbuf);
-    if (max_db_id < 0) {
+    if (max_db_id < 0 || cbm_delta_envjoin_base(staging, project, &envjoin_base) != 0) {
         goto out;
     }
     registry = cbm_registry_new();
@@ -3231,6 +3266,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         .build_decl_files = decl_files,
         .build_decl_count = decl_count,
         .stem_marks = &stem_marks,
+        .envjoin_base = &envjoin_base,
     };
     for (int i = 0; i < ci; i++) {
         char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
@@ -3300,9 +3336,12 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     /* An Image's build edges (Image -> Dockerfile, pass_docker.c) belong to
      * the skaffold / compose file declaring them, not to either end: the K8s
      * pass just recomputed them from every build file, so they replace the
-     * staging set wholesale. */
+     * staging set wholesale. So do the env join's edges (pass_envjoin.c),
+     * recomputed from this repair's files and the stored rest. */
     if (cbm_delta_drop_edges_from_label(staging, project, CBM_BUILD_EDGE_TYPE,
-                                        CBM_BUILD_EDGE_SOURCE) < 0) {
+                                        CBM_BUILD_EDGE_SOURCE) < 0 ||
+        cbm_delta_drop_edges_from_label(staging, project, CBM_ENVJOIN_EDGE_TYPE,
+                                        CBM_ENVJOIN_EDGE_SOURCE) < 0) {
         goto out;
     }
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
@@ -3497,6 +3536,7 @@ out:
     cbm_delta_free_snapshot(snapshot, snapshot_count);
     cbm_arena_destroy(&decl_arena);
     cbm_stem_marks_free(&stem_marks);
+    cbm_envjoin_base_free(&envjoin_base);
     surface_name_set_free(stale_surface_set);
     cbm_doclinks_free_scopes(doc_base, doc_base_count);
     cbm_doclinks_free_rows(doc_fresh, doc_fresh_count);
@@ -3831,12 +3871,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* An Image's build edges (Image -> Dockerfile, pass_docker.c) belong to
      * the skaffold / compose file declaring them, not to either end: the K8s
      * pass recomputes them all from every build file, so none is kept (nor
-     * captured below). */
+     * captured below). Neither is an env join edge (pass_envjoin.c): the
+     * join recomputes them all over the whole loaded graph. */
     CBMArena decl_arena; /* the files that declared image builds before */
     cbm_arena_init_lazy(&decl_arena, CBM_SZ_4K);
     const char **decl_files = NULL;
     int decl_count = incr_build_decl_files(existing, &decl_arena, &decl_files);
     (void)cbm_gbuf_delete_edges_from_label(existing, CBM_BUILD_EDGE_TYPE, CBM_BUILD_EDGE_SOURCE);
+    (void)cbm_gbuf_delete_edges_from_label(existing, CBM_ENVJOIN_EDGE_TYPE,
+                                           CBM_ENVJOIN_EDGE_SOURCE);
 
     /* Snapshot inbound cross-file edges into changed files BEFORE purging, so
      * the cascade delete doesn't permanently drop edges whose source lives in

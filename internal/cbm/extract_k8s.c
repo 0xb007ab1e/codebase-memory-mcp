@@ -773,35 +773,13 @@ static void k8s_emit_ref(k8s_walk_t *w, const char *kind, const char *ns, const 
     cbm_k8sfact_push(&w->ctx->result->k8s_facts, a, f);
 }
 
-// A container's literal image: `path` ends in containers[].image,
-// initContainers[].image or ephemeralContainers[].image at any depth (pod
-// templates, CronJobs, the pod templates of custom resources).
-static bool k8s_image_leaf(const char *path, const char *value) {
-    static const char *const LEAVES[] = {"containers[].image", "initContainers[].image",
-                                         "ephemeralContainers[].image"};
-    if (!value[0] || strchr(value, '$') || strchr(value, ' ') || strstr(value, "{{")) {
-        return false;
-    }
-    size_t pl = strlen(path);
-    for (size_t i = 0; i < sizeof(LEAVES) / sizeof(LEAVES[0]); i++) {
-        size_t ll = strlen(LEAVES[i]);
-        if (pl >= ll && strcmp(path + pl - ll, LEAVES[i]) == 0 &&
-            (pl == ll || path[pl - ll - SKIP_ONE] == '.')) {
-            return true;
-        }
-    }
-    return false;
+// A literal image reference: no variable, no template, no blank.
+static bool k8s_image_literal(const char *value) {
+    return value && value[0] && !strchr(value, '$') && !strchr(value, ' ') && !strstr(value, "{{");
 }
 
 // A scalar at `path`: a leaf reference, or a CRD's group / kind.
 static void k8s_leaf(k8s_walk_t *w, const char *path, const char *value) {
-    if (k8s_image_leaf(path, value)) {
-        CBMK8sFact f = {.fact = CBM_K8S_FACT_IMAGE,
-                        .def_index = w->def_index,
-                        .name = cbm_arena_strdup(w->ctx->arena, value),
-                        .via = "container"};
-        cbm_k8sfact_push(&w->ctx->result->k8s_facts, w->ctx->arena, f);
-    }
     const char *pod = k8s_pod_prefix(w->kind);
     size_t pl = strlen(pod);
     if (pl && strncmp(path, pod, pl) == 0 && path[pl] == '.') {
@@ -1086,10 +1064,13 @@ static const char *k8s_env_source(k8s_walk_t *w, TSNode item) {
     return "value";
 }
 
-// The environment variables a container (`path` ends in containers[],
-// initContainers[] or ephemeralContainers[], any depth) sets: each env[]
-// name, with where its value comes from -- never the value.
-static void k8s_container_env(k8s_walk_t *w, const char *path, TSNode container) {
+// A container (`path` ends in containers[], initContainers[] or
+// ephemeralContainers[], any depth: pod templates, CronJobs, the pod
+// templates of custom resources): its literal image, and the environment
+// variables it sets -- each env[] name, with where its value comes from,
+// never the value. Both carry the container's name, so a variable joins the
+// program of its own container's image.
+static void k8s_container(k8s_walk_t *w, const char *path, TSNode container) {
     static const char *const ITEMS[] = {"containers[]", "initContainers[]",
                                         "ephemeralContainers[]"};
     size_t pl = strlen(path);
@@ -1104,6 +1085,15 @@ static void k8s_container_env(k8s_walk_t *w, const char *path, TSNode container)
     }
     const char *cname = k8s_text(w, container, "name");
     cname = cname && cname[0] && !strstr(cname, "{{") ? cname : NULL;
+    const char *image = k8s_text(w, container, "image");
+    if (k8s_image_literal(image)) {
+        CBMK8sFact f = {.fact = CBM_K8S_FACT_IMAGE,
+                        .def_index = w->def_index,
+                        .name = image,
+                        .container = cname,
+                        .via = "container"};
+        cbm_k8sfact_push(&w->ctx->result->k8s_facts, w->ctx->arena, f);
+    }
     k8s_iter_t env = k8s_iter(k8s_child(w, container, "env"));
     TSNode item;
     while (k8s_next(&env, &item)) {
@@ -1123,7 +1113,7 @@ static void k8s_container_env(k8s_walk_t *w, const char *path, TSNode container)
 
 // A mapping at `path` that holds a reference in its kind/name/namespace.
 static void k8s_mapping(k8s_walk_t *w, const char *path, TSNode mapping) {
-    k8s_container_env(w, path, mapping);
+    k8s_container(w, path, mapping);
     for (size_t i = 0; i < sizeof(k8s_mapping_refs) / sizeof(k8s_mapping_refs[0]); i++) {
         const k8s_mapping_ref_t *r = &k8s_mapping_refs[i];
         if (k8s_kind_in(r->kinds, w->kind) && strcmp(path, r->path) == 0) {
