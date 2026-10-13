@@ -2488,6 +2488,30 @@ static void process_keyword_arg(CBMExtractCtx *ctx, TSNode arg_node, CBMCallArg 
 
 static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node, bool url_context);
 
+/* Whether a call's callee is an HTTP client or a global fetch, which selects
+ * the URL projection of a folded argument (#706, #1147). The service-pattern
+ * scan is a linear strstr over every pattern, so it runs at most once per call
+ * and only when an argument reads the answer; computing it for every positional
+ * argument of every call made C# extraction 57 % slower. */
+typedef struct {
+    const char *callee_name;
+    int state; /* -1 not computed, 0 no, 1 yes */
+} url_context_t;
+
+static bool url_context_get(url_context_t *uc) {
+    if (uc->state < 0) {
+        uc->state = cbm_service_pattern_match(uc->callee_name) == CBM_SVC_HTTP ||
+                    cbm_service_pattern_is_global_fetch(uc->callee_name);
+    }
+    return uc->state == 1;
+}
+
+/* The URL context as the folding functions read it: outside the folding
+ * languages they return NULL whatever it is, so it is never computed there. */
+static bool url_context_for_fold(const CBMExtractCtx *ctx, url_context_t *uc) {
+    return cbm_url_fold_lang(ctx->language) && url_context_get(uc);
+}
+
 /* A JS/TS request-config object -- `http({url: `/users/${id}`, method: 'GET'})`,
  * `axios({url: '/orders'})`, the shape Orval and similar generators emit -- names
  * its request URL in the `url` property. Return that URL (template literals
@@ -2734,7 +2758,7 @@ static const char *extract_composite_queue_field(CBMExtractCtx *ctx, TSNode node
 }
 
 // Try to extract URL/topic from a keyword_argument or pair node.
-static const char *extract_keyword_url(CBMExtractCtx *ctx, TSNode arg, const char *callee_name) {
+static const char *extract_keyword_url(CBMExtractCtx *ctx, TSNode arg, url_context_t *uc) {
     TSNode key_node = ts_node_child_by_field_name(arg, TS_FIELD("name"));
     TSNode val_node = ts_node_child_by_field_name(arg, TS_FIELD("value"));
     if (ts_node_is_null(key_node)) {
@@ -2747,9 +2771,7 @@ static const char *extract_keyword_url(CBMExtractCtx *ctx, TSNode arg, const cha
     if (!key || !is_url_or_topic_keyword(key)) {
         return NULL;
     }
-    bool url_context =
-        !is_topic_keyword(key) && (cbm_service_pattern_match(callee_name) == CBM_SVC_HTTP ||
-                                   cbm_service_pattern_is_global_fetch(callee_name));
+    bool url_context = !is_topic_keyword(key) && url_context_for_fold(ctx, uc);
     return extract_string_value(ctx, val_node, url_context);
 }
 
@@ -2843,13 +2865,13 @@ static const char *template_path_after_base(TSNode tpl, const char *flat) {
 }
 
 static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const char *ak,
-                                          bool url_context) {
+                                          url_context_t *uc) {
     /* Python / JS / TS: fold a URL composed from module constants (#706,
      * #1147). A reference that folds to nothing usable stays unresolved; a
      * template or concatenation falls back to the #1006 / #1249 / #2291
      * handling below. */
-    const char *folded =
-        url_context ? cbm_url_fold_call_url(ctx, arg) : cbm_url_fold_call_raw(ctx, arg);
+    const char *folded = url_context_for_fold(ctx, uc) ? cbm_url_fold_call_url(ctx, arg)
+                                                       : cbm_url_fold_call_raw(ctx, arg);
     if (folded) {
         return strip_and_validate_string_arg(ctx->arena, (char *)folded);
     }
@@ -2861,7 +2883,7 @@ static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const 
     if (strcmp(ak, "template_string") == 0) {
         const char *flat = cbm_template_string_text(ctx->arena, arg, ctx->source);
         if (flat) {
-            if (url_context) {
+            if (url_context_get(uc)) {
                 flat = template_path_after_base(arg, flat);
             }
             return strip_and_validate_string_arg(ctx->arena, (char *)flat);
@@ -2892,6 +2914,7 @@ static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const 
 // Extract URL/topic from keyword or positional args.
 static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args,
                                             const char *callee_name) {
+    url_context_t uc = {callee_name, -1};
     uint32_t nc = ts_node_named_child_count(args);
     for (uint32_t ai = 0; ai < nc; ai++) {
         TSNode arg = ts_node_named_child(args, ai);
@@ -2912,7 +2935,7 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args,
         const char *ak = ts_node_type(arg);
 
         if (strcmp(ak, "keyword_argument") == 0 || strcmp(ak, "pair") == 0) {
-            const char *val = extract_keyword_url(ctx, arg, callee_name);
+            const char *val = extract_keyword_url(ctx, arg, &uc);
             if (val) {
                 return val;
             }
@@ -2921,9 +2944,8 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args,
 
         /* JS/TS request-config object: `axios({url: '/orders'})` (#2235). */
         if (strcmp(ak, "object") == 0) {
-            bool url_context = cbm_service_pattern_match(callee_name) == CBM_SVC_HTTP ||
-                               cbm_service_pattern_is_global_fetch(callee_name);
-            const char *val = js_config_object_url(ctx, arg, callee_name, url_context);
+            const char *val =
+                js_config_object_url(ctx, arg, callee_name, url_context_for_fold(ctx, &uc));
             if (val) {
                 return val;
             }
@@ -2956,9 +2978,7 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args,
         if (ai < MAX_POSITIONAL_SCAN) {
             /* Unknown/aliased callees keep raw text until service resolution.
              * Relative HTTP candidates remain available in args[].url_value. */
-            bool url_context = cbm_service_pattern_match(callee_name) == CBM_SVC_HTTP ||
-                               cbm_service_pattern_is_global_fetch(callee_name);
-            const char *val = extract_positional_url(ctx, arg, ak, url_context);
+            const char *val = extract_positional_url(ctx, arg, ak, &uc);
             if (val) {
                 return val;
             }
