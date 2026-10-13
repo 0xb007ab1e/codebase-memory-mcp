@@ -16278,21 +16278,23 @@ TEST(clsp_c_global_initializer_does_not_inherit_previous_function_caller) {
 }
 
 static int assert_cpp_family_preprocessed_collision_isolated(CBMLanguage language) {
-    /* simplecpp removes the 41-byte comment payload and normalizes tokens. As
-     * verified by the non-vacuity assertions below, raw alpha.render and the
-     * macro-hidden expanded bravo.render both land at numeric span 182:200,
-     * even though those offsets refer to different source texts. */
+    /* The preprocessed buffer drops the 21-byte comment payload and the line
+     * indentation, keeps source spacing between source tokens and one space
+     * between macro-expansion tokens. As verified by the non-vacuity assertions
+     * below, raw alpha.render and the macro-hidden expanded bravo.render both
+     * land at numeric span 162:180, even though those offsets refer to
+     * different source texts. */
     static const char source[] =
         "struct Alpha { int render(){return 1;} };\n"
         "struct Bravo { int render(){return 2;} };\n"
         "int occurrence_probe(){\n"
         " Alpha alpha; Bravo bravo;\n"
-        " /*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/ alpha . render ( );\n"
+        " /*xxxxxxxxxxxxxxxxxxxxx*/ alpha . render ( );\n"
         "#define HIDDEN_RENDER(x) x.render()\n"
         " return HIDDEN_RENDER(bravo);\n"
         "}\n";
-    const uint32_t collision_start = 182;
-    const uint32_t collision_end = 200;
+    const uint32_t collision_start = 162;
+    const uint32_t collision_end = 180;
     ASSERT_EQ((uint32_t)(strstr(source, "alpha . render ( )") - source), collision_start);
 
     CBMFileResult *result = extract_c_family(source, language);
@@ -16354,19 +16356,20 @@ TEST(clsp_cuda_preprocessed_coordinate_collision_isolated) {
 }
 
 TEST(clsp_c_preprocessed_coordinate_collision_isolated) {
-    /* The raw fp call and macro-hidden expanded fp call both occupy 206:212,
-     * but data flow resolves them to different targets. */
+    /* The raw fp call and macro-hidden expanded fp call both occupy 180:186
+     * (comment payload sized against the preprocessed buffer's spacing), but
+     * data flow resolves them to different targets. */
     static const char source[] =
         "static int alpha_target(void){return 1;}\n"
         "static int bravo_target(void){return 2;}\n"
         "int occurrence_probe(void){\n"
         " int (*fp)(void) = alpha_target;\n"
-        " /*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/ fp ( );\n"
+        " /*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/ fp ( );\n"
         "#define HIDDEN_FP_CALL() (fp = bravo_target, fp())\n"
         " return HIDDEN_FP_CALL();\n"
         "}\n";
-    const uint32_t collision_start = 206;
-    const uint32_t collision_end = 212;
+    const uint32_t collision_start = 180;
+    const uint32_t collision_end = 186;
     const char *raw_probe = strstr(source, "occurrence_probe");
     ASSERT_NOT_NULL(raw_probe);
     ASSERT_EQ((uint32_t)(strstr(raw_probe, "fp ( )") - source), collision_start);
