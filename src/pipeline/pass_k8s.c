@@ -760,6 +760,15 @@ static void k8s_kusts_free(k8s_kusts_t *ks) {
     *ks = (k8s_kusts_t){0};
 }
 
+/* qsort for this file's vectors. An empty vector's items is NULL, and glibc
+ * declares qsort's base nonnull, so sorting it is undefined even with n == 0
+ * (UBSan nonnull-attribute on Linux). Fewer than two elements need no sort. */
+static void k8s_qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *)) {
+    if (base && n > 1) {
+        qsort(base, n, size, cmp);
+    }
+}
+
 static int k8s_cmp_str(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
@@ -827,9 +836,9 @@ static void k8s_kusts_wire(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, CBMHashTabl
         }
     }
     for (int i = 0; i < ks->count; i++) {
-        qsort(ks->items[i].files, (size_t)ks->items[i].file_n, sizeof(*ks->items[i].files),
-              k8s_cmp_str);
-        qsort(ks->items[i].kids, (size_t)ks->items[i].kid_n, sizeof(int), k8s_cmp_int);
+        k8s_qsort(ks->items[i].files, (size_t)ks->items[i].file_n, sizeof(*ks->items[i].files),
+                  k8s_cmp_str);
+        k8s_qsort(ks->items[i].kids, (size_t)ks->items[i].kid_n, sizeof(int), k8s_cmp_int);
     }
 }
 
@@ -1006,7 +1015,7 @@ static void k8s_bundles_build(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bund
     if (!b->names || !b->members || !b->charts) {
         return;
     }
-    qsort(ks->items, (size_t)ks->count, sizeof(*ks->items), k8s_cmp_kust);
+    k8s_qsort(ks->items, (size_t)ks->count, sizeof(*ks->items), k8s_cmp_kust);
     CBMHashTable *by_path = cbm_ht_create(0);
     if (!by_path) {
         return;
@@ -1345,7 +1354,7 @@ static void k8s_paths_sort_unique(k8s_paths_t *v) {
     if (v->count == 0) {
         return;
     }
-    qsort((void *)v->items, (size_t)v->count, sizeof(*v->items), k8s_cmp_str);
+    k8s_qsort((void *)v->items, (size_t)v->count, sizeof(*v->items), k8s_cmp_str);
     int w = SKIP_ONE;
     for (int i = SKIP_ONE; i < v->count; i++) {
         if (strcmp(v->items[w - SKIP_ONE], v->items[i]) != 0) {
@@ -1522,7 +1531,7 @@ static void k8s_deploys_build(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bund
             k8s_dir_members(ks, by_path, &manifests, f->deploys[d].dir, seen, d + SKIP_ONE,
                             &members[d], NULL);
         }
-        qsort(keys, un, sizeof(*keys), k8s_cmp_deploy_key);
+        k8s_qsort(keys, un, sizeof(*keys), k8s_cmp_deploy_key);
         /* deploy d reaches deploy e when e sits in a manifest d applies */
         for (int d = 0; d < n; d++) {
             for (int i = 0; i < members[d].count; i++) {
@@ -1626,7 +1635,7 @@ static void k8s_ids_sort_unique(k8s_ids_t *v) {
     if (v->count < PAIR_LEN) {
         return;
     }
-    qsort(v->items, (size_t)v->count, sizeof(*v->items), k8s_cmp_id);
+    k8s_qsort(v->items, (size_t)v->count, sizeof(*v->items), k8s_cmp_id);
     int w = SKIP_ONE;
     for (int i = SKIP_ONE; i < v->count; i++) {
         if (v->items[i] != v->items[w - SKIP_ONE]) {
@@ -1974,7 +1983,7 @@ static void k8s_link_crds(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8s_f
         snprintf(order[i].key, sizeof(order[i].key), "%s/%s", f->crds[i].group, f->crds[i].kind);
         order[i].crd = i;
     }
-    qsort(order, (size_t)f->crd_n, sizeof(*order), k8s_cmp_crd_key);
+    k8s_qsort(order, (size_t)f->crd_n, sizeof(*order), k8s_cmp_crd_key);
     for (int i = f->crd_n - SKIP_ONE; i >= 0; i--) {
         cbm_ht_set(by_type, order[i].key, (void *)(intptr_t)(i + SKIP_ONE)); /* first of run */
     }
@@ -2128,7 +2137,7 @@ static int k8s_cmp_match(const void *a, const void *b) {
  * there is one, is the one it selects. */
 static int k8s_draw_matches(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t *recs,
                             const k8s_record_t *svc, k8s_match_t *m, int n) {
-    qsort(m, (size_t)n, sizeof(*m), k8s_cmp_match);
+    k8s_qsort(m, (size_t)n, sizeof(*m), k8s_cmp_match);
     int edges = 0;
     for (int g = 0; g < n;) {
         int end = g;
