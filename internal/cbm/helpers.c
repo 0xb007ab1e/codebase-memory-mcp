@@ -1065,6 +1065,42 @@ TSNode cbm_c_recovered_func_name(TSNode func_declarator) {
     return last;
 }
 
+// Macro-wrapped definition name — see the header for the full rationale (#946).
+TSNode cbm_c_macro_wrapped_name_node(TSNode decl) {
+    TSNode null_node = {0};
+    if (ts_node_is_null(decl) || strcmp(ts_node_type(decl), "function_declarator") != 0) {
+        return null_node;
+    }
+    TSNode macro = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+    if (ts_node_is_null(macro) || strcmp(ts_node_type(macro), "function_declarator") != 0) {
+        return null_node;
+    }
+    // The macro itself is a plain or class-qualified name: FNAME / Cls::__API_HOOK.
+    TSNode macro_name = ts_node_child_by_field_name(macro, TS_FIELD("declarator"));
+    const char *mk = ts_node_is_null(macro_name) ? "" : ts_node_type(macro_name);
+    if (strcmp(mk, "identifier") != 0 && strcmp(mk, "qualified_identifier") != 0) {
+        return null_node;
+    }
+    // Exactly one argument, and that argument is a bare name: the grammar reads
+    // it as a parameter whose type is the name, with no declarator or qualifier.
+    // A multi-argument wrapper does not say which argument names the function.
+    TSNode args = ts_node_child_by_field_name(macro, TS_FIELD("parameters"));
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) != SKIP_ONE) {
+        return null_node;
+    }
+    TSNode arg = ts_node_named_child(args, 0);
+    if (strcmp(ts_node_type(arg), "parameter_declaration") != 0 ||
+        ts_node_named_child_count(arg) != SKIP_ONE) {
+        return null_node;
+    }
+    TSNode name = ts_node_child_by_field_name(arg, TS_FIELD("type"));
+    const char *nk = ts_node_is_null(name) ? "" : ts_node_type(name);
+    if (strcmp(nk, "type_identifier") != 0 && strcmp(nk, "identifier") != 0) {
+        return null_node;
+    }
+    return name;
+}
+
 // Resolve function name from C/C++/CUDA/GLSL declarator chain. Shared canonical
 // implementation — see the header for the full rationale (#438).
 TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
@@ -1092,6 +1128,12 @@ TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
                 continue;
             }
             return resolve_qualified_name(decl);
+        }
+        /* #946: `FNAME(first)(void)` names the def `first`, not `FNAME` — every
+         * definition wrapped by the same macro otherwise shares one QN. */
+        TSNode wrapped = cbm_c_macro_wrapped_name_node(decl);
+        if (!ts_node_is_null(wrapped)) {
+            return wrapped;
         }
         TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
         if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
@@ -1651,7 +1693,29 @@ bool cbm_is_module_level(TSNode node, CBMLanguage lang) {
 // Mirrors Go's fqn.Compute(): project + path_parts_dotted + name
 
 // Internal helper: find extension start in basename (returns length without ext)
+/* A container build file named for its variant ("Dockerfile.debug") keeps
+ * the suffix (no language extension; dropping it gives the variant the QN of
+ * the plain Dockerfile beside it). Mirrors strip_file_extension in
+ * src/pipeline/fqn.c -- both must agree. */
+static bool build_file_variant(const char *s, size_t len) {
+    size_t b = len;
+    while (b > 0 && s[b - SKIP_ONE] != '/') {
+        b--;
+    }
+    static const char *const BASES[] = {"Dockerfile.", "Containerfile."};
+    for (size_t i = 0; i < sizeof(BASES) / sizeof(BASES[0]); i++) {
+        size_t bl = strlen(BASES[i]);
+        if (len - b > bl && strncmp(s + b, BASES[i], bl) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static size_t strip_ext_len(const char *s, size_t len) {
+    if (build_file_variant(s, len)) {
+        return len;
+    }
     for (size_t i = len; i > 0; i--) {
         if (s[i - SKIP_ONE] == '.') {
             /* A dot at the very start of a filename segment (index 0, or right
@@ -1750,6 +1814,17 @@ char *cbm_fqn_compute(CBMArena *a, const char *project, const char *rel_path, co
     }
     *out = '\0';
     return buf;
+}
+
+size_t cbm_fqn_symbol_scope_len(const char *module_qn) {
+    if (!module_qn)
+        return 0;
+    size_t len = strlen(module_qn);
+    static const char suffix[] = ".__init__";
+    size_t suffix_len = sizeof(suffix) - 1;
+    if (len > suffix_len && memcmp(module_qn + len - suffix_len, suffix, suffix_len) == 0)
+        return len - suffix_len;
+    return len;
 }
 
 char *cbm_fqn_module(CBMArena *a, const char *project, const char *rel_path) {
@@ -1871,16 +1946,16 @@ static bool func_is_static(TSNode func_node) {
     return false;
 }
 
-const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *project,
+const char *cbm_platform_neutral_qn(CBMArena *a, CBMLanguage lang, const char *project,
                                     const char *rel_path, const char *name, const char *qn,
                                     TSNode func_node) {
     if (!c_family_variant_lang(lang) || !rel_path || !name || !name[0] || !qn ||
         ts_node_is_null(func_node) || func_is_static(func_node)) {
-        return qn;
+        return NULL;
     }
     char *plain = cbm_fqn_compute(a, project, rel_path, name);
     if (!plain || strcmp(plain, qn) != 0) {
-        return qn; /* namespaced or otherwise scoped: not a file-scope function */
+        return NULL; /* namespaced or otherwise scoped: not a file-scope function */
     }
     /* Rebuild the path without platform tokens: a directory segment that is
      * one is dropped; a filename stem loses its platform suffix, and a stem
@@ -1888,7 +1963,7 @@ const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *p
     size_t len = strlen(rel_path);
     char *neutral = (char *)cbm_arena_alloc(a, len + SKIP_ONE);
     if (!neutral) {
-        return qn;
+        return NULL;
     }
     size_t out = 0;
     bool changed = false;
@@ -1935,16 +2010,15 @@ const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *p
     }
     neutral[out] = '\0';
     if (!changed) {
-        return qn;
+        return NULL;
     }
     if (dir_level) {
         /* No file stem left: the folder form keeps every directory segment
          * (cbm_fqn_compute would strip a dotted segment as an extension). */
         char *folder = cbm_fqn_folder(a, project ? project : "", neutral);
-        return folder ? cbm_arena_sprintf(a, "%s.%s", folder, name) : qn;
+        return folder ? cbm_arena_sprintf(a, "%s.%s", folder, name) : NULL;
     }
-    char *variant = cbm_fqn_compute(a, project, neutral, name);
-    return variant ? variant : qn;
+    return cbm_fqn_compute(a, project, neutral, name);
 }
 
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir) {

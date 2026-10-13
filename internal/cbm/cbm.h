@@ -304,14 +304,24 @@ typedef struct {
      * values are escaped where the properties are written. Tail field:
      * zero-init stays valid. */
     const char **extra_props;
+    /* C-family platform variants (helpers.h cbm_platform_neutral_qn): the
+     * platform-neutral QN of a non-static file-scope function whose path
+     * carries a platform token (foo_win.c, src/unix/fs.c). The definition
+     * keeps its own path QN; this becomes the node's `variant_key` property,
+     * and the nodes of a project sharing one key are the platform variants of
+     * one function (the test-impact walk treats a change in any of them as a
+     * change of all, store_impact.h follow_variant_keys). NULL on every other
+     * definition. Tail field: zero-init stays valid. */
+    const char *variant_key;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
 typedef struct {
-    const char *expr;    // raw expression text ("payload.info", "MY_URL", "'hello'")
-    const char *value;   // resolved string value or NULL (constant propagation)
-    const char *keyword; // keyword name if keyword arg ("url", "topic_id"), NULL if positional
-    int index;           // positional index (0-based)
+    const char *expr;      // raw expression text ("payload.info", "MY_URL", "'hello'")
+    const char *value;     // raw resolved string value or NULL (constant propagation)
+    const char *keyword;   // keyword name if keyword arg ("url", "topic_id"), NULL if positional
+    int index;             // positional index (0-based)
+    const char *url_value; // URL projection when different; never a topic/string identity
 } CBMCallArg;
 
 #define CBM_MAX_CALL_ARGS 8
@@ -385,9 +395,84 @@ typedef enum {
 typedef struct {
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
+    const char *member;      // ES named import: the exported name the local binds (`get` in
+                             // `import { get as navigate } from "axios"`); NULL otherwise
     bool is_default;         // ES default import (`import X from "Y"`), JS/TS only (#1916)
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
 } CBMImport;
+
+/* Content-only ordered Python namespace facts; no resolved target identities. */
+#define CBM_PY_NAMESPACE_FACTS_VERSION 1u
+
+typedef enum {
+    CBM_PY_NS_NOT_CAPTURED = 0,
+    CBM_PY_NS_NOT_APPLICABLE = 1,
+    CBM_PY_NS_COMPLETE = 2,
+    CBM_PY_NS_INCOMPLETE = 3
+} CBMPyNamespaceStatus;
+typedef enum {
+    CBM_PY_NS_FAILURE_NONE = 0,
+    CBM_PY_NS_FAILURE_INVALID_INPUT = 1,
+    CBM_PY_NS_FAILURE_ALLOCATION = 2,
+    CBM_PY_NS_FAILURE_LIMIT = 3
+} CBMPyNamespaceFailure;
+typedef enum {
+    CBM_PY_NS_OWN_DEF = 1,
+    CBM_PY_NS_IMPORT_MODULE = 2,
+    CBM_PY_NS_IMPORT_NAME = 3,
+    CBM_PY_NS_IMPORT_STAR = 4,
+    CBM_PY_NS_SHADOW = 5,
+    CBM_PY_NS_DELETE = 6,
+    CBM_PY_NS_UNKNOWN = 7,
+    CBM_PY_NS_ALL_SET = 8,
+    CBM_PY_NS_ALL_APPEND = 9,
+    CBM_PY_NS_ALL_UNKNOWN = 10,
+    CBM_PY_NS_ALL_DELETE = 11
+} CBMPyNamespaceFactKind;
+typedef enum {
+    CBM_PY_NS_DEF_NONE = 0,
+    CBM_PY_NS_DEF_FUNCTION = 1,
+    CBM_PY_NS_DEF_CLASS = 2
+} CBMPyNamespaceDefKind;
+typedef enum {
+    CBM_PY_NS_SEQUENCE_NONE = 0,
+    CBM_PY_NS_SEQUENCE_LIST = 1,
+    CBM_PY_NS_SEQUENCE_TUPLE = 2
+} CBMPyNamespaceSequenceKind;
+typedef enum {
+    CBM_PY_NS_REASON_NONE = 0,
+    CBM_PY_NS_REASON_VALUE = 1,
+    CBM_PY_NS_REASON_DECORATED = 2,
+    CBM_PY_NS_REASON_UNPROVEN_CLASS = 3,
+    CBM_PY_NS_REASON_COMPOUND = 4,
+    CBM_PY_NS_REASON_EFFECT = 5,
+    CBM_PY_NS_REASON_UNSUPPORTED = 6,
+    CBM_PY_NS_REASON_PARSE = 7
+} CBMPyNamespaceUnknownReason;
+enum { CBM_PY_NS_IMPORT_BINDS_ROOT = 1u << 0 };
+
+typedef struct {
+    CBMPyNamespaceFactKind kind;
+    CBMPyNamespaceDefKind def_kind;
+    CBMPyNamespaceSequenceKind sequence_kind;
+    CBMPyNamespaceUnknownReason reason;
+    uint32_t flags;
+    uint32_t relative_level;
+    const char *local_name;
+    const char *module_name;
+    const char *member_name;
+    const char **names;
+    int name_count;
+} CBMPyNamespaceFact;
+typedef struct {
+    uint32_t version;
+    CBMLanguage language;
+    CBMPyNamespaceStatus status;
+    CBMPyNamespaceFailure failure;
+    CBMPyNamespaceFact *items;
+    int count;
+    int cap;
+} CBMPyNamespaceFacts;
 
 typedef enum {
     CBM_USAGE_VALUE = 0,
@@ -537,6 +622,15 @@ typedef struct {
     int cap;
 } CBMResolvedCallArray;
 
+/* Refinement status: existing parser/no-op exits are separate from these
+ * explicit evaluator failures. The caller retains prior completed output. */
+typedef enum {
+    CBM_LSP_COMPLETE = 0,
+    CBM_LSP_MEMO_FAILED,
+    CBM_LSP_DEPTH_EXCEEDED,
+    CBM_LSP_SCOPE_FAILED,
+} CBMLSPStatus;
+
 // Growable arrays used during extraction.
 typedef struct {
     CBMDefinition *items;
@@ -603,6 +697,54 @@ typedef struct {
     int count;
     int cap;
 } CBMInfraBindingArray;
+
+/* A fact a Kubernetes manifest states about other objects (extract_k8s.c),
+ * resolved by the K8s pass against the objects of the source's bundle.
+ *   CBM_K8S_FACT_REF: object def_index names a kind/ns/name object at a
+ *     reference path (via), drawn as edge (USAGE, INFRA_MAPS or DEPENDS_ON);
+ *     ns NULL = the source's own namespace.
+ *   CBM_K8S_FACT_CRD: the CRD def_index declares kind `kind` in group `name`.
+ *   CBM_K8S_FACT_DEPLOY: object def_index (a Flux Kustomization, an Argo
+ *     Application) deploys the repository directory `name` into namespace
+ *     `ns` (NULL: the objects' own); via "flux" / "argo".
+ *   CBM_K8S_FACT_ROUTE: object def_index (an Ingress, an HTTPRoute) exposes
+ *     `route` ("<host or *><path>") and sends it to the kind/ns/name backend
+ *     (name NULL: none); via "ingress" / "httproute".
+ *   CBM_K8S_FACT_SOURCE: object def_index (a Flux OCIRepository) fetches
+ *     from the URL `name`; a HelmRelease whose chartRef names it deploys the
+ *     chart there.
+ *   CBM_K8S_FACT_IMAGE: object def_index runs a container of image `name`
+ *     (a literal reference); via "container".
+ *   CBM_K8S_FACT_ENV: object def_index sets environment variable `name` in
+ *     its container `container` (NULL: unnamed) at `line`; via = where the
+ *     value comes from ("value", or the valueFrom kind) -- never the value. */
+typedef enum {
+    CBM_K8S_FACT_REF = 0,
+    CBM_K8S_FACT_CRD,
+    CBM_K8S_FACT_DEPLOY,
+    CBM_K8S_FACT_ROUTE,
+    CBM_K8S_FACT_SOURCE,
+    CBM_K8S_FACT_IMAGE,
+    CBM_K8S_FACT_ENV
+} CBMK8sFactKind;
+typedef struct {
+    CBMK8sFactKind fact;
+    int def_index;
+    const char *kind;
+    const char *ns;
+    const char *name;
+    const char *via;
+    const char *edge;
+    const char *route;
+    const char *container;
+    int line;
+} CBMK8sFact;
+
+typedef struct {
+    CBMK8sFact *items;
+    int count;
+    int cap;
+} CBMK8sFactArray;
 
 typedef struct {
     CBMImplTrait *items;
@@ -671,6 +813,7 @@ typedef struct CBMFileResult {
     CBMDefArray defs;
     CBMCallArray calls;
     CBMImportArray imports;
+    CBMPyNamespaceFacts py_namespace;
     CBMUsageArray usages;
     CBMThrowArray throws;
     CBMRWArray rw;
@@ -681,6 +824,7 @@ typedef struct CBMFileResult {
     CBMResolvedCallArray resolved_calls; // LSP-resolved invocations/references (high confidence)
     CBMStringRefArray string_refs;       // URL/config string literals from AST
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
+    CBMK8sFactArray k8s_facts;           // Kubernetes references and CRD declarations
     CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
     CBMDiagramArrowArray diagram_arrows; // arrows between the file's DiagramElement defs
     CBMFieldTypeArray field_types;       // Python: annotated instance fields (#1277)
@@ -810,6 +954,7 @@ typedef struct {
 typedef struct {
     const char *names[CBM_MAX_STRING_CONSTANTS];
     const char *values[CBM_MAX_STRING_CONSTANTS];
+    const char *url_values[CBM_MAX_STRING_CONSTANTS]; // extraction-only URL projections
     bool is_url_builder[CBM_MAX_STRING_CONSTANTS];
     int count;
 } CBMStringConstantMap;
@@ -1128,6 +1273,15 @@ int cbm_macro_extraction_enabled(void);
 
 // --- Internal helpers used by extractors ---
 
+CBMPyNamespaceStatus cbm_extract_python_namespace_facts(CBMExtractCtx *ctx);
+bool cbm_py_namespace_facts_valid(const CBMPyNamespaceFacts *facts);
+bool cbm_py_namespace_facts_copy(CBMArena *arena, const CBMPyNamespaceFacts *source,
+                                 CBMPyNamespaceFacts *out);
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_py_namespace_test_capture_fail_after(int successful_allocations);
+void cbm_py_namespace_test_copy_fail_after(int successful_allocations);
+#endif
+
 // Growable array push functions (arena-allocated, no individual free needed).
 void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
 void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
@@ -1141,7 +1295,15 @@ void cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta)
 void cbm_fieldtype_push(CBMFieldTypeArray *arr, CBMArena *a, CBMFieldType ft);
 void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
 void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);
+void cbm_k8sfact_push(CBMK8sFactArray *arr, CBMArena *a, CBMK8sFact f);
 void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1527 seam: how many of result's calls get a different innermost enclosing
+ * Function/Method from the call-context sweep than from the reference
+ * per-call scan (0 = identical), or -1 when the sweep could not allocate. */
+int cbm_test_enclosing_sweep_mismatches(const CBMFileResult *result);
+#endif
 void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
 void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 void cbm_diagram_arrows_push(CBMDiagramArrowArray *arr, CBMArena *a, CBMDiagramArrow da);
@@ -1220,5 +1382,10 @@ bool cbm_label_is_relation(const char *label);
 // all seed through this predicate so their registries never diverge.
 // `label` may be NULL (returns false). Defined in helpers.c.
 bool cbm_label_is_registry_symbol(const char *label);
+
+/* Python symbol scope only: callers must establish the language explicitly.
+ * A trailing .__init__ is omitted when a nonempty prefix precedes it; raw
+ * Module/file identity is unchanged. NULL returns zero. */
+size_t cbm_fqn_symbol_scope_len(const char *module_qn);
 
 #endif // CBM_H

@@ -46,6 +46,12 @@ static const setting_t settings[] = {
     CFG("auto_watch", "Automatic watching",
         "Register a background Git watcher when an MCP session connects.", "boolean", "true", 0, 0,
         NULL, "src/mcp/mcp.c", "next-session"),
+    /* No fixed default: unset, the index mode decides (shown as automatic). */
+    CFG("doc_candidates", "Doc-code candidates",
+        "Score documentation sections against code for doc-code candidates. Automatic: on for "
+        "full indexes, off for moderate and fast; on or off applies to every mode. Costly on very "
+        "large repositories; off stores none.",
+        "boolean", NULL, 0, 0, NULL, "src/mcp/mcp.c", "next-session"),
     CFG("watcher_enabled", "Background watcher", "Enable the daemon's background watcher thread.",
         "boolean", "true", 0, 0, NULL, "src/daemon/application.c", "restart"),
     {"ui-lang", "Interface language", "Language preference used by subsequent HTTP requests.",

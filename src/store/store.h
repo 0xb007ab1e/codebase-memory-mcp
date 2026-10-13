@@ -24,7 +24,13 @@ typedef struct cbm_store_read_scope cbm_store_read_scope_t;
 #define CBM_STORE_OK 0
 #define CBM_STORE_ERR (-1)
 #define CBM_STORE_NOT_FOUND (-2)
-#define CBM_INDEX_FORMAT_VERSION 1
+/* Persisted index format. A bump routes every existing index through one full
+ * rebuild (pipeline.c, format_change_reindex) that keeps ADR/project metadata.
+ *   1  #1108: File-node QNs keep the file extension.
+ *   2  Kubernetes objects: one Resource per YAML document, QN
+ *      <file>::<group>/<Kind>/<declared namespace or ->/<name>; a
+ *      Dockerfile.<variant> keeps its suffix in its QNs. */
+#define CBM_INDEX_FORMAT_VERSION 2
 #define CBM_STORE_CANCELLED (-3)
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)
@@ -226,6 +232,8 @@ typedef struct {
     const char *sort_by; /* "relevance" / "name" / "degree", NULL = relevance */
     bool case_sensitive;
     const char **exclude_labels; /* NULL-terminated array, or NULL */
+    const char *kind;            /* a Resource's kind property ("Deployment"), NULL = any */
+    const char *namespace_name;  /* the namespace of a Resource's obj_key, NULL = any */
 } cbm_search_params_t;
 
 typedef struct {

@@ -6571,6 +6571,33 @@ static void where_add_like_hints(const char *column, const char *pattern, char *
     }
 }
 
+/* Infra filters: a Resource's kind property and the namespace of its
+ * obj_key "group/Kind/ns/name" (no part holds a '/', so `%/%/<ns>/%` pins
+ * the third; the pattern is built in SQL from the bound name, LIKE
+ * metacharacters escaped). Properties are guarded: json_extract raises on
+ * malformed JSON. */
+static void search_where_infra(const cbm_search_params_t *params, char *where, int where_sz,
+                               int *wlen, int *nparams, search_bind_t *binds, int *bind_idx) {
+    char clause[CBM_SZ_256];
+    if (params->kind && params->kind[0]) {
+        snprintf(clause, sizeof(clause),
+                 "(CASE WHEN json_valid(n.properties) THEN json_extract(n.properties,'$.kind') "
+                 "END) = ?%d",
+                 *bind_idx + SKIP_ONE);
+        *wlen = where_append(where, where_sz, *wlen, nparams, clause);
+        where_bind_text(binds, bind_idx, params->kind);
+    }
+    if (params->namespace_name && params->namespace_name[0]) {
+        snprintf(clause, sizeof(clause),
+                 "(CASE WHEN json_valid(n.properties) THEN json_extract(n.properties,'$.obj_key') "
+                 "END) LIKE ('%%/%%/' || replace(replace(replace(?%d,'\\','\\\\'),'%%','\\%%'),"
+                 "'_','\\_') || '/%%') ESCAPE '\\'",
+                 *bind_idx + SKIP_ONE);
+        *wlen = where_append(where, where_sz, *wlen, nparams, clause);
+        where_bind_text(binds, bind_idx, params->namespace_name);
+    }
+}
+
 /* Build basic WHERE clauses: project, label, name, file, qn patterns. */
 static int search_where_basic(const cbm_search_params_t *params, char *where, int where_sz,
                               int *wlen, int *nparams, search_bind_t *binds, int *bind_idx,
@@ -6630,6 +6657,7 @@ static int search_where_basic(const cbm_search_params_t *params, char *where, in
             where_bind_text(binds, bind_idx, lp);
         }
     }
+    search_where_infra(params, where, where_sz, wlen, nparams, binds, bind_idx);
     return *nparams;
 }
 

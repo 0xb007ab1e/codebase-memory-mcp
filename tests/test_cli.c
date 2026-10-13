@@ -40,6 +40,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef _WIN32
+#include <fcntl.h> // _O_BINARY
 #include <io.h>
 #endif
 #ifndef _WIN32
@@ -74,7 +75,8 @@ int cbm_cli_activation_abort_cleanup_probe_for_test(void);
 bool cbm_cli_activation_test_ops_installed(void);
 int cbm_cli_build_yaml_stdio_mcp_block_for_test(const char *binary_path, bool goose_schema,
                                                 char *block, size_t block_size);
-bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str);
+bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str,
+                                               cbm_cli_stdin_kind_t stdin_kind);
 
 /* CLI config lifecycle tests exercise the real activation guard on POSIX. Keep
  * that protocol coverage, but bind it to this suite's private endpoint so an
@@ -17338,27 +17340,71 @@ TEST(cli_zero_argument_tool_never_reads_stdin_issue1359) {
      * never read stdin (nothing it could carry; the read is pure deadlock).
      * Since #1181 no SHIPPED tool is zero-argument anymore — list_projects,
      * the original example, now declares pagination properties — so the
-     * zero-argument branch is exercised directly through the schema seam,
-     * and list_projects asserts its NEW truth. */
-    ASSERT_FALSE(
-        cbm_cli_stdin_allowed_for_schema_for_test("{\"type\":\"object\",\"properties\":{}}"));
-    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test("{\"type\":\"object\"}"));
-    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(
-        "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}}}"));
+     * zero-argument branch is exercised directly through the schema seam. */
+    const char *no_props = "{\"type\":\"object\",\"properties\":{}}";
+    const char *no_props_key = "{\"type\":\"object\"}";
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(no_props, CBM_CLI_STDIN_STREAM));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(no_props, CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(no_props_key, CBM_CLI_STDIN_STREAM));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(no_props_key, CBM_CLI_STDIN_FILE));
 
-    /* list_projects now takes piped arguments (offset/limit/include_details);
-     * the TTY guard still refuses regardless of schema. */
-    ASSERT_TRUE(cbm_cli_args_from_stdin_allowed("list_projects", false));
-    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", true));
+    /* A required argument: the bare call cannot succeed, so stdin is the
+     * documented channel from a pipe and from a file alike. */
+    const char *required =
+        "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}},\"required\":[\"p\"]}";
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(required, CBM_CLI_STDIN_STREAM));
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(required, CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(required, CBM_CLI_STDIN_TERMINAL));
+    PASS();
+}
+
+/* #1181 gave list_projects optional paging properties, which re-opened #1359:
+ * the schema gate only skipped EMPTY schemas, so `cli list_projects` parked in
+ * fread(0) again for every caller holding an inherited pipe open (an ssh
+ * session's stdin hung the Windows smoke's Phase 1b for 25 minutes). A call
+ * complete without arguments must never wait on a stream; a regular file
+ * (`< args.json`) always reaches EOF and keeps working. */
+TEST(cli_optional_argument_tool_never_reads_stream_stdin) {
+    const char *optional = "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}}}";
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(optional, CBM_CLI_STDIN_STREAM));
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(optional, CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(optional, CBM_CLI_STDIN_TERMINAL));
+    const char *empty_required =
+        "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}},\"required\":[]}";
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(empty_required, CBM_CLI_STDIN_STREAM));
+
+    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", CBM_CLI_STDIN_STREAM));
+    ASSERT_TRUE(cbm_cli_args_from_stdin_allowed("list_projects", CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", CBM_CLI_STDIN_TERMINAL));
+    PASS();
+}
+
+/* The classifier behind the gate, on real descriptors: a regular file is FILE
+ * (reads always end), a pipe is STREAM (ends only when its writer closes). */
+TEST(cli_stdin_kind_classifies_file_and_pipe) {
+    FILE *file = tmpfile();
+    ASSERT_NOT_NULL(file);
+    ASSERT_EQ(cbm_cli_stdin_kind(fileno(file)), CBM_CLI_STDIN_FILE);
+    (void)fclose(file);
+
+    int fds[2];
+#ifdef _WIN32
+    ASSERT_EQ(_pipe(fds, 4096, _O_BINARY), 0);
+#else
+    ASSERT_EQ(pipe(fds), 0);
+#endif
+    ASSERT_EQ(cbm_cli_stdin_kind(fds[0]), CBM_CLI_STDIN_STREAM);
+    (void)close(fds[0]);
+    (void)close(fds[1]);
     PASS();
 }
 
 /* The gate must track the advertised input_schema for the WHOLE tool table, not
- * carry a special case for list_projects: a future zero-argument tool would
- * otherwise reintroduce #1359 silently. Expectation is derived independently
- * from the schema the MCP tools/list publishes. */
+ * carry a special case for list_projects: a future zero-argument or
+ * optional-only tool would otherwise reintroduce #1359 silently. Expectation is
+ * derived independently from the schema the MCP tools/list publishes. */
 TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359) {
-    int zero_argument_tools = 0;
+    int optional_only_tools = 0;
     for (int i = 0; i < cbm_mcp_tool_count(); i++) {
         const char *name = cbm_mcp_tool_name(i);
         ASSERT_NOT_NULL(name);
@@ -17367,22 +17413,25 @@ TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359) {
 
         yyjson_doc *doc = yyjson_read(schema, strlen(schema), 0);
         ASSERT_NOT_NULL(doc);
-        yyjson_val *props = yyjson_obj_get(yyjson_doc_get_root(doc), "properties");
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        yyjson_val *props = yyjson_obj_get(root, "properties");
+        yyjson_val *required = yyjson_obj_get(root, "required");
         bool declares_properties = props && yyjson_is_obj(props) && yyjson_obj_size(props) > 0;
+        bool declares_required =
+            required && yyjson_is_arr(required) && yyjson_arr_size(required) > 0;
         yyjson_doc_free(doc);
 
-        if (!declares_properties) {
-            zero_argument_tools++;
+        if (declares_properties && !declares_required) {
+            optional_only_tools++;
         }
-        ASSERT_EQ(cbm_cli_args_from_stdin_allowed(name, false), declares_properties);
-        ASSERT_FALSE(cbm_cli_args_from_stdin_allowed(name, true));
+        ASSERT_EQ(cbm_cli_args_from_stdin_allowed(name, CBM_CLI_STDIN_FILE), declares_properties);
+        ASSERT_EQ(cbm_cli_args_from_stdin_allowed(name, CBM_CLI_STDIN_STREAM),
+                  declares_properties && declares_required);
+        ASSERT_FALSE(cbm_cli_args_from_stdin_allowed(name, CBM_CLI_STDIN_TERMINAL));
     }
-    /* Since #1181 every shipped tool declares properties, so the sweep's
-     * zero-argument branch can be empty here — that branch is pinned directly
-     * against the schema seam in the test above, which survives the registry
-     * having no zero-argument example. The sweep still proves schema↔gate
-     * parity for every tool that exists. */
-    (void)zero_argument_tools;
+    /* list_projects is the live optional-only example today; the sweep must
+     * actually exercise that branch, not pass vacuously. */
+    ASSERT_GT(optional_only_tools, 0);
     PASS();
 }
 
@@ -18529,6 +18578,8 @@ SUITE(cli) {
 
     /* Stdin argument gate (#1359) */
     RUN_TEST(cli_zero_argument_tool_never_reads_stdin_issue1359);
+    RUN_TEST(cli_optional_argument_tool_never_reads_stream_stdin);
+    RUN_TEST(cli_stdin_kind_classifies_file_and_pipe);
     RUN_TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359);
     cbm_cli_set_activation_runtime_parent_for_test(NULL);
     test_rmdir_r(g_cli_suite_runtime_parent);

@@ -366,6 +366,7 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_imports.c \
     $(CBM_DIR)/extract_usages.c \
     $(CBM_DIR)/extract_unified.c \
+    $(CBM_DIR)/extract_url_fold.c \
     $(CBM_DIR)/extract_semantic.c \
     $(CBM_DIR)/extract_type_refs.c \
     $(CBM_DIR)/extract_type_assigns.c \
@@ -533,10 +534,14 @@ PIPELINE_SRCS = \
     src/pipeline/doc_links_msbuild.c \
     src/pipeline/pass_route_nodes.c \
     src/pipeline/pass_enrichment.c \
-    src/pipeline/pass_envscan.c \
     src/pipeline/pass_compile_commands.c \
     src/pipeline/pass_infrascan.c \
     src/pipeline/pass_k8s.c \
+    src/pipeline/pass_operator.c \
+    src/pipeline/pass_shell.c \
+    src/pipeline/pass_terraform.c \
+    src/pipeline/pass_docker.c \
+    src/pipeline/pass_ci.c \
     src/pipeline/pass_similarity.c \
     src/pipeline/pass_semantic_edges.c \
     src/pipeline/pass_complexity.c \
@@ -1601,8 +1606,12 @@ fuzz:
 	$(MAKE) -f Makefile.cbm build/fuzz/cbm-fuzz BUILD_DIR=build/fuzz \
 		CC=$(FUZZ_CC) CXX=$(FUZZ_CXX) SANITIZE="$(FUZZ_SANITIZE)"
 
+# -fsanitize-link-c++-runtime: the link runs through the C driver, which on
+# Linux leaves out UBSan's C++ runtime, but the C++ objects (preprocessor,
+# simplecpp) carry -fsanitize=vptr checks that need it
+# (__ubsan_vptr_type_cache, __ubsan_handle_dynamic_type_cache_miss).
 $(BUILD_DIR)/cbm-fuzz: $(FUZZ_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -fsanitize=fuzzer -o $@ \
+	$(CC) $(CFLAGS_TEST) -fsanitize=fuzzer -fsanitize-link-c++-runtime -o $@ \
 		$(FUZZ_SRC) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \

@@ -548,6 +548,9 @@ static const tool_def_t TOOLS[] = {
      "\"Name override; Non-ASCII bytes are encoded; unsafe characters normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write .codebase-memory/graph.db.zst.\"},"
+     "\"doc_candidates\":{\"type\":\"boolean\",\"description\":"
+     "\"Doc-code candidates; default: the doc_candidates setting, else on for full, off for "
+     "moderate/fast.\"},"
      "\"async\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Start the index in the background and return immediately; it keeps running if this "
      "call is cancelled or times out. Not with status or cross-repo-intelligence. Refused for a "
@@ -564,6 +567,8 @@ static const tool_def_t TOOLS[] = {
      "\"query\":{\"type\":\"string\"},"
      "\"label\":{\"type\":\"string\"},\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{"
      "\"type\":\"string\"},\"file_pattern\":{\"type\":\"string\"},"
+     "\"kind\":{\"type\":\"string\",\"description\":\"Resource kind, e.g. Deployment.\"},"
+     "\"namespace\":{\"type\":\"string\",\"description\":\"Resource namespace.\"},"
      "\"relationship\":{\"type\":\"string\"},\"min_degree\":{\"type\":\"integer\"},"
      "\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{\"type\":\"boolean\"},"
      "\"include_connected\":{\"type\":\"boolean\"},\"semantic_query\":{"
@@ -621,8 +626,12 @@ static const tool_def_t TOOLS[] = {
      "\"cursor\":{\"type\":\"string\",\"description\":\"Pass next/next_cursor with traversal "
      "args unchanged; budget may increase.\"},"
      "\"mode\":{"
-     "\"type\":\"string\",\"enum\":[\"calls\",\"data_flow\",\"cross_service\"],\"default\":"
-     "\"calls\",\"description\":\"calls, argument-aware data_flow, or service edges.\"},"
+     "\"type\":\"string\",\"enum\":[\"calls\",\"data_flow\",\"cross_service\",\"topology\","
+     "\"deploy\",\"run\"],"
+     "\"default\":\"calls\",\"description\":\"calls; argument-aware data_flow; service edges; "
+     "topology: infra objects, routes, controllers (from a Resource/Route); deploy: what CI "
+     "jobs and scripts run and deploy; run: what a Service runs (image, Dockerfile, program, "
+     "env).\"},"
      "\"parameter_name\":{\"type\":\"string\",\"description\":\"data_flow parameter filter.\"},"
      "\"edge_types\":{\"type\":\"array\",\"items\":{"
      "\"type\":\"string\"}},\"risk_labels\":{\"type\":\"boolean\",\"default\":false,"
@@ -1549,6 +1558,23 @@ char *cbm_mcp_get_string_arg(const char *args_json, const char *key) {
     }
     yyjson_doc_free(doc);
     return result;
+}
+
+/* String argument `key` copied into `buf` (truncated to fit): buf, or NULL
+ * when absent or empty. Nothing to free. */
+static const char *mcp_string_arg_buf(const char *args_json, const char *key, char *buf,
+                                      size_t buf_sz) {
+    buf[0] = '\0';
+    yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_val *val = yyjson_obj_get(yyjson_doc_get_root(doc), key);
+    if (val && yyjson_is_str(val)) {
+        snprintf(buf, buf_sz, "%s", yyjson_get_str(val));
+    }
+    yyjson_doc_free(doc);
+    return buf[0] ? buf : NULL;
 }
 
 static char *canonicalize_repo_path_if_exists(char *repo_path) {
@@ -3941,6 +3967,8 @@ enum {
     BM25_BIND_FILE = 6,
     BM25_BIND_LABEL = 7,
     BM25_BIND_EXACT = 8,
+    BM25_BIND_KIND = 9,
+    BM25_BIND_NS = 10,
     BM25_SQL_AUTO_LEN = -1,
     /* Inner FTS5 candidate cap.  SQLite can early-terminate a plain FTS5 query
      * (no JOIN/WHERE on outer table) of the form:
@@ -4198,8 +4226,9 @@ static char *bm25_render(const bm25_output_row_t *rows, int returned, int total,
  * Returns NULL if FTS5 is unavailable or the query produced no usable tokens,
  * in which case the caller falls back to the regex-based search path. */
 static char *bm25_search(cbm_store_t *store, const char *project, const char *query,
-                         const char *file_pattern, const char *label, int limit, int offset,
-                         bool tree_format, size_t max_output_bytes) {
+                         const char *file_pattern, const char *label, const char *kind,
+                         const char *ns, int limit, int offset, bool tree_format,
+                         size_t max_output_bytes) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
         return NULL;
@@ -4262,6 +4291,14 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
          * in the structural mode (2026-09-16 probe: `label=Class` was ignored
          * here and five Methods came back). MIRRORED in the count query. */
         "  AND (?7 IS NULL OR n.label = ?7) "
+        /* Infra filters, guarded (json_extract raises on malformed JSON).
+         * MIRRORED in the count query. */
+        "  AND (?9 IS NULL OR (CASE WHEN json_valid(n.properties) THEN "
+        "       json_extract(n.properties,'$.kind') END) = ?9) "
+        "  AND (?10 IS NULL OR (CASE WHEN json_valid(n.properties) THEN "
+        "       json_extract(n.properties,'$.obj_key') END) LIKE ('%/%/' || "
+        "       replace(replace(replace(?10,'\\','\\\\'),'%','\\%'),'_','\\_') || '/%') "
+        "       ESCAPE '\\') "
         /* rank ties are common (boosted floats) — the id tie-break makes
          * offset pages contractually stable across calls. */
         "ORDER BY rank, n.id "
@@ -4288,25 +4325,42 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         sqlite3_bind_null(stmt, BM25_BIND_LABEL);
     }
     sqlite3_bind_text(stmt, BM25_BIND_EXACT, query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    if (kind && kind[0]) {
+        sqlite3_bind_text(stmt, BM25_BIND_KIND, kind, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, BM25_BIND_KIND);
+    }
+    if (ns && ns[0]) {
+        sqlite3_bind_text(stmt, BM25_BIND_NS, ns, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, BM25_BIND_NS);
+    }
 
     /* Count hits within the same inner-limit window — capped at BM25_INNER_LIMIT.
      * Uses the identical subquery structure so the FTS5 early-exit applies here too. */
     int total = 0;
     {
-        const char *count_sql = "SELECT COUNT(*) FROM ("
-                                "    SELECT fts.rowid FROM ("
-                                "        SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1"
-                                "        ORDER BY " BM25_WEIGHTS " LIMIT ?3"
-                                "    ) fts "
-                                "    JOIN nodes n ON n.id = fts.rowid "
-                                "    WHERE n.project = ?2 "
-                                /* MIRRORS the ranked query's filter verbatim — same weights, same
-                                 * label exclusions. Changing one alone reports a total that does
-                                 * not describe the rows returned. */
-                                "      AND n.label NOT IN ('File','Folder','Variable','Project')"
-                                "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
-                                "      AND (?7 IS NULL OR n.label = ?7)"
-                                ")";
+        const char *count_sql =
+            "SELECT COUNT(*) FROM ("
+            "    SELECT fts.rowid FROM ("
+            "        SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1"
+            "        ORDER BY " BM25_WEIGHTS " LIMIT ?3"
+            "    ) fts "
+            "    JOIN nodes n ON n.id = fts.rowid "
+            "    WHERE n.project = ?2 "
+            /* MIRRORS the ranked query's filter verbatim — same weights, same
+             * label exclusions. Changing one alone reports a total that does
+             * not describe the rows returned. */
+            "      AND n.label NOT IN ('File','Folder','Variable','Project')"
+            "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
+            "      AND (?7 IS NULL OR n.label = ?7)"
+            "      AND (?9 IS NULL OR (CASE WHEN json_valid(n.properties) "
+            "           THEN json_extract(n.properties,'$.kind') END) = ?9)"
+            "      AND (?10 IS NULL OR (CASE WHEN json_valid(n.properties) "
+            "           THEN json_extract(n.properties,'$.obj_key') END) "
+            "           LIKE ('%/%/' || replace(replace(replace(?10,'\\','\\\\'),'%','\\%'),"
+            "           '_','\\_') || '/%') ESCAPE '\\')"
+            ")";
         sqlite3_stmt *cs = NULL;
         if (sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &cs, NULL) == SQLITE_OK) {
             sqlite3_bind_text(cs, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN,
@@ -4325,6 +4379,17 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
                                   MCP_SQLITE_TRANSIENT);
             } else {
                 sqlite3_bind_null(cs, BM25_BIND_LABEL);
+            }
+            if (kind && kind[0]) {
+                sqlite3_bind_text(cs, BM25_BIND_KIND, kind, BM25_SQL_AUTO_LEN,
+                                  MCP_SQLITE_TRANSIENT);
+            } else {
+                sqlite3_bind_null(cs, BM25_BIND_KIND);
+            }
+            if (ns && ns[0]) {
+                sqlite3_bind_text(cs, BM25_BIND_NS, ns, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+            } else {
+                sqlite3_bind_null(cs, BM25_BIND_NS);
             }
             if (sqlite3_step(cs) == SQLITE_ROW) {
                 total = sqlite3_column_int(cs, 0);
@@ -5304,8 +5369,12 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     if (query && query[0]) {
         char *q_file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
         char *q_label = cbm_mcp_get_string_arg(args, "label");
-        char *bm25_json = bm25_search(store, project, query, q_file_pattern, q_label, limit, offset,
-                                      !json_format, max_output_bytes);
+        char q_kind_buf[CBM_SZ_256];
+        char q_ns_buf[CBM_SZ_256];
+        const char *q_kind = mcp_string_arg_buf(args, "kind", q_kind_buf, sizeof(q_kind_buf));
+        const char *q_ns = mcp_string_arg_buf(args, "namespace", q_ns_buf, sizeof(q_ns_buf));
+        char *bm25_json = bm25_search(store, project, query, q_file_pattern, q_label, q_kind, q_ns,
+                                      limit, offset, !json_format, max_output_bytes);
         free(q_file_pattern);
         free(q_label);
         if (bm25_json) {
@@ -5319,6 +5388,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(query);
 
     char *label = cbm_mcp_get_string_arg(args, "label");
+    char kind_buf[CBM_SZ_256];
+    char ns_buf[CBM_SZ_256];
+    const char *kind_arg = mcp_string_arg_buf(args, "kind", kind_buf, sizeof(kind_buf));
+    const char *ns_arg = mcp_string_arg_buf(args, "namespace", ns_buf, sizeof(ns_buf));
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *qn_pattern = cbm_mcp_get_string_arg(args, "qn_pattern");
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
@@ -5351,6 +5424,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         .offset = offset,
         .min_degree = min_degree,
         .max_degree = max_degree,
+        .kind = kind_arg,
+        .namespace_name = ns_arg,
     };
     const char *fields[SG_MAX_EXTRA_FIELDS];
     yyjson_doc *fields_owner = NULL;
@@ -8649,6 +8724,22 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
         "HTTP_CALLS",          "ASYNC_CALLS",       "DATA_FLOWS",    "CALLS",
         "CROSS_HTTP_CALLS",    "CROSS_ASYNC_CALLS", "CROSS_CHANNEL", "CROSS_GRPC_CALLS",
         "CROSS_GRAPHQL_CALLS", "CROSS_TRPC_CALLS"};
+    /* topology: traffic (INFRA_MAPS), object references (USAGE), ordering
+     * (DEPENDS_ON), controllers (HANDLES), what an object declares
+     * (DEFINES: an Ingress's routes) and what it deploys (DEPLOYS: a Flux
+     * Kustomization's path, a HelmRelease's chart) */
+    static const char *mode_topology[] = {"INFRA_MAPS", "USAGE",   "DEPENDS_ON",
+                                          "HANDLES",    "DEFINES", "DEPLOYS"};
+    /* deploy: what a CI job, script or Make rule starts (SPAWNS: scripts,
+     * make targets, programs), calls (CALLS: shell functions) and puts on a
+     * cluster (DEPLOYS) -- outbound from the job, inbound from a chart */
+    static const char *mode_deploy[] = {"DEPLOYS", "SPAWNS", "CALLS"};
+    /* run: what a Service or workload runs -- traffic to the workload
+     * (INFRA_MAPS), the Image its container runs (USAGE), the Dockerfile
+     * that builds it and what that builds on (DEPENDS_ON), the program the
+     * ENTRYPOINT starts (SPAWNS) and the environment each container is
+     * given (CONFIGURES) */
+    static const char *mode_run[] = {"INFRA_MAPS", "USAGE", "DEPENDS_ON", "SPAWNS", "CONFIGURES"};
 
     *out_count = 0;
 
@@ -8681,6 +8772,15 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
     } else if (mode && strcmp(mode, "cross_service") == 0) {
         defaults = mode_cross_svc;
         n_defaults = (int)(sizeof(mode_cross_svc) / sizeof(mode_cross_svc[0]));
+    } else if (mode && strcmp(mode, "topology") == 0) {
+        defaults = mode_topology;
+        n_defaults = (int)(sizeof(mode_topology) / sizeof(mode_topology[0]));
+    } else if (mode && strcmp(mode, "deploy") == 0) {
+        defaults = mode_deploy;
+        n_defaults = (int)(sizeof(mode_deploy) / sizeof(mode_deploy[0]));
+    } else if (mode && strcmp(mode, "run") == 0) {
+        defaults = mode_run;
+        n_defaults = (int)(sizeof(mode_run) / sizeof(mode_run[0]));
     }
     for (int i = 0; i < n_defaults; i++) {
         out_types[i] = defaults[i];
@@ -11358,6 +11458,13 @@ bool cbm_mcp_index_policy_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
     return valid && yyjson_mut_obj_add_val(doc, root, "_cbm_index_policy", encoded);
 }
 
+bool cbm_mcp_index_doc_candidates_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                              cbm_config_t *config) {
+    bool enabled = false;
+    return !cbm_config_get_bool_set(config, CBM_CONFIG_DOC_CANDIDATES, &enabled) ||
+           yyjson_mut_obj_add_bool(doc, root, "doc_candidates", enabled);
+}
+
 /* Run index_repository in a supervised worker subprocess with skip-and-continue
  * (Stage 3c). Returns the response string (caller frees):
  *   - the worker's own response on a clean first run (the common path);
@@ -11687,8 +11794,11 @@ static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_p
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
+    /* A doc_candidates setting the user set travels with the request (the
+     * worker reads no config); unset, the worker's index mode decides. */
     if (!yyjson_mut_obj_add_strcpy(doc, root, "repo_path", root_path) ||
-        !cbm_mcp_index_policy_add_to_args(doc, root, &policy)) {
+        !cbm_mcp_index_policy_add_to_args(doc, root, &policy) ||
+        !cbm_mcp_index_doc_candidates_add_to_args(doc, root, srv ? srv->config : NULL)) {
         yyjson_mut_doc_free(doc);
         return NULL;
     }
@@ -11738,14 +11848,52 @@ static bool resolve_session_repo_path(cbm_mcp_server_t *srv, char **repo_path) {
     return true;
 }
 
+/* doc_candidates for one index, explicit or unset: an explicit boolean
+ * argument wins, else a doc_candidates setting the user set to a boolean.
+ * Neither: unset, and the pipeline's index mode decides (on for full, off
+ * for moderate and fast). The parent resolves an explicit value once and
+ * passes it on, so a daemon job or supervised worker gets it as an argument
+ * instead of reading a config of its own; an unset one is not passed. */
+typedef enum {
+    INDEX_DOC_CANDIDATES_BY_MODE = 0,
+    INDEX_DOC_CANDIDATES_ON,
+    INDEX_DOC_CANDIDATES_OFF,
+} index_doc_candidates_t;
+
+static index_doc_candidates_t index_doc_candidates_choice(cbm_mcp_server_t *srv, const char *args) {
+    yyjson_doc *doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    yyjson_val *val = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "doc_candidates") : NULL;
+    bool explicit_value = val && yyjson_is_bool(val);
+    bool enabled = explicit_value && yyjson_get_bool(val);
+    yyjson_doc_free(doc);
+    if (!explicit_value) {
+        explicit_value =
+            cbm_config_get_bool_set(srv ? srv->config : NULL, CBM_CONFIG_DOC_CANDIDATES, &enabled);
+    }
+    if (!explicit_value) {
+        return INDEX_DOC_CANDIDATES_BY_MODE;
+    }
+    return enabled ? INDEX_DOC_CANDIDATES_ON : INDEX_DOC_CANDIDATES_OFF;
+}
+
+/* An explicit choice is set on the pipeline; unset leaves the mode default. */
+static void index_doc_candidates_apply(cbm_pipeline_t *p, index_doc_candidates_t choice) {
+    if (choice != INDEX_DOC_CANDIDATES_BY_MODE) {
+        cbm_pipeline_set_doc_candidates_enabled(p, choice == INDEX_DOC_CANDIDATES_ON);
+    }
+}
+
 /* Preserve every index option while replacing all caller-supplied repo_path
  * keys with the one canonical path that was actually authorized. A non-empty
  * project_name likewise replaces any caller "name" (#2134: the project key the
  * parent resolved for this root travels to the daemon job / worker verbatim,
- * so lease key and written index cannot diverge). */
+ * so lease key and written index cannot diverge). Every caller doc_candidates
+ * is replaced by the explicit value the parent resolved, or dropped when it
+ * is unset, so the worker's index mode decides. */
 static char *index_args_with_repo_path(const char *args, const char *canonical_repo_path,
                                        const char *project_name,
-                                       const cbm_index_resource_policy_t *policy) {
+                                       const cbm_index_resource_policy_t *policy,
+                                       index_doc_candidates_t doc_candidates) {
     if (!args || !canonical_repo_path || !policy) {
         return NULL;
     }
@@ -11783,9 +11931,15 @@ static char *index_args_with_repo_path(const char *args, const char *canonical_r
     while (has_name && yyjson_mut_obj_get(copy_root, "name")) {
         (void)yyjson_mut_obj_remove_key(copy_root, "name");
     }
+    while (yyjson_mut_obj_get(copy_root, "doc_candidates")) {
+        (void)yyjson_mut_obj_remove_key(copy_root, "doc_candidates");
+    }
     if ((has_name && !yyjson_mut_obj_add_strcpy(copy, copy_root, "name", project_name)) ||
         !yyjson_mut_obj_add_strcpy(copy, copy_root, "repo_path", canonical_repo_path) ||
-        !cbm_mcp_index_policy_add_to_args(copy, copy_root, policy)) {
+        !cbm_mcp_index_policy_add_to_args(copy, copy_root, policy) ||
+        (doc_candidates != INDEX_DOC_CANDIDATES_BY_MODE &&
+         !yyjson_mut_obj_add_bool(copy, copy_root, "doc_candidates",
+                                  doc_candidates == INDEX_DOC_CANDIDATES_ON))) {
         yyjson_mut_doc_free(copy);
         return NULL;
     }
@@ -12151,12 +12305,13 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         index_args_free(repo_path, mode_str, name_override);
         return cbm_mcp_text_result(policy_error, true);
     }
+    index_doc_candidates_t doc_candidates = index_doc_candidates_choice(srv, args);
 
     /* A daemon session delegates the one physical write to its shared job
      * registry only after path canonicalization and workspace authorization. */
     if (srv->index_executor) {
-        char *worker_args =
-            index_args_with_repo_path(args, repo_path, name_override, &resource_policy);
+        char *worker_args = index_args_with_repo_path(args, repo_path, name_override,
+                                                      &resource_policy, doc_candidates);
         char *coordinated = worker_args ? srv->index_executor(srv->index_executor_context,
                                                               repo_path, worker_args, async_mode)
                                         : NULL;
@@ -12184,8 +12339,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * installs the same guard before running the in-process pipeline. A marked
      * host fails closed if preparation or worker startup cannot complete. */
     if (cbm_index_supervisor_should_wrap()) {
-        char *worker_args =
-            index_args_with_repo_path(args, repo_path, name_override, &resource_policy);
+        char *worker_args = index_args_with_repo_path(args, repo_path, name_override,
+                                                      &resource_policy, doc_candidates);
         if (!worker_args) {
             free(mutation_project);
             index_args_free(repo_path, mode_str, name_override);
@@ -12249,6 +12404,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     free(name_override);
     cbm_pipeline_set_persistence(p, persistence);
     cbm_pipeline_set_resource_policy(p, &resource_policy);
+    index_doc_candidates_apply(p, doc_candidates);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
 
@@ -19957,6 +20113,7 @@ static void *autoindex_thread(void *arg) {
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
         return NULL;
     }
+    index_doc_candidates_apply(p, index_doc_candidates_choice(srv, NULL));
 
     /* Block until any concurrent pipeline finishes */
     cbm_pipeline_lock();

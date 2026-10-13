@@ -3029,6 +3029,12 @@ static void phase6c_doc_sections(cbm_pipeline_ctx_t *ctx, const cbm_sem_func_t *
     if (!corpus || func_count <= 0) {
         return;
     }
+    /* doc_candidates off: no scoring and no rows (the scoring grows with
+     * sections x functions; on the Linux kernel it is ~174 s of the index). */
+    if (!cbm_pipeline_doc_candidates_enabled(ctx->pipeline)) {
+        cbm_log_info("pass.semantic.doc_candidates", "skipped", "doc_candidates_off");
+        return;
+    }
     const cbm_gbuf_node_t **found = NULL;
     int nsec = 0;
     if (cbm_gbuf_find_by_label(gbuf, "Section", &found, &nsec) != 0 || nsec == 0) {
@@ -3178,8 +3184,16 @@ static void phase6c_doc_sections(cbm_pipeline_ctx_t *ctx, const cbm_sem_func_t *
 }
 
 int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
-    /* Controlled by pipeline mode (moderate/full), not env var */
-    cbm_log_info("pass.start", "pass", "semantic_edges");
+    /* Controlled by pipeline mode, not env var. Full and moderate run every
+     * phase. Fast mode has no SEMANTICALLY_RELATED edges: it runs the pass
+     * only for doc -> code candidates, doc-only -- phases 1-4 (the corpus and
+     * vectors phase 6c scores against) and 6c, never the LSH + scoring of
+     * 5-6 -- and not at all with doc candidates off. */
+    bool doc_only = ctx->mode == CBM_MODE_FAST;
+    if (doc_only && !cbm_pipeline_doc_candidates_enabled(ctx->pipeline)) {
+        return 0;
+    }
+    cbm_log_info("pass.start", "pass", "semantic_edges", "doc_only", doc_only ? "true" : "false");
 
     cbm_gbuf_t *gbuf = ctx->gbuf;
     cbm_sem_config_t cfg = cbm_sem_get_config();
@@ -3248,22 +3262,25 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
 
     cbm_log_info("pass.semantic.vectors_stored", "count", itoa_log(func_count));
 
-    /* Phase 5: LSH hyperplanes → signatures → buckets. */
-    CBM_PROF_START(t_phase5);
     uint64_t *signatures = NULL;
     sem_bucket_t **band_buckets = NULL;
-    phase5_lsh_build(funcs, func_count, worker_count, &signatures, &band_buckets);
-    CBM_PROF_END_N("semantic_edges", "5_lsh_build", t_phase5, func_count);
+    int total_edges = 0;
+    if (!doc_only) {
+        /* Phase 5: LSH hyperplanes → signatures → buckets. */
+        CBM_PROF_START(t_phase5);
+        phase5_lsh_build(funcs, func_count, worker_count, &signatures, &band_buckets);
+        CBM_PROF_END_N("semantic_edges", "5_lsh_build", t_phase5, func_count);
 
-    cbm_log_info("pass.semantic.lsh_built", "functions", itoa_log(func_count), "bands",
-                 itoa_log(SEM_LSH_BANDS));
-    sem_mem_mark("5_lsh");
+        cbm_log_info("pass.semantic.lsh_built", "functions", itoa_log(func_count), "bands",
+                     itoa_log(SEM_LSH_BANDS));
+        sem_mem_mark("5_lsh");
 
-    /* Phase 6: Parallel scoring + sequential edge merge. */
-    int total_edges =
-        run_scoring_phase(gbuf, funcs, signatures, band_buckets, cfg, func_count, worker_count);
+        /* Phase 6: Parallel scoring + sequential edge merge. */
+        total_edges =
+            run_scoring_phase(gbuf, funcs, signatures, band_buckets, cfg, func_count, worker_count);
 
-    sem_mem_mark("6_score");
+        sem_mem_mark("6_score");
+    }
 
     /* Phase 6c: doc sections -> function candidates (doc_link_candidates). */
     phase6c_doc_sections(ctx, funcs, func_count, corpus, worker_count);

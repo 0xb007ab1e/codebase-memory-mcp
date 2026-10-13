@@ -18,7 +18,9 @@
 #include "git/git_context.h"
 #include "foundation/hash_table.h"
 #include "spawn_patterns.h"
+#include "service_patterns.h" /* cbm_svc_kind_t */
 #include "cbm.h"
+#include "lsp/php_lsp.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
 #include <string.h>
@@ -246,6 +248,22 @@ bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_
                                          int left_count, const cbm_file_hash_t *right,
                                          int right_count);
 
+/* Internal explicit-language resolution; public raw/lineage APIs stay raw. */
+cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
+                                           const char *module_qn, const char **import_map_keys,
+                                           const char **import_map_vals, int import_map_count,
+                                           CBMLanguage lang);
+/* The CALLS variant: as cbm_registry_resolve_lang, except that a bare C call
+ * (no `.` / `->`) does not consider Field or Method nodes, which it can never
+ * call. */
+cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
+                                                const char *module_qn, const char **import_map_keys,
+                                                const char **import_map_vals, int import_map_count,
+                                                CBMLanguage lang);
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_pxc_test_import_probe_fail_after(int successful_allocations);
+#endif
+
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
 /* Per-file tree-sitter parse budget, in MICROSECONDS of this thread's CPU time
@@ -265,6 +283,34 @@ bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_
 #define CBM_PIPELINE_FORCE_FULL_REINDEX (-3)
 
 /* cbm_route_canon_path: cbm.h (route_path.c). */
+
+/* A file and the directory beside it share a stem (`pkg/foo.sh` beside
+ * `pkg/foo/`): the file's Module QN equals the directory's Folder QN, and the
+ * graph buffer keeps only the Folder. One side yields:
+ * - the Folder, spelled `proj.pkg.foo/` (cbm_stem_marks_folder_qn);
+ * - but a Java/Go package directory keeps its plain QN -- it IS their module,
+ *   and their imports resolve to it -- so there the file's Module yields,
+ *   spelled `proj.pkg.foo#sh` (cbm_stem_marks_module_qn).
+ * Symbol QNs never change. Built from the discovered files once per run,
+ * read-only while extraction workers consult it. */
+typedef struct {
+    CBMArena arena;               /* owns the QN keys of both tables */
+    CBMHashTable *module_qns;     /* Module QNs of files outside Java/Go */
+    CBMHashTable *dir_module_qns; /* Module QNs of Java/Go files: their package dirs */
+} cbm_stem_marks_t;
+
+void cbm_stem_marks_init(cbm_stem_marks_t *m, const char *project, const cbm_file_info_t *files,
+                         int file_count);
+void cbm_stem_marks_free(cbm_stem_marks_t *m);
+/* rel_dir's Folder QN, marked when it must yield, written into buf; NULL
+ * when it does not fit. */
+const char *cbm_stem_marks_folder_qn(const cbm_stem_marks_t *m, const char *project,
+                                     const char *rel_dir, char *buf, size_t buf_size);
+/* The QN a file's Module definition takes: `qn#ext` when it must yield,
+ * written into buf; qn itself otherwise (and when m is NULL). */
+const char *cbm_stem_marks_module_qn(const cbm_stem_marks_t *m, const char *qn,
+                                     const char *rel_path, CBMLanguage lang, char *buf,
+                                     size_t buf_size);
 
 /* True when a graph node is a structural directory container (Folder/Project)
  * rather than a code node. In a directory-based-module language (Java/Go, see
@@ -308,6 +354,11 @@ void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
 typedef struct {
     const char *project_name; /* borrowed from pipeline */
     const char *repo_path;    /* borrowed from pipeline */
+    /* An incremental run: the unchanged files whose earlier run declared
+     * image builds (docker build ...), read again by the shell pass, as
+     * those edges are recomputed whole. Borrowed; NULL in a full run. */
+    const char *const *build_decl_files;
+    int build_decl_count;
     cbm_gbuf_t *gbuf;         /* owned by pipeline */
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
@@ -342,6 +393,10 @@ typedef struct {
     /* Directory subtrees excluded during discovery. Borrowed from pipeline.c. */
     char **excluded_dirs;
     int excluded_count;
+
+    /* Stem collisions of the discovered files: which Module definitions take
+     * `qn#ext`. Borrowed for the extraction phase; NULL elsewhere. */
+    const cbm_stem_marks_t *stem_marks;
 
     /* Sequential cross-LSP registry arena. The lsp_cross pass builds its
      * shared per-language registries here; resolved_calls entries may BORROW
@@ -599,11 +654,12 @@ void cbm_pipeline_set_pkgmap(CBMHashTable *map);
  * (#1186). Only a class no prefix covers falls back to the one candidate whose
  * directories end with the class's namespace. Never by short name alone, so a
  * vendor controller that is not in the repo gets no handler. A reference
- * without "::" resolves exactly as cbm_registry_resolve does. */
+ * without "::" resolves exactly as cbm_registry_resolve_lang does for the
+ * calling file's language. */
 cbm_resolution_t cbm_registry_resolve_handler(const cbm_registry_t *r, const char *handler_ref,
                                               const char *module_qn, const char **import_map_keys,
                                               const char **import_map_vals, int import_map_count,
-                                              const cbm_gbuf_t *gbuf);
+                                              const cbm_gbuf_t *gbuf, CBMLanguage lang);
 
 /* Where composer's PSR-4 autoloader places a PHP class member. Tri-state, so
  * "no prefix covers the class" (another strategy may answer) is never
@@ -647,6 +703,48 @@ bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *proje
                                        const char **imp_vals, int imp_count, const CBMCall *call,
                                        char *out, size_t out_sz);
 
+/* Finish a call edge's props: `props` is a CBM_SZ_2K buffer holding `n` bytes
+ * of an unclosed JSON object. Appends the call's ,"args":[...] (and, when
+ * `with_line`, its ,"line":N), then the closing brace. The one formatter
+ * behind both passes' HTTP_CALLS / ASYNC_CALLS props (pass_parallel.c). */
+void cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool with_line);
+
+/* Per-file index of the names a file's imports bind onto EXTERNAL modules:
+ * local name -> the binding import. Built lazily, on the first call that
+ * asks, from the file's extraction imports and its IMPORTS edges; one hash
+ * lookup per call after that. Zero-initialize, pass to
+ * cbm_pipeline_external_import_service for every call of ONE file, then
+ * release with cbm_pipeline_external_import_index_free. */
+typedef struct {
+    CBMHashTable *by_local;
+    bool built;
+} cbm_external_import_index_t;
+
+void cbm_pipeline_external_import_index_free(cbm_external_import_index_t *index);
+
+/* A call no project symbol resolved, whose callee is bound by an import of an
+ * EXTERNAL library: `send(...)` under `from paho.mqtt import publish as send`,
+ * `navigate(...)` under `import { get as navigate } from 'axios'`. Spells the
+ * callee as its import makes it (paho.mqtt.publish, axios.get), runs the
+ * service patterns on that name, and returns CBM_SVC_HTTP or CBM_SVC_ASYNC
+ * (writing the spelled name to `spelled`) for an HTTP request -- the spelled
+ * name ends in a request verb, so urllib.parse.urljoin is none -- with a URL
+ * argument, or a messaging call with a URL or topic argument; CBM_SVC_NONE
+ * otherwise.
+ *
+ * Only adds what the resolvers had no answer for: a project import (one an
+ * IMPORTS edge materialized, or a relative path), a name bound by two
+ * different imports, a Python callee rebound as a parameter, and every call
+ * the route-suffix and global-fetch fallbacks already own are left alone.
+ * Python and JS/TS today; a language plugs in with its binding rule in
+ * pass_calls.c. Both call resolvers call this, so they cannot diverge. */
+cbm_svc_kind_t cbm_pipeline_external_import_service(cbm_external_import_index_t *index,
+                                                    const cbm_gbuf_t *gbuf, const char *project,
+                                                    const char *rel, CBMLanguage lang,
+                                                    const CBMImportArray *imports,
+                                                    const CBMCall *call, char *spelled,
+                                                    size_t spelled_sz);
+
 /* A spawn site (pass_spawns.c): the API the call names and the program it
  * starts (CBM_SPAWN_DYNAMIC when not a literal). */
 typedef struct {
@@ -689,6 +787,22 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                                                         const char *source_file_qn,
                                                         const CBMImport *imp,
                                                         CBMHashTable *namespace_map);
+
+/* PHP binding arrays borrow current result and graph strings. Free before
+ * releasing/reloading the result; never cache this state across files. */
+typedef CBMPHPImportBindings cbm_php_vendor_names_t;
+void cbm_pipeline_php_vendor_names_build(const cbm_gbuf_t *gbuf, const char *project_name,
+                                         const char *rel, const CBMFileResult *result,
+                                         cbm_php_vendor_names_t *out);
+void cbm_pipeline_php_vendor_names_free(cbm_php_vendor_names_t *value);
+bool cbm_pipeline_php_vendor_bound(const cbm_php_vendor_names_t *value, const char *name);
+bool cbm_pipeline_php_vendor_call(const cbm_php_vendor_names_t *value, const CBMFileResult *result,
+                                  const CBMCall *call);
+bool cbm_pipeline_php_vendor_usage(const cbm_php_vendor_names_t *value, const CBMFileResult *result,
+                                   const CBMUsage *usage);
+int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                         const char *rel, const char *file_qn,
+                                         const cbm_gbuf_node_t *file, CBMHashTable *namespace_map);
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by
@@ -906,11 +1020,6 @@ int cbm_parse_compile_commands(const char *json_data, const char *repo_path, cha
 /* ── Infrascan helpers (pass_infrascan.c) ─────────────────────────── */
 
 /* File identification helpers */
-bool cbm_is_dockerfile(const char *name);
-bool cbm_is_compose_file(const char *name);
-bool cbm_is_cloudbuild_file(const char *name);
-bool cbm_is_env_file(const char *name);
-bool cbm_is_shell_script(const char *name, const char *ext);
 bool cbm_is_kustomize_file(const char *name);
 bool cbm_is_k8s_manifest(const char *name, const char *content);
 
@@ -918,114 +1027,24 @@ bool cbm_is_k8s_manifest(const char *name, const char *content);
 bool cbm_is_secret_binding(const char *key, const char *value);
 bool cbm_is_secret_value(const char *value);
 
-/* Clean JSON array brackets from CMD/ENTRYPOINT values.
- * E.g. ["./app", "--flag"] → ./app --flag
- * Writes result to out (up to out_sz). */
-void cbm_clean_json_brackets(const char *s, char *out, size_t out_sz);
-
-/* Key-value pair for environment variables / config entries */
+/* Helm Chart.yaml parse result: chart name + its dependencies (#338). */
+enum { CBM_HELM_NAME_MAX = 128, CBM_HELM_REPO_MAX = 512 };
 typedef struct {
-    char key[CBM_SZ_128];
-    char value[CBM_SZ_512];
-} cbm_env_kv_t;
-
-/* Dockerfile parsing result */
-typedef struct {
-    char base_image[CBM_SZ_256];
-    char stage_images[CBM_SZ_16][CBM_SZ_256];
-    char stage_names[CBM_SZ_16][CBM_SZ_128];
-    int stage_count;
-    char exposed_ports[CBM_SZ_16][CBM_SZ_32];
-    int port_count;
-    cbm_env_kv_t env_vars[CBM_SZ_64];
-    int env_count;
-    char build_args[CBM_SZ_32][CBM_SZ_128];
-    int build_arg_count;
-    char workdir[CBM_SZ_256];
-    char cmd[CBM_SZ_512];
-    char entrypoint[CBM_SZ_512];
-    char healthcheck[CBM_SZ_512];
-    char user[CBM_SZ_64];
-} cbm_dockerfile_result_t;
-
-/* Dotenv parsing result */
-typedef struct {
-    cbm_env_kv_t env_vars[CBM_SZ_64];
-    int env_count;
-} cbm_dotenv_result_t;
-
-/* Shell script parsing result */
-typedef struct {
-    char shebang[CBM_SZ_256];
-    cbm_env_kv_t env_vars[CBM_SZ_64];
-    int env_count;
-    char sources[CBM_SZ_16][CBM_SZ_256];
-    int source_count;
-    char docker_cmds[CBM_SZ_16][CBM_SZ_256];
-    int docker_cmd_count;
-} cbm_shell_result_t;
-
-/* Terraform variable */
-typedef struct {
-    char name[CBM_SZ_128];
-    char type[CBM_SZ_64];
-    char default_val[CBM_SZ_256];
-    char description[CBM_SZ_256];
-} cbm_tf_variable_t;
-
-/* Terraform resource / data source */
-typedef struct {
-    char type[CBM_SZ_128];
-    char name[CBM_SZ_128];
-} cbm_tf_resource_t;
-
-/* Terraform module */
-typedef struct {
-    char tf_name[CBM_SZ_128];
-    char source[CBM_SZ_256];
-} cbm_tf_module_t;
-
-/* Terraform parsing result */
-typedef struct {
-    cbm_tf_resource_t resources[CBM_SZ_32];
-    int resource_count;
-    cbm_tf_variable_t variables[CBM_SZ_32];
-    int variable_count;
-    char outputs[CBM_SZ_32][CBM_SZ_128];
-    int output_count;
-    char providers[CBM_SZ_16][CBM_SZ_128];
-    int provider_count;
-    cbm_tf_module_t modules[CBM_SZ_16];
-    int module_count;
-    cbm_tf_resource_t data_sources[CBM_SZ_16];
-    int data_source_count;
-    char backend[CBM_SZ_128];
-    bool has_locals;
-} cbm_terraform_result_t;
-
-/* Parse a Dockerfile from source text. Returns 0 if parsed, -1 if empty/invalid. */
-int cbm_parse_dockerfile_source(const char *source, cbm_dockerfile_result_t *out);
-
-/* Parse a .env file from source text. Returns 0 if parsed, -1 if empty. */
-int cbm_parse_dotenv_source(const char *source, cbm_dotenv_result_t *out);
-
-/* Parse a shell script from source text. Returns 0 if parsed, -1 if empty. */
-int cbm_parse_shell_source(const char *source, cbm_shell_result_t *out);
-
-/* Parse a Terraform file from source text. Returns 0 if parsed, -1 if empty. */
-int cbm_parse_terraform_source(const char *source, cbm_terraform_result_t *out);
-
-/* Helm Chart.yaml parse result: chart name + dependency chart names (#338). */
-enum { CBM_HELM_MAX_DEPS = 128, CBM_HELM_NAME_MAX = 128 };
+    char name[CBM_HELM_NAME_MAX];
+    char repository[CBM_HELM_REPO_MAX]; /* "" when the entry names none */
+} cbm_helm_dep_t;
 typedef struct {
     char chart_name[CBM_HELM_NAME_MAX];
-    char deps[CBM_HELM_MAX_DEPS][CBM_HELM_NAME_MAX];
+    cbm_helm_dep_t *deps; /* heap-owned; release with cbm_helm_chart_free */
     int dep_count;
+    int dep_cap;
 } cbm_helm_chart_t;
 
-/* Parse a Helm Chart.yaml: top-level `name:` and `dependencies:` list names.
- * Returns 0 if parsed (name or deps found), -1 otherwise. */
+/* Parse a Helm Chart.yaml: top-level `name:` and every `dependencies:` entry's
+ * name and repository. Returns 0 if parsed (name or deps found), -1 otherwise;
+ * either way the caller releases `out` with cbm_helm_chart_free. */
 int cbm_parse_helm_chart(const char *source, cbm_helm_chart_t *out);
+void cbm_helm_chart_free(cbm_helm_chart_t *hc);
 
 /* Build an infrastructure QN. Caller must free the returned string. */
 char *cbm_infra_qn(const char *project_name, const char *rel_path, const char *infra_type,
@@ -1055,6 +1074,14 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count);
+
+/* Sync the main buffer's id counter after a parallel extract or resolve.
+ * Merged worker nodes keep their shared ids, and merged edges take fresh ids
+ * from the main counter after the highest of them, so the main counter can
+ * end above the shared one. */
+void cbm_pipeline_sync_next_id(cbm_gbuf_t *gb, _Atomic int64_t *shared_ids);
+/* Test seam: runs on the syncing thread right before each such sync. */
+void cbm_pipeline_set_id_sync_hook_for_tests(void (*hook)(cbm_gbuf_t *, void *), void *ctx);
 
 /* Phase 3B: Serial registry build from cached extraction results.
  * Creates DEFINES, DEFINES_METHOD, and IMPORTS edges in ctx->gbuf.
@@ -1152,6 +1179,116 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project);
 /* Pre-dump pass: config ↔ code linking. */
 int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
 
+/* Go Kubernetes operators (pass_operator.c): controller-runtime controllers
+ * HANDLES the kinds they reconcile, CRDs -> their Go types, //go:embed files.
+ * Runs after USAGE resolution. */
+int cbm_pipeline_pass_operator(cbm_pipeline_ctx_t *ctx);
+
+/* Shell scripts, Make recipes and the commands CI runs (pass_shell.c): a
+ * command that puts manifests, kustomizations or charts on a cluster DEPLOYS
+ * them; one that starts a program by a path, or a script of the repository,
+ * SPAWNS it. Run at the end of the K8s pass, over the same files. */
+void cbm_pipeline_pass_shell(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
+
+/* One command line a CI configuration runs (pass_ci.c). */
+typedef struct {
+    const char *ci;         /* "github-actions" | "prow" */
+    const char *job;        /* the job; NULL: none (a composite action's step) */
+    const char *text;       /* shell text; CBM_SZ_16 zero bytes past len */
+    size_t len;             /* bytes of text */
+    int row;                /* 0-based source row of the text's first line */
+    const char *wd;         /* start directory, repo-relative ("" = root); NULL: unknown */
+    const char *action_dir; /* a composite action's directory; NULL: none */
+    const char **env;       /* name, value pairs (a value NULL: unknown) */
+    int nenv;               /* pairs in env */
+    bool exec;              /* an argv exec'd without a shell, quoted into text */
+} cbm_ci_cmd_t;
+
+typedef void (*cbm_ci_cmd_fn)(const cbm_ci_cmd_t *cmd, void *ud);
+
+/* `rel` is a CI configuration by its path: a GitHub workflow
+ * (.github/workflows/<name>.yml|yaml) or a composite action (action.yml|yaml). */
+bool cbm_ci_path(const char *rel);
+
+/* Hand each command line the CI configuration `rel` (YAML text src) runs to
+ * fn: GitHub Actions run: steps for a workflow or composite action, else
+ * Prow job containers. Strings live in arena `a`. */
+void cbm_ci_commands(CBMArena *a, const char *rel, const char *src, size_t len, cbm_ci_cmd_fn fn,
+                     void *ud);
+
+/* An image a build configuration builds from a Dockerfile (pass_ci.c). */
+typedef struct {
+    const char *via;        /* "skaffold" / "compose" */
+    const char *image;      /* the reference, variables expanded */
+    const char *dockerfile; /* repository path */
+    int line;
+} cbm_build_site_t;
+typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
+
+/* A compose service (pass_ci.c): its image (a reference, variables
+ * expanded; NULL: none or unknown), the Dockerfile its build names
+ * (repository path; NULL: no build, or unknown), the service names its
+ * depends_on and links list, and the names of the environment variables its
+ * environment sets (map keys / list items' names -- never a value), with
+ * their 1-based lines. */
+typedef struct {
+    const char *name;
+    const char *image;
+    const char *dockerfile;
+    const char **deps;
+    int ndeps;
+    const char **env;
+    const int *env_lines;
+    int nenv;
+    int line;
+    int end_line;
+} cbm_compose_service_t;
+typedef void (*cbm_compose_service_fn)(const cbm_compose_service_t *svc, void *ud);
+
+/* Hand fn each service of compose file `rel` (YAML text src; `dotenv` the
+ * project's .env text or NULL). Nothing for a file that is no compose file. */
+void cbm_compose_services(CBMArena *a, const char *rel, const char *src, size_t len,
+                          const char *dotenv, cbm_compose_service_fn fn, void *ud);
+
+/* Whether `rel` names a build configuration: skaffold*.yaml|yml,
+ * [docker-]compose[.x].yaml|yml. */
+bool cbm_build_path(const char *rel);
+
+/* Hand fn each image build configuration `rel` (YAML text src) declares:
+ * skaffold build.artifacts (top level and profiles; the docker builder),
+ * compose services with build and image. `dotenv` (may be NULL): the text of
+ * the compose project's .env, whose variables compose interpolates. */
+void cbm_build_sites(CBMArena *a, const char *rel, const char *src, size_t len, const char *dotenv,
+                     cbm_build_site_fn fn, void *ud);
+
+/* Terraform / OpenTofu modules (pass_terraform.c): a helm_release DEPLOYS its
+ * chart. Run at the end of the K8s pass, over the same files. */
+void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                 int file_count);
+
+/* The Image node of image reference `ref` (its normalised repository:
+ * docker.io for no registry host, library/ for an official image; tag and
+ * digest dropped), made when new; 0 for scratch or no image. */
+int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref);
+
+/* Environment variable `key` that `owner` sets (pass_docker.c): a K8s or
+ * compose Resource for its container `container`, a Dockerfile Module for
+ * its image (container NULL). Makes the container-scoped EnvVar
+ * `<owner QN>#env/<container | ->/<key>` {env_key, scope, container,
+ * source}, owned by the owner's file at `line`, and owner -CONFIGURES
+ * {strategy:env_set, source}-> it. No edge to the global EnvVar of the key:
+ * the same name read elsewhere is another program's. `source` says where the
+ * value comes from; the value is never stored. 0 when `key` is no variable
+ * name ([A-Za-z_][A-Za-z0-9_.-]*). */
+int64_t cbm_pipeline_env_setter(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *owner,
+                                const char *container, const char *key, const char *source,
+                                int line);
+
+/* Container builds (pass_docker.c): a Dockerfile DEPENDS_ON the Images it
+ * builds on (FROM, COPY --from). Run at the end of the K8s pass. */
+void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                              int file_count);
+
 /* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
 int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
 
@@ -1228,25 +1365,13 @@ extern _Atomic uint64_t g_importance_name_visits;
  * closure-delta route actually took that path instead of passing vacuously. */
 extern _Atomic uint64_t g_importance_store_rows;
 
-/* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
-
-typedef struct {
-    char key[CBM_SZ_128];
-    char value[CBM_SZ_512];
-    char file_path[CBM_SZ_256];
-} cbm_env_binding_t;
-
-/* Scan a project directory for environment variable assignments with URL values.
- * Walks the filesystem, scans Dockerfiles, shell scripts, .env, YAML, TOML,
- * Terraform, and .properties files. Filters out secrets.
- * Returns number of bindings written to out (up to max_out).
- * NOTE: this walker currently has no production callers — it is exercised
- * only by tests. The _excluded variant honors discovery exclusions for
- * consistency with the pkgmap/path-alias walks (#792); the plain variant
- * scans unexcluded (NULL exclusion list). */
-int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int max_out);
-int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t *out, int max_out,
-                                       char **excluded_dirs, int excluded_count);
+/* Work counters of the infra resolvers, gated by the complexity suite:
+ * candidate objects the K8s pass examines for references, selectors and
+ * CRDs (pass_k8s.c), and candidate Go types / package dirs the operator pass
+ * examines (pass_operator.c). Independent copies must grow them linearly. */
+extern _Atomic uint64_t g_k8s_candidates;
+extern _Atomic uint64_t g_op_candidates;
+extern _Atomic uint64_t g_sh_candidates;
 
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
@@ -1305,8 +1430,17 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      diagrams are Diagram/DiagramElement nodes with DIAGRAM_ARROW edges;
  *      OpenAPI operations are Routes; a Markdown section's text keeps a
  *      diagram fence's labels instead of its syntax, and its candidates
- *      carry the p of its diagrams' kind family. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 7 };
+ *      carry the p of its diagrams' kind family; a non-static file-scope
+ *      C/C++/CUDA/ObjC function in a platform file or directory (foo_win.c,
+ *      src/unix/) keeps its path QN and carries a `variant_key` property
+ *      (its platform-neutral QN) that relates its platform variants.
+ *   8: a file and the directory beside it with one stem (`pkg/foo.sh`,
+ *      `pkg/foo/`) no longer share a QN (cbm_stem_marks_t): the Folder is
+ *      spelled `proj.pkg.foo/`, or, where the directory is a Java/Go package,
+ *      the file's Module is `proj.pkg.foo#sh`. The Module the Folder used to
+ *      swallow is a node again. An index built before holds neither, so it
+ *      rebuilds once on upgrade. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 8 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -1396,6 +1530,41 @@ int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const ch
 void cbm_delta_free_snapshot(cbm_delta_saved_edge_t *items, int count);
 int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *paths,
                     int path_count);
+/* Delete the project's `label` nodes no edge of `edge_types` (NULL-terminated)
+ * touches as source or target (a Process whose last spawner was purged, an
+ * Image no Dockerfile or workload names any more); returns how many, or -1
+ * on failure. */
+int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const char *label,
+                                const char *const *edge_types);
+/* An Image's build edges (Image -DEPENDS_ON {via:build}-> Dockerfile,
+ * pass_docker.c) belong to the build configuration declaring them, not to
+ * either end: every run recomputes them whole from all build files, the
+ * incremental routes drop the old set first and write the new one even
+ * between pre-existing nodes. */
+#define CBM_BUILD_EDGE_TYPE "DEPENDS_ON"
+#define CBM_BUILD_EDGE_SOURCE "Image"
+
+/* The files whose File node the shell pass marked as running a container
+ * build ({"declares_build":true}), into arena `a`; returns how many, or -1
+ * on failure. */
+int cbm_delta_build_decl_files(cbm_store_t *store, const char *project, CBMArena *a,
+                               const char ***out);
+
+/* The QNs of the component Images a split repository gave its components
+ * (pass_docker.c P4.2b: Images with a `component` property), sorted, into
+ * arena `a`; returns how many, or -1 on failure. A closure repair compares
+ * them with the run's own: references in files it does not repair point at
+ * the old ones. */
+int cbm_delta_image_components(cbm_store_t *store, const char *project, CBMArena *a,
+                               const char ***out);
+
+/* Delete the project's `type` edges whose source node has label `label`;
+ * returns how many, or -1 on failure. */
+int cbm_delta_drop_edges_from_label(cbm_store_t *store, const char *project, const char *type,
+                                    const char *label);
+/* The edges that keep a file-less shared node alive. */
+#define SH_PROCESS_EDGES ((const char *const[]){"SPAWNS", NULL})
+#define DK_IMAGE_EDGES ((const char *const[]){"DEPENDS_ON", "USAGE", NULL})
 /* Pre-seed proxy nodes with their REAL database ids and move the gbuf id
  * watermark above MAX(id); returns that max id, or -1 on failure. */
 int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf);
@@ -1440,9 +1609,20 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
  * before the cancellation check + atomic replace. Not part of the public API. */
 void cbm_pipeline_set_before_publish_hook_for_tests(
     cbm_pipeline_t *p, void (*hook)(cbm_pipeline_t *, const char *, void *), void *ctx);
+/* Test seam: invoked with the complete graph buffer just before the full
+ * route dumps it (the dump releases the buffer's indexes). */
+void cbm_pipeline_set_before_dump_hook_for_tests(cbm_pipeline_t *p,
+                                                 void (*hook)(const cbm_gbuf_t *, void *),
+                                                 void *ctx);
 void cbm_pipeline_set_rename_hook_for_tests(cbm_pipeline_t *p,
                                             int (*hook)(const char *, const char *, void *),
                                             void *ctx);
+
+/* Test seam: the sequential CALLS pass's args formatter (pass_calls.c), so a
+ * test can hand it an argument longer than its formatting buffer and read the
+ * props it leaves behind. `props` is a NUL-terminated JSON object of `cap`
+ * bytes; the formatter appends its "args" array in place. */
+void cbm_pipeline_calls_append_args_for_tests(char *props, size_t cap, const CBMCall *call);
 
 /* Synchronous thread-local seam for deterministic cross-repo cancellation
  * tests. The callback runs immediately after a CROSS_* edge is committed and

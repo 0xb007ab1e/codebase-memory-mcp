@@ -523,6 +523,51 @@ TEST(test_impact_engine_variant_tests_are_one_test) {
     PASS();
 }
 
+/* Platform variants of one function (pick_posix.c / pick_win.c) are separate
+ * graph nodes sharing a variant_key, and the test's call binds to one of
+ * them. A change confined to EITHER variant reaches the test, whichever
+ * variant the call bound to: the other platform's build runs the other. */
+static const char tie_pick_posix[] = "int pick(void) {\n"
+                                     "    return 1;\n"
+                                     "}\n";
+static const char tie_pick_win[] = "int pick(void) {\n"
+                                   "    return 2;\n"
+                                   "}\n";
+static const char tie_pick_beta[] = "int pick(void);\n"
+                                    "TEST(beta_picks) {\n"
+                                    "    return pick() > 0 ? 0 : 1;\n"
+                                    "}\n"
+                                    "SUITE(beta) {\n"
+                                    "    RUN_TEST(beta_picks);\n"
+                                    "}\n";
+
+TEST(test_impact_engine_platform_variants_reach_each_others_callers) {
+    const char *const extra[] = {"src/pick_posix.c",  tie_pick_posix, /* variant A */
+                                 "src/pick_win.c",    tie_pick_win,   /* variant B */
+                                 "tests/test_beta.c", tie_pick_beta};
+    static const char *const changes[][2] = {
+        {"src/pick_win.c", "int pick(void) {\n    return 2 + 0;\n}\n"},
+        {"src/pick_posix.c", "int pick(void) {\n    return 1 + 0;\n}\n"}};
+    const char *reset[] = {"reset", "--quiet", "--hard", "main", NULL};
+    tie_fixture_t fx;
+    ASSERT_TRUE(tie_open_files(&fx, extra, 3));
+    for (int i = 0; i < 2; i++) {
+        ASSERT_TRUE(tie_git(&fx, reset));
+        ASSERT_TRUE(tie_write(&fx, changes[i][0], changes[i][1]));
+        ASSERT_TRUE(tie_commit(&fx, "change one platform variant"));
+        char *json = tie_answer(&fx);
+        ASSERT_NOT_NULL(json);
+        if (!tie_suite_has(json, "beta", "STATIC")) {
+            printf("  %s changed: %.900s\n", changes[i][0], json);
+        }
+        ASSERT_TRUE(tie_suite_has(json, "beta", "STATIC"));
+        ASSERT_FALSE(tie_suite_has(json, "alpha", "STATIC"));
+        free(json);
+    }
+    tie_close(&fx);
+    PASS();
+}
+
 /* A test that starts a program runs code no CALLS edge leads to; the program
  * runs main, and main reaches everything. A change that reaches the product's
  * main reaches the tests that spawn; one that does not, does not. */
@@ -572,6 +617,7 @@ TEST(test_impact_engine_spawning_tests_follow_main) {
 
 SUITE(test_impact_engine) {
     RUN_TEST(test_impact_engine_variant_tests_are_one_test);
+    RUN_TEST(test_impact_engine_platform_variants_reach_each_others_callers);
     RUN_TEST(test_impact_engine_spawning_tests_follow_main);
     RUN_TEST(test_impact_engine_reached_suites_carry_static);
     RUN_TEST(test_impact_engine_macro_registered_tests_select_their_suite);
