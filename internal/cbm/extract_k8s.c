@@ -1064,6 +1064,32 @@ static const char *k8s_env_source(k8s_walk_t *w, TSNode item) {
     return "value";
 }
 
+// The Service a container's literal env value addresses (`host:port`, a URL,
+// `<svc>.<ns>.svc...`, a bare name on an address key): a CONNECTS_TO
+// reference, resolved in the bundle like every other. Only the service's
+// name and namespace are kept -- never the value.
+static void k8s_env_address(k8s_walk_t *w, TSNode item, const char *key, const char *cname) {
+    enum { K8S_DNS_LABEL = 64 };
+    const char *value = k8s_text(w, item, "value");
+    char svc[K8S_DNS_LABEL];
+    char ns[K8S_DNS_LABEL];
+    if (!value || cbm_env_address(key, value, svc, sizeof(svc), ns, sizeof(ns)) == 0) {
+        return;
+    }
+    CBMArena *a = w->ctx->arena;
+    CBMK8sFact f = {.fact = CBM_K8S_FACT_REF,
+                    .def_index = w->def_index,
+                    .kind = "Service",
+                    .ns = ns[0] ? cbm_arena_strdup(a, ns) : NULL,
+                    .name = cbm_arena_strdup(a, svc),
+                    .via = "env",
+                    .edge = "CONNECTS_TO",
+                    .container = cname,
+                    .key = key,
+                    .line = (int)ts_node_start_point(item).row + SKIP_ONE};
+    cbm_k8sfact_push(&w->ctx->result->k8s_facts, a, f);
+}
+
 // A container (`path` ends in containers[], initContainers[] or
 // ephemeralContainers[], any depth: pod templates, CronJobs, the pod
 // templates of custom resources): its literal image, and the environment
@@ -1108,6 +1134,7 @@ static void k8s_container(k8s_walk_t *w, const char *path, TSNode container) {
                         .via = k8s_env_source(w, item),
                         .line = (int)ts_node_start_point(item).row + SKIP_ONE};
         cbm_k8sfact_push(&w->ctx->result->k8s_facts, w->ctx->arena, f);
+        k8s_env_address(w, item, key, cname);
     }
 }
 

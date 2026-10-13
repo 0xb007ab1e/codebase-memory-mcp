@@ -1265,7 +1265,8 @@ typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
  * (repository path; NULL: no build, or unknown), the service names its
  * depends_on and links list, and the names of the environment variables its
  * environment sets (map keys / list items' names -- never a value), with
- * their 1-based lines. */
+ * their 1-based lines and the service name each value addresses (a bare
+ * name, `name:port`, a URL's host; NULL: none -- cbm_env_address). */
 typedef struct {
     const char *name;
     const char *image;
@@ -1274,6 +1275,7 @@ typedef struct {
     int ndeps;
     const char **env;
     const int *env_lines;
+    const char **env_hosts;
     int nenv;
     int line;
     int end_line;
@@ -1490,8 +1492,9 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      files the container's image is built from (pass_envjoin.c); a K8s
  *      image reference says its container (USAGE {ref:image, container}) and
  *      a Dockerfile's Module its image's files (image_context, image_files,
- *      image_ignore). An index built before holds none of them, so it
- *      rebuilds once on upgrade. */
+ *      image_ignore). A workload or compose service CONNECTS_TO the Service
+ *      its environment addresses (extract_k8s.c, pass_docker.c). An index
+ *      built before holds none of them, so it rebuilds once on upgrade. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
 
 typedef struct {

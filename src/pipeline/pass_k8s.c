@@ -1124,8 +1124,10 @@ typedef struct {
     char *ns;         /* explicit target namespace, NULL = the source's */
     char *name;       /* target metadata.name */
     const char *via;  /* static: the extractor's table */
-    const char *edge; /* static: "USAGE", "INFRA_MAPS" or "DEPENDS_ON" */
+    const char *edge; /* static: "USAGE", "INFRA_MAPS", "DEPENDS_ON" or "CONNECTS_TO" */
     char *route;      /* an exposed route "<host><path>" the edge leaves from, NULL = src */
+    char *key;        /* CONNECTS_TO: the environment variable addressing the target */
+    char *container;  /* CONNECTS_TO: its container, NULL = unnamed */
 } k8s_ref_t;
 
 /* A CRD and the group/kind it declares. */
@@ -1198,6 +1200,8 @@ static void k8s_facts_free(k8s_facts_t *f) {
         cbm_free(CBM_MEM_CLASS_OTHER, f->refs[i].ns);
         cbm_free(CBM_MEM_CLASS_OTHER, f->refs[i].name);
         cbm_free(CBM_MEM_CLASS_OTHER, f->refs[i].route);
+        cbm_free(CBM_MEM_CLASS_OTHER, f->refs[i].key);
+        cbm_free(CBM_MEM_CLASS_OTHER, f->refs[i].container);
     }
     for (int i = 0; i < f->crd_n; i++) {
         cbm_free(CBM_MEM_CLASS_OTHER, f->crds[i].group);
@@ -1331,7 +1335,11 @@ static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64
                             .name = x->name ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name) : NULL,
                             .via = x->via,
                             .edge = x->edge,
-                            .route = route ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->route) : NULL};
+                            .route = route ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->route) : NULL,
+                            .key = x->key ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->key) : NULL,
+                            .container = x->key && x->container
+                                             ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->container)
+                                             : NULL};
         }
     }
 }
@@ -1888,12 +1896,21 @@ static void k8s_resolve_refs(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8
             }
         }
         atomic_fetch_add_explicit(&g_k8s_candidates, (uint64_t)(n), memory_order_relaxed);
-        char props[CBM_SZ_256];
-        snprintf(props, sizeof(props), "{\"%s\":\"%s\"}",
-                 strcmp(ref->edge, "INFRA_MAPS") == 0   ? "kind"
-                 : strcmp(ref->edge, "DEPENDS_ON") == 0 ? "via"
-                                                        : "ref",
-                 ref->via);
+        char props[CBM_SZ_1K];
+        if (ref->key) { /* CONNECTS_TO: the variable and container, never the value */
+            char kesc[CBM_SZ_256];
+            char cesc[CBM_SZ_256];
+            cbm_json_escape(kesc, (int)sizeof(kesc), ref->key);
+            cbm_json_escape(cesc, (int)sizeof(cesc), ref->container ? ref->container : "-");
+            snprintf(props, sizeof(props), "{\"via\":\"%s\",\"key\":\"%s\",\"container\":\"%s\"}",
+                     ref->via, kesc, cesc);
+        } else {
+            snprintf(props, sizeof(props), "{\"%s\":\"%s\"}",
+                     strcmp(ref->edge, "INFRA_MAPS") == 0   ? "kind"
+                     : strcmp(ref->edge, "DEPENDS_ON") == 0 ? "via"
+                                                            : "ref",
+                     ref->via);
+        }
         /* A name is one object per kind and namespace, so two declarations
          * of it in one bundle are alternatives (versioned manifests side by
          * side): the declaration in the reference's own file, when there is

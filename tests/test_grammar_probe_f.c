@@ -2492,6 +2492,95 @@ static char *gpf_env_joins(const GpfFile *files, int nfiles) {
     return out;
 }
 
+/* Every CONNECTS_TO edge as "<source file> <source> -> <target> (<key>)". */
+static char *gpf_connects(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.name || ' -> ' || t.name || ' (' || json_extract(e.properties,'$.key') || ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE "
+            "e.project=?1 AND e.type='CONNECTS_TO' ORDER BY x)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A service address in a container's environment CONNECTS_TO the Service it
+ * names: `svc:port`, a URL's host, `<svc>.<ns>.svc...`, a bare name on an
+ * address key -- a K8s Service of the bundle in the named (else the
+ * object's own) namespace, a compose service of the same file, its .env
+ * interpolated (a name without a value takes the .env's, which may itself
+ * name others). Never: another domain's host, a templated value, localhost,
+ * a bare name on any other key, a namespace without that Service, a service
+ * addressing itself -- and never a value in the graph. */
+TEST(probe_env_address_connects_to_its_service) {
+    static const GpfFile files[] = {
+        {"k8s/app.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: shop\n"
+         "spec:\n  template:\n    spec:\n      containers:\n        - name: web\n"
+         "          image: acme/web\n          env:\n"
+         "            - name: CATALOG_ADDR\n              value: \"catalog:3550\"\n"
+         "            - name: AUTH_URL\n"
+         "              value: \"http://auth.auth.svc.cluster.local:8080/login\"\n"
+         "            - name: CACHE_HOST\n              value: cache\n"
+         "            - name: DB_HOST\n              value: db.example.com\n"
+         "            - name: TEMPLATED_ADDR\n              value: \"{{ .Values.addr }}\"\n"
+         "            - name: LOCAL_ADDR\n              value: \"localhost:9000\"\n"
+         "            - name: GREETING\n              value: catalog\n"
+         "            - name: PRICES_ADDR\n              value: \"catalog.other:3550\"\n"
+         "            - name: MAIL_URL\n              value: \"smtp://mail.shop.example.com:25\"\n"},
+        {"k8s/svc.yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: catalog\n"
+                         "  namespace: shop\n---\napiVersion: v1\nkind: Service\nmetadata:\n"
+                         "  name: cache\n  namespace: shop\n---\napiVersion: v1\nkind: Service\n"
+                         "metadata:\n  name: auth\n  namespace: auth\n---\napiVersion: v1\n"
+                         "kind: Service\nmetadata:\n  name: db\n  namespace: shop\n---\n"
+                         "apiVersion: v1\nkind: Service\nmetadata:\n  name: mail\n"
+                         "  namespace: shop\n"},
+        {"compose.yaml",
+         "services:\n  web:\n    image: acme/web\n    environment:\n      DB_HOST: db\n"
+         "      CACHE_URL: redis://cache:6379\n      API_KEY: s3cr3t-value\n"
+         "      WEB_ADDR: web\n  worker:\n    image: acme/worker\n    environment:\n"
+         "      - QUEUE_ADDR\n      - OTHER_URL=http://${QUEUE_HOST}:80\n"
+         "  db:\n    image: postgres\n  cache:\n    image: redis\n  queue:\n"
+         "    image: rabbitmq\n"},
+        {".env", "QUEUE_PORT=5672\nQUEUE_HOST=queue\nQUEUE_ADDR=queue:${QUEUE_PORT}\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_connects(files, n);
+    static const char want[] = "compose.yaml Service/web -> Service/cache (CACHE_URL)\n"
+                               "compose.yaml Service/web -> Service/db (DB_HOST)\n"
+                               "compose.yaml Service/worker -> Service/queue (QUEUE_ADDR)\n"
+                               "k8s/app.yaml Deployment/web -> Service/auth (AUTH_URL)\n"
+                               "k8s/app.yaml Deployment/web -> Service/cache (CACHE_HOST)\n"
+                               "k8s/app.yaml Deployment/web -> Service/catalog (CATALOG_ADDR)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "connects got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("CONNECTS_TO edge set");
+    }
+    free(got);
+    static const char *const values[] = {"catalog:3550", "s3cr3t-value", "redis://cache:6379",
+                                         "queue:5672", "/login"};
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        int hits = gpf_graph_mentions(files, n, values[i]);
+        if (hits != 0) {
+            fprintf(stderr, "value %s: %d graph mentions\n", values[i], hits);
+            FAIL("an env value reached the graph");
+        }
+    }
+    PASS();
+}
+
 /* A variable a container sets joins the readers of its name inside the files
  * its own image is built from: the K8s container's image (two containers,
  * two images), built by compose from a Dockerfile; the stages the last one
@@ -4823,6 +4912,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_shell_docker_builds_build_images);
     RUN_TEST(probe_container_env_sets_scoped_envvars);
     RUN_TEST(probe_container_env_joins_its_own_image_readers);
+    RUN_TEST(probe_env_address_connects_to_its_service);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);

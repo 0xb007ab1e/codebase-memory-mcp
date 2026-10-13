@@ -1563,9 +1563,30 @@ static void dk_compose_edge(dk_compose_t *c, int64_t src, int64_t tgt, const cha
     }
 }
 
+/* The services of the same file a service's environment addresses:
+ * CONNECTS_TO {via:env, key, container} -- the variable, never its value. */
+static void dk_compose_connects(dk_compose_t *c, const cbm_compose_service_t *s, int64_t self) {
+    for (int i = 0; s->env_hosts && i < s->nenv; i++) {
+        const char *hq = s->env_hosts[i] ? dk_compose_qn(c, s->env_hosts[i]) : NULL;
+        const cbm_gbuf_node_t *to = hq ? cbm_gbuf_find_by_qn(c->ctx->gbuf, hq) : NULL;
+        if (!to) {
+            continue;
+        }
+        char kesc[CBM_SZ_256];
+        char sesc[CBM_SZ_256];
+        cbm_json_escape(kesc, (int)sizeof(kesc), s->env[i]);
+        cbm_json_escape(sesc, (int)sizeof(sesc), s->name);
+        char props[CBM_SZ_1K];
+        snprintf(props, sizeof(props), "{\"via\":\"env\",\"key\":\"%s\",\"container\":\"%s\"}",
+                 kesc, sesc);
+        dk_compose_edge(c, self, to->id, "CONNECTS_TO", props);
+    }
+}
+
 /* A compose service: a Resource {ecosystem:compose, kind:Service} the file
  * DEFINES; it DEPENDS_ON the services it depends on / links, USAGE
- * {ref:image} its image and DEPENDS_ON {via:build} the Dockerfile it builds. */
+ * {ref:image} its image, DEPENDS_ON {via:build} the Dockerfile it builds and
+ * CONNECTS_TO the services its environment addresses. */
 static void dk_compose_service(const cbm_compose_service_t *s, void *ud) {
     dk_compose_t *c = ud;
     const char *qn = dk_compose_qn(c, s->name);
@@ -1600,6 +1621,7 @@ static void dk_compose_service(const cbm_compose_service_t *s, void *ud) {
         const cbm_gbuf_node_t *dep = dq ? cbm_gbuf_find_by_qn(c->ctx->gbuf, dq) : NULL;
         dk_compose_edge(c, self->id, dep ? dep->id : 0, "DEPENDS_ON", "{\"via\":\"depends_on\"}");
     }
+    dk_compose_connects(c, s, self->id);
     if (s->image) {
         char esc[CBM_SZ_1K];
         cbm_json_escape(esc, (int)sizeof(esc), s->image);
