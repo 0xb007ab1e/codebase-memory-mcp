@@ -1259,6 +1259,48 @@ TEST(go_bare_ref_never_binds_field) {
     PASS();
 }
 
+TEST(c_bare_call_does_not_weigh_field_namesakes) {
+    /* 2026-10-13 kernel audit: a struct member named like a header function
+     * made the bare name two candidates, the answer a suffix_match, and the
+     * #725 guard (.h is C++) refused it -- `put_page(page)` 345 -> 9 callers.
+     * A bare C call never names a member, so its Field namesakes do not
+     * compete: the function is the unique name it was in v0.11.0. */
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_lang(r, "put_page", "proj.include.linux.mm.put_page", "Function",
+                          CBM_LANG_CPP);
+    cbm_registry_add_lang(r, "put_page",
+                          "proj.arch.arm64.include.asm.kvm_pgtable.kvm_pgtable_mm_ops.put_page",
+                          "Field", CBM_LANG_CPP);
+    const char *mod = "proj.arch.arm64.kernel.elfcore";
+    cbm_resolution_t res =
+        cbm_registry_resolve_call_lang(r, "put_page", mod, NULL, NULL, 0, CBM_LANG_C);
+    ASSERT_STR_EQ(res.qualified_name, "proj.include.linux.mm.put_page");
+    ASSERT_STR_EQ(res.strategy, "unique_name");
+    /* The reference resolver and C++ (which reaches its own members bare) still
+     * weigh the member: two candidates. */
+    res = cbm_registry_resolve_lang(r, "put_page", mod, NULL, NULL, 0, CBM_LANG_C);
+    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    res = cbm_registry_resolve_call_lang(r, "put_page", mod, NULL, NULL, 0, CBM_LANG_CPP);
+    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    /* A name only members carry is no bare C call target at all -- neither a
+     * struct member nor a C++ method: redis's libc `read()` became the unique
+     * name of a Qt adapter's `read` Method once only Fields were set aside. */
+    cbm_registry_add_lang(r, "on_close", "proj.net.sock.sock_ops.on_close", "Field", CBM_LANG_C);
+    res = cbm_registry_resolve_call_lang(r, "on_close", mod, NULL, NULL, 0, CBM_LANG_C);
+    ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
+    cbm_registry_add_lang(r, "read", "proj.deps.hiredis.adapters.qt.RedisQtAdapter.read", "Method",
+                          CBM_LANG_CPP);
+    cbm_registry_add_lang(r, "read", "proj.src.connection.ConnectionType.read", "Field",
+                          CBM_LANG_C);
+    res = cbm_registry_resolve_call_lang(r, "read", mod, NULL, NULL, 0, CBM_LANG_C);
+    ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
+    /* C++ still reaches the method by name. */
+    res = cbm_registry_resolve_call_lang(r, "read", mod, NULL, NULL, 0, CBM_LANG_CPP);
+    ASSERT_TRUE(res.qualified_name && res.qualified_name[0] != '\0');
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(call_onto_field_follows_language_and_shape) {
     /* A call the registry resolved onto a Field node. */
     /* Another language: only the spelling connects them. */
@@ -2012,6 +2054,7 @@ SUITE(registry) {
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
     RUN_TEST(call_onto_field_follows_language_and_shape);
+    RUN_TEST(c_bare_call_does_not_weigh_field_namesakes);
     RUN_TEST(c_arrow_member_call_is_c_family_and_arrow_only);
     RUN_TEST(unique_field_qn_needs_exactly_one_field_of_that_name);
     RUN_TEST(c_member_access_binds_by_owner_only);

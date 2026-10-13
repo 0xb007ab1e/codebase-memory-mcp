@@ -3252,8 +3252,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                         lang, lsp->strategy, lsp->callee_qn, rc->project_name);
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
             !rust_external && !php_vendor_call) {
-            res = cbm_registry_resolve_lang(rc->registry, call->callee_name, module_qn, imp_keys,
-                                            imp_vals, imp_count, lang);
+            res = cbm_registry_resolve_call_lang(rc->registry, call->callee_name, module_qn,
+                                                 imp_keys, imp_vals, imp_count, lang);
         }
         /* `p->open(fd)`: the registry does not split a callee on the arrow.
          * The object's type decides, as for the dot call handled further
