@@ -1400,7 +1400,7 @@ enum {
      * the honest signal that a rebuild costs less than a repair. */
     CLOSURE_BUDGET_FLOOR_FILES = 8,
     /* Variant partners of partners: real chains are one step (a header and
-     * its source, a set of platform files); a longer one declines. */
+     * its source, a set of Go build-tagged files); a longer one declines. */
     CLOSURE_VARIANT_ROUNDS_MAX = 8,
 };
 
@@ -2348,16 +2348,21 @@ static bool closure_path_listed(char **paths, int count, const char *path) {
 }
 
 /* Variant partners (graph_buffer.c "Definition variants"): a definition
- * written in several files (platform files, a struct's header declaration
- * and its source definition, Go build-tagged files) is ONE node whose
- * file_path names one of them, with a DEFINES edge from every file that
- * writes a variant. Re-parsing one of those files alone rebuilds the node
- * without the others' spans and outbound edges, or leaves a changed
- * partner's stale span behind; so every file of such a node joins the
- * closure, to a fixpoint. `paths` is the delta (changed, then deleted from
- * index n_changed on); `dependents` already joined. A deleted partner is in
- * the delta already; any other partner outside the discovery declines, as a
- * dependent would. Returns the decline reason, or NULL. */
+ * written in several files (a struct's header declaration and its source
+ * definition, Go build-tagged files) is ONE node whose file_path names one of
+ * them, with a DEFINES edge from every file that writes a variant.
+ * Re-parsing one of those files alone rebuilds the node without the others'
+ * spans and outbound edges, or leaves a changed partner's stale span behind;
+ * so every file of such a node joins the closure, to a fixpoint. `paths` is
+ * the delta (changed, then deleted from index n_changed on); `dependents`
+ * already joined. A deleted partner is in the delta already; any other
+ * partner outside the discovery declines, as a dependent would. Returns the
+ * decline reason, or NULL.
+ * C-family platform files (foo_win.c / foo_posix.c) are no partners: each
+ * definition is its own node with its own path QN, and the `variant_key` that
+ * relates them is a function of the definition's own path, name and linkage,
+ * so re-parsing the changed file alone writes what a full index writes; the
+ * group is formed where it is read (store_impact.c), never stored. */
 static const char *closure_add_variant_partners(cbm_store_t *store, const char *project,
                                                 CBMHashTable *closure_set,
                                                 CBMHashTable *files_by_path, char **paths,

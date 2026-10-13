@@ -304,6 +304,15 @@ typedef struct {
      * values are escaped where the properties are written. Tail field:
      * zero-init stays valid. */
     const char **extra_props;
+    /* C-family platform variants (helpers.h cbm_platform_neutral_qn): the
+     * platform-neutral QN of a non-static file-scope function whose path
+     * carries a platform token (foo_win.c, src/unix/fs.c). The definition
+     * keeps its own path QN; this becomes the node's `variant_key` property,
+     * and the nodes of a project sharing one key are the platform variants of
+     * one function (the test-impact walk treats a change in any of them as a
+     * change of all, store_impact.h follow_variant_keys). NULL on every other
+     * definition. Tail field: zero-init stays valid. */
+    const char *variant_key;
 } CBMDefinition;
 
 /* Argument captured from a call expression */

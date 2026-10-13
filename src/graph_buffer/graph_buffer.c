@@ -889,7 +889,11 @@ int cbm_gbuf_duplicate_edge_ids(const cbm_gbuf_t *gb) {
  * sorted, unique), so a change in any variant maps to the node. Recorded only
  * between definitions of the same label with real spans: a different kind
  * sharing the QN (C: struct vs function) is no variant, a span on line 0 is
- * no location (delta-route proxies), and a full tie is the same entity. */
+ * no location (delta-route proxies), and a full tie is the same entity.
+ * C-family platform files (foo_win.c / foo_posix.c, src/unix/ vs src/win/)
+ * do not collide here: each definition keeps its path QN, and they share a
+ * `variant_key` property instead (helpers.h cbm_platform_neutral_qn), which
+ * the test-impact walk follows (store_impact.h follow_variant_keys). */
 static void *gb_yy_malloc(void *ctx, size_t size) {
     (void)ctx;
     return cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, size);

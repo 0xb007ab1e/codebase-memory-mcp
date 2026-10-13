@@ -1946,16 +1946,16 @@ static bool func_is_static(TSNode func_node) {
     return false;
 }
 
-const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *project,
+const char *cbm_platform_neutral_qn(CBMArena *a, CBMLanguage lang, const char *project,
                                     const char *rel_path, const char *name, const char *qn,
                                     TSNode func_node) {
     if (!c_family_variant_lang(lang) || !rel_path || !name || !name[0] || !qn ||
         ts_node_is_null(func_node) || func_is_static(func_node)) {
-        return qn;
+        return NULL;
     }
     char *plain = cbm_fqn_compute(a, project, rel_path, name);
     if (!plain || strcmp(plain, qn) != 0) {
-        return qn; /* namespaced or otherwise scoped: not a file-scope function */
+        return NULL; /* namespaced or otherwise scoped: not a file-scope function */
     }
     /* Rebuild the path without platform tokens: a directory segment that is
      * one is dropped; a filename stem loses its platform suffix, and a stem
@@ -1963,7 +1963,7 @@ const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *p
     size_t len = strlen(rel_path);
     char *neutral = (char *)cbm_arena_alloc(a, len + SKIP_ONE);
     if (!neutral) {
-        return qn;
+        return NULL;
     }
     size_t out = 0;
     bool changed = false;
@@ -2010,16 +2010,15 @@ const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *p
     }
     neutral[out] = '\0';
     if (!changed) {
-        return qn;
+        return NULL;
     }
     if (dir_level) {
         /* No file stem left: the folder form keeps every directory segment
          * (cbm_fqn_compute would strip a dotted segment as an extension). */
         char *folder = cbm_fqn_folder(a, project ? project : "", neutral);
-        return folder ? cbm_arena_sprintf(a, "%s.%s", folder, name) : qn;
+        return folder ? cbm_arena_sprintf(a, "%s.%s", folder, name) : NULL;
     }
-    char *variant = cbm_fqn_compute(a, project, neutral, name);
-    return variant ? variant : qn;
+    return cbm_fqn_compute(a, project, neutral, name);
 }
 
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir) {

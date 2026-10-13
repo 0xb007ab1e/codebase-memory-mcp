@@ -290,11 +290,15 @@ static bool te_collect_sinks(te_ctx_t *c, te_sinks_t *s) {
 
 static bool te_walk(te_ctx_t *c, const te_sinks_t *sinks, const int64_t *extra, int extra_count,
                     cbm_impact_walk_t **out) {
+    /* A change in one platform variant of a function (foo_win.c / foo_posix.c)
+     * reaches whoever calls any of its variants: a caller binds to one of
+     * them, and the build of another platform runs another. */
     cbm_impact_policy_t policy = {.project = "test-impact",
                                   .edge_types = te_walk_types,
                                   .edge_type_count =
                                       (int)(sizeof(te_walk_types) / sizeof(te_walk_types[0])),
-                                  .follow_routes = true};
+                                  .follow_routes = true,
+                                  .follow_variant_keys = true};
     *out = NULL;
     if (cbm_impact_walk_open_scoped(c->scope, &policy, out) != CBM_STORE_OK) {
         return te_fallback(c, CBM_TEST_RESULT_FALLBACK_ENGINE_SATURATED,
