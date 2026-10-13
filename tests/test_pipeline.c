@@ -4536,6 +4536,249 @@ TEST(pipeline_closure_repair_new_file_declines_to_full) {
     PASS();
 }
 
+static int stem_index(const char *repo, const char *db) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
+    if (!p) {
+        return -1;
+    }
+    (void)cbm_pipeline_set_project_name(p, "stem");
+    cbm_pipeline_set_persistence(p, false);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+static void stem_unlink(const char *tmp, const char *rel) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", tmp, rel);
+    (void)cbm_unlink(path);
+}
+
+/* Every collision shape of cbm_stem_marks_t, plus `fillers` plain scripts. */
+static void stem_repo(const char *tmp, int fillers) {
+    write_temp_file(tmp, "genproto.sh", "#!/bin/sh\ngen_all() {\n  echo all\n}\n");
+    write_temp_file(tmp, "genproto/one.sh", "#!/bin/sh\ngen_one() {\n  echo one\n}\n");
+    write_temp_file(tmp, "rs/foo.rs", "pub mod bar;\npub fn top() {}\n");
+    write_temp_file(tmp, "rs/foo/bar.rs", "pub fn inner() {}\n");
+    write_temp_file(tmp, "c/foo.h", "int foo_add(int a, int b);\n");
+    write_temp_file(tmp, "c/foo.c", "#include \"foo.h\"\nint foo_add(int a, int b) { return a + b; }\n");
+    write_temp_file(tmp, "c/foo/x.c", "int foo_x(void) { return 1; }\n");
+    write_temp_file(tmp, "ts/foo.test.ts", "export function stemProbeA(): number { return 1; }\n");
+    write_temp_file(tmp, "ts/foo/test/a.ts", "export function stemProbeB(): number { return 2; }\n");
+    write_temp_file(tmp, "go.mod", "module example.com/stem\n\ngo 1.21\n");
+    write_temp_file(tmp, "goapi/api.sh", "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
+    write_temp_file(tmp, "goapi/api/server.go", "package api\n\nfunc Serve() {}\n");
+    write_temp_file(tmp, "goapi/main/main.go",
+                    "package main\n\nimport \"example.com/stem/goapi/api\"\n\n"
+                    "func main() { api.Serve() }\n");
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "fill/f%02d.sh", i);
+        snprintf(body, sizeof(body), "#!/bin/sh\nfill_%02d() {\n  echo %d\n}\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+/* A file and the directory beside it with one stem (genproto.sh, genproto/)
+ * shared a QN, and the graph buffer kept only the Folder: the file's Module
+ * was lost. Now one side yields (cbm_stem_marks_t). The Folder is spelled
+ * `stem.genproto/` -- unless the directory is a Go package: it IS that
+ * package's module and Go imports land on it, so the file's Module yields as
+ * `stem.goapi.api#sh`. Rust's foo.rs beside foo/ and C's foo.h/foo.c stem pair
+ * keep their Module QNs; a dotted stem (foo.test.ts, foo/test/) collides by QN
+ * too. Run small (sequential extraction) and past MIN_FILES_FOR_PARALLEL
+ * (parallel workers), which insert Modules on separate paths. */
+TEST(pipeline_stem_folder_collision_keeps_both_nodes) {
+    static const char *const checks[][2] = {
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.genproto' AND "
+         "file_path='genproto.sh'",
+         "genproto.sh Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.genproto/' AND "
+         "file_path='genproto'",
+         "genproto/ Folder marked"},
+        {"SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+         "t.id=e.target_id WHERE e.type='CONTAINS_FILE' AND s.qualified_name='stem.genproto/' AND "
+         "t.file_path='genproto/one.sh'",
+         "marked Folder contains its file"},
+        {"SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+         "t.id=e.target_id WHERE e.type='DEFINES' AND s.label='File' AND "
+         "s.file_path='genproto.sh' AND t.label='Module' AND t.qualified_name='stem.genproto'",
+         "genproto.sh defines its Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.rs.foo' AND "
+         "file_path='rs/foo.rs'",
+         "Rust foo.rs Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.rs.foo.bar' AND "
+         "file_path='rs/foo/bar.rs'",
+         "Rust foo/bar.rs Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.rs.foo/'",
+         "rs/foo/ Folder marked"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.c.foo'",
+         "C stem pair Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.c.foo/'",
+         "c/foo/ Folder marked"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.ts.foo.test' AND "
+         "file_path='ts/foo.test.ts'",
+         "dotted foo.test.ts Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.ts.foo.test/'",
+         "ts/foo/test/ Folder marked"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.goapi.api'",
+         "Go package Folder keeps its QN"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.goapi.api#sh' "
+         "AND file_path='goapi/api.sh'",
+         "api.sh Module beside the Go package"},
+        {"SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+         "t.id=e.target_id WHERE e.type='DEFINES' AND s.label='File' AND "
+         "s.file_path='goapi/api.sh' AND t.qualified_name='stem.goapi.api#sh'",
+         "api.sh defines its Module"},
+        {"SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+         "t.id=e.target_id WHERE e.type='IMPORTS' AND s.file_path='goapi/main/main.go' AND "
+         "t.label='Folder' AND t.qualified_name='stem.goapi.api'",
+         "Go import lands on the package Folder"},
+    };
+    enum { STEM_CHECKS = sizeof(checks) / sizeof(checks[0]) };
+    static const int fillers[] = {0, 60};
+    int got[2][STEM_CHECKS];
+    int rcs[2];
+    for (int run = 0; run < 2; run++) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_stemdir_XXXXXX");
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        stem_repo(tmp, fillers[run]);
+        char db[512];
+        snprintf(db, sizeof(db), "%s/stem.db", tmp);
+        rcs[run] = stem_index(tmp, db);
+        for (int c = 0; c < STEM_CHECKS; c++) {
+            got[run][c] = k8s_inc_count(db, checks[c][0]);
+        }
+        th_rmtree(tmp);
+    }
+    int wrong = 0;
+    for (int run = 0; run < 2; run++) {
+        ASSERT_EQ(rcs[run], 0);
+        for (int c = 0; c < STEM_CHECKS; c++) {
+            if (got[run][c] != 1) {
+                printf("  fillers=%d: %s: %d\n", fillers[run], checks[c][1], got[run][c]);
+                wrong++;
+            }
+        }
+    }
+    ASSERT_EQ(wrong, 0);
+    PASS();
+}
+
+/* A kustomization names a directory (`dashboards`) and the manifest beside it
+ * with the same stem (`dashboards.yaml`), as kubernetes/k8s.io does. The
+ * file's Module, once swallowed by the Folder, is a node now: the directory
+ * entry must still land on the (marked) Folder, the file entry on the file. */
+TEST(pipeline_kustomize_entry_beside_same_stem_file) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stemkust_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "monitoring/kustomization.yaml",
+                    "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                    "kind: Kustomization\n"
+                    "resources:\n"
+                    "  - dashboards\n"
+                    "  - dashboards.yaml\n");
+    write_temp_file(tmp, "monitoring/dashboards.yaml",
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: board\n");
+    write_temp_file(tmp, "monitoring/dashboards/kustomization.yaml",
+                    "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                    "kind: Kustomization\n"
+                    "resources:\n"
+                    "  - cm.yaml\n");
+    write_temp_file(tmp, "monitoring/dashboards/cm.yaml",
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: inner\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/stemkust.db", tmp);
+    int rc = stem_index(tmp, db);
+    int to_dir = k8s_inc_count(
+        db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.type='IMPORTS' AND "
+            "s.file_path='monitoring/kustomization.yaml' AND t.label='Folder' AND "
+            "t.qualified_name='stem.monitoring.dashboards/'");
+    int to_file = k8s_inc_count(
+        db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.type='IMPORTS' AND "
+            "s.file_path='monitoring/kustomization.yaml' AND t.label='Module' AND "
+            "t.file_path='monitoring/dashboards.yaml'");
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(to_dir, 1);
+    ASSERT_EQ(to_file, 1);
+    PASS();
+}
+
+/* Deleting a file that takes part in a stem collision changes which side
+ * carries the mark, and only a full rebuild re-spells the survivors, so the
+ * planner declines the closure repair: deleting genproto.sh frees the
+ * Folder's plain QN; deleting a Go package's only Go file leaves a plain
+ * directory, whose Folder then yields to api.sh's Module. A deletion away
+ * from every collision stays a closure repair. */
+TEST(incremental_stem_mark_deletion_rebuilds) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stemdel_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    closure_probe_repo(tmp);
+    write_temp_file(tmp, "genproto.sh", "#!/bin/sh\ngen_all() {\n  echo all\n}\n");
+    write_temp_file(tmp, "genproto/one.sh", "#!/bin/sh\ngen_one() {\n  echo one\n}\n");
+    write_temp_file(tmp, "goapi/api.sh", "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
+    write_temp_file(tmp, "goapi/api/server.go", "package api\n\nfunc Serve() {}\n");
+    write_temp_file(tmp, "goapi/api/run.sh", "#!/bin/sh\nrun_it() {\n  echo run\n}\n");
+    write_temp_file(tmp, "misc/other.sh", "#!/bin/sh\nother() {\n  echo other\n}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/stemdel.db", tmp);
+    static const char marked_dir[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.genproto/'";
+    static const char plain_dir[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.genproto'";
+    static const char go_side[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.goapi.api#sh'";
+    static const char api_dir[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.goapi.api/'";
+    static const char api_mod[] = "SELECT COUNT(*) FROM nodes WHERE label='Module' AND "
+                                  "qualified_name='stem.goapi.api' AND file_path='goapi/api.sh'";
+
+    int full_rc = stem_index(tmp, db);
+    int full_marked = k8s_inc_count(db, marked_dir);
+    int full_go_side = k8s_inc_count(db, go_side);
+
+    stem_unlink(tmp, "misc/other.sh");
+    int other_rc = stem_index(tmp, db);
+    cbm_incremental_route_t other_route = cbm_pipeline_incremental_test_last_route();
+
+    stem_unlink(tmp, "genproto.sh");
+    int gen_rc = stem_index(tmp, db);
+    cbm_incremental_route_t gen_route = cbm_pipeline_incremental_test_last_route();
+    int gen_marked = k8s_inc_count(db, marked_dir);
+    int gen_plain = k8s_inc_count(db, plain_dir);
+
+    stem_unlink(tmp, "goapi/api/server.go");
+    int go_rc = stem_index(tmp, db);
+    cbm_incremental_route_t go_route = cbm_pipeline_incremental_test_last_route();
+    int go_side_after = k8s_inc_count(db, go_side);
+    int api_dir_after = k8s_inc_count(db, api_dir);
+    int api_mod_after = k8s_inc_count(db, api_mod);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full_rc, 0);
+    ASSERT_EQ(full_marked, 1);
+    ASSERT_EQ(full_go_side, 1);
+    ASSERT_EQ(other_rc, 0);
+    ASSERT_EQ(other_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(gen_rc, 0);
+    ASSERT_EQ(gen_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(gen_marked, 0);
+    ASSERT_EQ(gen_plain, 1);
+    ASSERT_EQ(go_rc, 0);
+    ASSERT_EQ(go_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(go_side_after, 0);
+    ASSERT_EQ(api_dir_after, 1);
+    ASSERT_EQ(api_mod_after, 1);
+    PASS();
+}
+
 TEST(pipeline_closure_repair_budget_declines_to_full) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_budget_XXXXXX");
@@ -22722,6 +22965,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_sql_dump_graph_matches_the_full_parse_issue1735);
     RUN_TEST(pipeline_spill_resolves_namespace_imports_like_memory);
     RUN_TEST(pipeline_structure_nodes);
+    RUN_TEST(pipeline_stem_folder_collision_keeps_both_nodes);
+    RUN_TEST(pipeline_kustomize_entry_beside_same_stem_file);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
     RUN_TEST(pipeline_export_error_snapshot_on_artifact_failure);
@@ -23093,6 +23338,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_closure_repair_removed_def_drops_dependent_edge);
     RUN_TEST(pipeline_closure_repair_added_name_declines_to_full);
     RUN_TEST(pipeline_closure_repair_new_file_declines_to_full);
+    RUN_TEST(incremental_stem_mark_deletion_rebuilds);
     RUN_TEST(pipeline_closure_repair_budget_declines_to_full);
     RUN_TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API

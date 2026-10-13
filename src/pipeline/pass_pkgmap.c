@@ -2241,6 +2241,23 @@ static bool kustomize_file_label(const char *label) {
     return label && (strcmp(label, "Module") == 0 || strcmp(label, "File") == 0);
 }
 
+/* The Folder of a directory entry: plain, or `proj.pkg.base/` when a file
+ * beside it shares the stem (cbm_stem_marks_t). */
+static const cbm_gbuf_node_t *kustomize_folder(const cbm_pipeline_ctx_t *ctx, const char *path) {
+    char *fqn = cbm_pipeline_fqn_folder(ctx->project_name, path);
+    if (!fqn) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, fqn);
+    if (!n || !n->label || strcmp(n->label, "Folder") != 0) {
+        char marked[PKGMAP_PATH_BUF];
+        int len = snprintf(marked, sizeof(marked), "%s/", fqn);
+        n = len > 0 && (size_t)len < sizeof(marked) ? cbm_gbuf_find_by_qn(ctx->gbuf, marked) : NULL;
+    }
+    free(fqn);
+    return n && n->label && strcmp(n->label, "Folder") == 0 ? n : NULL;
+}
+
 /* A kustomization entry is a path relative to the kustomization's own
  * directory -- a manifest file or a directory -- or a remote base; it never
  * names a symbol. Resolve it exactly or not at all: the name-guess strategies
@@ -2264,15 +2281,12 @@ static const cbm_gbuf_node_t *resolve_kustomize_entry(const cbm_pipeline_ctx_t *
     char *qn = cbm_pipeline_fqn_module(ctx->project_name, path);
     const cbm_gbuf_node_t *n = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
     free(qn);
-    if (n && kustomize_file_label(n->label)) {
+    /* The Module must be the entry's own file: a directory entry `base`
+     * beside `base.yaml` shares its module QN but names the directory. */
+    if (n && kustomize_file_label(n->label) && n->file_path && strcmp(n->file_path, path) == 0) {
         found = n;
     } else {
-        char *fqn = cbm_pipeline_fqn_folder(ctx->project_name, path);
-        n = fqn ? cbm_gbuf_find_by_qn(ctx->gbuf, fqn) : NULL;
-        free(fqn);
-        if (n && n->label && strcmp(n->label, "Folder") == 0) {
-            found = n;
-        }
+        found = kustomize_folder(ctx, path);
     }
     free(path);
     return found;
