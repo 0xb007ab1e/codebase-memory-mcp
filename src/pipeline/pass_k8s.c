@@ -552,10 +552,12 @@ static bool k8s_cluster_scoped(const char *kind) {
  * `obj_key` is the logical identity: the namespace it lives in, `_` for a
  * cluster-scoped kind, `?` when the deploy decides; `effective_ns` (when
  * not NULL) is the namespace a kustomize build gives it. `version` (NULL or
- * "": none) is the version of its apiVersion, which the key leaves out. NULL
- * for a QN without a well-formed key (the caller keeps the plain source
- * tag). */
-static char *k8s_resource_props(const char *qn, const char *effective_ns, const char *version) {
+ * "": none) is the version of its apiVersion, which the key leaves out;
+ * `labels` (NULL: none) its metadata.labels as "k=v,k2=v2" (extract_k8s.c:
+ * nothing JSON escapes in it). NULL for a QN without a well-formed key (the
+ * caller keeps the plain source tag). */
+static char *k8s_resource_props(const char *qn, const char *effective_ns, const char *version,
+                                const char *labels) {
     enum { K8S_KEY_PARTS = 4, K8S_ESC = 6 * K8S_LABEL_LEN };
     const char *key = qn ? strstr(qn, "::") : NULL;
     if (!key) {
@@ -589,7 +591,8 @@ static char *k8s_resource_props(const char *qn, const char *effective_ns, const 
     cbm_json_escape(esc[3], K8S_ESC, name);
     cbm_json_escape(esc[4], K8S_ESC, effective);
     cbm_json_escape(esc[5], K8S_ESC, version ? version : "");
-    size_t n = K8S_KEY_PARTS * K8S_ESC + PAIR_LEN * K8S_ESC + CBM_SZ_256;
+    size_t n =
+        K8S_KEY_PARTS * K8S_ESC + PAIR_LEN * K8S_ESC + CBM_SZ_256 + (labels ? strlen(labels) : 0);
     char *props = cbm_alloc(CBM_MEM_CLASS_OTHER, n);
     if (!props) {
         return NULL;
@@ -598,6 +601,9 @@ static char *k8s_resource_props(const char *qn, const char *effective_ns, const 
         snprintf(props, n, "{\"source\":\"k8s\",\"group\":\"%s\",\"kind\":\"%s\"", esc[0], esc[1]);
     if (esc[5][0]) {
         w += snprintf(props + w, n - (size_t)w, ",\"version\":\"%s\"", esc[5]);
+    }
+    if (labels && labels[0]) {
+        w += snprintf(props + w, n - (size_t)w, ",\"labels\":\"%s\"", labels);
     }
     if (ns[0]) {
         w += snprintf(props + w, n - (size_t)w, ",\"namespace\":\"%s\"", esc[2]);
@@ -619,6 +625,25 @@ static void k8s_node_prop(const cbm_gbuf_node_t *n, const char *key, char *out, 
         const char *e = strchr(v, '"');
         snprintf(out, out_sz, "%.*s", e ? (int)(e - v) : 0, v);
     }
+}
+
+/* The string property `key` of node `n` as k8s_resource_props writes it,
+ * any length (caller frees), NULL when it has none. */
+static char *k8s_node_prop_dup(const cbm_gbuf_node_t *n, const char *key) {
+    char head[CBM_SZ_64];
+    snprintf(head, sizeof(head), "\"%s\":\"", key);
+    const char *v = n->properties_json ? strstr(n->properties_json, head) : NULL;
+    const char *e = v ? strchr(v + strlen(head), '"') : NULL;
+    if (!e) {
+        return NULL;
+    }
+    v += strlen(head);
+    char *out = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)(e - v) + SKIP_ONE);
+    if (out) {
+        memcpy(out, v, (size_t)(e - v));
+        out[e - v] = '\0';
+    }
+    return out;
 }
 
 static void k8s_records_free(k8s_record_array_t *recs) {
@@ -1147,7 +1172,9 @@ static void k8s_apply_effective_namespaces(cbm_pipeline_ctx_t *ctx, k8s_bundles_
         }
         char version[K8S_LABEL_LEN];
         k8s_node_prop(n, "version", version, sizeof(version));
-        char *props = k8s_resource_props(n->qualified_name, agree ? eff : "?", version);
+        char *labels = k8s_node_prop_dup(n, "labels");
+        char *props = k8s_resource_props(n->qualified_name, agree ? eff : "?", version, labels);
+        cbm_free(CBM_MEM_CLASS_OTHER, labels);
         if (props) {
             (void)cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)n, props);
             cbm_free(CBM_MEM_CLASS_OTHER, props);
@@ -1223,6 +1250,7 @@ typedef struct {
     char *version; /*   patch file name them */
     char *name;
     char *ns;
+    char *selector; /* labelSelector, NULL: none */
     int line;
 } k8s_patch_t;
 
@@ -1309,6 +1337,7 @@ static void k8s_facts_free(k8s_facts_t *f) {
         cbm_free(CBM_MEM_CLASS_OTHER, p->version);
         cbm_free(CBM_MEM_CLASS_OTHER, p->name);
         cbm_free(CBM_MEM_CLASS_OTHER, p->ns);
+        cbm_free(CBM_MEM_CLASS_OTHER, p->selector);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, f->patches);
     for (int i = 0; i < f->kchart_n; i++) {
@@ -2389,12 +2418,16 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, c
             continue;
         }
 
-        const char *version = NULL; /* extract_k8s.c: the one extra property */
-        if (def->extra_props && def->extra_props[0] && def->extra_props[SKIP_ONE] &&
-            strcmp(def->extra_props[0], "version") == 0) {
-            version = def->extra_props[SKIP_ONE];
+        const char *version = NULL; /* extract_k8s.c's extra properties */
+        const char *labels = NULL;
+        for (const char **kv = def->extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
+            if (strcmp(kv[0], "version") == 0) {
+                version = kv[SKIP_ONE];
+            } else if (strcmp(kv[0], "labels") == 0) {
+                labels = kv[SKIP_ONE];
+            }
         }
-        char *props = k8s_resource_props(def->qualified_name, NULL, version);
+        char *props = k8s_resource_props(def->qualified_name, NULL, version, labels);
         int64_t node_id = cbm_gbuf_upsert_node(
             ctx->gbuf, "Resource", def->name, def->qualified_name, rel_path, (int)def->start_line,
             (int)def->end_line, props ? props : "{\"source\":\"k8s\"}");
@@ -3582,6 +3615,7 @@ static void k8s_kustomize_keep(k8s_facts_t *f, const char *kust, const CBMFileRe
                           .version = k8s_dup_opt(x->version),
                           .name = k8s_dup_opt(x->name),
                           .ns = k8s_dup_opt(x->ns),
+                          .selector = k8s_dup_opt(x->selector),
                           .line = x->line};
     }
 }
@@ -3614,7 +3648,63 @@ typedef struct {
     const char *version;
     const char *name;
     const char *ns;
+    const char *selector;
 } k8s_want_t;
+
+/* Does label list `labels` ("k=v,k2=v2") carry `item` ("k=v") whole, or --
+ * `item` ending in "=" -- any value of that key? */
+static bool k8s_labels_have(const char *labels, const char *item) {
+    size_t il = strlen(item);
+    bool any_value = il > 0 && item[il - SKIP_ONE] == '=';
+    for (const char *p = labels; p && *p;) {
+        size_t l = strcspn(p, ",");
+        if (any_value ? (l >= il && strncmp(p, item, il) == 0)
+                      : (l == il && strncmp(p, item, il) == 0)) {
+            return true;
+        }
+        p = p[l] ? p + l + SKIP_ONE : NULL;
+    }
+    return false;
+}
+
+/* Does Resource `t` meet label selector `sel`: every term `k=v` / `k==v`
+ * (carried), `k!=v` (not carried), `k` (the key present), `!k` (absent)? A
+ * set-based term (`k in (a,b)`) names no key and meets nothing. */
+static bool k8s_selector_meets(const cbm_gbuf_node_t *t, const char *sel) {
+    char *labels = k8s_node_prop_dup(t, "labels");
+    bool ok = true;
+    for (const char *p = sel; ok && p && *p;) {
+        size_t l = strcspn(p, ",");
+        char term[CBM_SZ_512];
+        snprintf(term, sizeof(term), "%.*s", (int)l, p);
+        char *s = term;
+        while (*s == ' ') {
+            s++;
+        }
+        for (char *e = s + strlen(s); e > s && e[-SKIP_ONE] == ' '; e--) {
+            e[-SKIP_ONE] = '\0';
+        }
+        char item[CBM_SZ_512];
+        char *eq = strstr(s, "!=");
+        if (eq) {
+            snprintf(item, sizeof(item), "%.*s=%s", (int)(eq - s), s, eq + PAIR_LEN);
+            ok = !k8s_labels_have(labels, item);
+        } else if ((eq = strchr(s, '='))) {
+            const char *v = eq[SKIP_ONE] == '=' ? eq + PAIR_LEN : eq + SKIP_ONE;
+            snprintf(item, sizeof(item), "%.*s=%s", (int)(eq - s), s, v);
+            ok = k8s_labels_have(labels, item);
+        } else if (s[0] == '!') {
+            snprintf(item, sizeof(item), "%s=", s + SKIP_ONE);
+            ok = !k8s_labels_have(labels, item);
+        } else {
+            snprintf(item, sizeof(item), "%s=", s);
+            ok = s[0] && k8s_labels_have(labels, item);
+        }
+        p = p[l] ? p + l + SKIP_ONE : NULL;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, labels);
+    return ok;
+}
 
 /* Is Resource `t` what `w` names? A namespace meets the target's declared
  * one or its effective one. */
@@ -3648,9 +3738,11 @@ static bool k8s_patch_meets(const cbm_gbuf_node_t *t, const k8s_want_t *w) {
         char decl[K8S_LABEL_LEN];
         k8s_declared_ns(t->qualified_name, decl, sizeof(decl));
         k8s_effective_ns(t, prop, sizeof(prop));
-        return strcmp(w->ns, decl) == 0 || strcmp(w->ns, prop) == 0;
+        if (strcmp(w->ns, decl) != 0 && strcmp(w->ns, prop) != 0) {
+            return false;
+        }
     }
-    return true;
+    return !w->selector || k8s_selector_meets(t, w->selector);
 }
 
 static void k8s_patch_edge(cbm_pipeline_ctx_t *ctx, int64_t src, int64_t tgt,
@@ -3724,7 +3816,7 @@ static int64_t k8s_file_of(cbm_pipeline_ctx_t *ctx, const char *path) {
  * File `kust_file` -- to what it names. */
 static void k8s_patch_in_build(const k8s_build_t *b, const k8s_patch_t *p, int64_t kust_file) {
     const k8s_ids_t *docs = p->path ? cbm_ht_get(b->by_file, p->path) : NULL;
-    if (!p->kind && !p->name) {
+    if (!p->kind && !p->name && !p->selector) {
         for (int d = 0; docs && d < docs->count; d++) {
             const cbm_gbuf_node_t *doc = cbm_gbuf_find_by_id(b->ctx->gbuf, docs->items[d]);
             char kind[K8S_LABEL_LEN];
@@ -3736,12 +3828,12 @@ static void k8s_patch_in_build(const k8s_build_t *b, const k8s_patch_t *p, int64
             }
             k8s_node_prop(doc, "group", group, sizeof(group));
             k8s_declared_ns(doc->qualified_name, ns, sizeof(ns));
-            k8s_want_t w = {kind, group[0] ? group : NULL, NULL, name, ns[0] ? ns : NULL};
+            k8s_want_t w = {kind, group[0] ? group : NULL, NULL, name, ns[0] ? ns : NULL, NULL};
             k8s_patch_targets(b, p, doc->id, &w);
         }
         return;
     }
-    k8s_want_t w = {p->kind, p->group, p->version, p->name, p->ns};
+    k8s_want_t w = {p->kind, p->group, p->version, p->name, p->ns, p->selector};
     if (docs && docs->count > 0) {
         for (int d = 0; d < docs->count; d++) {
             k8s_patch_targets(b, p, docs->items[d], &w);

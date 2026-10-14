@@ -23,7 +23,7 @@
 /* Local constants. */
 enum {
     K8S_BUF_SIZE = 256,
-    K8S_PROPS_KV = 3, /* extra_props: one key, its value, the NULL end */
+    K8S_PROPS_KV = 5, /* extra_props: version, labels (key + value each), NULL */
 };
 
 // ---------------------------------------------------------------------------
@@ -237,7 +237,8 @@ typedef struct {
     const char *version;
     const char *name;
     const char *ns;
-    bool selector; /* labelSelector / annotationSelector */
+    const char *selector; /* labelSelector */
+    bool unsupported;     /* annotationSelector: not evaluated */
 } kust_target_t;
 
 static void kust_target(CBMExtractCtx *ctx, TSNode map, kust_target_t *t) {
@@ -264,8 +265,10 @@ static void kust_target(CBMExtractCtx *ctx, TSNode map, kust_target_t *t) {
             t->name = val;
         } else if (strcmp(key, "namespace") == 0) {
             t->ns = val;
-        } else if (strcmp(key, "labelSelector") == 0 || strcmp(key, "annotationSelector") == 0) {
-            t->selector = true;
+        } else if (strcmp(key, "labelSelector") == 0) {
+            t->selector = val;
+        } else if (strcmp(key, "annotationSelector") == 0) {
+            t->unsupported = true;
         }
     }
 }
@@ -436,13 +439,14 @@ static void emit_kustomize_patches(CBMExtractCtx *ctx, TSNode seq) {
                            .path = path && path[0] ? path : NULL,
                            .line = (int)ts_node_start_point(item).row + TS_LINE_OFFSET};
         if (has_target) {
-            if (!t.selector && (t.kind || t.name)) {
+            if (!t.unsupported && (t.kind || t.name || t.selector)) {
                 CBMK8sFact f = base;
                 f.kind = t.kind;
                 f.group = t.group;
                 f.version = t.version;
                 f.name = t.name;
                 f.ns = t.ns;
+                f.selector = t.selector;
                 cbm_k8sfact_push(&ctx->result->k8s_facts, a, f);
             }
         } else if (inline_text) {
@@ -613,7 +617,71 @@ typedef struct {
     char kind[K8S_BUF_SIZE];
     char name[K8S_BUF_SIZE];
     char ns[K8S_BUF_SIZE];
+    const char *labels; // metadata.labels as "k=v,k2=v2" (text order), NULL: none
 } k8s_doc_id_t;
+
+// A label a selector term can name: no templated part (a skeleton's `<...>`,
+// `{{`), no `,` or `=` (the separators of the list), nothing JSON escapes
+// (`"`, `\`, control characters -- none in a valid label).
+static bool k8s_label_plain(const char *s) {
+    if (s[0] == '<' || strstr(s, "{{") || strpbrk(s, ",=\"\\")) {
+        return false;
+    }
+    for (const char *p = s; *p; p++) {
+        if ((unsigned char)*p < ' ') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int k8s_cmp_label(const void *x, const void *y) {
+    return strcmp(*(const char *const *)x, *(const char *const *)y);
+}
+
+// metadata.labels as "k=v,k2=v2" in text order (the arena's), NULL when it
+// has none a selector can name.
+static const char *k8s_labels(CBMArena *a, TSNode map, const char *source) {
+    if (strcmp(ts_node_type(map), "block_mapping") != 0) {
+        return NULL;
+    }
+    int cap = (int)ts_node_named_child_count(map);
+    const char **items = cap > 0 ? cbm_arena_alloc(a, (size_t)cap * sizeof(*items)) : NULL;
+    int n = 0;
+    size_t len = 0;
+    k8s_kids_t pairs = k8s_kids(map);
+    TSNode p;
+    while (items && n < cap && k8s_kid(&pairs, false, &p)) {
+        if (strcmp(ts_node_type(p), "block_mapping_pair") != 0) {
+            continue;
+        }
+        const char *k = get_scalar_text(a, ts_node_named_child(p, 0), source);
+        TSNode vn = unwrap_pair_value(p);
+        const char *v = ts_node_is_null(vn) ? NULL : get_scalar_text(a, vn, source);
+        if (k && k[0] && v && k8s_label_plain(k) && k8s_label_plain(v)) {
+            items[n] = cbm_arena_sprintf(a, "%s=%s", k, v);
+            len += items[n] ? strlen(items[n]) + SKIP_ONE : 0;
+            n += items[n] ? SKIP_ONE : 0;
+        }
+    }
+    k8s_kids_done(&pairs);
+    if (n == 0) {
+        return NULL;
+    }
+    qsort((void *)items, (size_t)n, sizeof(*items), k8s_cmp_label);
+    char *out = cbm_arena_alloc(a, len);
+    if (!out) {
+        return NULL;
+    }
+    size_t w = 0;
+    for (int i = 0; i < n; i++) {
+        size_t l = strlen(items[i]);
+        memcpy(out + w, items[i], l);
+        w += l;
+        out[w++] = i + SKIP_ONE < n ? ',' : '\0';
+    }
+    return out;
+}
 
 // Read metadata.name and metadata.namespace from a metadata block_mapping.
 static void extract_metadata(CBMArena *a, TSNode meta_mapping, const char *source,
@@ -634,10 +702,14 @@ static void extract_metadata(CBMArena *a, TSNode meta_mapping, const char *sourc
         const char *mkey_text = get_scalar_text(a, mkey, source);
         bool is_name = mkey_text && strcmp(mkey_text, "name") == 0;
         bool is_ns = mkey_text && strcmp(mkey_text, "namespace") == 0;
+        TSNode mval = unwrap_pair_value(mpair);
+        if (mkey_text && strcmp(mkey_text, "labels") == 0 && !ts_node_is_null(mval)) {
+            id->labels = k8s_labels(a, mval, source);
+            continue;
+        }
         if (!is_name && !is_ns) {
             continue;
         }
-        TSNode mval = unwrap_pair_value(mpair);
         const char *text = ts_node_is_null(mval) ? NULL : get_scalar_text(a, mval, source);
         if (text) {
             snprintf(is_name ? id->name : id->ns, K8S_BUF_SIZE, "%s", text);
@@ -1658,14 +1730,19 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         const char *slash = strchr(id.api_version, '/');
         const char *version = slash ? slash + SKIP_ONE : id.api_version;
         bool versioned = slash || (version[0] == 'v' && isdigit((unsigned char)version[1]));
-        if (version[0] && versioned && id.api_version[0] != '<') {
-            const char **kv = (const char **)cbm_arena_alloc(a, K8S_PROPS_KV * sizeof(char *));
-            if (kv) {
-                kv[0] = "version";
-                kv[SKIP_ONE] = cbm_arena_strdup(a, version);
-                kv[PAIR_LEN] = NULL;
-                def.extra_props = kv;
-            }
+        const char **kv = (const char **)cbm_arena_alloc(a, K8S_PROPS_KV * sizeof(char *));
+        int kn = 0;
+        if (kv && version[0] && versioned && id.api_version[0] != '<') {
+            kv[kn++] = "version";
+            kv[kn++] = cbm_arena_strdup(a, version);
+        }
+        if (kv && id.labels) {
+            kv[kn++] = "labels";
+            kv[kn++] = id.labels;
+        }
+        if (kv && kn > 0) {
+            kv[kn] = NULL;
+            def.extra_props = kv;
         }
         cbm_defs_push(&ctx->result->defs, a, def);
         k8s_emit_facts(ctx, mapping, group, id.kind, ctx->result->defs.count - SKIP_ONE);

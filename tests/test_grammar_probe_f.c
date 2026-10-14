@@ -2585,7 +2585,8 @@ TEST(probe_env_address_connects_to_its_service) {
  * @<target file>", then "patch imports <n>" (IMPORTS of patch files), "maps
  * into patches <n>" (INFRA_MAPS into a patch file's documents) and "version
  * <v>" (base/deploy.yaml's Resource), "odd version <v>" (other/odd.yaml's:
- * none without one, missing without the Resource). */
+ * none without one, missing without the Resource), "labels <l>"
+ * (base/deploy.yaml's). */
 static char *gpf_patches(const GpfFile *files, int nfiles) {
     GpfProj lp;
     cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
@@ -2606,7 +2607,9 @@ static char *gpf_patches(const GpfFile *files, int nfiles) {
             "label='Resource' AND file_path='base/deploy.yaml'), '-') || char(10) || "
             "'odd version ' || coalesce((SELECT coalesce(json_extract(properties,'$.version'), "
             "'none') FROM nodes WHERE project=?1 AND label='Resource' AND "
-            "file_path='other/odd.yaml'), 'missing')";
+            "file_path='other/odd.yaml'), 'missing') || char(10) || 'labels ' || "
+            "coalesce((SELECT json_extract(properties,'$.labels') FROM nodes WHERE project=?1 "
+            "AND label='Resource' AND file_path='base/deploy.yaml'), '-')";
         if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
             if (sqlite3_step(st) == SQLITE_ROW) {
@@ -2627,7 +2630,9 @@ static char *gpf_patches(const GpfFile *files, int nfiles) {
  * component's the objects of the build including it; a kind alone every
  * object of that kind. Never: an object outside the build, one the patch
  * does not name (another name, group, version or namespace), a component
- * nothing includes, a label selector (not evaluated). A patch file is an import of
+ * nothing includes. A label selector meets the objects whose metadata.labels
+ * carry its terms (`k=v`, `k`, `k!=v`; a Resource keeps them sorted). A
+ * patch file is an import of
  * the kustomization, never a member of its build (a Service selects no patch
  * document). A Resource keeps the version of its apiVersion; a bare group
  * (`apiVersion: example.io`) has none. */
@@ -2637,7 +2642,8 @@ TEST(probe_kustomize_patches_override_their_base) {
         {"base/cm.yaml",
          "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ${APP}-config\n  namespace: app\n"},
         {"base/deploy.yaml",
-         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: app\nspec:\n"
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: app\n"
+         "  labels:\n    tier: front\n    app: web\n    note: a=b\nspec:\n"
          "  template:\n    metadata:\n      labels:\n        app: web\n"},
         {"base/svc.yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: app\n"
                           "spec:\n  selector:\n    app: web\n"},
@@ -2653,6 +2659,10 @@ TEST(probe_kustomize_patches_override_their_base) {
          "- path: ops-v2.yaml\n  target:\n    group: apps\n    version: v2\n    kind: Deployment\n"
          "- path: ops-batch.yaml\n  target:\n    group: batch\n    kind: Deployment\n"
          "- path: sel.yaml\n  target:\n    kind: Deployment\n    labelSelector: tier=none\n"
+         "- path: lab.yaml\n  target:\n    kind: Deployment\n    labelSelector: app=web,tier\n"
+         "- path: neq.yaml\n  target:\n    kind: Deployment\n    labelSelector: app!=web\n"
+         "- path: sel-only.yaml\n  target:\n    labelSelector: tier=front\n"
+         "- path: ann.yaml\n  target:\n    kind: Deployment\n    annotationSelector: x=y\n"
          "- path: cm-patch.yaml\n"
          "- patch: |-\n    apiVersion: apps/v1\n    kind: Deployment\n    metadata:\n"
          "      name: missing\n"},
@@ -2661,6 +2671,10 @@ TEST(probe_kustomize_patches_override_their_base) {
          "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: elsewhere\n"},
         {"overlays/prod/all.yaml", "- op: add\n  path: /metadata/labels/tier\n  value: front\n"},
         {"overlays/prod/sel.yaml", "- op: replace\n  path: /spec/replicas\n  value: 6\n"},
+        {"overlays/prod/lab.yaml", "- op: replace\n  path: /spec/replicas\n  value: 7\n"},
+        {"overlays/prod/neq.yaml", "- op: replace\n  path: /spec/replicas\n  value: 8\n"},
+        {"overlays/prod/sel-only.yaml", "- op: replace\n  path: /spec/replicas\n  value: 9\n"},
+        {"overlays/prod/ann.yaml", "- op: replace\n  path: /spec/replicas\n  value: 1\n"},
         {"overlays/prod/cm-patch.yaml",
          "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ${APP}-config\n  namespace: app\n"
          "data:\n  k: v\n"},
@@ -2686,12 +2700,15 @@ TEST(probe_kustomize_patches_override_their_base) {
         "overlays/prod/all.yaml File -> Service/web @base/svc.yaml\n"
         "overlays/prod/cm-patch.yaml Resource -> ConfigMap/${APP}-config @base/cm.yaml\n"
         "overlays/prod/kustomization.yaml File -> Service/web @base/svc.yaml\n"
+        "overlays/prod/lab.yaml File -> Deployment/web @base/deploy.yaml\n"
         "overlays/prod/ops.yaml File -> Deployment/web @base/deploy.yaml\n"
         "overlays/prod/patch-deploy.yaml Resource -> Deployment/web @base/deploy.yaml\n"
-        "patch imports 8\n"
+        "overlays/prod/sel-only.yaml File -> Deployment/web @base/deploy.yaml\n"
+        "patch imports 12\n"
         "maps into patches 0\n"
         "version v1\n"
-        "odd version none";
+        "odd version none\n"
+        "labels app=web,tier=front";
     if (!got || strcmp(got, want) != 0) {
         fprintf(stderr, "patches got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
         free(got);

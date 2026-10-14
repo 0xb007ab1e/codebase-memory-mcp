@@ -750,12 +750,13 @@ typedef struct {
     const char *edge;
     const char *route;
     const char *container;
-    const char *key;     /* CONNECTS_TO: the environment variable addressing it */
-    const char *group;   /* PATCH: the API group named ("core"), NULL: any */
-    const char *version; /* PATCH: the API version named, NULL: any */
-    const char *path;    /* PATCH: the patch file, NULL: inline */
-    const char *url;     /* DEPLOY (kustomize): the chart repository */
-    const char *release; /* DEPLOY (kustomize): the release name */
+    const char *key;      /* CONNECTS_TO: the environment variable addressing it */
+    const char *group;    /* PATCH: the API group named ("core"), NULL: any */
+    const char *version;  /* PATCH: the API version named, NULL: any */
+    const char *path;     /* PATCH: the patch file, NULL: inline */
+    const char *selector; /* PATCH: the target's labelSelector, NULL: none */
+    const char *url;      /* DEPLOY (kustomize): the chart repository */
+    const char *release;  /* DEPLOY (kustomize): the release name */
     int line;
 } CBMK8sFact;
 
