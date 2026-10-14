@@ -3023,6 +3023,81 @@ TEST(probe_terraform_tfvars_override_their_variables) {
     PASS();
 }
 
+/* Every Terragrunt edge as "<file> <block> <type> <target> <local_name |
+ * read=<file> | ->:<line>", a Folder target as "Folder:<path>". */
+static char *gpf_tg_edges(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.name || ' ' || e.type || ' ' || CASE t.label WHEN 'Folder' THEN 'Folder:' || "
+            "t.file_path ELSE t.file_path END || ' ' || coalesce(json_extract(e.properties,"
+            "'$.local_name'), 'read=' || json_extract(e.properties,'$.read'), '-') || ':' || "
+            "json_extract(e.properties,'$.line') AS x FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+            "json_extract(e.properties,'$.via')='terragrunt' ORDER BY x)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A Terragrunt unit (terragrunt.hcl), evaluated in its own context: an
+ * include IMPORTS {local_name} the file its path names; a
+ * read_terragrunt_config IMPORTS {read} the file it names -- from the block
+ * holding the call, or, for a call in an included file (evaluated for the
+ * including unit: find_in_parent_folders searches from the UNIT), from the
+ * include block bringing that file in; a dependency DEPENDS_ON the other
+ * unit; a local terraform source IMPORTS its Folder. A path built from an
+ * unknown function (get_env) makes none. */
+TEST(probe_terragrunt_units_compose_their_files) {
+    static const GpfFile files[] = {
+        {"root.hcl",
+         "locals {\n  acct = read_terragrunt_config(find_in_parent_folders(\"account.hcl\"))\n}\n"},
+        {"live/account.hcl", "locals {\n  id = \"1\"\n}\n"},
+        {"live/app/terragrunt.hcl",
+         "include \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n"
+         "include \"common\" {\n"
+         "  path = \"${dirname(find_in_parent_folders(\"root.hcl\"))}/_common/app.hcl\"\n}\n"
+         "dependency \"db\" {\n  config_path = \"../db\"\n}\n"
+         "terraform {\n  source = \"../../modules/app\"\n}\n"
+         "locals {\n  env = read_terragrunt_config(\"env.hcl\")\n"
+         "  bad = read_terragrunt_config(get_env(\"X\"))\n}\n"},
+        {"live/app/env.hcl", "locals {\n  name = \"app\"\n}\n"},
+        {"_common/app.hcl",
+         "locals {\n  acct = read_terragrunt_config(find_in_parent_folders(\"account.hcl\"))\n}\n"},
+        {"live/db/terragrunt.hcl", "include \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n"},
+        {"modules/app/main.tf", "variable \"x\" {}\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_tg_edges(files, n);
+    static const char want[] =
+        "live/app/terragrunt.hcl dependency.db DEPENDS_ON live/db/terragrunt.hcl db:7\n"
+        "live/app/terragrunt.hcl include.common IMPORTS _common/app.hcl common:4\n"
+        "live/app/terragrunt.hcl include.common IMPORTS live/account.hcl read=_common/app.hcl:2\n"
+        "live/app/terragrunt.hcl include.root IMPORTS live/account.hcl read=root.hcl:2\n"
+        "live/app/terragrunt.hcl include.root IMPORTS root.hcl root:1\n"
+        "live/app/terragrunt.hcl locals IMPORTS live/app/env.hcl read=live/app/terragrunt.hcl:14\n"
+        "live/app/terragrunt.hcl terraform IMPORTS Folder:modules/app -:10\n"
+        "live/db/terragrunt.hcl include.root IMPORTS live/account.hcl read=root.hcl:2\n"
+        "live/db/terragrunt.hcl include.root IMPORTS root.hcl root:1";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "terragrunt got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("terragrunt");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
  * "edgeless routes <n>": the Route nodes no edge touches. */
 static char *gpf_script_http(const GpfFile *files, int nfiles) {
@@ -5464,6 +5539,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_terraform_module_files_extract_no_generic_refs);
     RUN_TEST(probe_terraform_module_calls_import_their_source);
     RUN_TEST(probe_terraform_tfvars_override_their_variables);
+    RUN_TEST(probe_terragrunt_units_compose_their_files);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);

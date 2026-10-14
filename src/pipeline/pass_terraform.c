@@ -625,11 +625,18 @@ static void tf_walk_refs(tf_mod_t *m, const char *src_block, TSNode n) {
     ts_tree_cursor_delete(&cur);
 }
 
-/* Node `n`'s text is `word`. */
-static bool tf_is_word(const tf_mod_t *m, TSNode n, const char *word) {
+/* Node `n`'s text (in file text `src`) is `word`. */
+static bool tf_text_is(const char *src, TSNode n, const char *word) {
+    if (ts_node_is_null(n)) {
+        return false;
+    }
     uint32_t b = ts_node_start_byte(n);
     size_t len = strlen(word);
-    return ts_node_end_byte(n) - b == len && memcmp(m->src + b, word, len) == 0;
+    return ts_node_end_byte(n) - b == len && memcmp(src + b, word, len) == 0;
+}
+
+static bool tf_is_word(const tf_mod_t *m, TSNode n, const char *word) {
+    return tf_text_is(m->src, n, word);
 }
 
 /* The references of one top-level block's body, those of its depends_on
@@ -992,6 +999,386 @@ static int tf_link_refs(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, i
     return edges;
 }
 
+/* ── Terragrunt (PHASE 6 P6.4) ─────────────────────────────────────── */
+
+/* A Terragrunt unit is a terragrunt.hcl file. Its expressions are evaluated
+ * in the unit's context -- also those of a file it includes, which Terragrunt
+ * evaluates as part of the unit:
+ *   include "N" { path = E }           IMPORTS {local_name: N, via: terragrunt,
+ *                                      line} the file E names, from the block
+ *   read_terragrunt_config(E)          IMPORTS {via: terragrunt, read: <the file
+ *                                      holding the call>, line} the file E names:
+ *                                      from the unit's top-level block holding
+ *                                      the call or, for a call in an included
+ *                                      file, from the unit's include block that
+ *                                      brings that file in
+ *   dependency "N" { config_path = E } DEPENDS_ON {local_name: N, via: terragrunt,
+ *                                      line} the terragrunt.hcl of directory E
+ *   terraform { source = "./..." }     IMPORTS {via: terragrunt, line} the Folder
+ * E is a string template of literals and find_in_parent_folders(name) (the
+ * first file of that name in the unit's parent directory or above),
+ * dirname(x) and get_terragrunt_dir(); anything else is unknown, and an
+ * unknown path is no edge. A target must be a file (a directory) the graph
+ * holds. */
+
+static const char TG_UNIT[] = "terragrunt.hcl";
+static const char TG_INCLUDE[] = "include.";
+static const char TG_DEPENDENCY[] = "dependency.";
+
+typedef struct {
+    cbm_pipeline_ctx_t *ctx;
+    CBMArena *arena;
+    CBMHashTable *files;   /* repository path -> File node */
+    CBMHashTable *folders; /* directory -> Folder node */
+    const char *unit;      /* the unit's path */
+    const char *udir;      /* its directory */
+    const char *src;       /* the text of the file being read */
+    int edges;
+} tg_t;
+
+/* The directory part of `p`, in place; an anchored value keeps its anchor. */
+static void tg_dirname(char *p) {
+    char *s = strrchr(p, '/');
+    if (s) {
+        *s = '\0';
+    } else {
+        p[p[0] == '\x01' ? SKIP_ONE : 0] = '\0';
+    }
+}
+
+/* find_in_parent_folders(name): the first `name` in the unit's parent
+ * directory or above, anchored at the repository root. */
+static bool tg_find_up(const tg_t *g, const char *name, char *out, size_t sz) {
+    char d[CBM_SZ_1K];
+    snprintf(d, sizeof(d), "%s", g->udir);
+    while (d[0]) {
+        tg_dirname(d);
+        char cand[CBM_SZ_2K];
+        snprintf(cand, sizeof(cand), "%s%s%s", d, d[0] ? "/" : "", name);
+        if (cbm_ht_get(g->files, cand)) {
+            snprintf(out, sz, "\x01%s", cand);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool tg_eval(const tg_t *g, TSNode n, char *out, size_t sz);
+
+/* The argument expressions of a call (up to `max`); their number. */
+static int tg_args(TSNode call, TSNode *args, int max) {
+    int k = 0;
+    for (uint32_t i = 0; i < ts_node_named_child_count(call); i++) {
+        TSNode c = ts_node_named_child(call, i);
+        for (uint32_t j = 0; tf_type(c, "function_arguments") && j < ts_node_named_child_count(c);
+             j++) {
+            if (tf_type(ts_node_named_child(c, j), "expression")) {
+                if (k < max) {
+                    args[k] = ts_node_named_child(c, j);
+                }
+                k++;
+            }
+        }
+    }
+    return k;
+}
+
+/* A call of a function the evaluator knows. */
+static bool tg_call(const tg_t *g, TSNode call, char *out, size_t sz) {
+    TSNode fn = ts_node_named_child(call, 0);
+    TSNode args[PAIR_LEN];
+    int na = tg_args(call, args, PAIR_LEN);
+    char a[CBM_SZ_1K];
+    if (tf_text_is(g->src, fn, "find_in_parent_folders")) {
+        return na == SKIP_ONE && tg_eval(g, args[0], a, sizeof(a)) && a[0] != '\x01' &&
+               tg_find_up(g, a, out, sz);
+    }
+    if (tf_text_is(g->src, fn, "dirname")) {
+        if (na != SKIP_ONE || !tg_eval(g, args[0], out, sz)) {
+            return false;
+        }
+        tg_dirname(out);
+        return true;
+    }
+    if (tf_text_is(g->src, fn, "get_terragrunt_dir") && na == 0) {
+        snprintf(out, sz, "\x01%s", g->udir);
+        return true;
+    }
+    return false;
+}
+
+/* An expression's value: a string template of literals and known calls;
+ * false when any part is something else. */
+static bool tg_eval(const tg_t *g, TSNode n, char *out, size_t sz) {
+    while (
+        (tf_type(n, "expression") || tf_type(n, "literal_value") || tf_type(n, "template_expr")) &&
+        ts_node_named_child_count(n) == SKIP_ONE) {
+        n = ts_node_named_child(n, 0);
+    }
+    if (tf_type(n, "function_call")) {
+        return tg_call(g, n, out, sz);
+    }
+    if (!tf_type(n, "string_lit") && !tf_type(n, "quoted_template")) {
+        return false;
+    }
+    size_t len = 0;
+    out[0] = '\0';
+    for (uint32_t i = 0; i < ts_node_named_child_count(n); i++) {
+        TSNode c = ts_node_named_child(n, i);
+        if (tf_type(c, "quoted_template_start") || tf_type(c, "quoted_template_end")) {
+            continue;
+        }
+        uint32_t b = ts_node_start_byte(c);
+        if (tf_type(c, "template_literal")) {
+            if (!tf_add(out, sz, &len, g->src + b, ts_node_end_byte(c) - b)) {
+                return false;
+            }
+            continue;
+        }
+        TSNode expr = {0};
+        for (uint32_t j = 0;
+             tf_type(c, "template_interpolation") && j < ts_node_named_child_count(c); j++) {
+            if (tf_type(ts_node_named_child(c, j), "expression")) {
+                expr = ts_node_named_child(c, j);
+            }
+        }
+        char part[CBM_SZ_1K];
+        if (ts_node_is_null(expr) || !tg_eval(g, expr, part, sizeof(part)) ||
+            !tf_add(out, sz, &len, part, strlen(part))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The expression of attribute `key` in a block body; a null node when none. */
+static TSNode tg_attr(const tg_t *g, TSNode body, const char *key) {
+    for (uint32_t i = 0; !ts_node_is_null(body) && i < ts_node_named_child_count(body); i++) {
+        TSNode at = ts_node_named_child(body, i);
+        if (tf_type(at, "attribute") && ts_node_named_child_count(at) >= PAIR_LEN &&
+            tf_text_is(g->src, ts_node_named_child(at, 0), key)) {
+            return ts_node_named_child(at, SKIP_ONE);
+        }
+    }
+    return (TSNode){0};
+}
+
+/* The node of definition `name` in `file`, by the QN extract_defs gave it. */
+static int64_t tg_def_node(const tg_t *g, const char *file, const char *name) {
+    const char *qn = cbm_fqn_compute(g->arena, g->ctx->project_name, file, name);
+    const cbm_gbuf_node_t *n = qn ? cbm_gbuf_find_by_qn(g->ctx->gbuf, qn) : NULL;
+    atomic_fetch_add_explicit(&g_tf_candidates, SKIP_ONE, memory_order_relaxed);
+    return n && n->file_path && strcmp(n->file_path, file) == 0 ? n->id : 0;
+}
+
+static void tg_edge(tg_t *g, int64_t src, const cbm_gbuf_node_t *tgt, const char *type,
+                    const char *props) {
+    if (src > 0 && tgt && tgt->id != src) {
+        cbm_gbuf_insert_edge(g->ctx->gbuf, src, tgt->id, type, props);
+        g->edges++;
+    }
+}
+
+/* Expression `e` as the repository path of a graph file (relative values
+ * from `base`); NULL when unknown or not in the graph. */
+static const cbm_gbuf_node_t *tg_file(const tg_t *g, TSNode e, const char *base, char *path,
+                                      size_t sz) {
+    char v[CBM_SZ_1K];
+    if (ts_node_is_null(e) || !tg_eval(g, e, v, sizeof(v)) || !tf_repo_path(base, v, path, sz)) {
+        return NULL;
+    }
+    return cbm_ht_get(g->files, path);
+}
+
+/* Every read_terragrunt_config(E) of file `site` (its body `body`): IMPORTS
+ * the file E names, relative paths from `base`, from `from` -- or, when 0,
+ * from the top-level block (a top-level attribute: the file) holding it. */
+static void tg_reads(tg_t *g, TSNode body, const char *site, const char *base, int64_t from) {
+    for (uint32_t i = 0; !ts_node_is_null(body) && i < ts_node_named_child_count(body); i++) {
+        TSNode b = ts_node_named_child(body, i);
+        int64_t src = from;
+        if (!src) {
+            TSNode bb;
+            const char *name = tf_type(b, "block") ? tf_block_name(g->arena, g->src, b, &bb) : NULL;
+            const cbm_gbuf_node_t *file = cbm_ht_get(g->files, site);
+            src = name ? tg_def_node(g, site, name) : file ? file->id : 0;
+        }
+        TSTreeCursor cur = ts_tree_cursor_new(b);
+        bool more = true;
+        while (more) {
+            TSNode c = ts_tree_cursor_current_node(&cur);
+            TSNode args[SKIP_ONE];
+            if (tf_type(c, "function_call") &&
+                tf_text_is(g->src, ts_node_named_child(c, 0), "read_terragrunt_config") &&
+                tg_args(c, args, SKIP_ONE) >= SKIP_ONE) {
+                char path[CBM_SZ_1K];
+                const cbm_gbuf_node_t *tgt = tg_file(g, args[0], base, path, sizeof(path));
+                char props[CBM_SZ_2K];
+                snprintf(props, sizeof(props),
+                         "{\"via\":\"terragrunt\",\"read\":\"%s\",\"line\":%d}", site,
+                         (int)ts_node_start_point(c).row + SKIP_ONE);
+                tg_edge(g, src, tgt, "IMPORTS", props);
+            }
+            if (ts_tree_cursor_goto_first_child(&cur)) {
+                continue;
+            }
+            while (!ts_tree_cursor_goto_next_sibling(&cur)) {
+                if (!ts_tree_cursor_goto_parent(&cur)) {
+                    more = false;
+                    break;
+                }
+            }
+        }
+        ts_tree_cursor_delete(&cur);
+    }
+}
+
+/* One block of the unit: an include, a dependency, the terraform block. An
+ * include's file (its path into `inc`, its block into `inc_node`) is read
+ * afterwards for the calls it holds. */
+static void tg_block(tg_t *g, TSNode b, char *inc, size_t inc_sz, int64_t *inc_node) {
+    TSNode bb;
+    const char *name = tf_type(b, "block") ? tf_block_name(g->arena, g->src, b, &bb) : NULL;
+    if (!name || ts_node_is_null(bb)) {
+        return;
+    }
+    int line = (int)ts_node_start_point(b).row + SKIP_ONE;
+    char path[CBM_SZ_1K];
+    char props[CBM_SZ_256];
+    if (strncmp(name, TG_INCLUDE, sizeof(TG_INCLUDE) - SKIP_ONE) == 0) {
+        const cbm_gbuf_node_t *tgt =
+            tg_file(g, tg_attr(g, bb, "path"), g->udir, path, sizeof(path));
+        int64_t src = tgt ? tg_def_node(g, g->unit, name) : 0;
+        snprintf(props, sizeof(props), "{\"local_name\":\"%s\",\"via\":\"terragrunt\",\"line\":%d}",
+                 name + sizeof(TG_INCLUDE) - SKIP_ONE, line);
+        tg_edge(g, src, tgt, "IMPORTS", props);
+        if (src > 0) {
+            snprintf(inc, inc_sz, "%s", path);
+            *inc_node = src;
+        }
+    } else if (strncmp(name, TG_DEPENDENCY, sizeof(TG_DEPENDENCY) - SKIP_ONE) == 0) {
+        char v[CBM_SZ_1K];
+        char dir[CBM_SZ_1K];
+        TSNode e = tg_attr(g, bb, "config_path");
+        if (!ts_node_is_null(e) && tg_eval(g, e, v, sizeof(v)) &&
+            tf_repo_path(g->udir, v, dir, sizeof(dir))) {
+            snprintf(path, sizeof(path), "%s%s%s", dir, dir[0] ? "/" : "", TG_UNIT);
+            const cbm_gbuf_node_t *tgt = cbm_ht_get(g->files, path);
+            snprintf(props, sizeof(props),
+                     "{\"local_name\":\"%s\",\"via\":\"terragrunt\",\"line\":%d}",
+                     name + sizeof(TG_DEPENDENCY) - SKIP_ONE, line);
+            tg_edge(g, tgt ? tg_def_node(g, g->unit, name) : 0, tgt, "DEPENDS_ON", props);
+        }
+    } else if (strcmp(name, "terraform") == 0) {
+        char v[CBM_SZ_1K];
+        TSNode e = tg_attr(g, bb, "source");
+        if (!ts_node_is_null(e) && tg_eval(g, e, v, sizeof(v)) &&
+            (strncmp(v, "./", sizeof("./") - SKIP_ONE) == 0 ||
+             strncmp(v, "../", sizeof("../") - SKIP_ONE) == 0) &&
+            tf_repo_path(g->udir, v, path, sizeof(path))) {
+            const cbm_gbuf_node_t *tgt = g->folders ? cbm_ht_get(g->folders, path) : NULL;
+            snprintf(props, sizeof(props), "{\"via\":\"terragrunt\",\"line\":%d}", line);
+            tg_edge(g, tgt ? tg_def_node(g, g->unit, name) : 0, tgt, "IMPORTS", props);
+        }
+    }
+}
+
+enum { TG_MAX_INCLUDES = 32 };
+
+/* One unit: its blocks and reads, then the reads of the files it includes. */
+static void tg_unit(tg_t *g, TSParser *parser, const char *rel) {
+    const char *slash = strrchr(rel, '/');
+    g->unit = rel;
+    g->udir = cbm_arena_strndup(g->arena, rel, slash ? (size_t)(slash - rel) : 0);
+    char path[CBM_SZ_2K];
+    snprintf(path, sizeof(path), "%s/%s", g->ctx->repo_path, rel);
+    size_t len = 0;
+    char *src = g->udir ? tf_read(path, &len) : NULL;
+    TSTree *tree = src ? ts_parser_parse_string(parser, NULL, src, (uint32_t)len) : NULL;
+    char inc[TG_MAX_INCLUDES][CBM_SZ_1K];
+    int64_t inc_node[TG_MAX_INCLUDES];
+    int ni = 0;
+    if (tree) {
+        g->src = src;
+        TSNode body = tf_root_body(ts_tree_root_node(tree));
+        for (uint32_t i = 0; !ts_node_is_null(body) && i < ts_node_named_child_count(body); i++) {
+            inc_node[ni] = 0;
+            tg_block(g, ts_node_named_child(body, i), inc[ni], sizeof(inc[ni]), &inc_node[ni]);
+            if (ni < TG_MAX_INCLUDES - SKIP_ONE && inc_node[ni] > 0) {
+                ni++; /* past the cap, the last slot is overwritten */
+            }
+        }
+        tg_reads(g, body, rel, g->udir, 0);
+        ts_tree_delete(tree);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, src);
+    for (int k = 0; k < ni; k++) {
+        snprintf(path, sizeof(path), "%s/%s", g->ctx->repo_path, inc[k]);
+        src = tf_read(path, &len);
+        tree = src ? ts_parser_parse_string(parser, NULL, src, (uint32_t)len) : NULL;
+        if (tree) {
+            g->src = src;
+            char base[CBM_SZ_1K];
+            snprintf(base, sizeof(base), "%s", inc[k]);
+            tg_dirname(base);
+            tg_reads(g, tf_root_body(ts_tree_root_node(tree)), inc[k], base, inc_node[k]);
+            ts_tree_delete(tree);
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, src);
+    }
+    g->src = NULL;
+}
+
+static int tg_cmp_str(const void *x, const void *y) {
+    return strcmp(*(const char *const *)x, *(const char *const *)y);
+}
+
+/* Every Terragrunt unit of the repository, when the run holds a .hcl file
+ * (a unit, or a file units include or read). */
+static int tg_link_units(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
+                         TSParser *parser) {
+    bool any = false;
+    for (int i = 0; i < file_count && !any; i++) {
+        const char *dot = strrchr(tf_basename(files[i].rel_path), '.');
+        any = dot && strcmp(dot, ".hcl") == 0;
+    }
+    const cbm_gbuf_node_t **fnodes = NULL;
+    int fn = 0;
+    if (!any || cbm_gbuf_find_by_label(ctx->gbuf, "File", &fnodes, &fn) != 0 || fn <= 0) {
+        return 0;
+    }
+    CBMArena arena;
+    cbm_arena_init_lazy(&arena, CBM_SZ_4K);
+    tg_t g = {.ctx = ctx, .arena = &arena, .files = cbm_ht_create(0)};
+    const char **units = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)fn * sizeof(char *));
+    int nu = 0;
+    for (int i = 0; g.files && units && i < fn; i++) {
+        const char *rel = fnodes[i]->file_path;
+        if (rel) {
+            cbm_ht_set(g.files, rel, (void *)fnodes[i]);
+            if (strcmp(tf_basename(rel), TG_UNIT) == 0) {
+                units[nu++] = rel;
+            }
+        }
+    }
+    if (nu > 0 && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_HCL))) {
+        qsort((void *)units, (size_t)nu, sizeof(*units), tg_cmp_str);
+        g.folders = tf_folder_index(ctx);
+        for (int i = 0; i < nu; i++) {
+            tg_unit(&g, parser, units[i]);
+        }
+    }
+    if (g.folders) {
+        cbm_ht_free(g.folders);
+    }
+    if (g.files) {
+        cbm_ht_free(g.files);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)units);
+    cbm_arena_destroy(&arena);
+    return g.edges;
+}
+
 void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                  int file_count) {
     TSParser *parser = NULL;
@@ -1037,6 +1424,7 @@ void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t 
         parser = ts_parser_new();
     }
     int refs = parser ? tf_link_refs(ctx, files, file_count, parser) : 0;
+    int units = parser ? tg_link_units(ctx, files, file_count, parser) : 0;
     if (parser) {
         ts_parser_delete(parser);
     }
@@ -1044,11 +1432,13 @@ void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t 
         cbm_ht_free(charts);
     }
     cbm_arena_destroy(&arena);
-    if (edges > 0 || refs > 0) {
+    if (edges > 0 || refs > 0 || units > 0) {
         char buf[CBM_SZ_32];
         char rbuf[CBM_SZ_32];
+        char ubuf[CBM_SZ_32];
         snprintf(buf, sizeof(buf), "%d", edges);
         snprintf(rbuf, sizeof(rbuf), "%d", refs);
-        cbm_log_info("pass.terraform.edges", "deploys", buf, "refs", rbuf);
+        snprintf(ubuf, sizeof(ubuf), "%d", units);
+        cbm_log_info("pass.terraform.edges", "deploys", buf, "refs", rbuf, "terragrunt", ubuf);
     }
 }
