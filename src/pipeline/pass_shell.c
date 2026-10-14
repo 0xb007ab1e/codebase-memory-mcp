@@ -2101,7 +2101,7 @@ static const char *sh_url_skip_expansion(const char *p) {
 }
 
 /* An http(s) URL word the script states with a literal host but variable
- * parts after it ("https://github.com/x/releases/download/${VER}/x.tgz"),
+ * parts after it ("https://host/releases/download/${VER}/x.tgz"),
  * from its source text as the shell reads the word -- up to an unquoted
  * blank or operator, as tree-sitter-bash may split an unquoted word with
  * expansions into several arguments: quotes dropped, each expansion of the
