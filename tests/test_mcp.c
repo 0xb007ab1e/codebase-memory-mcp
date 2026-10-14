@@ -12205,6 +12205,16 @@ TEST(search_code_windows_scope_prefilter_removes_pipeline_filter) {
 #endif
 }
 
+/* An indexed project's scan runs in process; the supervised runner now serves
+ * the unindexed recursive fallback and a Windows file_pattern it cannot
+ * prefilter. The supervision tests below pin that runner through the command
+ * override, with a command that does nothing: their probes act at spawn. */
+#ifdef _WIN32
+static const char MCP_SUPERVISED_SCAN_NOOP[] = "cd .";
+#else
+static const char MCP_SUPERVISED_SCAN_NOOP[] = ":";
+#endif
+
 TEST(search_code_cancel_cleans_supervised_scan) {
     mcp_search_cache_t cache;
     ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-cancel"));
@@ -12213,6 +12223,7 @@ TEST(search_code_cancel_cleans_supervised_scan) {
     cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
                                                    vendor_path, sizeof(vendor_path));
     ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_scan_command_for_test(srv, MCP_SUPERVISED_SCAN_NOOP);
     mcp_search_command_probe_t probe = {
         .server = srv,
         .cancel_on_call = true,
@@ -12490,6 +12501,7 @@ TEST(search_code_scan_deadline_precedes_output_limit) {
     cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
                                                    vendor_path, sizeof(vendor_path));
     ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_scan_command_for_test(srv, MCP_SUPERVISED_SCAN_NOOP);
     mcp_search_command_probe_t probe = {.fill_output_directory = logs, .delay_ms = 1100};
     cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
     cbm_mcp_server_set_search_scan_timeout_for_test(srv, 1000, true);
@@ -12521,6 +12533,7 @@ TEST(search_code_scan_hook_rejection_is_contained_and_cleans_up) {
                                                    vendor_path, sizeof(vendor_path));
     ASSERT_NOT_NULL(srv);
     cbm_mcp_server_set_search_scratch_dir_for_test(srv, cache.path);
+    cbm_mcp_server_set_search_scan_command_for_test(srv, MCP_SUPERVISED_SCAN_NOOP);
     mcp_search_command_probe_t probe = {.reject = true, .scratch_directory = cache.path};
     cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
 
@@ -24546,6 +24559,272 @@ TEST(search_code_drops_walker_hits_that_resolve_outside_root) {
 #endif
 }
 
+/* ── In-process search_code scan ───────────────────────────────────
+ * The scoped scan used to shell out to grep (POSIX) or Select-String
+ * (Windows) and now runs in process. These cases pin its records to the
+ * `grep -Hn` shape the subprocess wrote: path:line:content on POSIX, the
+ * same fields TAB-separated on Windows. */
+
+#ifdef _WIN32
+#define SCAN_FS "\t"
+#define SCAN_RS '\n'
+#else
+#define SCAN_FS ":"
+#define SCAN_RS '\0'
+#endif
+
+typedef struct {
+    char dir[256];
+    char list[512];
+    char out[512];
+    char files[4][512];
+    int count;
+} scan_fixture_t;
+
+static bool scan_fixture_open(scan_fixture_t *fx) {
+    memset(fx, 0, sizeof(*fx));
+    const char *tmp = th_mktempdir("cbm_scan");
+    if (!tmp) {
+        return false;
+    }
+    snprintf(fx->dir, sizeof(fx->dir), "%s", tmp);
+    snprintf(fx->list, sizeof(fx->list), "%s/list", tmp);
+    snprintf(fx->out, sizeof(fx->out), "%s/out", tmp);
+    return true;
+}
+
+/* Add a file holding exactly `length` bytes (NUL bytes allowed). */
+static bool scan_fixture_add(scan_fixture_t *fx, const char *name, const char *data,
+                             size_t length) {
+    if (fx->count >= 4) {
+        return false;
+    }
+    /* Format from a copy: GCC's -Werror=restrict rejects a source and a
+     * destination inside the same struct. */
+    char dir[sizeof(fx->dir)];
+    memcpy(dir, fx->dir, sizeof(dir));
+    char *path = fx->files[fx->count];
+    snprintf(path, sizeof(fx->files[0]), "%s/%s", dir, name);
+    FILE *fp = cbm_fopen(path, "wb");
+    if (!fp) {
+        return false;
+    }
+    bool ok = fwrite(data, 1, length, fp) == length;
+    ok = fclose(fp) == 0 && ok;
+    fx->count += ok ? 1 : 0;
+    return ok;
+}
+
+/* Write the scoped file list as search_code does (NUL records on POSIX,
+ * lines on Windows); `extra` names one more path that need not exist. */
+static bool scan_fixture_list(const scan_fixture_t *fx, const char *extra) {
+    FILE *fp = cbm_fopen(fx->list, "wb");
+    if (!fp) {
+        return false;
+    }
+    bool ok = true;
+    for (int i = 0; i < fx->count; i++) {
+        ok = ok && fputs(fx->files[i], fp) != EOF && fputc(SCAN_RS, fp) != EOF;
+    }
+    if (extra) {
+        ok = ok && fputs(extra, fp) != EOF && fputc(SCAN_RS, fp) != EOF;
+    }
+    return fclose(fp) == 0 && ok;
+}
+
+/* Run the scan; returns the records it wrote (caller frees), CRs kept. */
+static char *scan_fixture_run(const scan_fixture_t *fx, const char *pattern, bool use_regex,
+                              size_t output_limit, int *cause) {
+    *cause = cbm_mcp_search_scan_for_test(NULL, fx->list, pattern, use_regex, fx->out,
+                                          output_limit, UINT64_MAX);
+    FILE *fp = cbm_fopen(fx->out, "rb");
+    if (!fp) {
+        return NULL;
+    }
+    char *text = calloc(CBM_SZ_64K, 1);
+    size_t length = text ? fread(text, 1, CBM_SZ_64K - 1, fp) : 0;
+    (void)fclose(fp);
+    if (text) {
+        text[length] = '\0';
+    }
+    return text;
+}
+
+/* Append one expected record to `buf`. */
+static void scan_expect(char *buf, size_t cap, const char *path, int line, const char *content) {
+    size_t used = strlen(buf);
+    snprintf(buf + used, cap - used, "%s" SCAN_FS "%d" SCAN_FS "%s\n", path, line, content);
+}
+
+TEST(search_code_scan_in_process_writes_grep_records) {
+    scan_fixture_t fx;
+    ASSERT_TRUE(scan_fixture_open(&fx));
+    /* The last line has no newline and line 3 is empty. */
+    static const char a[] = "alpha\nbeta gamma\n\nalpha beta\nlast alpha";
+    static const char b[] = "nothing\nalpha\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "a.txt", a, sizeof(a) - 1));
+    ASSERT_TRUE(scan_fixture_add(&fx, "b.txt", b, sizeof(b) - 1));
+    ASSERT_TRUE(scan_fixture_list(&fx, NULL));
+    const char *pa = fx.files[0];
+    const char *pb = fx.files[1];
+    char want[4096];
+    int cause = -1;
+
+    /* Literal: every matching line, file order, then line order. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), pa, 1, "alpha");
+    scan_expect(want, sizeof(want), pa, 4, "alpha beta");
+    scan_expect(want, sizeof(want), pa, 5, "last alpha");
+    scan_expect(want, sizeof(want), pb, 2, "alpha");
+    char *got = scan_fixture_run(&fx, "alpha", false, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* A multi-line pattern is one pattern per line, as with grep -f. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), pa, 2, "beta gamma");
+    scan_expect(want, sizeof(want), pa, 4, "alpha beta");
+    got = scan_fixture_run(&fx, "gamma\nbeta", false, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* An empty pattern matches every line, the empty one included. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), pa, 1, "alpha");
+    scan_expect(want, sizeof(want), pa, 2, "beta gamma");
+    scan_expect(want, sizeof(want), pa, 3, "");
+    scan_expect(want, sizeof(want), pa, 4, "alpha beta");
+    scan_expect(want, sizeof(want), pa, 5, "last alpha");
+    scan_expect(want, sizeof(want), pb, 1, "nothing");
+    scan_expect(want, sizeof(want), pb, 2, "alpha");
+    got = scan_fixture_run(&fx, "", false, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* Extended regex, anchored per line. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), pa, 1, "alpha");
+    scan_expect(want, sizeof(want), pa, 4, "alpha beta");
+    scan_expect(want, sizeof(want), pa, 5, "last alpha");
+    scan_expect(want, sizeof(want), pb, 2, "alpha");
+    got = scan_fixture_run(&fx, "^(alpha|last)", true, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* No match: success with no records. */
+    got = scan_fixture_run(&fx, "zzqqxx", false, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, "");
+    free(got);
+    th_rmtree(fx.dir);
+    PASS();
+}
+
+TEST(search_code_scan_in_process_binary_and_crlf) {
+    scan_fixture_t fx;
+    ASSERT_TRUE(scan_fixture_open(&fx));
+    /* A NUL in the first 32 KiB marks the whole file binary: no records. */
+    static const char bin[] = "alpha\n\0alpha\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "bin.dat", bin, sizeof(bin) - 1));
+    /* A later NUL ends the text at the last complete line before it. */
+    enum { FILLER_LINES = 4000 }; /* 10 bytes each: past the 32 KiB probe */
+    size_t late_cap = (size_t)FILLER_LINES * 10 + 64;
+    char *late = malloc(late_cap);
+    ASSERT_NOT_NULL(late);
+    size_t used = 0;
+    for (int i = 0; i < FILLER_LINES; i++) {
+        memcpy(late + used, "xxxxxxxxx\n", 10);
+        used += 10;
+    }
+    static const char tail[] = "alpha one\nalpha two\0\nalpha three\n";
+    memcpy(late + used, tail, sizeof(tail) - 1);
+    used += sizeof(tail) - 1;
+    ASSERT_TRUE(scan_fixture_add(&fx, "late.txt", late, used));
+    free(late);
+    static const char crlf[] = "alpha\r\nbeta\r\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "crlf.txt", crlf, sizeof(crlf) - 1));
+    ASSERT_TRUE(scan_fixture_list(&fx, NULL));
+    char want[4096];
+    int cause = -1;
+
+    /* The record keeps the line's CR; the result parser trims it. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), fx.files[1], FILLER_LINES + 1, "alpha one");
+    scan_expect(want, sizeof(want), fx.files[2], 1, "alpha\r");
+    char *got = scan_fixture_run(&fx, "alpha", false, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* `$` before a CR: grep on POSIX sees the CR and does not match;
+     * Select-String's Line on Windows had no CR and did. */
+    want[0] = '\0';
+#ifdef _WIN32
+    scan_expect(want, sizeof(want), fx.files[2], 2, "beta\r");
+#endif
+    got = scan_fixture_run(&fx, "^beta$", true, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+    th_rmtree(fx.dir);
+    PASS();
+}
+
+TEST(search_code_scan_in_process_limits_and_failures) {
+    scan_fixture_t fx;
+    ASSERT_TRUE(scan_fixture_open(&fx));
+    static const char a[] = "alpha\nalpha\nalpha\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "a.txt", a, sizeof(a) - 1));
+    ASSERT_TRUE(scan_fixture_list(&fx, NULL));
+    int cause = -1;
+
+    /* Past the output limit: the output-limit cause (3), not a failure. */
+    char *got = scan_fixture_run(&fx, "alpha", false, 8, &cause);
+    free(got);
+    ASSERT_EQ(cause, 3);
+
+    /* An invalid regex is a command failure (1), as grep's exit 2 was. */
+    got = scan_fixture_run(&fx, "(", true, 0, &cause);
+    free(got);
+    ASSERT_EQ(cause, 1);
+
+    /* A passed deadline stops the scan before the next file (4); a request
+     * cancelled under the server stops it too, and takes precedence (5). */
+    ASSERT_EQ(cbm_mcp_search_scan_for_test(NULL, fx.list, "alpha", false, fx.out, 0, 0), 4);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_request_scope_begin(srv));
+    ASSERT_TRUE(cbm_mcp_server_cancel_active(srv));
+    cause = cbm_mcp_search_scan_for_test(srv, fx.list, "alpha", false, fx.out, 0, 0);
+    cbm_mcp_server_request_scope_end(srv);
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(cause, 5);
+
+    /* A listed file that cannot be read is a command failure (1) as well. */
+    char missing[600];
+    snprintf(missing, sizeof(missing), "%s/missing.txt", fx.dir);
+    ASSERT_TRUE(scan_fixture_list(&fx, missing));
+    got = scan_fixture_run(&fx, "alpha", false, 0, &cause);
+    free(got);
+    ASSERT_EQ(cause, 1);
+    th_rmtree(fx.dir);
+    PASS();
+}
+
+#undef SCAN_FS
+#undef SCAN_RS
+
 SUITE(mcp) {
     RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
     RUN_TEST(index_repository_schema_documents_async_polling_issue2144);
@@ -24813,6 +25092,9 @@ SUITE(mcp) {
     RUN_TEST(search_code_scan_deadline_override_is_per_server);
     RUN_TEST(search_code_scan_setup_failures_respect_cause_precedence);
     RUN_TEST(search_code_scan_live_child_deadline_is_bounded_and_fails_closed);
+    RUN_TEST(search_code_scan_in_process_writes_grep_records);
+    RUN_TEST(search_code_scan_in_process_binary_and_crlf);
+    RUN_TEST(search_code_scan_in_process_limits_and_failures);
     RUN_TEST(search_code_scan_cancellation_precedes_zero_deadline);
     RUN_TEST(search_code_scan_deadline_precedes_output_limit);
     RUN_TEST(search_code_scan_hook_rejection_is_contained_and_cleans_up);

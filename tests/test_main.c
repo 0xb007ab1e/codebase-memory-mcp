@@ -1732,6 +1732,7 @@ extern void suite_store_edges(void);
 extern void suite_store_impact(void);
 extern void suite_store_scope(void);
 extern void suite_store_graph_digest(void);
+extern void suite_graph_mem(void);
 extern void suite_test_impact(void);
 extern void suite_test_impact_profiles(void);
 extern void suite_test_impact_changes(void);
@@ -2194,6 +2195,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(store_impact);
     RUN_SELECTED_SUITE(store_scope);
     RUN_SELECTED_SUITE(store_graph_digest);
+    RUN_SELECTED_SUITE(graph_mem);
     RUN_SELECTED_SUITE(test_impact);
     RUN_SELECTED_SUITE(test_impact_profiles);
     RUN_SELECTED_SUITE(test_impact_changes);

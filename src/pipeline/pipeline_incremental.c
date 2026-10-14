@@ -3743,6 +3743,62 @@ static bool incr_doc_links_current(cbm_store_t *store, const char *project) {
     return current;
 }
 
+/* The exact no-op test: the stored generation's metadata is current for this
+ * mode, its doc-link layer is usable, and its recorded semantic manifest
+ * equals the baseline byte for byte. Read-only. The two out flags report the
+ * halves the staged route also needs for its own routing. */
+static bool incr_generation_exact(cbm_pipeline_t *p, cbm_store_t *store, const char *project,
+                                  const cbm_file_hash_t *stored, int stored_count,
+                                  const cbm_file_hash_t *baseline_manifest, int baseline_count,
+                                  bool *metadata_current_out, bool *doc_links_current_out) {
+    cbm_coverage_meta_t meta = {0};
+    int meta_rc = cbm_store_coverage_meta_get(store, project, &meta);
+    const char *mode_name = incr_mode_name(cbm_pipeline_get_mode(p));
+    bool metadata_current =
+        meta_rc == CBM_STORE_OK && meta.coverage_version == CBM_SEMANTIC_INDEX_VERSION &&
+        meta.hash_records_complete && meta.index_mode && strcmp(meta.index_mode, mode_name) == 0;
+    /* A generation whose doc-link layer is missing or failed is not
+     * current even with identical inputs: index_status tells the user to
+     * re-run, and the re-run has to rebuild. */
+    bool doc_links_current = metadata_current && incr_doc_links_current(store, project);
+    bool exact = doc_links_current && cbm_pipeline_semantic_manifests_equal(
+                                          stored, stored_count, baseline_manifest, baseline_count);
+    cbm_store_coverage_meta_clear(&meta);
+    *metadata_current_out = metadata_current;
+    *doc_links_current_out = doc_links_current;
+    return exact;
+}
+
+bool cbm_pipeline_incremental_generation_exact(cbm_pipeline_t *p, cbm_store_t *store,
+                                               const cbm_file_hash_t *baseline_manifest,
+                                               int baseline_count) {
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    /* A forced legacy-partial run must reach the staged route that takes
+     * the one-shot flag; answering here would consume the run without it. */
+    if (atomic_load(&g_incr_test_force_legacy_partial)) {
+        return false;
+    }
+#endif
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_file_hash_t *stored = NULL;
+    int stored_count = 0;
+    if (!store ||
+        cbm_store_get_file_hashes(store, project, &stored, &stored_count) != CBM_STORE_OK) {
+        return false;
+    }
+    bool metadata_current = false;
+    bool doc_links_current = false;
+    bool exact = incr_generation_exact(p, store, project, stored, stored_count, baseline_manifest,
+                                       baseline_count, &metadata_current, &doc_links_current);
+    cbm_store_free_file_hashes(stored, stored_count);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (exact) {
+        incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_NOOP);
+    }
+#endif
+    return exact;
+}
+
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count, const cbm_file_hash_t *baseline_manifest,
                                  int baseline_count, bool force_full_on_mismatch) {
@@ -3788,21 +3844,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * rebuilds the complete graph. This avoids partial LSP/package/config
      * convergence gaps while retaining the common unchanged-repo fast path. */
     if (!force_legacy_partial) {
-        cbm_coverage_meta_t meta = {0};
-        int meta_rc = cbm_store_coverage_meta_get(store, project, &meta);
-        const char *mode_name = incr_mode_name(cbm_pipeline_get_mode(p));
-        bool metadata_current = meta_rc == CBM_STORE_OK &&
-                                meta.coverage_version == CBM_SEMANTIC_INDEX_VERSION &&
-                                meta.hash_records_complete && meta.index_mode &&
-                                strcmp(meta.index_mode, mode_name) == 0;
-        /* A generation whose doc-link layer is missing or failed is not
-         * current even with identical inputs: index_status tells the user to
-         * re-run, and the re-run has to rebuild. */
-        bool doc_links_current = metadata_current && incr_doc_links_current(store, project);
-        bool exact = doc_links_current &&
-                     cbm_pipeline_semantic_manifests_equal(stored, stored_count, baseline_manifest,
-                                                           baseline_count);
-        cbm_store_coverage_meta_clear(&meta);
+        bool metadata_current = false;
+        bool doc_links_current = false;
+        bool exact =
+            incr_generation_exact(p, store, project, stored, stored_count, baseline_manifest,
+                                  baseline_count, &metadata_current, &doc_links_current);
         if (exact) {
             cbm_store_free_file_hashes(stored, stored_count);
             cbm_store_close(store);
