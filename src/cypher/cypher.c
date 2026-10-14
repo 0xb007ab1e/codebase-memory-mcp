@@ -4016,10 +4016,20 @@ static const char *rb_row_key(const result_builder_t *rb, const char **row, char
         *cap = need;
     }
     size_t used = 0;
-    (*buf)[0] = '\0';
     for (int c = 0; c < rb->col_count; c++) {
-        used += (size_t)snprintf(*buf + used, *cap - used, "%zu:%s", strlen(row[c]), row[c]);
+        size_t len = strlen(row[c]);
+        char prefix[CBM_SZ_32];
+        int prefix_len = snprintf(prefix, sizeof(prefix), "%zu:", len);
+        if (prefix_len <= 0 || (size_t)prefix_len >= sizeof(prefix) ||
+            (size_t)prefix_len + len >= *cap - used) {
+            return NULL; /* cannot happen: `need` reserved this */
+        }
+        memcpy(*buf + used, prefix, (size_t)prefix_len);
+        used += (size_t)prefix_len;
+        memcpy(*buf + used, row[c], len);
+        used += len;
     }
+    (*buf)[used] = '\0';
     return *buf;
 }
 
