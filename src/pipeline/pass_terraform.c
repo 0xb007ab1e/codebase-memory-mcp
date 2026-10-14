@@ -67,9 +67,10 @@ static bool tf_add(char *out, size_t sz, size_t *len, const char *p, size_t n) {
     return true;
 }
 
-/* A string value: a literal, or a template of literals and ${path.module}.
- * false when any part is something else. */
-static bool tf_string(const tf_t *t, TSNode n, char *out, size_t sz) {
+/* A string value of file text `src` in module directory `mdir`: a literal, or
+ * a template of literals and ${path.module}. false when any part is something
+ * else. */
+static bool tf_string(const char *src, const char *mdir, TSNode n, char *out, size_t sz) {
     size_t len = 0;
     out[0] = '\0';
     while (tf_type(n, "expression") || tf_type(n, "literal_value") || tf_type(n, "template_expr") ||
@@ -93,7 +94,7 @@ static bool tf_string(const tf_t *t, TSNode n, char *out, size_t sz) {
             continue;
         }
         if (tf_type(c, "template_literal")) {
-            if (!tf_add(out, sz, &len, t->src + b, e - b)) {
+            if (!tf_add(out, sz, &len, src + b, e - b)) {
                 return false;
             }
             continue;
@@ -115,12 +116,12 @@ static bool tf_string(const tf_t *t, TSNode n, char *out, size_t sz) {
         uint32_t xe = ts_node_end_byte(expr);
         static const char PATH_MODULE[] = "path.module";
         if (xe - xb != sizeof(PATH_MODULE) - SKIP_ONE ||
-            strncmp(t->src + xb, PATH_MODULE, xe - xb) != 0) {
+            strncmp(src + xb, PATH_MODULE, xe - xb) != 0) {
             return false;
         }
         /* an absolute marker: the module directory, from the repo root */
         if (!tf_add(out, sz, &len, "\x01", SKIP_ONE) ||
-            !tf_add(out, sz, &len, t->mdir, strlen(t->mdir))) {
+            !tf_add(out, sz, &len, mdir, strlen(mdir))) {
             return false;
         }
     }
@@ -277,7 +278,7 @@ static void tf_helm_release(tf_t *t, TSNode block, const char *name) {
         uint32_t ke = ts_node_end_byte(key);
         size_t kl = ke - kb;
         if (kl == strlen("chart") && strncmp(t->src + kb, "chart", kl) == 0) {
-            has_chart = tf_string(t, val, chart, sizeof(chart));
+            has_chart = tf_string(t->src, t->mdir, val, chart, sizeof(chart));
         } else if (kl == strlen("repository") && strncmp(t->src + kb, "repository", kl) == 0) {
             has_repo = true;
         }
@@ -393,7 +394,7 @@ static bool tf_is_module_file(const char *rel) {
     return dot && (strcmp(dot, ".tf") == 0 || strcmp(dot, ".tofu") == 0);
 }
 
-/* ── References (PHASE 6 P6.1) ─────────────────────────────────────── */
+/* ── References (PHASE 6 P6.1, P6.2) ───────────────────────────────── */
 
 /* A Terraform module is a directory: every .tf / .tofu file of it. A
  * reference resolves inside its module only -- var.X to `variable "X"`,
@@ -403,28 +404,50 @@ static bool tf_is_module_file(const char *rel) {
  * builtin function) to nothing. Edge: USAGE {ref, via: terraform, line} from
  * the top-level block holding the reference to the declaring block; an entry
  * of the block's depends_on list orders it after the object: DEPENDS_ON, the
- * same properties. */
+ * same properties.
+ *
+ * A module call with a local source (`module "X" { source = "./net" }`; the
+ * directory inside the repository, holding .tf / .tofu files) IMPORTS
+ * {local_name: X, via: terraform, line} that directory's Folder, and
+ * module.X.Y (also module.X[i].Y, module.X[*].Y) USAGEs {ref: output}, beside
+ * module.X, the `output "Y"` of it. */
 
 typedef struct {
     char *file;      /* the referencing file */
     char *src;       /* the holding top-level block's definition name */
     char *key;       /* what it names: variable.X, local.X, module.X, data.T.N, resource.T.N */
+    char *out;       /* module.X.Y: Y, the output it reads; else NULL */
     const char *ref; /* static: var, local, module, data, resource */
     int line;
     bool dep; /* stands in the holder's depends_on list */
 } tf_ref_t;
 
+/* A module call with a local source. */
+typedef struct {
+    char *file; /* the calling file */
+    char *name; /* its block: module.X */
+    char *dir;  /* the source directory, from the repository root */
+    int line;
+} tf_call_t;
+
 typedef struct {
     cbm_pipeline_ctx_t *ctx;
     CBMArena *arena;
     CBMHashTable *decls; /* key (as tf_ref_t.key) -> declaring file (arena) */
+    CBMHashTable *calls; /* module.X -> its local source directory (arena) */
     tf_ref_t *refs;
     int ref_n;
     int ref_cap;
+    tf_call_t *mcalls;
+    int call_n;
+    int call_cap;
+    const char *dir;  /* the module's directory */
     const char *src;  /* the file's text */
     const char *file; /* its repository path (arena) */
     bool dep;         /* walking a depends_on list */
 } tf_mod_t;
+
+static const char TF_MODULE_PREFIX[] = "module.";
 
 static const char *tf_text(CBMArena *a, const char *src, TSNode n) {
     uint32_t b = ts_node_start_byte(n);
@@ -464,36 +487,66 @@ static const char *tf_block_name(CBMArena *a, const char *src, TSNode block, TSN
     return name;
 }
 
-static void tf_ref_push(tf_mod_t *m, const char *src_block, const char *ref, const char *key,
-                        int line) {
-    if (m->ref_n >= m->ref_cap) {
-        int cap = m->ref_cap ? m->ref_cap * PAIR_LEN : CBM_SZ_64;
-        tf_ref_t *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, m->refs, (size_t)cap * sizeof(*grown));
-        if (!grown) {
-            return;
-        }
-        m->refs = grown;
-        m->ref_cap = cap;
+/* Room for one more element in a growing array. */
+static bool tf_grow(void **items, int *cap, int n, size_t size) {
+    if (n < *cap) {
+        return true;
     }
-    m->refs[m->ref_n++] =
-        (tf_ref_t){(char *)m->file, (char *)src_block, (char *)key, ref, line, m->dep};
+    int ncap = *cap ? *cap * PAIR_LEN : CBM_SZ_64;
+    void *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, *items, (size_t)ncap * size);
+    if (!grown) {
+        return false;
+    }
+    *items = grown;
+    *cap = ncap;
+    return true;
 }
 
-/* The identifier of the k-th get_attr following `v` among its siblings (a
- * traversal is variable_expr, get_attr, get_attr, ... once the grammar's
- * hidden expression rule is flattened); NULL past the attributes. */
+static void tf_ref_push(tf_mod_t *m, const char *src_block, const char *ref, const char *key,
+                        const char *out, int line) {
+    if (tf_grow((void **)&m->refs, &m->ref_cap, m->ref_n, sizeof(*m->refs))) {
+        m->refs[m->ref_n++] = (tf_ref_t){
+            (char *)m->file, (char *)src_block, (char *)key, (char *)out, ref, line, m->dep};
+    }
+}
+
+/* The identifier of a get_attr node. */
+static const char *tf_attr_name(CBMArena *a, const char *src, TSNode g) {
+    for (uint32_t c = 0; c < ts_node_named_child_count(g); c++) {
+        if (tf_type(ts_node_named_child(g, c), "identifier")) {
+            return tf_text(a, src, ts_node_named_child(g, c));
+        }
+    }
+    return NULL;
+}
+
+/* The k-th attribute name of the traversal `v` starts. Its siblings, once the
+ * grammar's hidden expression rule is flattened, are get_attr / index /
+ * splat nodes: an index ([0], ["a"]) is passed over, a splat's own
+ * attributes ([*].y, .*.y) count. NULL past the attributes. */
 static const char *tf_attr(CBMArena *a, const char *src, TSNode v, int k) {
-    TSNode s = ts_node_next_named_sibling(v);
-    for (int i = 0; !ts_node_is_null(s) && tf_type(s, "get_attr"); i++) {
-        if (i == k) {
-            for (uint32_t c = 0; c < ts_node_named_child_count(s); c++) {
-                if (tf_type(ts_node_named_child(s, c), "identifier")) {
-                    return tf_text(a, src, ts_node_named_child(s, c));
+    int i = 0;
+    for (TSNode s = ts_node_next_named_sibling(v); !ts_node_is_null(s);
+         s = ts_node_next_named_sibling(s)) {
+        if (tf_type(s, "index")) {
+            continue;
+        }
+        if (tf_type(s, "splat")) {
+            TSNode sp = ts_node_named_child_count(s) > 0 ? ts_node_named_child(s, 0) : s;
+            for (uint32_t c = 0; c < ts_node_named_child_count(sp); c++) {
+                TSNode g = ts_node_named_child(sp, c);
+                if (tf_type(g, "get_attr") && i++ == k) {
+                    return tf_attr_name(a, src, g);
                 }
             }
+            continue;
+        }
+        if (!tf_type(s, "get_attr")) {
             return NULL;
         }
-        s = ts_node_next_named_sibling(s);
+        if (i++ == k) {
+            return tf_attr_name(a, src, s);
+        }
     }
     return NULL;
 }
@@ -511,19 +564,21 @@ static void tf_traversal(tf_mod_t *m, const char *src_block, TSNode v) {
     }
     int line = (int)ts_node_start_point(v).row + SKIP_ONE;
     if (strcmp(root, "var") == 0) {
-        tf_ref_push(m, src_block, "var", cbm_arena_sprintf(a, "variable.%s", a1), line);
+        tf_ref_push(m, src_block, "var", cbm_arena_sprintf(a, "variable.%s", a1), NULL, line);
     } else if (strcmp(root, "local") == 0) {
-        tf_ref_push(m, src_block, "local", cbm_arena_sprintf(a, "local.%s", a1), line);
+        tf_ref_push(m, src_block, "local", cbm_arena_sprintf(a, "local.%s", a1), NULL, line);
     } else if (strcmp(root, "module") == 0) {
-        tf_ref_push(m, src_block, "module", cbm_arena_sprintf(a, "module.%s", a1), line);
+        tf_ref_push(m, src_block, "module", cbm_arena_sprintf(a, "module.%s", a1),
+                    tf_attr(a, m->src, v, SKIP_ONE), line);
     } else if (strcmp(root, "data") == 0) {
         const char *a2 = tf_attr(a, m->src, v, SKIP_ONE);
         if (a2) {
-            tf_ref_push(m, src_block, "data", cbm_arena_sprintf(a, "data.%s.%s", a1, a2), line);
+            tf_ref_push(m, src_block, "data", cbm_arena_sprintf(a, "data.%s.%s", a1, a2), NULL,
+                        line);
         }
     } else if (strchr(root, '_')) {
         tf_ref_push(m, src_block, "resource", cbm_arena_sprintf(a, "resource.%s.%s", root, a1),
-                    line);
+                    NULL, line);
     }
 }
 
@@ -568,8 +623,37 @@ static void tf_walk_block(tf_mod_t *m, const char *src_block, TSNode body) {
     m->dep = false;
 }
 
-/* One file of a module: its declarations (blocks, locals entries) and the
- * references of each top-level block. */
+/* `module "X" { source = "./dir" }`: the call, its source resolved from the
+ * module's directory. A local source is "./..." or "../..."; any other -- a
+ * registry address, git, http, a bucket -- lies outside the repository. */
+static void tf_mod_call(tf_mod_t *m, const char *name, TSNode block, TSNode body) {
+    for (uint32_t i = 0; i < ts_node_named_child_count(body); i++) {
+        TSNode at = ts_node_named_child(body, i);
+        if (!tf_type(at, "attribute") || ts_node_named_child_count(at) < PAIR_LEN ||
+            !tf_is_word(m, ts_node_named_child(at, 0), "source")) {
+            continue;
+        }
+        char v[CBM_SZ_1K];
+        char dir[CBM_SZ_1K];
+        if (!tf_string(m->src, m->dir, ts_node_named_child(at, SKIP_ONE), v, sizeof(v)) ||
+            (strncmp(v, "./", sizeof("./") - SKIP_ONE) != 0 &&
+             strncmp(v, "../", sizeof("../") - SKIP_ONE) != 0) ||
+            !tf_repo_path(m->dir, v, dir, sizeof(dir)) ||
+            !tf_grow((void **)&m->mcalls, &m->call_cap, m->call_n, sizeof(*m->mcalls))) {
+            return;
+        }
+        char *d = cbm_arena_strdup(m->arena, dir);
+        if (d) {
+            m->mcalls[m->call_n++] = (tf_call_t){(char *)m->file, (char *)name, d,
+                                                 (int)ts_node_start_point(block).row + SKIP_ONE};
+            cbm_ht_set(m->calls, name, d);
+        }
+        return;
+    }
+}
+
+/* One file of a module: its declarations (blocks, locals entries), module
+ * calls and the references of each top-level block. */
 static void tf_mod_file(tf_mod_t *m, TSNode root) {
     CBMArena *a = m->arena;
     TSNode body = {0};
@@ -597,6 +681,8 @@ static void tf_mod_file(tf_mod_t *m, TSNode root) {
                     cbm_ht_set(m->decls, cbm_arena_sprintf(a, "local.%s", key), (void *)m->file);
                 }
             }
+        } else if (strncmp(name, TF_MODULE_PREFIX, sizeof(TF_MODULE_PREFIX) - SKIP_ONE) == 0) {
+            tf_mod_call(m, name, b, bb);
         }
         tf_walk_block(m, name, bb);
     }
@@ -634,120 +720,206 @@ static bool tf_same_dir(const char *p, const char *q) {
     return pl == ql && strncmp(p, q, pl) == 0;
 }
 
-/* Resolve the module's references against its declarations. */
-static int tf_mod_link(tf_mod_t *m) {
+/* One reference edge; 1 when made. */
+static int tf_ref_edge(tf_mod_t *m, int64_t src, int64_t tgt, const char *type, const char *ref,
+                       int line) {
+    if (src <= 0 || tgt <= 0 || src == tgt) {
+        return 0;
+    }
+    char props[CBM_SZ_128];
+    snprintf(props, sizeof(props), "{\"ref\":\"%s\",\"via\":\"terraform\",\"line\":%d}", ref, line);
+    cbm_gbuf_insert_edge(m->ctx->gbuf, src, tgt, type, props);
+    return SKIP_ONE;
+}
+
+/* Resolve the module's references against its declarations, module.X.Y
+ * against the outputs of X's source directory (`mods`: directory -> its
+ * module), and its local module calls to their directories' Folders. */
+static int tf_mod_link(tf_mod_t *m, CBMHashTable *mods, CBMHashTable *folders) {
     int edges = 0;
     for (int i = 0; i < m->ref_n; i++) {
         const tf_ref_t *r = &m->refs[i];
         const char *tfile = cbm_ht_get(m->decls, r->key);
-        if (!tfile) {
+        const char *oname = NULL;
+        const char *ofile = NULL;
+        if (r->out) {
+            const char *cdir = cbm_ht_get(m->calls, r->key);
+            const tf_mod_t *callee = cdir ? cbm_ht_get(mods, cdir) : NULL;
+            oname = callee ? cbm_arena_sprintf(m->arena, "output.%s", r->out) : NULL;
+            ofile = oname ? cbm_ht_get(callee->decls, oname) : NULL;
+        }
+        if (!tfile && !ofile) {
             continue;
         }
-        bool local = strcmp(r->ref, "local") == 0;
         int64_t src = tf_def_node(m, r->file, r->src);
-        int64_t tgt = tf_def_node(m, tfile, local ? "locals" : r->key);
-        if (src <= 0 || tgt <= 0 || src == tgt) {
+        if (tfile) {
+            bool local = strcmp(r->ref, "local") == 0;
+            edges += tf_ref_edge(m, src, tf_def_node(m, tfile, local ? "locals" : r->key),
+                                 r->dep ? "DEPENDS_ON" : "USAGE", r->ref, r->line);
+        }
+        if (ofile) {
+            edges += tf_ref_edge(m, src, tf_def_node(m, ofile, oname), "USAGE", "output", r->line);
+        }
+    }
+    for (int i = 0; i < m->call_n; i++) {
+        const tf_call_t *c = &m->mcalls[i];
+        const cbm_gbuf_node_t *folder = NULL;
+        if (cbm_ht_get(mods, c->dir)) {
+            /* the repository root has no Folder: its Project stands for it */
+            folder = c->dir[0] ? (folders ? cbm_ht_get(folders, c->dir) : NULL)
+                               : cbm_gbuf_find_by_qn(m->ctx->gbuf, m->ctx->project_name);
+        }
+        if (folder && !c->dir[0] && (!folder->label || strcmp(folder->label, "Project") != 0)) {
+            folder = NULL;
+        }
+        int64_t src = folder ? tf_def_node(m, c->file, c->name) : 0;
+        if (src <= 0) {
             continue;
         }
-        char props[CBM_SZ_128];
-        snprintf(props, sizeof(props), "{\"ref\":\"%s\",\"via\":\"terraform\",\"line\":%d}", r->ref,
-                 r->line);
-        cbm_gbuf_insert_edge(m->ctx->gbuf, src, tgt, r->dep ? "DEPENDS_ON" : "USAGE", props);
+        char props[CBM_SZ_256];
+        snprintf(props, sizeof(props), "{\"local_name\":\"%s\",\"via\":\"terraform\",\"line\":%d}",
+                 c->name + sizeof(TF_MODULE_PREFIX) - SKIP_ONE, c->line);
+        cbm_gbuf_insert_edge(m->ctx->gbuf, src, folder->id, "IMPORTS", props);
         edges++;
     }
     return edges;
 }
 
+static void tf_mod_free(tf_mod_t *m) {
+    if (m->decls) {
+        cbm_ht_free(m->decls);
+    }
+    if (m->calls) {
+        cbm_ht_free(m->calls);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, m->refs);
+    cbm_free(CBM_MEM_CLASS_OTHER, m->mcalls);
+    cbm_free(CBM_MEM_CLASS_OTHER, m);
+}
+
 /* One module directory, its files `paths[0..n)`: parse each (read from the
- * repository), then resolve. */
-static int tf_link_module(cbm_pipeline_ctx_t *ctx, TSParser *parser, const char *const *paths,
-                          int n) {
-    CBMArena arena;
-    cbm_arena_init_lazy(&arena, CBM_SZ_4K);
-    tf_mod_t m = {.ctx = ctx, .arena = &arena, .decls = cbm_ht_create(0)};
-    for (int i = 0; m.decls && i < n; i++) {
+ * repository) into its declarations, calls and references. */
+static tf_mod_t *tf_mod_parse(cbm_pipeline_ctx_t *ctx, CBMArena *arena, TSParser *parser,
+                              const char *const *paths, int n) {
+    tf_mod_t *m = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*m));
+    if (!m) {
+        return NULL;
+    }
+    const char *slash = strrchr(paths[0], '/');
+    *m = (tf_mod_t){.ctx = ctx,
+                    .arena = arena,
+                    .decls = cbm_ht_create(0),
+                    .calls = cbm_ht_create(0),
+                    .dir =
+                        cbm_arena_strndup(arena, paths[0], slash ? (size_t)(slash - paths[0]) : 0)};
+    if (!m->decls || !m->calls || !m->dir) {
+        tf_mod_free(m);
+        return NULL;
+    }
+    for (int i = 0; i < n; i++) {
         char path[CBM_SZ_2K];
         snprintf(path, sizeof(path), "%s/%s", ctx->repo_path, paths[i]);
         size_t len = 0;
         char *src = tf_read(path, &len);
         TSTree *tree = src ? ts_parser_parse_string(parser, NULL, src, (uint32_t)len) : NULL;
         if (tree) {
-            m.src = src;
-            m.file = cbm_arena_strdup(&arena, paths[i]);
-            tf_mod_file(&m, ts_tree_root_node(tree));
+            m->src = src;
+            m->file = cbm_arena_strdup(arena, paths[i]);
+            tf_mod_file(m, ts_tree_root_node(tree));
             ts_tree_delete(tree);
         }
+        m->src = NULL;
         cbm_free(CBM_MEM_CLASS_OTHER, src);
     }
-    int edges = m.decls ? tf_mod_link(&m) : 0;
-    if (m.decls) {
-        cbm_ht_free(m.decls);
+    return m;
+}
+
+/* Folder path -> its Folder node. */
+static CBMHashTable *tf_folder_index(cbm_pipeline_ctx_t *ctx) {
+    CBMHashTable *ix = cbm_ht_create(0);
+    const cbm_gbuf_node_t **nodes = NULL;
+    int n = 0;
+    if (ix && cbm_gbuf_find_by_label(ctx->gbuf, "Folder", &nodes, &n) == 0) {
+        for (int i = 0; i < n; i++) {
+            if (nodes[i]->file_path) {
+                cbm_ht_set(ix, nodes[i]->file_path, (void *)nodes[i]);
+            }
+        }
     }
-    cbm_free(CBM_MEM_CLASS_OTHER, m.refs);
+    return ix;
+}
+
+/* Every module directory, `paths[0..pn)` sorted by directory: parse all,
+ * then link each -- a reference may read an output of another directory. */
+static int tf_link_repo(cbm_pipeline_ctx_t *ctx, TSParser *parser, const char *const *paths,
+                        int pn) {
+    CBMArena arena;
+    cbm_arena_init_lazy(&arena, CBM_SZ_4K);
+    CBMHashTable *mods = cbm_ht_create(0);
+    tf_mod_t **list = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)pn * sizeof(*list));
+    int nm = 0;
+    int calls = 0;
+    for (int i = 0; mods && list && i < pn;) {
+        int j = i;
+        while (j < pn && tf_same_dir(paths[i], paths[j])) {
+            j++;
+        }
+        tf_mod_t *m = tf_mod_parse(ctx, &arena, parser, paths + i, j - i);
+        if (m) {
+            list[nm++] = m;
+            cbm_ht_set(mods, m->dir, m);
+            calls += m->call_n;
+        }
+        i = j;
+    }
+    CBMHashTable *folders = calls > 0 ? tf_folder_index(ctx) : NULL;
+    int edges = 0;
+    for (int k = 0; k < nm; k++) {
+        edges += tf_mod_link(list[k], mods, folders);
+    }
+    for (int k = 0; k < nm; k++) {
+        tf_mod_free(list[k]);
+    }
+    if (folders) {
+        cbm_ht_free(folders);
+    }
+    if (mods) {
+        cbm_ht_free(mods);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, list);
     cbm_arena_destroy(&arena);
     return edges;
 }
 
-/* Every module directory one of the run's .tf / .tofu files is in, resolved
- * whole: all its files (the graph's File nodes) -- on an incremental run an
- * unchanged file's reference may meet what a changed one declares. */
+/* When one of the run's files is a .tf / .tofu file, every module directory
+ * of the repository (the graph's File nodes) is resolved whole: on an
+ * incremental run an unchanged file's reference may meet what a changed one
+ * declares -- in its own directory (a variable, a locals entry) or in a
+ * module it calls (an output). */
 static int tf_link_refs(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                         TSParser *parser) {
-    CBMHashTable *dirs = cbm_ht_create(0);
-    if (!dirs) {
-        return 0;
-    }
-    CBMArena keys;
-    cbm_arena_init_lazy(&keys, CBM_SZ_4K);
-    int ndirs = 0;
-    for (int i = 0; i < file_count; i++) {
-        const char *rel = files[i].rel_path;
-        if (files[i].language == CBM_LANG_HCL && tf_is_module_file(rel)) {
-            const char *slash = strrchr(rel, '/');
-            const char *dir = cbm_arena_strndup(&keys, rel, slash ? (size_t)(slash - rel) : 0);
-            if (dir && !cbm_ht_get(dirs, dir)) {
-                cbm_ht_set(dirs, dir, (void *)dir);
-                ndirs++;
-            }
-        }
+    bool any = false;
+    for (int i = 0; i < file_count && !any; i++) {
+        any = files[i].language == CBM_LANG_HCL && tf_is_module_file(files[i].rel_path);
     }
     const cbm_gbuf_node_t **fnodes = NULL;
     int fn = 0;
-    if (ndirs == 0 || cbm_gbuf_find_by_label(ctx->gbuf, "File", &fnodes, &fn) != 0) {
-        cbm_ht_free(dirs);
-        cbm_arena_destroy(&keys);
+    if (!any || cbm_gbuf_find_by_label(ctx->gbuf, "File", &fnodes, &fn) != 0 || fn <= 0) {
         return 0;
     }
-    const char **paths =
-        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)(fn ? fn : SKIP_ONE) * sizeof(char *));
+    const char **paths = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)fn * sizeof(char *));
     int pn = 0;
     for (int i = 0; paths && i < fn; i++) {
-        const char *rel = fnodes[i]->file_path;
-        if (!rel || !tf_is_module_file(rel)) {
-            continue;
-        }
-        const char *slash = strrchr(rel, '/');
-        char dir[CBM_SZ_1K];
-        snprintf(dir, sizeof(dir), "%.*s", slash ? (int)(slash - rel) : 0, rel);
-        if (cbm_ht_get(dirs, dir)) {
-            paths[pn++] = rel;
+        if (fnodes[i]->file_path && tf_is_module_file(fnodes[i]->file_path)) {
+            paths[pn++] = fnodes[i]->file_path;
         }
     }
     int edges = 0;
-    if (paths && pn > 0 && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_HCL))) {
+    if (pn > 0 && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_HCL))) {
         qsort((void *)paths, (size_t)pn, sizeof(*paths), tf_cmp_dir_path);
-        for (int i = 0; i < pn;) {
-            int j = i;
-            while (j < pn && tf_same_dir(paths[i], paths[j])) {
-                j++;
-            }
-            edges += tf_link_module(ctx, parser, paths + i, j - i);
-            i = j;
-        }
+        edges = tf_link_repo(ctx, parser, paths, pn);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)paths);
-    cbm_ht_free(dirs);
-    cbm_arena_destroy(&keys);
     return edges;
 }
 

@@ -1502,7 +1502,9 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      USAGEs {ref, via:terraform}, from its block, the block of its module
  *      (directory) declaring it (one in depends_on: DEPENDS_ON), instead of
  *      the generic name matcher's USAGE / CALLS; a bare block label names
- *      its block like a quoted one
+ *      its block like a quoted one; a module call with a local source
+ *      IMPORTS its directory's Folder (the root: the Project) and module.X.Y
+ *      USAGEs {ref:output} the output there
  *      (pass_terraform.c, extract_unified.c, extract_defs.c). An index built
  *      before holds none of them, so it rebuilds once on upgrade. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 9 };

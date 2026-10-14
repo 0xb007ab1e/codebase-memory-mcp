@@ -2898,6 +2898,82 @@ TEST(probe_terraform_module_files_extract_no_generic_refs) {
     PASS();
 }
 
+/* Every Terraform module IMPORTS and output-read edge as
+ * "<file> <block> <type> <target> <local_name|ref>:<line>", the target a
+ * Folder's path, the Project, or "<file> <block>". */
+static char *gpf_tf_modules(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.name || ' ' || e.type || ' ' || CASE t.label WHEN 'Folder' THEN 'Folder:' || "
+            "t.file_path WHEN 'Project' THEN 'Project' ELSE t.file_path || ' ' || t.name END || "
+            "' ' || coalesce(json_extract(e.properties,'$.local_name'), "
+            "json_extract(e.properties,'$.ref')) || ':' || json_extract(e.properties,'$.line') AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND json_extract(e.properties,'$.via')='terraform' AND "
+            "(e.type='IMPORTS' OR json_extract(e.properties,'$.ref')='output') ORDER BY x)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A module call with a local source IMPORTS {local_name} the Folder of that
+ * directory (the root directory: the Project), and module.X.Y -- also through
+ * an index or a splat -- USAGEs {ref: output} the `output "Y"` there. A
+ * registry source (also `modules/net`: a local path starts with ./ or ../), a
+ * directory that does not exist, holds no .tf file or lies past the
+ * repository root, and an output the module does not declare make none. */
+TEST(probe_terraform_module_calls_import_their_source) {
+    static const GpfFile files[] = {
+        {"main.tf",
+         "module \"net\" {\n  source = \"./modules/net\"\n}\n"
+         "module \"cnt\" {\n  source = \"./modules/net\"\n  count  = 2\n}\n"
+         "module \"reg\" {\n  source  = \"terraform-aws-modules/vpc/aws\"\n"
+         "  version = \"5.0.0\"\n}\n"
+         "module \"gone\" {\n  source = \"./modules/missing\"\n}\n"
+         "module \"out\" {\n  source = \"../outside\"\n}\n"
+         "output \"a\" {\n  value = module.net.id\n}\n"
+         "output \"b\" {\n  value = module.cnt[0].id\n}\n"
+         "output \"c\" {\n  value = module.cnt[*].name\n}\n"
+         "output \"d\" {\n  value = module.net.nope\n}\n"
+         "output \"e\" {\n  value = module.reg.vpc_id\n}\n"
+         "module \"bare\" {\n  source = \"modules/net\"\n}\n"
+         "module \"docs\" {\n  source = \"./docs\"\n}\n"},
+        {"docs/README.md", "# docs\n"},
+        {"modules/net/main.tf",
+         "output \"id\" {\n  value = \"x\"\n}\noutput \"name\" {\n  value = \"n\"\n}\n"},
+        {"examples/basic/main.tf",
+         "module \"root\" {\n  source = \"../..\"\n}\noutput \"r\" {\n  value = module.root.a\n}\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_tf_modules(files, n);
+    static const char want[] =
+        "examples/basic/main.tf module.root IMPORTS Project root:1\n"
+        "examples/basic/main.tf output.r USAGE main.tf output.a output:5\n"
+        "main.tf module.cnt IMPORTS Folder:modules/net cnt:4\n"
+        "main.tf module.net IMPORTS Folder:modules/net net:1\n"
+        "main.tf output.a USAGE modules/net/main.tf output.id output:19\n"
+        "main.tf output.b USAGE modules/net/main.tf output.id output:22\n"
+        "main.tf output.c USAGE modules/net/main.tf output.name output:25";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "terraform modules got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("terraform modules");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
  * "edgeless routes <n>": the Route nodes no edge touches. */
 static char *gpf_script_http(const GpfFile *files, int nfiles) {
@@ -5337,6 +5413,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_kustomize_helm_charts_deploy_their_chart);
     RUN_TEST(probe_terraform_refs_resolve_in_their_module);
     RUN_TEST(probe_terraform_module_files_extract_no_generic_refs);
+    RUN_TEST(probe_terraform_module_calls_import_their_source);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
