@@ -34,6 +34,28 @@
  * directory before its tasks/), else in its file (a play's handlers). The
  * incremental repair declines on any change to Ansible content
  * (closure_ansible_decline): a notify joins two files.
+ *
+ * PHASE 7 P7.3: applies. A kube (kubespray's library module) or k8s
+ * (kubernetes.core / community.kubernetes) task applies a manifest the play
+ * rendered: it DEPLOYS {via: ansible, module, line} the repository file the
+ * render read -- a template task's src (the role's templates/) or a copy
+ * task's (its files/; never remote_src), else the task file's directory:
+ *   a k8s template: argument            that template;
+ *   filename == a renderer's dest (D)   that renderer's src;
+ *   {{ item.item.K }} over "{{ R.results }}" (L)
+ *                                       the src of the renderer registering
+ *                                       R, for each item of its loop;
+ *   {{ item.K }} (S)                    for each of the task's own items, the
+ *                                       src of the renderer of that dest;
+ *   a literal filename (R)              the src of each looped renderer item
+ *                                       whose dest renders to it.
+ * A loop is a literal list, or "{{ V }}": a set_fact of the file, else the
+ * role's defaults/ or vars/ main.yml. Templates are searched before copies,
+ * each in file order. The incremental repair declines on a change to a
+ * role's defaults / vars main file (closure_ansible_decline), and when a
+ * task file would join it as a dependent -- a deleted template it applies --
+ * since the repair would walk it without its role's other files
+ * (closure_ansible_dependent_decline).
  */
 #include "foundation/constants.h"
 #include "foundation/compat.h"
@@ -88,6 +110,20 @@ typedef struct {
     int note_cap;
     int tasks;
     int calls;
+    CBMHashTable *file_nodes; /* P7.3: File nodes by path (what a task applies) */
+    CBMHashTable *by_rel;     /* every input file's path -> its index + 1 */
+    const cbm_file_info_t *files;
+    TSParser *parser;          /* reads a role's defaults / vars */
+    struct an_render *renders; /* per file: template / copy tasks */
+    int render_n;
+    int render_cap;
+    struct an_apply *applies; /* per file: kube / k8s tasks */
+    int apply_n;
+    int apply_cap;
+    struct an_fact *facts; /* per file: set_fact lists */
+    int fact_n;
+    int fact_cap;
+    int deploys;
 } an_t;
 
 static bool an_type(TSNode n, const char *t) {
@@ -141,6 +177,38 @@ static bool an_scalar(const an_t *a, TSNode n, char *out, size_t sz) {
         an_unescape(out, dq);
     }
     return out[0] != '\0';
+}
+
+/* Is `n` an Ansible boolean that holds true -- y / yes / on / 1 / true / t,
+ * any case (Ansible's boolean()), a YAML boolean or a string? an_scalar
+ * reads strings only: `remote_src: true` is a boolean_scalar. */
+static bool an_true(const an_t *a, TSNode n) {
+    static const char *const TRUE_WORDS[] = {"y", "yes", "on", "1", "true", "t"};
+    while ((an_type(n, "flow_node") || an_type(n, "block_node") || an_type(n, "plain_scalar")) &&
+           ts_node_named_child_count(n) == SKIP_ONE) {
+        n = ts_node_named_child(n, 0);
+    }
+    char v[CBM_SZ_16];
+    if (an_type(n, "boolean_scalar") || an_type(n, "integer_scalar")) {
+        uint32_t b = ts_node_start_byte(n);
+        uint32_t e = ts_node_end_byte(n);
+        if (e - b + SKIP_ONE > sizeof(v)) {
+            return false;
+        }
+        memcpy(v, a->src + b, e - b);
+        v[e - b] = '\0';
+    } else if (!an_scalar(a, n, v, sizeof(v))) {
+        return false;
+    }
+    for (char *c = v; *c; c++) {
+        *c = (char)(*c >= 'A' && *c <= 'Z' ? *c - 'A' + 'a' : *c);
+    }
+    for (size_t i = 0; i < sizeof(TRUE_WORDS) / sizeof(TRUE_WORDS[0]); i++) {
+        if (strcmp(v, TRUE_WORDS[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* The key of a mapping pair, its text, the ansible.builtin. prefix dropped. */
@@ -586,6 +654,586 @@ static bool an_name_at(const an_t *a, TSNode v, TSNode list, uint32_t i, char *o
     return an_scalar(a, item, out, sz);
 }
 
+/* ── Applies (P7.3) ───────────────────────────────────────────────── */
+
+/* One item of a loop list: a scalar, or a mapping's scalar pairs. */
+typedef struct {
+    char *scalar;
+    char **keys;
+    char **vals;
+    int n;
+} an_item_t;
+
+/* A loop (with_items / loop): its literal items, or its expression
+ * ("{{ X }}", "{{ R.results }}"). */
+typedef struct {
+    an_item_t *items;
+    int n;
+    char *expr;
+} an_loop_t;
+
+/* A task rendering a file: template (src in the role's templates/) or copy
+ * of a repository file (its files/). */
+typedef struct an_render {
+    char *src;
+    char *dest;
+    char *reg;
+    an_loop_t loop;
+    bool copy;
+} an_render_t;
+
+/* A task applying a manifest: kube / k8s, its filename (src) or template
+ * argument, its loop. */
+typedef struct an_apply {
+    int64_t task;
+    int line;
+    char *module;
+    char *fname;
+    char *tmpl;
+    an_loop_t loop;
+} an_apply_t;
+
+/* A list a set_fact of the file names. */
+typedef struct an_fact {
+    char *name;
+    an_loop_t list;
+} an_fact_t;
+
+static const char *const AN_APPLIERS[] = {"kube", "k8s", "kubernetes.core.k8s",
+                                          "community.kubernetes.k8s"};
+
+static void *an_grow(void *items, int *cap, int count, size_t elem) {
+    if (count < *cap) {
+        return items;
+    }
+    int ncap = *cap ? *cap * PAIR_LEN : AN_GROW_MIN;
+    void *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, items, (size_t)ncap * elem);
+    if (grown) {
+        *cap = ncap;
+    }
+    return grown;
+}
+
+static char *an_dup(const char *s) {
+    return s ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, s) : NULL;
+}
+
+/* A value node without its block_node / flow_node wrappers. */
+static TSNode an_bare(TSNode v) {
+    while ((an_type(v, "block_node") || an_type(v, "flow_node")) &&
+           ts_node_named_child_count(v) == SKIP_ONE) {
+        v = ts_node_named_child(v, 0);
+    }
+    return v;
+}
+
+/* A loop item: a scalar, or the scalar pairs of a block / flow mapping. */
+static void an_item_parse(const an_t *a, TSNode node, an_item_t *it) {
+    char buf[CBM_SZ_1K];
+    *it = (an_item_t){0};
+    if (an_scalar(a, node, buf, sizeof(buf))) {
+        it->scalar = an_dup(buf);
+        return;
+    }
+    TSNode m = an_bare(node);
+    if (!an_type(m, "block_mapping") && !an_type(m, "flow_mapping")) {
+        return;
+    }
+    int cap = 0;
+    int vcap = 0;
+    for (uint32_t i = 0; i < ts_node_named_child_count(m); i++) {
+        TSNode pair = ts_node_named_child(m, i);
+        char k[CBM_SZ_128];
+        if (!an_type(pair, "block_mapping_pair") && !an_type(pair, "flow_pair")) {
+            continue;
+        }
+        if (!an_scalar(a, ts_node_child_by_field_name(pair, "key", sizeof("key") - SKIP_ONE), k,
+                       sizeof(k)) ||
+            !an_scalar(a, ts_node_child_by_field_name(pair, "value", sizeof("value") - SKIP_ONE),
+                       buf, sizeof(buf))) {
+            continue;
+        }
+        char **keys = an_grow(it->keys, &cap, it->n, sizeof(char *));
+        if (keys) {
+            it->keys = keys;
+        }
+        char **vals = keys ? an_grow(it->vals, &vcap, it->n, sizeof(char *)) : NULL;
+        if (!keys || !vals) {
+            return;
+        }
+        it->vals = vals;
+        it->keys[it->n] = an_dup(k);
+        it->vals[it->n++] = an_dup(buf);
+    }
+}
+
+/* A loop value: an expression (a scalar holding {{ }}, or a list of exactly
+ * one -- with_items flattens one level), else a literal list of items. */
+static void an_loop_parse(const an_t *a, TSNode v, an_loop_t *out) {
+    char buf[CBM_SZ_1K];
+    *out = (an_loop_t){0};
+    if (an_scalar(a, v, buf, sizeof(buf))) {
+        out->expr = strstr(buf, "{{") ? an_dup(buf) : NULL;
+        return;
+    }
+    TSNode s = an_bare(v);
+    bool block = an_type(s, "block_sequence");
+    if (!block && !an_type(s, "flow_sequence")) {
+        return;
+    }
+    int cap = 0;
+    for (uint32_t i = 0; i < ts_node_named_child_count(s); i++) {
+        TSNode item = ts_node_named_child(s, i);
+        if (block ? !an_type(item, "block_sequence_item") : !an_type(item, "flow_node")) {
+            continue;
+        }
+        if (block) {
+            item = ts_node_named_child(item, 0);
+        }
+        an_item_t *grown = an_grow(out->items, &cap, out->n, sizeof(an_item_t));
+        if (!grown) {
+            return;
+        }
+        out->items = grown;
+        an_item_parse(a, item, &out->items[out->n++]);
+    }
+    if (out->n == SKIP_ONE && out->items[0].scalar && strstr(out->items[0].scalar, "{{")) {
+        out->expr = out->items[0].scalar;
+        out->items[0].scalar = NULL;
+        cbm_free(CBM_MEM_CLASS_OTHER, out->items);
+        out->items = NULL;
+        out->n = 0;
+    }
+}
+
+static void an_loop_free(an_loop_t *l) {
+    for (int i = 0; i < l->n; i++) {
+        an_item_t *it = &l->items[i];
+        for (int k = 0; k < it->n; k++) {
+            cbm_free(CBM_MEM_CLASS_OTHER, it->keys[k]);
+            cbm_free(CBM_MEM_CLASS_OTHER, it->vals[k]);
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, it->keys);
+        cbm_free(CBM_MEM_CLASS_OTHER, it->vals);
+        cbm_free(CBM_MEM_CLASS_OTHER, it->scalar);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, l->items);
+    cbm_free(CBM_MEM_CLASS_OTHER, l->expr);
+    *l = (an_loop_t){0};
+}
+
+/* The task's loop: with_items, else loop. */
+static void an_task_loop(const an_t *a, TSNode m, an_loop_t *out) {
+    TSNode v = an_get(a, m, "with_items");
+    an_loop_parse(a, ts_node_is_null(v) ? an_get(a, m, "loop") : v, out);
+}
+
+/* What task `m` (Function `id`) renders, applies or sets, for an_link_applies. */
+static void an_collect(an_t *a, TSNode m, int64_t id) {
+    char k[CBM_SZ_128];
+    char v[CBM_SZ_1K];
+    for (uint32_t i = 0; i < ts_node_named_child_count(m); i++) {
+        TSNode pair = ts_node_named_child(m, i);
+        if (!an_key(a, pair, k, sizeof(k))) {
+            continue;
+        }
+        TSNode value = ts_node_child_by_field_name(pair, "value", sizeof("value") - SKIP_ONE);
+        bool copy = strcmp(k, "copy") == 0;
+        if (strcmp(k, "template") == 0 || copy) {
+            TSNode args = an_bare(value);
+            if (!an_type(args, "block_mapping") && !an_type(args, "flow_mapping")) {
+                continue;
+            }
+            if (copy && an_true(a, an_get(a, value, "remote_src"))) {
+                continue;
+            }
+            an_render_t *r = an_grow(a->renders, &a->render_cap, a->render_n, sizeof(*r));
+            if (!r) {
+                continue;
+            }
+            a->renders = r;
+            r = &a->renders[a->render_n++];
+            *r = (an_render_t){.copy = copy};
+            r->src = an_scalar(a, an_get(a, value, "src"), v, sizeof(v)) ? an_dup(v) : NULL;
+            r->dest = an_scalar(a, an_get(a, value, "dest"), v, sizeof(v)) ? an_dup(v) : NULL;
+            r->reg = an_scalar(a, an_get(a, m, "register"), v, sizeof(v)) ? an_dup(v) : NULL;
+            an_task_loop(a, m, &r->loop);
+        } else if (strcmp(k, "set_fact") == 0) {
+            TSNode f = an_bare(value);
+            for (uint32_t j = 0; an_type(f, "block_mapping") && j < ts_node_named_child_count(f);
+                 j++) {
+                TSNode fp = ts_node_named_child(f, j);
+                char name[CBM_SZ_128];
+                TSNode fv = ts_node_child_by_field_name(fp, "value", sizeof("value") - SKIP_ONE);
+                TSNode seq = an_bare(fv);
+                an_fact_t *g =
+                    (an_type(fp, "block_mapping_pair") && an_key(a, fp, name, sizeof(name)) &&
+                     (an_type(seq, "block_sequence") || an_type(seq, "flow_sequence")))
+                        ? an_grow(a->facts, &a->fact_cap, a->fact_n, sizeof(*g))
+                        : NULL;
+                if (g) {
+                    a->facts = g;
+                    a->facts[a->fact_n].name = an_dup(name);
+                    an_loop_parse(a, fv, &a->facts[a->fact_n++].list);
+                }
+            }
+        } else {
+            for (size_t j = 0; j < sizeof(AN_APPLIERS) / sizeof(AN_APPLIERS[0]); j++) {
+                if (strcmp(k, AN_APPLIERS[j]) != 0) {
+                    continue;
+                }
+                an_apply_t *p = an_grow(a->applies, &a->apply_cap, a->apply_n, sizeof(*p));
+                if (!p) {
+                    break;
+                }
+                a->applies = p;
+                p = &a->applies[a->apply_n++];
+                *p = (an_apply_t){.task = id,
+                                  .line = (int)ts_node_start_point(m).row + SKIP_ONE,
+                                  .module = an_dup(k)};
+                if (an_scalar(a, an_get(a, value, "template"), v, sizeof(v))) {
+                    p->tmpl = an_dup(v);
+                } else if (an_scalar(a, an_get(a, value, "filename"), v, sizeof(v)) ||
+                           an_scalar(a, an_get(a, value, "src"), v, sizeof(v))) {
+                    p->fname = an_dup(v);
+                }
+                an_task_loop(a, m, &p->loop);
+                break;
+            }
+        }
+    }
+}
+
+/* The trimmed inside of a {{ }}, `n` bytes at `b`: "item" (key length 0) or
+ * "item.K", K an identifier (into key / kl); false for anything else. */
+static bool an_item_ref(const char *b, size_t n, const char **key, size_t *kl) {
+    static const char ITEM[] = "item";
+    size_t il = sizeof(ITEM) - SKIP_ONE;
+    if (n < il || strncmp(b, ITEM, il) != 0) {
+        return false;
+    }
+    *key = b + il;
+    *kl = 0;
+    if (n == il) {
+        return true;
+    }
+    if (b[il] != '.' || n == il + SKIP_ONE) {
+        return false;
+    }
+    *key = b + il + SKIP_ONE;
+    *kl = n - il - SKIP_ONE;
+    for (size_t i = 0; i < *kl; i++) {
+        char c = (*key)[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
+              (i > 0 && c >= '0' && c <= '9'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* `pattern` with each {{ item }} / {{ item.K }} replaced from `it`; false
+ * when one cannot be, or -- `strict` -- when any other {{ }} is left. */
+static bool an_subst(const char *pattern, const an_item_t *it, bool strict, char *out, size_t sz) {
+    size_t w = 0;
+    for (const char *p = pattern; p && *p;) {
+        const char *end = p[0] == '{' && p[SKIP_ONE] == '{' ? strstr(p + PAIR_LEN, "}}") : NULL;
+        const char *piece = p;
+        size_t len = SKIP_ONE;
+        if (end) {
+            const char *b = p + PAIR_LEN;
+            while (*b == ' ' || *b == '\t') {
+                b++;
+            }
+            size_t n = (size_t)(end - b); /* b stops at end's '}' at the latest */
+            while (n > 0 && (b[n - SKIP_ONE] == ' ' || b[n - SKIP_ONE] == '\t')) {
+                n--;
+            }
+            const char *key = NULL;
+            size_t kl = 0;
+            if (an_item_ref(b, n, &key, &kl)) {
+                piece = kl == 0 ? it->scalar : NULL;
+                for (int k = 0; kl > 0 && k < it->n && !piece; k++) {
+                    if (strlen(it->keys[k]) == kl && strncmp(it->keys[k], key, kl) == 0) {
+                        piece = it->vals[k];
+                    }
+                }
+                if (!piece) {
+                    return false;
+                }
+                len = strlen(piece);
+            } else if (strict) {
+                return false;
+            } else {
+                len = (size_t)(end + PAIR_LEN - p);
+            }
+            p = end + PAIR_LEN;
+        } else {
+            p++;
+        }
+        if (w + len >= sz) {
+            return false;
+        }
+        memcpy(out + w, piece, len);
+        w += len;
+    }
+    out[w] = '\0';
+    return true;
+}
+
+/* The repository file a template / copy `src` names: in the role's
+ * templates/ (files/ for a copy), else the task file's directory. */
+static const cbm_gbuf_node_t *an_src_file(const an_t *a, const char *src, bool copy) {
+    char base[CBM_SZ_1K];
+    char path[CBM_SZ_1K];
+    if (!src || strstr(src, "{{")) {
+        return NULL;
+    }
+    if (a->role_dir[0]) {
+        snprintf(base, sizeof(base), "%s/%s", a->role_dir, copy ? "files" : "templates");
+        const cbm_gbuf_node_t *n = cbm_repo_rel_join(base, src, path, sizeof(path))
+                                       ? cbm_ht_get(a->file_nodes, path)
+                                       : NULL;
+        if (n) {
+            return n;
+        }
+    }
+    return cbm_repo_rel_join(a->dir, src, path, sizeof(path)) ? cbm_ht_get(a->file_nodes, path)
+                                                              : NULL;
+}
+
+/* A top-level list `name` of the role's defaults/ or vars/ main.yml, into
+ * `out`; false when none holds one. */
+static bool an_role_list(an_t *a, const char *name, an_loop_t *out) {
+    static const char *const FILES[] = {"defaults/main.yml", "defaults/main.yaml", "vars/main.yml",
+                                        "vars/main.yaml"};
+    bool found = false;
+    for (size_t f = 0; a->role_dir[0] && !found && f < sizeof(FILES) / sizeof(FILES[0]); f++) {
+        char rel[CBM_SZ_1K];
+        snprintf(rel, sizeof(rel), "%s/%s", a->role_dir, FILES[f]);
+        intptr_t ix = (intptr_t)cbm_ht_get(a->by_rel, rel);
+        size_t len = 0;
+        char *src = ix > 0 ? an_read(a->files[ix - SKIP_ONE].path, &len) : NULL;
+        TSTree *tree = src ? ts_parser_parse_string(a->parser, NULL, src, (uint32_t)len) : NULL;
+        TSNode top =
+            tree ? an_bare(an_child(an_child(ts_tree_root_node(tree), "document"), "block_node"))
+                 : (TSNode){0};
+        const char *saved = a->src;
+        a->src = src;
+        for (uint32_t i = 0;
+             an_type(top, "block_mapping") && !found && i < ts_node_named_child_count(top); i++) {
+            TSNode pair = ts_node_named_child(top, i);
+            char k[CBM_SZ_128];
+            TSNode v = ts_node_child_by_field_name(pair, "value", sizeof("value") - SKIP_ONE);
+            TSNode seq = an_bare(v);
+            if (an_key(a, pair, k, sizeof(k)) && strcmp(k, name) == 0 &&
+                (an_type(seq, "block_sequence") || an_type(seq, "flow_sequence"))) {
+                an_loop_parse(a, v, out);
+                found = true;
+            }
+        }
+        a->src = saved;
+        if (tree) {
+            ts_tree_delete(tree);
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, src);
+    }
+    return found;
+}
+
+/* An expression "{{ X }}" with X an identifier, then `tail` ("" or
+ * ".results"): X into `out`. */
+static bool an_expr_name(const char *expr, const char *tail, char *out, size_t sz) {
+    const char *b = expr && expr[0] == '{' && expr[SKIP_ONE] == '{' ? expr + PAIR_LEN : NULL;
+    size_t n = 0;
+    while (b && (*b == ' ' || *b == '\t')) {
+        b++;
+    }
+    while (b && n + SKIP_ONE < sz &&
+           ((*b >= 'a' && *b <= 'z') || (*b >= 'A' && *b <= 'Z') || *b == '_' ||
+            (n > 0 && *b >= '0' && *b <= '9'))) {
+        out[n++] = *b++;
+    }
+    out[n] = '\0';
+    size_t tl = strlen(tail);
+    if (!n || !b || strncmp(b, tail, tl) != 0) {
+        return false;
+    }
+    for (b += tl; *b == ' ' || *b == '\t'; b++) {}
+    return strcmp(b, "}}") == 0;
+}
+
+/* "{{ R.results }}": R into `out`. */
+static bool an_results_of(const char *expr, char *out, size_t sz) {
+    return an_expr_name(expr, ".results", out, sz);
+}
+
+/* Does `s` hold a {{ item.K }} reference (one key level)? */
+static bool an_has_item_key(const char *s) {
+    for (const char *p = s ? strstr(s, "{{") : NULL; p; p = strstr(p + PAIR_LEN, "{{")) {
+        const char *b = p + PAIR_LEN;
+        while (*b == ' ' || *b == '\t') {
+            b++;
+        }
+        if (strncmp(b, "item.", sizeof("item.") - SKIP_ONE) != 0) {
+            continue;
+        }
+        b += sizeof("item.") - SKIP_ONE;
+        const char *k = b;
+        while ((*b >= 'a' && *b <= 'z') || (*b >= 'A' && *b <= 'Z') || *b == '_') {
+            b++;
+        }
+        while (b > k && (*b == ' ' || *b == '\t')) {
+            b++;
+        }
+        if (b > k && b[0] == '}' && b[SKIP_ONE] == '}') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The items a loop goes over: its literal list, or the list "{{ V }}" names
+ * -- a set_fact of the file, else the role's defaults / vars. `scratch`
+ * holds a list read from the role (the caller frees it). */
+static const an_loop_t *an_items(an_t *a, const an_loop_t *l, an_loop_t *scratch) {
+    if (!l->expr) {
+        return l->items ? l : NULL;
+    }
+    char name[CBM_SZ_128];
+    if (!an_expr_name(l->expr, "", name, sizeof(name))) {
+        return NULL;
+    }
+    for (int i = 0; i < a->fact_n; i++) {
+        if (strcmp(a->facts[i].name, name) == 0) {
+            return &a->facts[i].list;
+        }
+    }
+    return an_role_list(a, name, scratch) ? scratch : NULL;
+}
+
+static void an_deploy(an_t *a, const an_apply_t *p, const cbm_gbuf_node_t *target) {
+    if (!target || p->task <= 0) {
+        return;
+    }
+    char em[CBM_SZ_256];
+    char props[CBM_SZ_512];
+    cbm_json_escape(em, (int)sizeof(em), p->module);
+    snprintf(props, sizeof(props), "{\"via\":\"ansible\",\"module\":\"%s\",\"line\":%d}", em,
+             p->line);
+    cbm_gbuf_insert_edge(a->ctx->gbuf, p->task, target->id, "DEPLOYS", props);
+    a->deploys++;
+}
+
+/* The renderer `src` of each item of `items`, substituted (strict). */
+static int an_deploy_items(an_t *a, const an_apply_t *p, const an_render_t *r,
+                           const an_loop_t *items) {
+    int made = 0;
+    char path[CBM_SZ_1K];
+    for (int i = 0; r && items && i < items->n; i++) {
+        const cbm_gbuf_node_t *t =
+            r->src && an_subst(r->src, &items->items[i], true, path, sizeof(path))
+                ? an_src_file(a, path, r->copy)
+                : NULL;
+        if (t) {
+            an_deploy(a, p, t);
+            made++;
+        }
+    }
+    return made;
+}
+
+/* The first renderer (templates before copies, each in file order) whose
+ * `dest` -- or, with `reg`, whose register -- is the very string. */
+static const an_render_t *an_render_find(const an_t *a, const char *dest, const char *reg) {
+    for (int pass = 0; pass < PAIR_LEN; pass++) {
+        for (int i = 0; i < a->render_n; i++) {
+            const an_render_t *r = &a->renders[i];
+            const char *v = reg ? r->reg : r->dest;
+            if (r->copy == (pass == SKIP_ONE) && v && strcmp(v, reg ? reg : dest) == 0) {
+                return r;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* kube / k8s -> DEPLOYS {via: ansible, module, line} the repository file it
+ * applies, traced to the template (or copied file) the play rendered it from:
+ * a k8s template: argument; a renderer whose dest is the filename (D); for
+ * {{ item.item.K }} over "{{ R.results }}", each item of the renderer
+ * registering R (L); for {{ item.K }}, each of the task's own items through
+ * the renderer of that dest (S); a literal filename a looped renderer's dest
+ * renders to (R). */
+static void an_link_applies(an_t *a) {
+    for (int i = 0; i < a->apply_n; i++) {
+        const an_apply_t *p = &a->applies[i];
+        an_loop_t scratch = {0};
+        int made = 0;
+        if (p->tmpl) {
+            an_deploy(a, p, an_src_file(a, p->tmpl, false));
+            continue;
+        }
+        if (!p->fname) {
+            continue;
+        }
+        const an_render_t *r = an_render_find(a, p->fname, NULL);
+        const cbm_gbuf_node_t *d = r ? an_src_file(a, r->src, r->copy) : NULL;
+        if (d) {
+            an_deploy(a, p, d);
+            continue;
+        }
+        char reg[CBM_SZ_128];
+        if (strstr(p->fname, "item.item") && an_results_of(p->loop.expr, reg, sizeof(reg))) {
+            const an_render_t *g = an_render_find(a, NULL, reg);
+            made = g ? an_deploy_items(a, p, g, an_items(a, &g->loop, &scratch)) : 0;
+        }
+        if (!made && an_has_item_key(p->fname) && (p->loop.expr || p->loop.items)) {
+            an_loop_free(&scratch);
+            made = an_deploy_items(a, p, r, an_items(a, &p->loop, &scratch));
+        }
+        if (!made && !strstr(p->fname, "{{ item")) {
+            char path[CBM_SZ_1K];
+            for (int j = 0; j < a->render_n; j++) {
+                const an_render_t *x = &a->renders[j];
+                an_loop_free(&scratch);
+                const an_loop_t *items = an_items(a, &x->loop, &scratch);
+                for (int k = 0; items && x->dest && k < items->n; k++) {
+                    if (an_subst(x->dest, &items->items[k], false, path, sizeof(path)) &&
+                        strcmp(path, p->fname) == 0 && x->src &&
+                        an_subst(x->src, &items->items[k], true, path, sizeof(path))) {
+                        an_deploy(a, p, an_src_file(a, path, x->copy));
+                    }
+                }
+            }
+        }
+        an_loop_free(&scratch);
+    }
+}
+
+/* The per-file render / apply / set_fact records, freed. */
+static void an_applies_reset(an_t *a) {
+    for (int i = 0; i < a->render_n; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, a->renders[i].src);
+        cbm_free(CBM_MEM_CLASS_OTHER, a->renders[i].dest);
+        cbm_free(CBM_MEM_CLASS_OTHER, a->renders[i].reg);
+        an_loop_free(&a->renders[i].loop);
+    }
+    for (int i = 0; i < a->apply_n; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, a->applies[i].module);
+        cbm_free(CBM_MEM_CLASS_OTHER, a->applies[i].fname);
+        cbm_free(CBM_MEM_CLASS_OTHER, a->applies[i].tmpl);
+        an_loop_free(&a->applies[i].loop);
+    }
+    for (int i = 0; i < a->fact_n; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, a->facts[i].name);
+        an_loop_free(&a->facts[i].list);
+    }
+    a->render_n = 0;
+    a->apply_n = 0;
+    a->fact_n = 0;
+}
+
 static void an_index_handler(an_t *a, const char *name, int64_t id) {
     char key[CBM_SZ_2K];
     if (a->role_dir[0]) {
@@ -654,6 +1302,7 @@ static void an_task(an_t *a, TSNode m, bool handler) {
     }
     cbm_gbuf_insert_edge(a->ctx->gbuf, a->from, id, "DEFINES", "{}");
     a->tasks++;
+    an_collect(a, m, id);
     TSNode list;
     char n[CBM_SZ_256];
     if (handler) {
@@ -926,6 +1575,13 @@ static void an_free(an_t *a) {
         cbm_ht_foreach(a->handlers, an_free_ids_entry, NULL);
         cbm_ht_free(a->handlers);
     }
+    an_applies_reset(a);
+    cbm_free(CBM_MEM_CLASS_OTHER, a->renders);
+    cbm_free(CBM_MEM_CLASS_OTHER, a->applies);
+    cbm_free(CBM_MEM_CLASS_OTHER, a->facts);
+    if (a->by_rel) {
+        cbm_ht_free(a->by_rel);
+    }
 }
 
 /* Parse `files[i]` when it is a YAML file whose top level is a sequence;
@@ -974,9 +1630,16 @@ void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         }
         cbm_free(CBM_MEM_CLASS_OTHER, src);
     }
-    /* pass 2: the tasks of the Ansible files, then their notifies */
+    /* pass 2: the tasks of the Ansible files (what each applies), then their notifies */
     an_mark_ansible(&a, &cands, files);
     a.handlers = cands.count > 0 ? cbm_ht_create(0) : NULL;
+    a.by_rel = a.handlers ? cbm_ht_create(0) : NULL;
+    for (int i = 0; a.by_rel && i < file_count; i++) {
+        cbm_ht_set(a.by_rel, files[i].rel_path, (void *)(intptr_t)(i + SKIP_ONE));
+    }
+    a.files = files;
+    a.file_nodes = file_nodes;
+    a.parser = parser;
     for (int c = 0; a.handlers && c < cands.count; c++) {
         const cbm_file_info_t *f = &files[cands.items[c].file];
         char *src = NULL;
@@ -985,6 +1648,8 @@ void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         if (fnode) {
             an_begin_file(&a, f->rel_path, fnode, src);
             an_file_tasks(&a, an_top(ts_tree_root_node(tree)), cands.items[c].playbook);
+            an_link_applies(&a);
+            an_applies_reset(&a);
         }
         if (tree) {
             ts_tree_delete(tree);
@@ -1004,9 +1669,11 @@ void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         char e[CBM_SZ_32];
         char t[CBM_SZ_32];
         char n[CBM_SZ_32];
+        char d[CBM_SZ_32];
         snprintf(e, sizeof(e), "%d", a.edges);
         snprintf(t, sizeof(t), "%d", a.tasks);
         snprintf(n, sizeof(n), "%d", a.calls);
-        cbm_log_info("pass.ansible", "imports", e, "tasks", t, "notifies", n);
+        snprintf(d, sizeof(d), "%d", a.deploys);
+        cbm_log_info("pass.ansible", "imports", e, "tasks", t, "notifies", n, "deploys", d);
     }
 }

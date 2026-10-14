@@ -11,8 +11,8 @@
  *   kubectl ... -k D                      the Kustomization of D
  *   kustomize build D | ... | kubectl apply -f -   (also kubectl kustomize D)
  *   helm install|upgrade [NAME] CHART     the Chart of a chart dir, else the
- *                                         shared external Chart (repo/name,
- *                                         oci://.../name)
+ *                                         external Chart of that name
+ *                                         (repo/name, oci://.../name)
  *   helm template [NAME] CHART | ... | kubectl apply -f -
  *   find D -name G -exec kubectl apply -f {} \;    D's manifests matching G
  *
@@ -216,7 +216,7 @@ static bool sh_index_build(sh_index_t *ix, cbm_pipeline_ctx_t *ctx) {
             const char *base = fp ? sh_basename(fp) : "";
             const char *qn = nodes[i]->qualified_name;
             if ((strcmp(base, "Chart.yaml") == 0 || strcmp(base, "Chart.yml") == 0) && qn &&
-                !strstr(qn, ".__helm_dep__.")) {
+                !cbm_pipeline_chart_is_external(nodes[i])) {
                 cbm_ht_set(ix->charts, fp, (void *)(intptr_t)nodes[i]->id);
             }
         }
@@ -3569,16 +3569,11 @@ static int64_t sh_source(cbm_pipeline_ctx_t *ctx, const sh_span_t *spans, int n,
     return fn ? fn->id : 0;
 }
 
-/* The shared external Chart of `name` (the one chart dependencies use). */
+/* The external Chart of `name` a helm command names: the hit keeps no
+ * repository URL (a `repo/name` alias, an oci:// reference's last segment),
+ * so the per-project one. */
 static int64_t sh_external_chart(cbm_pipeline_ctx_t *ctx, const char *name, const char *file) {
-    char qn[CBM_SZ_512];
-    snprintf(qn, sizeof(qn), "%s.__helm_dep__.%s", ctx->project_name, name);
-    const cbm_gbuf_node_t *known = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
-    if (known) {
-        return known->id;
-    }
-    return cbm_gbuf_upsert_node(ctx->gbuf, "Chart", name, qn, file, SKIP_ONE, 0,
-                                "{\"source\":\"helm\",\"external\":true}");
+    return cbm_pipeline_external_chart(ctx, name, NULL, file);
 }
 
 /* A hit's CI context as JSON members (`,"ci":..,"job":..`); "" for none. */

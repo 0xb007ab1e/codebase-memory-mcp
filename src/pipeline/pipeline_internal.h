@@ -1317,8 +1317,9 @@ char *cbm_k8s_resource_props(const char *qn, const char *effective_ns, const cha
 
 /* Ansible (pass_ansible.c): a playbook or task file IMPORTS the playbooks,
  * task files and roles its directives name; its tasks and handlers are
- * Functions, a notify CALLS the handlers it names. Run at the end of the
- * K8s pass, over the same files. */
+ * Functions, a notify CALLS the handlers it names, a kube / k8s task
+ * DEPLOYS the template it applies. Run at the end of the K8s pass, over the
+ * same files. */
 void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                int file_count);
 
@@ -1335,6 +1336,30 @@ bool cbm_repo_rel_join(const char *dir, const char *v, char *out, size_t sz);
  * docker.io for no registry host, library/ for an official image; tag and
  * digest dropped), made when new; 0 for scratch or no image. */
 int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref);
+
+/* A chart repository URL as an identity (pass_k8s.c): `url` trimmed, its
+ * scheme and host lower-cased, trailing `/` and `.git` dropped. False for no
+ * URL: no scheme or host, a file:// directory, credentials in the authority,
+ * a query or fragment (`?`, `#`: a token may ride there), or a byte no
+ * stated URL holds (whitespace, quote, template, `$`). A
+ * repository URL is never cut: oci://host/x with chart x is oci://host/x/x. */
+bool cbm_chart_repo_url(const char *url, char *out, size_t sz);
+
+/* The repository of chart reference `ref` (a Flux OCIRepository url, a
+ * Terraform `chart = "oci://..."`): all before its last segment, the chart.
+ * False when none is left. */
+bool cbm_chart_ref_repo(const char *ref, char *out, size_t sz);
+
+/* The external Chart node of chart `name` from repository `url` (pass_k8s.c),
+ * made when new and owned by `file`: `__chart__<url>/<name>` {source,
+ * external, repository} -- one QN in every project -- when `url` resolves
+ * (cbm_chart_repo_url), else `<project>.__helm_dep__.<name>`. */
+int64_t cbm_pipeline_external_chart(cbm_pipeline_ctx_t *ctx, const char *name, const char *url,
+                                    const char *file);
+
+/* Is Chart node `node` an external chart (either identity) rather than one
+ * a Chart.yaml of this repository declares? */
+bool cbm_pipeline_chart_is_external(const cbm_gbuf_node_t *node);
 
 /* Environment variable `key` that `owner` sets (pass_docker.c): a K8s or
  * compose Resource for its container `container`, a Dockerfile Module for
@@ -1545,9 +1570,11 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      (pass_terraform.c, extract_unified.c, extract_defs.c); an Ansible
  *      playbook / task file IMPORTS {via:ansible} the playbooks, task files
  *      and roles its directives name, its tasks and handlers are Functions
- *      {source:ansible} and a notify CALLS {via:notify} the handlers it names
- *      (pass_ansible.c). An index built before holds none of them, so it
- *      rebuilds once on upgrade. */
+ *      {source:ansible}, a notify CALLS {via:notify} the handlers it names,
+ *      a kube / k8s task DEPLOYS {via:ansible} the template it applies
+ *      (pass_ansible.c). An external Chart is keyed by its publisher URL.
+ *      An index built before holds none of them, so it rebuilds once on
+ *      upgrade. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
 
 typedef struct {

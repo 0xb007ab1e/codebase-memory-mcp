@@ -7,8 +7,9 @@
  *   chart = "./charts/x" / "${path.module}/charts/x"   the Chart of that
  *                                                      directory, relative to
  *                                                      the module's directory
- *   repository = "<url>", chart = "<name>"             the shared external
- *   chart = "oci://registry/.../<name>"                Chart of that name
+ *   repository = "<url>", chart = "<name>"             the external Chart of
+ *   chart = "oci://registry/.../<name>"                that name (an oci://
+ *                                                      reference: of its URL)
  * Values are evaluated from string literals and ${path.module}; any other
  * expression is unknown, and an unknown chart is no edge. Run at the end of
  * the K8s pass, over the same files.
@@ -198,7 +199,9 @@ static CBMHashTable *tf_chart_index(cbm_pipeline_ctx_t *ctx) {
         const char *fp = nodes[i]->file_path;
         const char *qn = nodes[i]->qualified_name;
         const char *base = fp ? tf_basename(fp) : "";
-        if (fp && qn && !strstr(qn, ".__helm_dep__.") &&
+        /* an external chart a Chart.yaml depends on carries that file's
+         * path too: only the chart it declares is the directory's */
+        if (fp && qn && !cbm_pipeline_chart_is_external(nodes[i]) &&
             (strcmp(base, "Chart.yaml") == 0 || strcmp(base, "Chart.yml") == 0)) {
             cbm_ht_set(ix, fp, (void *)(intptr_t)nodes[i]->id);
         }
@@ -218,18 +221,6 @@ static int64_t tf_local_chart(const tf_t *t, const char *dir) {
         }
     }
     return 0;
-}
-
-/* The shared external Chart of `name` (the one chart dependencies use). */
-static int64_t tf_external_chart(cbm_pipeline_ctx_t *ctx, const char *name, const char *file) {
-    char qn[CBM_SZ_512];
-    snprintf(qn, sizeof(qn), "%s.__helm_dep__.%s", ctx->project_name, name);
-    const cbm_gbuf_node_t *known = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
-    if (known) {
-        return known->id;
-    }
-    return cbm_gbuf_upsert_node(ctx->gbuf, "Chart", name, qn, file, SKIP_ONE, 0,
-                                "{\"source\":\"helm\",\"external\":true}");
 }
 
 /* The node of block `resource.helm_release.<name>` in the file, by the QN
@@ -293,6 +284,9 @@ static void tf_helm_release(tf_t *t, TSNode block, const char *name) {
     int64_t src = tf_block_node(t, name);
     int64_t tgt = 0;
     bool external = false;
+    /* the repository of an oci:// reference; "" when unknown (a
+     * `repository =` value is not read) */
+    char repo[CBM_SZ_1K] = "";
     char path[CBM_SZ_1K] = "";
     static const char OCI[] = "oci://";
     if (strncmp(chart, OCI, sizeof(OCI) - SKIP_ONE) == 0) {
@@ -300,6 +294,10 @@ static void tf_helm_release(tf_t *t, TSNode block, const char *name) {
         if (tf_plain_name(base)) {
             snprintf(path, sizeof(path), "%s", base);
             external = true;
+            /* the reference names its repository: all but the chart */
+            if (!cbm_chart_ref_repo(chart, repo, sizeof(repo))) {
+                repo[0] = '\0';
+            }
         }
     } else if (has_repo) {
         if (tf_plain_name(chart)) {
@@ -310,7 +308,7 @@ static void tf_helm_release(tf_t *t, TSNode block, const char *name) {
         tgt = tf_local_chart(t, path);
     }
     if (external) {
-        tgt = tf_external_chart(t->ctx, path, t->file);
+        tgt = cbm_pipeline_external_chart(t->ctx, path, repo[0] ? repo : NULL, t->file);
     }
     if (src <= 0 || tgt <= 0) {
         return;

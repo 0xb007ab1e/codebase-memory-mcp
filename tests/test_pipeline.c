@@ -1592,6 +1592,95 @@ TEST(pipeline_incremental_keeps_ansible_notifies_across_files) {
     PASS();
 }
 
+/* The files Ansible tasks DEPLOY (via ansible), ordered, one per line, into
+ * `out`; false on a query error. */
+static bool ansible_deploy_targets(cbm_store_t *s, const char *project, char *out, size_t sz) {
+    sqlite3_stmt *st = NULL;
+    bool ok = false;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT coalesce(group_concat(p, char(10)), '') FROM (SELECT "
+                           "t.file_path AS p FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+                           "e.project=?1 AND e.type='DEPLOYS' AND "
+                           "json_extract(e.properties,'$.via')='ansible' ORDER BY p)",
+                           -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        snprintf(out, sz, "%s", (const char *)sqlite3_column_text(st, 0));
+        ok = true;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* A kube task DEPLOYS the template its play rendered, read through a list of
+ * the role's defaults/main.yml -- a file holding no task. Editing it (the
+ * list names another template) or deleting it must land on the full graph,
+ * and so must deleting the deployed template while a file of that name sits
+ * in the task file's directory (the render falls back to it). The repair
+ * did not re-walk the task file for the list edit -- it kept the edge to the
+ * template the list no longer names -- and re-walked it for the deletion as
+ * a dependent of the template, without the role's defaults: no edge at all.
+ * Both decline to the full rebuild (closure_ansible_decline: a role's
+ * defaults / vars; closure_ansible_dependent_decline: a task file joining
+ * the repair as a dependent). A template body edit keeps the repair and the
+ * edge. */
+TEST(pipeline_incremental_keeps_ansible_deploys_across_files) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    write_temp_file(g_tmpdir, "roles/app/tasks/main.yml",
+                    "- name: Render\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+                    "    dest: \"/etc/k/{{ item.file }}\"\n  loop: \"{{ app_list }}\"\n"
+                    "  register: out\n"
+                    "- name: Apply\n  kube:\n    filename: \"/etc/k/{{ item.item.file }}\"\n"
+                    "  loop: \"{{ out.results }}\"\n");
+    write_temp_file(g_tmpdir, "roles/app/defaults/main.yml", "app_list:\n  - {file: a.yml}\n");
+    write_temp_file(g_tmpdir, "roles/app/templates/a.yml.j2", "a: 1\n");
+    write_temp_file(g_tmpdir, "roles/app/templates/b.yml.j2", "b: 1\n");
+    write_temp_file(g_tmpdir, "roles/app/tasks/b.yml.j2", "b: 2\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_incr_deploys.db", g_tmpdir);
+    static const char *const want[] = {
+        "roles/app/templates/a.yml.j2", /* the full index */
+        "roles/app/templates/a.yml.j2", /* a.yml.j2's body edited */
+        "roles/app/templates/b.yml.j2", /* the defaults list names b.yml */
+        "roles/app/tasks/b.yml.j2",     /* templates/b.yml.j2 deleted */
+        "",                             /* the defaults deleted */
+    };
+    char path[1024];
+    for (int step = 0; step < (int)(sizeof(want) / sizeof(want[0])); step++) {
+        if (step == 1) {
+            snprintf(path, sizeof(path), "%s/roles/app/templates/a.yml.j2", g_tmpdir);
+            ASSERT_EQ(th_append_file(path, "a2: 2\n"), 0);
+        } else if (step == 2) {
+            write_temp_file(g_tmpdir, "roles/app/defaults/main.yml",
+                            "app_list:\n  - {file: b.yml}\n");
+        } else if (step == 3) {
+            snprintf(path, sizeof(path), "%s/roles/app/templates/b.yml.j2", g_tmpdir);
+            ASSERT_EQ(th_unlink_force(path), 0);
+        } else if (step == 4) {
+            snprintf(path, sizeof(path), "%s/roles/app/defaults/main.yml", g_tmpdir);
+            ASSERT_EQ(th_unlink_force(path), 0);
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(s);
+        char got[2048];
+        bool ok = ansible_deploy_targets(s, cbm_pipeline_project_name(p), got, sizeof(got));
+        cbm_store_close(s);
+        cbm_pipeline_free(p);
+        ASSERT_TRUE(ok);
+        if (strcmp(got, want[step]) != 0) {
+            fprintf(stderr, "step %d deploys got [%s] want [%s]\n", step, got, want[step]);
+        }
+        ASSERT_STR_EQ(got, want[step]);
+    }
+    teardown_test_repo();
+    PASS();
+}
+
 /* Regression: a Terraform module's output read lives in one file
  * (infra/outputs.tf: module.net.vpc_id) and the module's source in another
  * (infra/main.tf). Pointing the source elsewhere edits main.tf alone; the
@@ -23295,6 +23384,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module);
     RUN_TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file);
     RUN_TEST(pipeline_incremental_keeps_ansible_notifies_across_files);
+    RUN_TEST(pipeline_incremental_keeps_ansible_deploys_across_files);
     RUN_TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);

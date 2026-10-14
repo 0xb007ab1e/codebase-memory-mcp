@@ -1812,7 +1812,7 @@ static char *gpf_deploys(const GpfFile *files, int nfiles) {
             "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT "
             "CASE WHEN s.label IN ('Module','File') THEN '@' || s.file_path ELSE s.name END "
             "|| ' -> ' || CASE WHEN t.label='Chart' THEN 'chart:' || t.name || "
-            "CASE WHEN instr(t.qualified_name,'__helm_dep__') THEN '(ext)' ELSE '' END "
+            "CASE WHEN json_extract(t.properties,'$.external') THEN '(ext)' ELSE '' END "
             "ELSE t.label || ':' || t.file_path END "
             "|| ' (' || json_extract(e.properties,'$.via') || ')' AS x "
             "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
@@ -3484,6 +3484,117 @@ TEST(probe_ansible_tasks_are_functions) {
     PASS();
 }
 
+/* Every DEPLOYS an Ansible task draws, as "<task> DEPLOYS <file> [<module>]",
+ * then "deploys <n>". */
+static char *gpf_ansible_deploys(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.name || ' DEPLOYS ' "
+            "|| t.file_path || ' [' || json_extract(e.properties,'$.module') || ']' AS x FROM "
+            "edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE "
+            "e.project=?1 AND e.type='DEPLOYS' AND json_extract(e.properties,'$.via')='ansible' "
+            "ORDER BY x)), '') || char(10) || 'deploys ' || (SELECT COUNT(*) FROM edges WHERE "
+            "project=?1 AND type='DEPLOYS' AND json_extract(properties,'$.via')='ansible')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A kube / k8s task DEPLOYS {via: ansible, module, line} the repository file
+ * it applies, traced to the template (or copied file) its play rendered it
+ * from: a renderer whose dest is the very filename; {{ item.item.K }} over
+ * "{{ R.results }}" -> each item of the renderer registering R (its list
+ * literal, a set_fact's or the role defaults'); {{ item.K }} -> each of the
+ * task's own items through the renderer of that dest; a literal filename a
+ * looped renderer renders to; a k8s template: argument. A template is found
+ * before a copy to the same dest. A remote copy (even of a name the role's
+ * files/ holds), a delete by name, apply nothing in the repository. */
+TEST(probe_ansible_kube_tasks_deploy_their_templates) {
+    static const GpfFile files[] = {
+        {"roles/app/tasks/main.yml",
+         "- name: Render manifests\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/{{ item.file }}\"\n  with_items:\n    - {name: a, file: a.yml}\n"
+         "    - {name: b, file: b.yml}\n  register: app_manifests\n"
+         "- name: Apply manifests\n  kube:\n    filename: \"{{ conf }}/{{ item.item.file }}\"\n"
+         "  with_items:\n    - \"{{ app_manifests.results }}\"\n"
+         "- name: Render single\n  template:\n    src: single.yml.j2\n"
+         "    dest: \"{{ conf }}/single.yml\"\n"
+         "- name: Apply single\n  kube:\n    filename: \"{{ conf }}/single.yml\"\n"
+         "- name: Copy static\n  copy:\n    src: static.yml\n    dest: \"{{ conf }}/static.yml\"\n"
+         "- name: Apply static\n  kube:\n    filename: \"{{ conf }}/static.yml\"\n"
+         "- name: Render from defaults\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/x/{{ item.file }}\"\n  loop: \"{{ app_extra }}\"\n"
+         "  register: extra_out\n"
+         "- name: Apply from defaults\n  kube:\n    filename: \"{{ conf }}/x/{{ item.item.file }}\"\n"
+         "  loop: \"{{ extra_out.results }}\"\n"
+         "- name: Facts\n  set_fact:\n    sf_list:\n      - {file: e.yml}\n"
+         "- name: Render from facts\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/f/{{ item.file }}\"\n  with_items: \"{{ sf_list }}\"\n"
+         "  register: sf_out\n"
+         "- name: Apply set_fact\n  kube:\n    filename: \"{{ conf }}/f/{{ item.item.file }}\"\n"
+         "  with_items: \"{{ sf_out.results }}\"\n"
+         "- name: Pairs\n  template:\n    src: \"{{ item.name }}/{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/{{ item.name }}-{{ item.file }}\"\n  with_items:\n"
+         "    - {name: c, file: c.yml}\n"
+         "- name: Apply pairs\n  kube:\n    filename: \"{{ conf }}/{{ item.name }}-{{ item.file }}\"\n"
+         "  loop:\n    - {name: c, file: c.yml}\n"
+         "- name: Rendered literal\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/r/{{ item.file }}\"\n  with_items:\n    - {file: ipam.yml}\n"
+         "- name: Apply literal\n  kube:\n    filename: \"{{ conf }}/r/ipam.yml\"\n"
+         "- name: Copy first\n  copy:\n    src: first.yml\n    dest: \"{{ conf }}/dup.yml\"\n"
+         "- name: Render dup\n  template:\n    src: dup.yml.j2\n    dest: \"{{ conf }}/dup.yml\"\n"
+         "- name: Apply dup\n  kube:\n    filename: \"{{ conf }}/dup.yml\"\n"
+         "- name: Remote copy\n  copy:\n    src: static.yml\n    dest: \"{{ conf }}/remote.yml\"\n"
+         "    remote_src: true\n"
+         "- name: Apply remote\n  kube:\n    filename: \"{{ conf }}/remote.yml\"\n"
+         "- name: Delete by name\n  kube:\n    name: old\n    resource: deploy\n    state: absent\n"
+         "- name: k8s template\n  kubernetes.core.k8s:\n    template: tpl.yml.j2\n"},
+        {"roles/app/defaults/main.yml", "app_extra:\n  - file: d.yml\nother: 1\n"},
+        {"roles/app/templates/a.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/b.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/c/c.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/d.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/e.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/ipam.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/single.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/tpl.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/dup.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/files/first.yml", "kind: ConfigMap\n"},
+        {"roles/app/files/static.yml", "kind: ConfigMap\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_ansible_deploys(files, n);
+    static const char want[] =
+        "Apply dup DEPLOYS roles/app/templates/dup.yml.j2 [kube]\n"
+        "Apply from defaults DEPLOYS roles/app/templates/d.yml.j2 [kube]\n"
+        "Apply literal DEPLOYS roles/app/templates/ipam.yml.j2 [kube]\n"
+        "Apply manifests DEPLOYS roles/app/templates/a.yml.j2 [kube]\n"
+        "Apply manifests DEPLOYS roles/app/templates/b.yml.j2 [kube]\n"
+        "Apply pairs DEPLOYS roles/app/templates/c/c.yml.j2 [kube]\n"
+        "Apply set_fact DEPLOYS roles/app/templates/e.yml.j2 [kube]\n"
+        "Apply single DEPLOYS roles/app/templates/single.yml.j2 [kube]\n"
+        "Apply static DEPLOYS roles/app/files/static.yml [kube]\n"
+        "k8s template DEPLOYS roles/app/templates/tpl.yml.j2 [kubernetes.core.k8s]\n"
+        "deploys 10";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "ansible deploys got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("ansible deploys");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
  * "edgeless routes <n>": the Route nodes no edge touches. */
 static char *gpf_script_http(const GpfFile *files, int nfiles) {
@@ -4649,6 +4760,128 @@ TEST(probe_helm_unresolved_file_dependency_stays_external) {
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.charts, 2);
     ASSERT_EQ(m.depends_on, 1);
+    PASS();
+}
+
+/* Every external Chart as "<name> <QN, the project as <p>> <repository or ->
+ * in=<edges into it>", sorted, one per line. NULL on failure; the caller
+ * frees. */
+static char *gpf_external_charts(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT n.name || ' ' || "
+            "replace(n.qualified_name, ?1, '<p>') || ' ' || "
+            "coalesce(json_extract(n.properties,'$.repository'), '-') || ' in=' || "
+            "(SELECT count(*) FROM edges e WHERE e.target_id=n.id) AS x FROM nodes n "
+            "WHERE n.project=?1 AND n.label='Chart' AND json_extract(n.properties,'$.external') "
+            "ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* An external Chart is keyed by its publisher, __chart__<repository>/<name>,
+ * the repository's scheme and host lower-cased, a trailing slash and `.git`
+ * dropped: a Chart.yaml dependency, a kustomization, a Flux chartRef and a
+ * Terraform oci:// reference naming one published chart meet in one node,
+ * the same QN in every project. An oci:// repository is never cut, even when
+ * it ends in the chart's name (karpenter); a chart reference is cut to its
+ * repository. A repository that is no URL (an @alias, no scheme, file://,
+ * credentials in the authority, a query or fragment a token may ride in, an
+ * unexpanded ${...}) or that the pass does not read (a
+ * Terraform `repository =`) keeps the per-project
+ * <project>.__helm_dep__.<name>. The external charts a Chart.yaml depends on
+ * carry its path, yet a helm_release, a helm command and a Go loader naming
+ * that chart directory deploy the chart the directory declares. */
+TEST(probe_external_chart_identity_is_its_publisher) {
+    static const GpfFile files[] = {
+        {"charts/app/Chart.yaml",
+         "apiVersion: v2\nname: app\nversion: 1.0.0\ndependencies:\n"
+         "  - name: redis\n    repository: https://Charts.Example.com/stable/\n"
+         "    version: 1.x\n"
+         "  - name: common\n    repository: \"@stable\"\n    version: 1.x\n"
+         "  - name: nats\n    repository: oci://registry.example.com/charts\n"
+         "    version: 1.x\n"
+         "  - name: vault\n    repository: https://user@charts.example.com/private\n"
+         "    version: 1.x\n"},
+        {"main.tf", "resource \"helm_release\" \"app\" {\n"
+                    "  name  = \"app\"\n  chart = \"./charts/app\"\n}\n\n"
+                    "resource \"helm_release\" \"queue\" {\n"
+                    "  name  = \"queue\"\n"
+                    "  chart = \"oci://registry.example.com/charts/nats\"\n}\n\n"
+                    "resource \"helm_release\" \"cache\" {\n"
+                    "  name       = \"cache\"\n"
+                    "  repository = \"https://charts.example.com/stable\"\n"
+                    "  chart      = \"redis\"\n}\n"},
+        {"deploy.sh", "#!/bin/sh\ndeploy_app() {\n  helm upgrade --install app ./charts/app\n}\n"},
+        {"go.mod", "module example.com/app\n\ngo 1.22\n"},
+        {"install.go", "package main\n\n"
+                       "import \"helm.sh/helm/v3/pkg/chart/loader\"\n\n"
+                       "func installApp() {\n\t_, _ = loader.Load(\"charts/app\")\n}\n"},
+        {"obs/kustomization.yaml",
+         GPF_KUST "helmCharts:\n- name: redis\n  repo: https://charts.example.com/stable.git\n"
+                  "- name: karpenter\n  repo: oci://registry.example.com/karpenter\n"
+                  "- name: templated\n  repo: https://charts.example.com/${ENV}\n"
+                  "- name: local\n  repo: file://../charts\n"
+                  "- name: bare\n  repo: charts.example.com/stable\n"
+                  "- name: tokened\n  repo: https://charts.example.com/stable?token=x\n"
+                  "- name: fragment\n  repo: https://charts.example.com/stable#x\n"},
+        {"apps/web/kustomization.yaml",
+         GPF_KUST "namespace: web\nresources:\n  - ocirepository.yaml\n  - helmrelease.yaml\n"},
+        {"apps/web/ocirepository.yaml",
+         "apiVersion: source.toolkit.fluxcd.io/v1\nkind: OCIRepository\nmetadata:\n"
+         "  name: web-chart\nspec:\n  url: oci://registry.example.com/charts/nats\n"},
+        {"apps/web/helmrelease.yaml",
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: web\n"
+         "spec:\n  chartRef:\n    kind: OCIRepository\n    name: web-chart\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_external_charts(files, n);
+    static const char want[] =
+        "bare <p>.__helm_dep__.bare - in=1\n"
+        "common <p>.__helm_dep__.common - in=1\n"
+        "fragment <p>.__helm_dep__.fragment - in=1\n"
+        "karpenter __chart__oci://registry.example.com/karpenter/karpenter "
+        "oci://registry.example.com/karpenter in=1\n"
+        "local <p>.__helm_dep__.local - in=1\n"
+        "nats __chart__oci://registry.example.com/charts/nats oci://registry.example.com/charts "
+        "in=3\n"
+        "redis <p>.__helm_dep__.redis - in=1\n"
+        "redis __chart__https://charts.example.com/stable/redis https://charts.example.com/stable "
+        "in=2\n"
+        "templated <p>.__helm_dep__.templated - in=1\n"
+        "tokened <p>.__helm_dep__.tokened - in=1\n"
+        "vault <p>.__helm_dep__.vault - in=1";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "external charts got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("external chart identity");
+    }
+    free(got);
+    GPF_ASSERT_DEPLOYS(files, n,
+                       "HelmRelease/web -> chart:nats(ext) (helmrelease)\n"
+                       "Kustomization -> chart:bare(ext) (helmcharts)\n"
+                       "Kustomization -> chart:fragment(ext) (helmcharts)\n"
+                       "Kustomization -> chart:karpenter(ext) (helmcharts)\n"
+                       "Kustomization -> chart:local(ext) (helmcharts)\n"
+                       "Kustomization -> chart:redis(ext) (helmcharts)\n"
+                       "Kustomization -> chart:templated(ext) (helmcharts)\n"
+                       "Kustomization -> chart:tokened(ext) (helmcharts)\n"
+                       "deploy_app -> chart:app (helm)\n"
+                       "installApp -> chart:app (helm-sdk)\n"
+                       "resource.helm_release.app -> chart:app (terraform)\n"
+                       "resource.helm_release.cache -> chart:redis(ext) (terraform)\n"
+                       "resource.helm_release.queue -> chart:nats(ext) (terraform)");
     PASS();
 }
 
@@ -5869,6 +6102,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_manifest_mints_no_envelope_variables);
     RUN_TEST(probe_yaml_config_keeps_variables);
     RUN_TEST(probe_helm_unresolved_file_dependency_stays_external);
+    RUN_TEST(probe_external_chart_identity_is_its_publisher);
     RUN_TEST(probe_kustomize_nested_sibling_entries);
     RUN_TEST(probe_kustomize_single_module);
     RUN_TEST(probe_kustomize_entries_after_commented_out_entry);
@@ -5930,6 +6164,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_terraform_kubernetes_objects_are_resources);
     RUN_TEST(probe_kustomize_name_prefix_makes_variants);
     RUN_TEST(probe_ansible_tasks_are_functions);
+    RUN_TEST(probe_ansible_kube_tasks_deploy_their_templates);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
