@@ -1812,7 +1812,7 @@ static char *gpf_deploys(const GpfFile *files, int nfiles) {
             "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT "
             "CASE WHEN s.label IN ('Module','File') THEN '@' || s.file_path ELSE s.name END "
             "|| ' -> ' || CASE WHEN t.label='Chart' THEN 'chart:' || t.name || "
-            "CASE WHEN instr(t.qualified_name,'__helm_dep__') THEN '(ext)' ELSE '' END "
+            "CASE WHEN json_extract(t.properties,'$.external') THEN '(ext)' ELSE '' END "
             "ELSE t.label || ':' || t.file_path END "
             "|| ' (' || json_extract(e.properties,'$.via') || ')' AS x "
             "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
@@ -4763,6 +4763,128 @@ TEST(probe_helm_unresolved_file_dependency_stays_external) {
     PASS();
 }
 
+/* Every external Chart as "<name> <QN, the project as <p>> <repository or ->
+ * in=<edges into it>", sorted, one per line. NULL on failure; the caller
+ * frees. */
+static char *gpf_external_charts(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT n.name || ' ' || "
+            "replace(n.qualified_name, ?1, '<p>') || ' ' || "
+            "coalesce(json_extract(n.properties,'$.repository'), '-') || ' in=' || "
+            "(SELECT count(*) FROM edges e WHERE e.target_id=n.id) AS x FROM nodes n "
+            "WHERE n.project=?1 AND n.label='Chart' AND json_extract(n.properties,'$.external') "
+            "ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* An external Chart is keyed by its publisher, __chart__<repository>/<name>,
+ * the repository's scheme and host lower-cased, a trailing slash and `.git`
+ * dropped: a Chart.yaml dependency, a kustomization, a Flux chartRef and a
+ * Terraform oci:// reference naming one published chart meet in one node,
+ * the same QN in every project. An oci:// repository is never cut, even when
+ * it ends in the chart's name (karpenter); a chart reference is cut to its
+ * repository. A repository that is no URL (an @alias, no scheme, file://,
+ * credentials in the authority, a query or fragment a token may ride in, an
+ * unexpanded ${...}) or that the pass does not read (a
+ * Terraform `repository =`) keeps the per-project
+ * <project>.__helm_dep__.<name>. The external charts a Chart.yaml depends on
+ * carry its path, yet a helm_release, a helm command and a Go loader naming
+ * that chart directory deploy the chart the directory declares. */
+TEST(probe_external_chart_identity_is_its_publisher) {
+    static const GpfFile files[] = {
+        {"charts/app/Chart.yaml",
+         "apiVersion: v2\nname: app\nversion: 1.0.0\ndependencies:\n"
+         "  - name: redis\n    repository: https://Charts.Example.com/stable/\n"
+         "    version: 1.x\n"
+         "  - name: common\n    repository: \"@stable\"\n    version: 1.x\n"
+         "  - name: nats\n    repository: oci://registry.example.com/charts\n"
+         "    version: 1.x\n"
+         "  - name: vault\n    repository: https://user@charts.example.com/private\n"
+         "    version: 1.x\n"},
+        {"main.tf", "resource \"helm_release\" \"app\" {\n"
+                    "  name  = \"app\"\n  chart = \"./charts/app\"\n}\n\n"
+                    "resource \"helm_release\" \"queue\" {\n"
+                    "  name  = \"queue\"\n"
+                    "  chart = \"oci://registry.example.com/charts/nats\"\n}\n\n"
+                    "resource \"helm_release\" \"cache\" {\n"
+                    "  name       = \"cache\"\n"
+                    "  repository = \"https://charts.example.com/stable\"\n"
+                    "  chart      = \"redis\"\n}\n"},
+        {"deploy.sh", "#!/bin/sh\ndeploy_app() {\n  helm upgrade --install app ./charts/app\n}\n"},
+        {"go.mod", "module example.com/app\n\ngo 1.22\n"},
+        {"install.go", "package main\n\n"
+                       "import \"helm.sh/helm/v3/pkg/chart/loader\"\n\n"
+                       "func installApp() {\n\t_, _ = loader.Load(\"charts/app\")\n}\n"},
+        {"obs/kustomization.yaml",
+         GPF_KUST "helmCharts:\n- name: redis\n  repo: https://charts.example.com/stable.git\n"
+                  "- name: karpenter\n  repo: oci://registry.example.com/karpenter\n"
+                  "- name: templated\n  repo: https://charts.example.com/${ENV}\n"
+                  "- name: local\n  repo: file://../charts\n"
+                  "- name: bare\n  repo: charts.example.com/stable\n"
+                  "- name: tokened\n  repo: https://charts.example.com/stable?token=x\n"
+                  "- name: fragment\n  repo: https://charts.example.com/stable#x\n"},
+        {"apps/web/kustomization.yaml",
+         GPF_KUST "namespace: web\nresources:\n  - ocirepository.yaml\n  - helmrelease.yaml\n"},
+        {"apps/web/ocirepository.yaml",
+         "apiVersion: source.toolkit.fluxcd.io/v1\nkind: OCIRepository\nmetadata:\n"
+         "  name: web-chart\nspec:\n  url: oci://registry.example.com/charts/nats\n"},
+        {"apps/web/helmrelease.yaml",
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: web\n"
+         "spec:\n  chartRef:\n    kind: OCIRepository\n    name: web-chart\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_external_charts(files, n);
+    static const char want[] =
+        "bare <p>.__helm_dep__.bare - in=1\n"
+        "common <p>.__helm_dep__.common - in=1\n"
+        "fragment <p>.__helm_dep__.fragment - in=1\n"
+        "karpenter __chart__oci://registry.example.com/karpenter/karpenter "
+        "oci://registry.example.com/karpenter in=1\n"
+        "local <p>.__helm_dep__.local - in=1\n"
+        "nats __chart__oci://registry.example.com/charts/nats oci://registry.example.com/charts "
+        "in=3\n"
+        "redis <p>.__helm_dep__.redis - in=1\n"
+        "redis __chart__https://charts.example.com/stable/redis https://charts.example.com/stable "
+        "in=2\n"
+        "templated <p>.__helm_dep__.templated - in=1\n"
+        "tokened <p>.__helm_dep__.tokened - in=1\n"
+        "vault <p>.__helm_dep__.vault - in=1";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "external charts got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("external chart identity");
+    }
+    free(got);
+    GPF_ASSERT_DEPLOYS(files, n,
+                       "HelmRelease/web -> chart:nats(ext) (helmrelease)\n"
+                       "Kustomization -> chart:bare(ext) (helmcharts)\n"
+                       "Kustomization -> chart:fragment(ext) (helmcharts)\n"
+                       "Kustomization -> chart:karpenter(ext) (helmcharts)\n"
+                       "Kustomization -> chart:local(ext) (helmcharts)\n"
+                       "Kustomization -> chart:redis(ext) (helmcharts)\n"
+                       "Kustomization -> chart:templated(ext) (helmcharts)\n"
+                       "Kustomization -> chart:tokened(ext) (helmcharts)\n"
+                       "deploy_app -> chart:app (helm)\n"
+                       "installApp -> chart:app (helm-sdk)\n"
+                       "resource.helm_release.app -> chart:app (terraform)\n"
+                       "resource.helm_release.cache -> chart:redis(ext) (terraform)\n"
+                       "resource.helm_release.queue -> chart:nats(ext) (terraform)");
+    PASS();
+}
+
 /* A remote base is outside the repository. The import resolver's symbol-name
  * guess walked its URL segments and linked kubermatic's gcp addon to the
  * `deploy` function of hack/ci/deploy.sh. A kustomize entry is a path,
@@ -5980,6 +6102,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_manifest_mints_no_envelope_variables);
     RUN_TEST(probe_yaml_config_keeps_variables);
     RUN_TEST(probe_helm_unresolved_file_dependency_stays_external);
+    RUN_TEST(probe_external_chart_identity_is_its_publisher);
     RUN_TEST(probe_kustomize_nested_sibling_entries);
     RUN_TEST(probe_kustomize_single_module);
     RUN_TEST(probe_kustomize_entries_after_commented_out_entry);

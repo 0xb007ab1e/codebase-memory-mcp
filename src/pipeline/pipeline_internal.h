@@ -1337,6 +1337,30 @@ bool cbm_repo_rel_join(const char *dir, const char *v, char *out, size_t sz);
  * digest dropped), made when new; 0 for scratch or no image. */
 int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref);
 
+/* A chart repository URL as an identity (pass_k8s.c): `url` trimmed, its
+ * scheme and host lower-cased, trailing `/` and `.git` dropped. False for no
+ * URL: no scheme or host, a file:// directory, credentials in the authority,
+ * a query or fragment (`?`, `#`: a token may ride there), or a byte no
+ * stated URL holds (whitespace, quote, template, `$`). A
+ * repository URL is never cut: oci://host/x with chart x is oci://host/x/x. */
+bool cbm_chart_repo_url(const char *url, char *out, size_t sz);
+
+/* The repository of chart reference `ref` (a Flux OCIRepository url, a
+ * Terraform `chart = "oci://..."`): all before its last segment, the chart.
+ * False when none is left. */
+bool cbm_chart_ref_repo(const char *ref, char *out, size_t sz);
+
+/* The external Chart node of chart `name` from repository `url` (pass_k8s.c),
+ * made when new and owned by `file`: `__chart__<url>/<name>` {source,
+ * external, repository} -- one QN in every project -- when `url` resolves
+ * (cbm_chart_repo_url), else `<project>.__helm_dep__.<name>`. */
+int64_t cbm_pipeline_external_chart(cbm_pipeline_ctx_t *ctx, const char *name, const char *url,
+                                    const char *file);
+
+/* Is Chart node `node` an external chart (either identity) rather than one
+ * a Chart.yaml of this repository declares? */
+bool cbm_pipeline_chart_is_external(const cbm_gbuf_node_t *node);
+
 /* Environment variable `key` that `owner` sets (pass_docker.c): a K8s or
  * compose Resource for its container `container`, a Dockerfile Module for
  * its image (container NULL). Makes the container-scoped EnvVar
@@ -1548,8 +1572,9 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      and roles its directives name, its tasks and handlers are Functions
  *      {source:ansible}, a notify CALLS {via:notify} the handlers it names,
  *      a kube / k8s task DEPLOYS {via:ansible} the template it applies
- *      (pass_ansible.c). An index built before holds none of them, so it
- *      rebuilds once on upgrade. */
+ *      (pass_ansible.c). An external Chart is keyed by its publisher URL.
+ *      An index built before holds none of them, so it rebuilds once on
+ *      upgrade. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
 
 typedef struct {

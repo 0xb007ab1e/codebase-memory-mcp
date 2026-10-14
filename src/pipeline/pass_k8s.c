@@ -26,6 +26,7 @@
 #include "foundation/str_util.h"   /* cbm_json_escape */
 #include "pipeline/worker_pool.h"
 
+#include <ctype.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2542,14 +2543,159 @@ static char *k8s_dep_props(const char *repository) {
     return props;
 }
 
-/* DEPENDS_ON from `chart_id` to the shared external Chart node of `name`
- * (one per name and project, so charts depending on the same chart meet). */
+/* ── External charts ─────────────────────────────────────────────── */
+
+/* An external Chart is keyed by its publisher: `__chart__<url>/<name>`, the
+ * same QN in every project, so two repositories naming one published chart
+ * name one node. A chart whose repository does not resolve to a URL (a
+ * `@alias`, an empty or templated repository, a source the pass cannot read)
+ * keeps the per-project `<project>.__helm_dep__.<name>`: no identity is
+ * claimed for what was not stated. */
+static const char K8S_CHART_QN_PREFIX[] = "__chart__";
+static const char K8S_HELM_DEP_MARK[] = ".__helm_dep__.";
+
+/* A byte a stated repository URL may hold: no whitespace or control byte,
+ * no quote, template or shell expansion, escape or angle bracket. */
+static bool k8s_url_byte_ok(unsigned char c) {
+    return c > ' ' && c < 0x7f && !strchr("\"'`{}$<>\\", c);
+}
+
+bool cbm_chart_repo_url(const char *url, char *out, size_t sz) {
+    if (!url || !out || sz == 0) {
+        return false;
+    }
+    while (*url == ' ' || *url == '\t') {
+        url++;
+    }
+    size_t n = strlen(url);
+    while (n > 0 && isspace((unsigned char)url[n - SKIP_ONE])) {
+        n--;
+    }
+    if (n == 0 || n + SKIP_ONE > sz || !isalpha((unsigned char)url[0])) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (!k8s_url_byte_ok((unsigned char)url[i])) {
+            return false;
+        }
+    }
+    /* a query or fragment may carry a token (?token=...): like credentials
+     * in the authority, never put into a QN or a property */
+    if (memchr(url, '?', n) || memchr(url, '#', n)) {
+        return false;
+    }
+    size_t s = 0; /* the scheme: [A-Za-z][A-Za-z0-9+.-]* then :// */
+    while (s < n &&
+           (isalnum((unsigned char)url[s]) || url[s] == '+' || url[s] == '-' || url[s] == '.')) {
+        s++;
+    }
+    if (s + K8S_SLEN("://") > n || strncmp(url + s, "://", K8S_SLEN("://")) != 0) {
+        return false;
+    }
+    size_t host = s + K8S_SLEN("://");
+    size_t path = host;
+    while (path < n && url[path] != '/') {
+        path++;
+    }
+    /* no host, or credentials in the authority: never put into a QN */
+    if (path == host || memchr(url + host, '@', path - host)) {
+        return false;
+    }
+    for (size_t i = 0; i < path; i++) {
+        out[i] = (char)tolower((unsigned char)url[i]);
+    }
+    memcpy(out + path, url + path, n - path);
+    out[n] = '\0';
+    if (strncmp(out, "file://", K8S_SLEN("file://")) == 0) {
+        return false; /* a directory, not a publisher */
+    }
+    size_t end = n;
+    while (end > path && out[end - SKIP_ONE] == '/') {
+        end--;
+    }
+    if (end - path >= K8S_SLEN(".git") &&
+        strncmp(out + end - K8S_SLEN(".git"), ".git", K8S_SLEN(".git")) == 0) {
+        end -= K8S_SLEN(".git");
+        while (end > path && out[end - SKIP_ONE] == '/') {
+            end--;
+        }
+    }
+    out[end] = '\0';
+    return true;
+}
+
+bool cbm_chart_ref_repo(const char *ref, char *out, size_t sz) {
+    if (!ref || !out || sz == 0) {
+        return false;
+    }
+    size_t end = strlen(ref);
+    while (end > 0 && ref[end - SKIP_ONE] == '/') {
+        end--;
+    }
+    while (end > 0 && ref[end - SKIP_ONE] != '/') {
+        end--;
+    }
+    while (end > 0 && ref[end - SKIP_ONE] == '/') {
+        end--;
+    }
+    if (end == 0 || end + SKIP_ONE > sz) {
+        return false;
+    }
+    memcpy(out, ref, end);
+    out[end] = '\0';
+    return true;
+}
+
+/* QN and node properties of the external Chart `name` (non-NULL) of
+ * repository `url` (NULL: unknown). */
+static void k8s_chart_identity(const char *project, const char *name, const char *url, char *qn,
+                               size_t qsz, char *props, size_t psz) {
+    char norm[CBM_SZ_1K];
+    if (name[0] && !strchr(name, '/') && cbm_chart_repo_url(url, norm, sizeof(norm))) {
+        int w = snprintf(qn, qsz, "%s%s/%s", K8S_CHART_QN_PREFIX, norm, name);
+        if (w > 0 && (size_t)w < qsz) {
+            char esc[CBM_SZ_2K];
+            cbm_json_escape(esc, (int)sizeof(esc), norm);
+            snprintf(props, psz, "{\"source\":\"helm\",\"external\":true,\"repository\":\"%s\"}",
+                     esc);
+            return;
+        }
+    }
+    snprintf(qn, qsz, "%s%s%s", project, K8S_HELM_DEP_MARK, name);
+    snprintf(props, psz, "{\"source\":\"helm\",\"external\":true}");
+}
+
+int64_t cbm_pipeline_external_chart(cbm_pipeline_ctx_t *ctx, const char *name, const char *url,
+                                    const char *file) {
+    if (!name) {
+        return 0;
+    }
+    char qn[CBM_SZ_2K];
+    char props[CBM_SZ_4K];
+    k8s_chart_identity(ctx->project_name, name, url, qn, sizeof(qn), props, sizeof(props));
+    const cbm_gbuf_node_t *known = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
+    if (known) {
+        return known->id;
+    }
+    return cbm_gbuf_upsert_node(ctx->gbuf, "Chart", name, qn, file, SKIP_ONE, 0, props);
+}
+
+bool cbm_pipeline_chart_is_external(const cbm_gbuf_node_t *node) {
+    const char *qn = node ? node->qualified_name : NULL;
+    return qn && (strncmp(qn, K8S_CHART_QN_PREFIX, K8S_SLEN(K8S_CHART_QN_PREFIX)) == 0 ||
+                  strstr(qn, K8S_HELM_DEP_MARK) != NULL);
+}
+
+/* DEPENDS_ON from `chart_id` to the external Chart node of `name` in
+ * `repository` (charts depending on the same published chart meet). */
 static bool k8s_external_dep(cbm_pipeline_ctx_t *ctx, int64_t chart_id, const char *name,
-                             const char *chart_rel, const char *props) {
-    char dep_qn[CBM_SZ_512];
-    snprintf(dep_qn, sizeof(dep_qn), "%s.__helm_dep__.%s", ctx->project_name, name);
-    int64_t dep_id = cbm_gbuf_upsert_node(ctx->gbuf, "Chart", name, dep_qn, chart_rel, SKIP_ONE, 0,
-                                          "{\"source\":\"helm\",\"external\":true}");
+                             const char *repository, const char *chart_rel, const char *props) {
+    char dep_qn[CBM_SZ_2K];
+    char node_props[CBM_SZ_4K];
+    k8s_chart_identity(ctx->project_name, name, repository, dep_qn, sizeof(dep_qn), node_props,
+                       sizeof(node_props));
+    int64_t dep_id =
+        cbm_gbuf_upsert_node(ctx->gbuf, "Chart", name, dep_qn, chart_rel, SKIP_ONE, 0, node_props);
     if (dep_id <= 0) {
         return false;
     }
@@ -2613,7 +2759,9 @@ static void k8s_link_local_deps(cbm_pipeline_ctx_t *ctx, k8s_local_deps_t *deps)
             target->id != d->chart_id) {
             cbm_gbuf_insert_edge(ctx->gbuf, d->chart_id, target->id, "DEPENDS_ON", d->props);
         } else if (d->chart_rel) {
-            (void)k8s_external_dep(ctx, d->chart_id, d->name, d->chart_rel, d->props);
+            /* a file:// directory this repository cannot resolve names no
+             * publisher: the per-project external Chart */
+            (void)k8s_external_dep(ctx, d->chart_id, d->name, NULL, d->chart_rel, d->props);
         }
     }
     k8s_local_deps_free(deps);
@@ -2621,8 +2769,9 @@ static void k8s_link_local_deps(cbm_pipeline_ctx_t *ctx, k8s_local_deps_t *deps)
 
 /* Emit a Chart node for a Chart.yaml and a DEPENDS_ON edge per declared
  * dependency (#338): to the chart in this repository for a resolvable
- * `file://` dependency (once all charts are read), otherwise to a shared
- * external Chart node per dependency name, the repository on the edge. */
+ * `file://` dependency (once all charts are read), otherwise to the external
+ * Chart node of the dependency's repository and name, the repository also on
+ * the edge. */
 static void handle_helm_chart(cbm_pipeline_ctx_t *ctx, const char *rel_path, const char *source,
                               k8s_local_deps_t *local_deps) {
     cbm_helm_chart_t hc;
@@ -2656,7 +2805,7 @@ static void handle_helm_chart(cbm_pipeline_ctx_t *ctx, const char *rel_path, con
             continue;
         }
         char *props = dep->repository[0] ? k8s_dep_props(dep->repository) : NULL;
-        dep_edges += k8s_external_dep(ctx, chart_id, dep->name, rel_path, props);
+        dep_edges += k8s_external_dep(ctx, chart_id, dep->name, dep->repository, rel_path, props);
         cbm_free(CBM_MEM_CLASS_OTHER, props);
     }
     cbm_helm_chart_free(&hc);
@@ -3439,7 +3588,7 @@ static void k8s_link_includes(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b,
  * outermost kustomizations below it -- their Kustomization node -- and the
  * manifests outside any, their File node; a chart dir: its Chart); a
  * HelmRelease -> its chart (a repository chart dir of a Git/Bucket source,
- * else the shared external Chart of that name). */
+ * else the external Chart of that name). */
 
 typedef struct {
     cbm_pipeline_ctx_t *ctx;
@@ -3475,21 +3624,17 @@ static int64_t k8s_chart_node(k8s_dep_link_t *l, const char *dir) {
     return 0;
 }
 
-/* The shared external Chart of `name` (the one chart dependencies use). */
-static int64_t k8s_external_chart(k8s_dep_link_t *l, const char *name, const char *file) {
-    char qn[CBM_SZ_512];
-    snprintf(qn, sizeof(qn), "%s.__helm_dep__.%s", l->ctx->project_name, name);
-    const cbm_gbuf_node_t *known = cbm_gbuf_find_by_qn(l->ctx->gbuf, qn);
-    if (known) {
-        return known->id;
-    }
-    return cbm_gbuf_upsert_node(l->ctx->gbuf, "Chart", name, qn, file, SKIP_ONE, 0,
-                                "{\"source\":\"helm\",\"external\":true}");
+/* The external Chart of `name` in repository `url` (NULL: unknown), the one
+ * chart dependencies use. */
+static int64_t k8s_external_chart(k8s_dep_link_t *l, const char *name, const char *url,
+                                  const char *file) {
+    return cbm_pipeline_external_chart(l->ctx, name, url, file);
 }
 
 /* A HelmRelease whose chartRef names OCIRepository `oci` (its USAGE edge
  * {"ref":"chartRef"}, resolved with the references) deploys the chart that
- * repository fetches: the shared external Chart of the URL's last segment. */
+ * repository fetches: the external Chart of that OCI reference (its last
+ * segment the chart, the rest its repository). */
 static void k8s_link_chart_refs(k8s_dep_link_t *l, const k8s_hr_t *oci) {
     const char *url = oci->chart;
     size_t end = strlen(url);
@@ -3513,6 +3658,8 @@ static void k8s_link_chart_refs(k8s_dep_link_t *l, const k8s_hr_t *oci) {
     snprintf(props, sizeof(props),
              "{\"via\":\"helmrelease\",\"chart\":\"%s\",\"external\":true,\"url\":\"%s\"}",
              esc_name, esc_url);
+    char repo[CBM_SZ_1K];
+    const char *repo_url = cbm_chart_ref_repo(url, repo, sizeof(repo)) ? repo : NULL;
     const cbm_gbuf_edge_t **in = NULL;
     int n = 0;
     if (cbm_gbuf_find_edges_by_target_type(l->ctx->gbuf, oci->node, "USAGE", &in, &n) != 0) {
@@ -3523,7 +3670,8 @@ static void k8s_link_chart_refs(k8s_dep_link_t *l, const k8s_hr_t *oci) {
         const char *p = in[i]->properties_json;
         const cbm_gbuf_node_t *hr = cbm_gbuf_find_by_id(l->ctx->gbuf, in[i]->source_id);
         if (p && strstr(p, "\"ref\":\"chartRef\"") && hr && hr->file_path) {
-            k8s_deploys_edge(l, hr->id, k8s_external_chart(l, name, hr->file_path), props);
+            k8s_deploys_edge(l, hr->id, k8s_external_chart(l, name, repo_url, hr->file_path),
+                             props);
         }
     }
 }
@@ -3542,7 +3690,7 @@ static void k8s_prop_add(char *out, size_t out_sz, int *w, const char *key, cons
  * build: DEPLOYS {via: helmcharts, external, chart, url, version, release,
  * namespace, values, line} from the kustomization (its Kustomization
  * Resource, else its File -- the unit a Flux / Argo deploy reaches) to the
- * shared external Chart of that name. */
+ * external Chart of that repository and name. */
 static void k8s_link_kcharts(k8s_dep_link_t *l, const k8s_facts_t *f) {
     for (int i = 0; i < f->kchart_n; i++) {
         const k8s_kchart_t *c = &f->kcharts[i];
@@ -3563,7 +3711,7 @@ static void k8s_link_kcharts(k8s_dep_link_t *l, const k8s_facts_t *f) {
             continue;
         }
         snprintf(props + w, sizeof(props) - (size_t)w, ",\"line\":%d}", c->line);
-        k8s_deploys_edge(l, src, k8s_external_chart(l, c->chart, c->kust), props);
+        k8s_deploys_edge(l, src, k8s_external_chart(l, c->chart, c->url, c->kust), props);
     }
 }
 
@@ -4230,7 +4378,9 @@ static void k8s_link_deploys(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundl
                 k8s_deploys_edge(&l, hr->node, k8s_chart_node(&l, dir), props);
             }
         } else if (src && src->file_path && !strchr(hr->chart, '/') && !strchr(hr->chart, '$')) {
-            k8s_deploys_edge(&l, hr->node, k8s_external_chart(&l, hr->chart, src->file_path),
+            /* the source's URL is not read (a HelmRepository's spec.url):
+             * the per-project external Chart */
+            k8s_deploys_edge(&l, hr->node, k8s_external_chart(&l, hr->chart, NULL, src->file_path),
                              props);
         }
     }
