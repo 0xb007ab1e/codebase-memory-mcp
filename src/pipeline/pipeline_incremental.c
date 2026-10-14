@@ -2516,6 +2516,28 @@ static const char *closure_k8s_decline(cbm_store_t *store, const char *project,
     return NULL;
 }
 
+/* Terraform / OpenTofu / Terragrunt inputs reach past their own file
+ * (pass_terraform.c): the files of a module directory resolve each other's
+ * references, a module call's source decides which outputs another file of
+ * the directory reads, a .tfvars file sets the variables beside it, and a
+ * Terragrunt unit includes and reads other .hcl files. The repair recomputes
+ * the changed files' edges only, so a delta touching any of them -- an edge
+ * held by two unchanged files may hang on it -- declines to the full
+ * rebuild. Returns the reason, or NULL. */
+static const char *closure_terraform_decline(char **paths, int n) {
+    static const char *const exts[] = {".tf", ".tofu", ".tfvars", ".hcl"};
+    for (int i = 0; i < n; i++) {
+        const char *slash = strrchr(paths[i], '/');
+        const char *dot = strrchr(slash ? slash + SKIP_ONE : paths[i], '.');
+        for (size_t k = 0; dot && k < sizeof(exts) / sizeof(exts[0]); k++) {
+            if (strcmp(dot, exts[k]) == 0) {
+                return "terraform_input_changed";
+            }
+        }
+    }
+    return NULL;
+}
+
 /* The env join (pass_envjoin.c) reads each image's files from its
  * Dockerfile's Module, stored with the ignore patterns of its context: an
  * ignore file changing, or a deletion of a file an image copies (which
@@ -2734,6 +2756,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     decline = closure_k8s_decline(store, project, cbm_pipeline_repo_path(p), changed_paths,
                                   n_changed, n_deleted);
+    if (decline) {
+        goto done;
+    }
+    decline = closure_terraform_decline(changed_paths, n_changed + n_deleted);
     if (decline) {
         goto done;
     }

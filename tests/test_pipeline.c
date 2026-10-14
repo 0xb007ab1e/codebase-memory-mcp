@@ -1490,6 +1490,55 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
     PASS();
 }
 
+static void write_temp_file(const char *dir, const char *name, const char *content);
+
+/* Regression: a Terraform module's output read lives in one file
+ * (infra/outputs.tf: module.net.vpc_id) and the module's source in another
+ * (infra/main.tf). Pointing the source elsewhere edits main.tf alone; the
+ * repair route recomputed the changed file's edges only, so the read -- held
+ * by two UNCHANGED files, outputs.tf and modules/net/main.tf -- stayed in the
+ * graph, which a full reindex no longer has. A Terraform input change now
+ * declines to the full rebuild (closure_terraform_decline). */
+TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    write_temp_file(g_tmpdir, "infra/main.tf", "module \"net\" {\n  source = \"./modules/net\"\n}\n");
+    write_temp_file(g_tmpdir, "infra/outputs.tf",
+                    "output \"net_vpc\" {\n  value = module.net.vpc_id\n}\n");
+    write_temp_file(g_tmpdir, "infra/modules/net/main.tf",
+                    "output \"vpc_id\" {\n  value = \"x\"\n}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_incr_tf.db", g_tmpdir);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    cbm_store_t *s1 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s1);
+    ASSERT_TRUE(cross_file_edge_exists(s1, cbm_pipeline_project_name(p1), "output.net_vpc",
+                                       "output.vpc_id", "USAGE"));
+    cbm_store_close(s1);
+    cbm_pipeline_free(p1);
+
+    /* the module's source moves to a directory that does not exist */
+    write_temp_file(g_tmpdir, "infra/main.tf",
+                    "module \"net\" {\n  source = \"./modules/none\"\n}\n");
+
+    cbm_pipeline_t *p2 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    ASSERT_FALSE(cross_file_edge_exists(s2, cbm_pipeline_project_name(p2), "output.net_vpc",
+                                        "output.vpc_id", "USAGE"));
+    cbm_store_close(s2);
+    cbm_pipeline_free(p2);
+
+    teardown_test_repo();
+    PASS();
+}
+
 /* TS/JS receiver-aware weak-strategy suppression (#592/#606 direction; Perl
  * precedent #477). A member call x.foo() whose receiver TYPE the TS-LSP cannot
  * resolve (a regex literal `re.test()`) must NOT be bound to a same-named
@@ -23143,6 +23192,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
     RUN_TEST(pipeline_hcl_block_reference_resolves_to_its_block);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
+    RUN_TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module);
     RUN_TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);
