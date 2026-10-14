@@ -3879,7 +3879,9 @@ CBMTypeRegistry *cbm_java_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
     }
     cbm_java_register_lsp_defs(arena, reg, jvm, type_count);
     cbm_registry_finalize(reg);
-    cbm_java_register_lsp_defs(arena, reg, jvm + type_count, total - type_count);
+    if (total > type_count) { /* jvm is NULL for an empty corpus: no offset */
+        cbm_java_register_lsp_defs(arena, reg, jvm + type_count, total - type_count);
+    }
     cbm_registry_finalize(reg);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;

@@ -56,6 +56,17 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 /* Apply a validated discovery resource policy. The value is copied. */
 void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resource_policy_t *policy);
 
+/* Doc -> code candidates (the doc_candidates setting). Never set, the index
+ * mode decides: on for full, off for moderate and fast. The setter makes an
+ * explicit choice that wins in every mode. Off skips scoring documentation
+ * sections against code and leaves the project with no doc_link_candidates
+ * rows; nodes and edges are unchanged. On in fast mode scores them without
+ * fast's skipped SIMILAR_TO / SEMANTICALLY_RELATED edges. The scoring grows
+ * with sections x functions, which is the cost on very large repositories.
+ * enabled() reports the effective choice for the pipeline's current mode. */
+void cbm_pipeline_set_doc_candidates_enabled(cbm_pipeline_t *p, bool enabled);
+bool cbm_pipeline_doc_candidates_enabled(const cbm_pipeline_t *p);
+
 /* Copy the exact discovery violation from the most recent run. */
 void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
                                          cbm_index_resource_violation_t *violation);

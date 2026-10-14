@@ -4,6 +4,7 @@
 #include "lang_specs.h"
 #include "macro_table.h"
 #include "extract_unified.h"
+#include "extract_url_fold.h" // URL constant folding (#706, #1147)
 #include "foundation/constants.h"
 #include "extract_node_stack.h"
 #include "service_patterns.h" // cbm_service_pattern_route_method (#952)
@@ -75,6 +76,14 @@ static const char *strip_quotes(CBMArena *a, const char *text) {
         return cbm_arena_strndup(a, text + CBM_QUOTE_OFFSET, (size_t)(len - CBM_QUOTE_PAIR));
     }
     return text;
+}
+
+/* A constant reference in a folding language (#706, #1147): when it does not
+ * fold to a usable value it stays unresolved -- the raw map entry may hold an
+ * unresolved "{}" base and is never a URL on its own. */
+static bool is_folded_reference(const CBMExtractCtx *ctx, const char *kind) {
+    return cbm_url_fold_lang(ctx->language) &&
+           (strcmp(kind, "identifier") == 0 || strcmp(kind, "member_expression") == 0);
 }
 
 // Callee suffixes for IRIS Python interop string-dispatch. Kept at file scope
@@ -2428,6 +2437,30 @@ static const char *python_iris_cls_callee(CBMExtractCtx *ctx, TSNode call_node) 
 
 // --- Unified handler: called once per node by the cursor walk ---
 
+/* Topic slots carry their literal identity even when a URL projection exists. */
+static bool is_topic_keyword(const char *key) {
+    static const char *keywords[] = {"topic",    "topic_id", "topic_name", "queue", "queue_name",
+                                     "queue_id", "subject",  "channel",    NULL};
+    for (int i = 0; key && keywords[i]; i++) {
+        if (strcmp(key, keywords[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Generic argument values stay raw. Only URL consumers may select the separate
+ * projection, and explicit topic slots never carry one. */
+static void fold_call_arg(CBMExtractCtx *ctx, TSNode node, CBMCallArg *ca) {
+    ca->value = cbm_url_fold_exact(ctx, node);
+    if (!is_topic_keyword(ca->keyword)) {
+        const char *url = cbm_url_fold_call_url(ctx, node);
+        if (url && (!ca->value || strcmp(url, ca->value) != 0)) {
+            ca->url_value = url;
+        }
+    }
+}
+
 // Process a keyword argument (keyword_argument or pair node).
 static void process_keyword_arg(CBMExtractCtx *ctx, TSNode arg_node, CBMCallArg *ca) {
     TSNode key_n = ts_node_child_by_field_name(arg_node, TS_FIELD("name"));
@@ -2440,6 +2473,11 @@ static void process_keyword_arg(CBMExtractCtx *ctx, TSNode arg_node, CBMCallArg 
     }
     if (!ts_node_is_null(val_n)) {
         ca->expr = cbm_node_text(ctx->arena, val_n, ctx->source);
+        /* Only a fully resolved fold is an exact value (#706, #1147). */
+        fold_call_arg(ctx, val_n, ca);
+        if (ca->value || is_folded_reference(ctx, ts_node_type(val_n))) {
+            return;
+        }
         if (strcmp(ts_node_type(val_n), "identifier") == 0 && ca->expr) {
             ca->value = lookup_string_constant(ctx, ca->expr);
         } else if (is_string_like(ts_node_type(val_n)) && ca->expr) {
@@ -2448,7 +2486,31 @@ static void process_keyword_arg(CBMExtractCtx *ctx, TSNode arg_node, CBMCallArg 
     }
 }
 
-static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node);
+static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node, bool url_context);
+
+/* Whether a call's callee is an HTTP client or a global fetch, which selects
+ * the URL projection of a folded argument (#706, #1147). The service-pattern
+ * scan is a linear strstr over every pattern, so it runs at most once per call
+ * and only when an argument reads the answer; computing it for every positional
+ * argument of every call made C# extraction 57 % slower. */
+typedef struct {
+    const char *callee_name;
+    int state; /* -1 not computed, 0 no, 1 yes */
+} url_context_t;
+
+static bool url_context_get(url_context_t *uc) {
+    if (uc->state < 0) {
+        uc->state = cbm_service_pattern_match(uc->callee_name) == CBM_SVC_HTTP ||
+                    cbm_service_pattern_is_global_fetch(uc->callee_name);
+    }
+    return uc->state == 1;
+}
+
+/* The URL context as the folding functions read it: outside the folding
+ * languages they return NULL whatever it is, so it is never computed there. */
+static bool url_context_for_fold(const CBMExtractCtx *ctx, url_context_t *uc) {
+    return cbm_url_fold_lang(ctx->language) && url_context_get(uc);
+}
 
 /* A JS/TS request-config object -- `http({url: `/users/${id}`, method: 'GET'})`,
  * `axios({url: '/orders'})`, the shape Orval and similar generators emit -- names
@@ -2474,7 +2536,8 @@ static bool config_object_callee_eligible(const CBMExtractCtx *ctx, const char *
     return !(clen >= glen && strcmp(callee_name + clen - glen, get_uri) == 0);
 }
 
-static const char *js_config_object_url(CBMExtractCtx *ctx, TSNode obj, const char *callee_name) {
+static const char *js_config_object_url(CBMExtractCtx *ctx, TSNode obj, const char *callee_name,
+                                        bool url_context) {
     if (strcmp(ts_node_type(obj), "object") != 0 ||
         !config_object_callee_eligible(ctx, callee_name)) {
         return NULL;
@@ -2492,7 +2555,7 @@ static const char *js_config_object_url(CBMExtractCtx *ctx, TSNode obj, const ch
         }
         const char *key = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, key_n, ctx->source));
         if (key && strcmp(key, "url") == 0) {
-            return extract_string_value(ctx, val_n);
+            return extract_string_value(ctx, val_n, url_context);
         }
     }
     return NULL;
@@ -2532,6 +2595,14 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
         } else {
             ca->expr = cbm_node_text(ctx->arena, arg_node, ctx->source);
             ca->index = positional_idx++;
+            /* Python / JS / TS: a URL composed from module constants carries its
+             * folded value, but only when nothing leading stayed unresolved
+             * (#706, #1147); otherwise the long-standing handling below. */
+            fold_call_arg(ctx, arg_node, ca);
+            if (ca->value || is_folded_reference(ctx, ak)) {
+                call->arg_count++;
+                continue;
+            }
             if (is_string_like(ak) && ca->expr) {
                 ca->value = strip_quotes(ctx->arena, ca->expr);
             } else if (strcmp(ak, "template_string") == 0) {
@@ -2543,7 +2614,11 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
             } else if (strcmp(ak, "object") == 0) {
                 /* Request-config object: its `url` is what the arg-url
                  * heuristic reads for a local fetch wrapper (#2235). */
-                ca->value = js_config_object_url(ctx, arg_node, call->callee_name);
+                ca->value = js_config_object_url(ctx, arg_node, call->callee_name, false);
+                const char *url = js_config_object_url(ctx, arg_node, call->callee_name, true);
+                if (url && (!ca->value || strcmp(url, ca->value) != 0)) {
+                    ca->url_value = url;
+                }
             } else if (strcmp(ak, "call_expression") == 0) {
                 /* URL-builder helper call (issue #1009): resolve
                  * client(buildPath(id)) through the per-file builder map. */
@@ -2564,20 +2639,12 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
 static bool is_url_or_topic_keyword(const char *key) {
     static const char *url_keywords[] = {"url",        "endpoint", "path", "uri",
                                          "target_url", "base_url", NULL};
-    static const char *topic_keywords[] = {"topic",   "topic_id",   "topic_name",
-                                           "queue",   "queue_name", "queue_id",
-                                           "subject", "channel",    NULL};
     for (int i = 0; url_keywords[i]; i++) {
         if (strcmp(key, url_keywords[i]) == 0) {
             return true;
         }
     }
-    for (int i = 0; topic_keywords[i]; i++) {
-        if (strcmp(key, topic_keywords[i]) == 0) {
-            return true;
-        }
-    }
-    return false;
+    return is_topic_keyword(key);
 }
 
 // Check if a struct-field name identifies a queue/topic target.  Cloud SDKs pass
@@ -2599,8 +2666,13 @@ static bool is_queue_topic_field(const char *key) {
 }
 
 // Extract string value from a node (literal or constant reference).
-static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node) {
+static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node, bool url_context) {
     const char *vk = ts_node_type(val_node);
+    const char *folded =
+        url_context ? cbm_url_fold_call_url(ctx, val_node) : cbm_url_fold_call_raw(ctx, val_node);
+    if (folded || is_folded_reference(ctx, vk)) {
+        return folded;
+    }
     if (strcmp(vk, "template_string") == 0) {
         return cbm_template_string_text(ctx->arena, val_node, ctx->source);
     }
@@ -2671,7 +2743,7 @@ static const char *extract_composite_queue_field(CBMExtractCtx *ctx, TSNode node
         if (!is_queue_topic_field(key)) {
             continue;
         }
-        const char *resolved = extract_string_value(ctx, val_n);
+        const char *resolved = extract_string_value(ctx, val_n, false);
         if (resolved && resolved[0]) {
             return resolved;
         }
@@ -2686,7 +2758,7 @@ static const char *extract_composite_queue_field(CBMExtractCtx *ctx, TSNode node
 }
 
 // Try to extract URL/topic from a keyword_argument or pair node.
-static const char *extract_keyword_url(CBMExtractCtx *ctx, TSNode arg) {
+static const char *extract_keyword_url(CBMExtractCtx *ctx, TSNode arg, url_context_t *uc) {
     TSNode key_node = ts_node_child_by_field_name(arg, TS_FIELD("name"));
     TSNode val_node = ts_node_child_by_field_name(arg, TS_FIELD("value"));
     if (ts_node_is_null(key_node)) {
@@ -2699,7 +2771,8 @@ static const char *extract_keyword_url(CBMExtractCtx *ctx, TSNode arg) {
     if (!key || !is_url_or_topic_keyword(key)) {
         return NULL;
     }
-    return extract_string_value(ctx, val_node);
+    bool url_context = !is_topic_keyword(key) && url_context_for_fold(ctx, uc);
+    return extract_string_value(ctx, val_node, url_context);
 }
 
 // `prefixVar + "/route"` (Go's idiomatic configurable-base-path pattern):
@@ -2776,12 +2849,43 @@ static TSNode swift_unwrap_url_constructor(CBMExtractCtx *ctx, TSNode arg) {
     return swift_argument_value(ts_node_named_child(inner, 0));
 }
 
-static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const char *ak) {
+/* `${BASE}/route` -- the JS/TS twin of #1249's `base + "/route"`. A template
+ * that opens with one substitution and continues with a literal path is a
+ * configurable base URL (`${process.env.BACKEND_URL}/wallet`), so the route is
+ * the literal path after it. Anything else (`${a}${b}`, `${BASE}/`, a template
+ * that opens with text) comes back unchanged: no path is fabricated (#2291). */
+static const char *template_path_after_base(TSNode tpl, const char *flat) {
+    if (ts_node_named_child_count(tpl) < PAIR_LEN ||
+        strcmp(ts_node_type(ts_node_named_child(tpl, 0)), "template_substitution") != 0) {
+        return flat;
+    }
+    const char *path = flat + PAIR_LEN; /* past the base's "{}" placeholder */
+    /* `${base}/${tail}` has no literal path to recover: "/{}" is not a route. */
+    return (path[0] == '/' && cbm_url_has_literal_path(path)) ? path : flat;
+}
+
+static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const char *ak,
+                                          url_context_t *uc) {
+    /* Python / JS / TS: fold a URL composed from module constants (#706,
+     * #1147). A reference that folds to nothing usable stays unresolved; a
+     * template or concatenation falls back to the #1006 / #1249 / #2291
+     * handling below. */
+    const char *folded = url_context_for_fold(ctx, uc) ? cbm_url_fold_call_url(ctx, arg)
+                                                       : cbm_url_fold_call_raw(ctx, arg);
+    if (folded) {
+        return strip_and_validate_string_arg(ctx->arena, (char *)folded);
+    }
+    if (is_folded_reference(ctx, ak)) {
+        return NULL;
+    }
     /* JS/TS template literals: `/things/${id}` normalizes to "/things/{}" so the
      * client URL joins the server route's canonical placeholder (issue #1006). */
     if (strcmp(ak, "template_string") == 0) {
         const char *flat = cbm_template_string_text(ctx->arena, arg, ctx->source);
         if (flat) {
+            if (url_context_get(uc)) {
+                flat = template_path_after_base(arg, flat);
+            }
             return strip_and_validate_string_arg(ctx->arena, (char *)flat);
         }
     }
@@ -2810,6 +2914,7 @@ static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const 
 // Extract URL/topic from keyword or positional args.
 static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args,
                                             const char *callee_name) {
+    url_context_t uc = {callee_name, -1};
     uint32_t nc = ts_node_named_child_count(args);
     for (uint32_t ai = 0; ai < nc; ai++) {
         TSNode arg = ts_node_named_child(args, ai);
@@ -2830,7 +2935,7 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args,
         const char *ak = ts_node_type(arg);
 
         if (strcmp(ak, "keyword_argument") == 0 || strcmp(ak, "pair") == 0) {
-            const char *val = extract_keyword_url(ctx, arg);
+            const char *val = extract_keyword_url(ctx, arg, &uc);
             if (val) {
                 return val;
             }
@@ -2839,7 +2944,8 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args,
 
         /* JS/TS request-config object: `axios({url: '/orders'})` (#2235). */
         if (strcmp(ak, "object") == 0) {
-            const char *val = js_config_object_url(ctx, arg, callee_name);
+            const char *val =
+                js_config_object_url(ctx, arg, callee_name, url_context_for_fold(ctx, &uc));
             if (val) {
                 return val;
             }
@@ -2870,7 +2976,9 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args,
         }
 
         if (ai < MAX_POSITIONAL_SCAN) {
-            const char *val = extract_positional_url(ctx, arg, ak);
+            /* Unknown/aliased callees keep raw text until service resolution.
+             * Relative HTTP candidates remain available in args[].url_value. */
+            const char *val = extract_positional_url(ctx, arg, ak, &uc);
             if (val) {
                 return val;
             }
@@ -3878,43 +3986,48 @@ static TSNode primary_callee_expr(TSNode node) {
 }
 
 static TSNode terminal_callee_leaf(const CBMExtractCtx *ctx, TSNode expr) {
-    if (ts_node_is_null(expr) || is_dynamic_callee_expr(ctx, expr)) {
-        return (TSNode){0};
-    }
-
     static const char *const terminal_fields[] = {"property", "field", "attribute",
                                                   "method",   "name",  NULL};
-    TSNode terminal = first_present_field(expr, terminal_fields);
-    if (!ts_node_is_null(terminal)) {
-        if (is_dynamic_callee_expr(ctx, expr)) {
+    // Each step either returns or moves `expr` to the child the search goes
+    // on in. Recursing for that step cost one stack frame per wrapper level of
+    // the callee — `((((f))))(...)`, or the head of a curried application —
+    // so stack use followed the nesting depth of the indexed file and a deep
+    // enough callee ran the worker thread out of stack. The loop visits the
+    // same nodes in the same order.
+    for (;;) {
+        if (ts_node_is_null(expr) || is_dynamic_callee_expr(ctx, expr)) {
             return (TSNode){0};
         }
-        return terminal_callee_leaf(ctx, terminal);
-    }
 
-    const char *kind = ts_node_type(expr);
-    if (strcmp(kind, "identifier") == 0 || strcmp(kind, "simple_identifier") == 0 ||
-        strcmp(kind, "type_identifier") == 0 || strcmp(kind, "field_identifier") == 0 ||
-        strcmp(kind, "property_identifier") == 0 || strcmp(kind, "name") == 0 ||
-        strcmp(kind, "variable_name") == 0 || strcmp(kind, "attribute") == 0 ||
-        strcmp(kind, "symbol") == 0 || strcmp(kind, "sym_lit") == 0 ||
-        strcmp(kind, "user_symbol") == 0) {
-        return expr;
-    }
+        TSNode terminal = first_present_field(expr, terminal_fields);
+        if (!ts_node_is_null(terminal)) {
+            expr = terminal;
+            continue;
+        }
 
-    // Known wrappers keep their static terminal in one of their named children.
-    // Prefer the last child for qualified/member/navigation forms and the first
-    // for transparent parentheses and generic wrappers whose name field was not
-    // exposed by the grammar.
-    uint32_t count = ts_node_named_child_count(expr);
-    if (count == 0) {
-        return (TSNode){0};
+        const char *kind = ts_node_type(expr);
+        if (strcmp(kind, "identifier") == 0 || strcmp(kind, "simple_identifier") == 0 ||
+            strcmp(kind, "type_identifier") == 0 || strcmp(kind, "field_identifier") == 0 ||
+            strcmp(kind, "property_identifier") == 0 || strcmp(kind, "name") == 0 ||
+            strcmp(kind, "variable_name") == 0 || strcmp(kind, "attribute") == 0 ||
+            strcmp(kind, "symbol") == 0 || strcmp(kind, "sym_lit") == 0 ||
+            strcmp(kind, "user_symbol") == 0) {
+            return expr;
+        }
+
+        // Known wrappers keep their static terminal in one of their named
+        // children. Prefer the last child for qualified/member/navigation forms
+        // and the first for transparent parentheses and generic wrappers whose
+        // name field was not exposed by the grammar.
+        uint32_t count = ts_node_named_child_count(expr);
+        if (count == 0) {
+            return (TSNode){0};
+        }
+        bool terminal_is_last = strstr(kind, "qualified") || strstr(kind, "scoped") ||
+                                strstr(kind, "member") || strstr(kind, "selector") ||
+                                strstr(kind, "navigation") || strstr(kind, "field_expression");
+        expr = ts_node_named_child(expr, terminal_is_last ? count - 1 : 0);
     }
-    bool terminal_is_last = strstr(kind, "qualified") || strstr(kind, "scoped") ||
-                            strstr(kind, "member") || strstr(kind, "selector") ||
-                            strstr(kind, "navigation") || strstr(kind, "field_expression");
-    TSNode child = ts_node_named_child(expr, terminal_is_last ? count - 1 : 0);
-    return terminal_callee_leaf(ctx, child);
 }
 
 typedef struct {
