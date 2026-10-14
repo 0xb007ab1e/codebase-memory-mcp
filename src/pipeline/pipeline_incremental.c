@@ -2539,31 +2539,65 @@ static const char *closure_terraform_decline(char **paths, int n) {
     return NULL;
 }
 
+/* A role's defaults/ or vars/ main.yml (.yaml): the lists a kube task's loop
+ * reads (pass_ansible.c, an_role_list) -- a roles/<name> component before. */
+static bool closure_ansible_role_vars(const char *rel) {
+    static const char *const TAILS[] = {"/defaults/main.yml", "/defaults/main.yaml",
+                                        "/vars/main.yml", "/vars/main.yaml"};
+    static const char ROLES[] = "roles/";
+    size_t n = strlen(rel);
+    for (size_t k = 0; k < sizeof(TAILS) / sizeof(TAILS[0]); k++) {
+        size_t tl = strlen(TAILS[k]);
+        if (n <= tl || strcmp(rel + n - tl, TAILS[k]) != 0) {
+            continue;
+        }
+        const char *end = rel + n - tl; /* the role directory: rel up to end */
+        for (const char *p = rel; (p = strstr(p, ROLES)) != NULL && p < end; p++) {
+            if ((p == rel || p[-SKIP_ONE] == '/') && p + sizeof(ROLES) - SKIP_ONE < end) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Does `rel` hold Ansible tasks (a Function {source: ansible})? -1 on a
+ * lookup error. */
+static int closure_holds_ansible_tasks(cbm_store_t *store, const char *project, const char *rel) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_file(store, project, rel, &nodes, &count) != CBM_STORE_OK) {
+        return -SKIP_ONE;
+    }
+    int held = 0;
+    for (int j = 0; j < count && !held; j++) {
+        held = nodes[j].label && strcmp(nodes[j].label, "Function") == 0 &&
+               nodes[j].properties_json &&
+               strstr(nodes[j].properties_json, "\"source\":\"ansible\"") != NULL;
+    }
+    cbm_store_free_nodes(nodes, count);
+    return held;
+}
+
 /* Ansible (pass_ansible.c): a task's notify CALLS the handlers of its role
- * in another file, and whether a file is Ansible at all can hang on another
- * file's include. The repair recomputes the changed files only, so a
- * changed or deleted file that held Ansible tasks, or a changed YAML file
- * whose top level is a sequence (it may be Ansible now), declines to the
- * full rebuild. Returns the reason, or NULL. */
+ * in another file, whether a file is Ansible at all can hang on another
+ * file's include, and what a kube task DEPLOYS on the lists of its role's
+ * defaults / vars. The repair recomputes the changed files only, so a
+ * changed or deleted file that held Ansible tasks, a changed YAML file whose
+ * top level is a sequence (it may be Ansible now), or a changed or deleted
+ * role defaults / vars main file declines to the full rebuild. Returns the
+ * reason, or NULL. */
 static const char *closure_ansible_decline(cbm_store_t *store, const char *project,
                                            const char *repo_path, char **paths, int n_changed,
                                            int n_deleted) {
     for (int i = 0; i < n_changed + n_deleted; i++) {
         const char *rel = paths[i];
-        cbm_node_t *nodes = NULL;
-        int count = 0;
-        if (cbm_store_find_nodes_by_file(store, project, rel, &nodes, &count) != CBM_STORE_OK) {
-            return "ansible_lookup_failed";
+        if (closure_ansible_role_vars(rel)) {
+            return "ansible_role_vars_changed";
         }
-        bool held = false;
-        for (int j = 0; j < count && !held; j++) {
-            held = nodes[j].label && strcmp(nodes[j].label, "Function") == 0 &&
-                   nodes[j].properties_json &&
-                   strstr(nodes[j].properties_json, "\"source\":\"ansible\"");
-        }
-        cbm_store_free_nodes(nodes, count);
-        if (held) {
-            return "ansible_tasks_changed";
+        int held = closure_holds_ansible_tasks(store, project, rel);
+        if (held != 0) {
+            return held < 0 ? "ansible_lookup_failed" : "ansible_tasks_changed";
         }
         const char *dot = strrchr(rel, '.');
         if (i >= n_changed || !dot || (strcmp(dot, ".yaml") != 0 && strcmp(dot, ".yml") != 0)) {
@@ -2590,6 +2624,24 @@ static const char *closure_ansible_decline(cbm_store_t *store, const char *proje
         cbm_free(CBM_MEM_CLASS_OTHER, text);
         if (sequence) {
             return "ansible_content_changed";
+        }
+    }
+    return NULL;
+}
+
+/* A file holding Ansible tasks that the repair would re-walk as a dependent
+ * (an edge of it reaches a changed or deleted file: a deleted template its
+ * task DEPLOYS) is walked without the files its edges are drawn from --
+ * its role's defaults / vars, handlers, included task files -- which are
+ * outside the closure: it would lose those edges, or keep a dropped one's
+ * fallback undrawn. Declines to the full rebuild. Returns the reason, or
+ * NULL. */
+static const char *closure_ansible_dependent_decline(cbm_store_t *store, const char *project,
+                                                     char **dependents, int count) {
+    for (int i = 0; i < count; i++) {
+        int held = closure_holds_ansible_tasks(store, project, dependents[i]);
+        if (held != 0) {
+            return held < 0 ? "ansible_lookup_failed" : "ansible_dependent";
         }
     }
     return NULL;
@@ -2990,6 +3042,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     if (gone_scope_changed) {
         decline = "doc_scope_changed";
+        goto done;
+    }
+    decline = closure_ansible_dependent_decline(store, project, dependents, dependent_count);
+    if (decline) {
         goto done;
     }
 

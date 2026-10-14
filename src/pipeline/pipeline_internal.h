@@ -1317,8 +1317,9 @@ char *cbm_k8s_resource_props(const char *qn, const char *effective_ns, const cha
 
 /* Ansible (pass_ansible.c): a playbook or task file IMPORTS the playbooks,
  * task files and roles its directives name; its tasks and handlers are
- * Functions, a notify CALLS the handlers it names. Run at the end of the
- * K8s pass, over the same files. */
+ * Functions, a notify CALLS the handlers it names, a kube / k8s task
+ * DEPLOYS the template it applies. Run at the end of the K8s pass, over the
+ * same files. */
 void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                int file_count);
 
@@ -1545,7 +1546,8 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      (pass_terraform.c, extract_unified.c, extract_defs.c); an Ansible
  *      playbook / task file IMPORTS {via:ansible} the playbooks, task files
  *      and roles its directives name, its tasks and handlers are Functions
- *      {source:ansible} and a notify CALLS {via:notify} the handlers it names
+ *      {source:ansible}, a notify CALLS {via:notify} the handlers it names,
+ *      a kube / k8s task DEPLOYS {via:ansible} the template it applies
  *      (pass_ansible.c). An index built before holds none of them, so it
  *      rebuilds once on upgrade. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 9 };

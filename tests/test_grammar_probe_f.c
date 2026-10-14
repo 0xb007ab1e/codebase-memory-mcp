@@ -3484,6 +3484,117 @@ TEST(probe_ansible_tasks_are_functions) {
     PASS();
 }
 
+/* Every DEPLOYS an Ansible task draws, as "<task> DEPLOYS <file> [<module>]",
+ * then "deploys <n>". */
+static char *gpf_ansible_deploys(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.name || ' DEPLOYS ' "
+            "|| t.file_path || ' [' || json_extract(e.properties,'$.module') || ']' AS x FROM "
+            "edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE "
+            "e.project=?1 AND e.type='DEPLOYS' AND json_extract(e.properties,'$.via')='ansible' "
+            "ORDER BY x)), '') || char(10) || 'deploys ' || (SELECT COUNT(*) FROM edges WHERE "
+            "project=?1 AND type='DEPLOYS' AND json_extract(properties,'$.via')='ansible')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A kube / k8s task DEPLOYS {via: ansible, module, line} the repository file
+ * it applies, traced to the template (or copied file) its play rendered it
+ * from: a renderer whose dest is the very filename; {{ item.item.K }} over
+ * "{{ R.results }}" -> each item of the renderer registering R (its list
+ * literal, a set_fact's or the role defaults'); {{ item.K }} -> each of the
+ * task's own items through the renderer of that dest; a literal filename a
+ * looped renderer renders to; a k8s template: argument. A template is found
+ * before a copy to the same dest. A remote copy (even of a name the role's
+ * files/ holds), a delete by name, apply nothing in the repository. */
+TEST(probe_ansible_kube_tasks_deploy_their_templates) {
+    static const GpfFile files[] = {
+        {"roles/app/tasks/main.yml",
+         "- name: Render manifests\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/{{ item.file }}\"\n  with_items:\n    - {name: a, file: a.yml}\n"
+         "    - {name: b, file: b.yml}\n  register: app_manifests\n"
+         "- name: Apply manifests\n  kube:\n    filename: \"{{ conf }}/{{ item.item.file }}\"\n"
+         "  with_items:\n    - \"{{ app_manifests.results }}\"\n"
+         "- name: Render single\n  template:\n    src: single.yml.j2\n"
+         "    dest: \"{{ conf }}/single.yml\"\n"
+         "- name: Apply single\n  kube:\n    filename: \"{{ conf }}/single.yml\"\n"
+         "- name: Copy static\n  copy:\n    src: static.yml\n    dest: \"{{ conf }}/static.yml\"\n"
+         "- name: Apply static\n  kube:\n    filename: \"{{ conf }}/static.yml\"\n"
+         "- name: Render from defaults\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/x/{{ item.file }}\"\n  loop: \"{{ app_extra }}\"\n"
+         "  register: extra_out\n"
+         "- name: Apply from defaults\n  kube:\n    filename: \"{{ conf }}/x/{{ item.item.file }}\"\n"
+         "  loop: \"{{ extra_out.results }}\"\n"
+         "- name: Facts\n  set_fact:\n    sf_list:\n      - {file: e.yml}\n"
+         "- name: Render from facts\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/f/{{ item.file }}\"\n  with_items: \"{{ sf_list }}\"\n"
+         "  register: sf_out\n"
+         "- name: Apply set_fact\n  kube:\n    filename: \"{{ conf }}/f/{{ item.item.file }}\"\n"
+         "  with_items: \"{{ sf_out.results }}\"\n"
+         "- name: Pairs\n  template:\n    src: \"{{ item.name }}/{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/{{ item.name }}-{{ item.file }}\"\n  with_items:\n"
+         "    - {name: c, file: c.yml}\n"
+         "- name: Apply pairs\n  kube:\n    filename: \"{{ conf }}/{{ item.name }}-{{ item.file }}\"\n"
+         "  loop:\n    - {name: c, file: c.yml}\n"
+         "- name: Rendered literal\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/r/{{ item.file }}\"\n  with_items:\n    - {file: ipam.yml}\n"
+         "- name: Apply literal\n  kube:\n    filename: \"{{ conf }}/r/ipam.yml\"\n"
+         "- name: Copy first\n  copy:\n    src: first.yml\n    dest: \"{{ conf }}/dup.yml\"\n"
+         "- name: Render dup\n  template:\n    src: dup.yml.j2\n    dest: \"{{ conf }}/dup.yml\"\n"
+         "- name: Apply dup\n  kube:\n    filename: \"{{ conf }}/dup.yml\"\n"
+         "- name: Remote copy\n  copy:\n    src: static.yml\n    dest: \"{{ conf }}/remote.yml\"\n"
+         "    remote_src: true\n"
+         "- name: Apply remote\n  kube:\n    filename: \"{{ conf }}/remote.yml\"\n"
+         "- name: Delete by name\n  kube:\n    name: old\n    resource: deploy\n    state: absent\n"
+         "- name: k8s template\n  kubernetes.core.k8s:\n    template: tpl.yml.j2\n"},
+        {"roles/app/defaults/main.yml", "app_extra:\n  - file: d.yml\nother: 1\n"},
+        {"roles/app/templates/a.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/b.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/c/c.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/d.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/e.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/ipam.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/single.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/tpl.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/dup.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/files/first.yml", "kind: ConfigMap\n"},
+        {"roles/app/files/static.yml", "kind: ConfigMap\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_ansible_deploys(files, n);
+    static const char want[] =
+        "Apply dup DEPLOYS roles/app/templates/dup.yml.j2 [kube]\n"
+        "Apply from defaults DEPLOYS roles/app/templates/d.yml.j2 [kube]\n"
+        "Apply literal DEPLOYS roles/app/templates/ipam.yml.j2 [kube]\n"
+        "Apply manifests DEPLOYS roles/app/templates/a.yml.j2 [kube]\n"
+        "Apply manifests DEPLOYS roles/app/templates/b.yml.j2 [kube]\n"
+        "Apply pairs DEPLOYS roles/app/templates/c/c.yml.j2 [kube]\n"
+        "Apply set_fact DEPLOYS roles/app/templates/e.yml.j2 [kube]\n"
+        "Apply single DEPLOYS roles/app/templates/single.yml.j2 [kube]\n"
+        "Apply static DEPLOYS roles/app/files/static.yml [kube]\n"
+        "k8s template DEPLOYS roles/app/templates/tpl.yml.j2 [kubernetes.core.k8s]\n"
+        "deploys 10";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "ansible deploys got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("ansible deploys");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
  * "edgeless routes <n>": the Route nodes no edge touches. */
 static char *gpf_script_http(const GpfFile *files, int nfiles) {
@@ -5930,6 +6041,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_terraform_kubernetes_objects_are_resources);
     RUN_TEST(probe_kustomize_name_prefix_makes_variants);
     RUN_TEST(probe_ansible_tasks_are_functions);
+    RUN_TEST(probe_ansible_kube_tasks_deploy_their_templates);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
