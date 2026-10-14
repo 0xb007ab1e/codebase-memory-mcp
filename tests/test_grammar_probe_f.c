@@ -2974,6 +2974,55 @@ TEST(probe_terraform_module_calls_import_their_source) {
     PASS();
 }
 
+/* Every tfvars OVERRIDE edge as "<file> <name> -> <file> <block> <line>". */
+static char *gpf_tf_tfvars(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.name || ' -> ' || t.file_path || ' ' || t.name || ' ' || "
+            "json_extract(e.properties,'$.line') AS x FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+            "e.type='OVERRIDE' AND json_extract(e.properties,'$.via')='tfvars' ORDER BY x)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A .tfvars file's assignment to a variable the module of its own directory
+ * declares OVERRIDEs {via: tfvars, line} that `variable` block, from the
+ * file's Variable of the name. An undeclared name, and a file in a directory
+ * without Terraform files (applied by a -var-file the repository does not
+ * state), make none. */
+TEST(probe_terraform_tfvars_override_their_variables) {
+    static const GpfFile files[] = {
+        {"stack/variables.tf", "variable \"region\" {}\nvariable \"size\" {\n  default = 1\n}\n"},
+        {"stack/terraform.tfvars", "region  = \"eu\"\nsize    = 3\nunknown = \"x\"\n"},
+        {"stack/prod/prod.tfvars", "region = \"us\"\n"},
+        {"other.tfvars", "region = \"ap\"\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_tf_tfvars(files, n);
+    static const char want[] = "stack/terraform.tfvars region -> stack/variables.tf variable.region 1\n"
+                               "stack/terraform.tfvars size -> stack/variables.tf variable.size 2";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "terraform tfvars got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("terraform tfvars");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
  * "edgeless routes <n>": the Route nodes no edge touches. */
 static char *gpf_script_http(const GpfFile *files, int nfiles) {
@@ -5414,6 +5463,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_terraform_refs_resolve_in_their_module);
     RUN_TEST(probe_terraform_module_files_extract_no_generic_refs);
     RUN_TEST(probe_terraform_module_calls_import_their_source);
+    RUN_TEST(probe_terraform_tfvars_override_their_variables);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
