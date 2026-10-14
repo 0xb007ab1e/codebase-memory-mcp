@@ -66,11 +66,13 @@
     "vitest": "4.1.11"
   },
   "overrides": {
-    "@huggingface/transformers": {
-      "sharp": "0.35.0"
+    "sharp": "$sharp",
+    "monaco-editor": {
+      "dompurify": "3.4.16"
     },
     "onnxruntime-node@1.24.3": {
-      "adm-zip": "0.6.0"
+      "adm-zip": "0.6.1",
+      "global-agent": "4.1.3"
     }
   },
   "dependencies": {
@@ -83,7 +85,8 @@
     "react-dom": "19.2.8",
     "react-markdown": "10.1.0",
     "remark-gfm": "4.0.1",
+    "sharp": "file:./stubs/sharp",
     "three": "0.183.2",
-    "yaml": "2.8.2"
+    "yaml": "2.8.3"
   }
 }
