@@ -151,8 +151,9 @@ static bool an_key(const an_t *a, TSNode pair, char *out, size_t sz) {
         return false;
     }
     size_t bl = sizeof(BUILTIN) - SKIP_ONE;
-    if (strncmp(out, BUILTIN, bl) == 0) {
-        memmove(out, out + bl, strlen(out + bl) + SKIP_ONE);
+    size_t len = strlen(out);
+    if (len >= bl && memcmp(out, BUILTIN, bl) == 0) {
+        memmove(out, out + bl, len - bl + SKIP_ONE);
     }
     return true;
 }
