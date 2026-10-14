@@ -2781,6 +2781,123 @@ TEST(probe_kustomize_helm_charts_deploy_their_chart) {
     PASS();
 }
 
+/* Every Terraform reference edge as
+ * "<file> <block> -> <file> <block> <type> <ref>:<line>", then a line
+ * "other tf edges <n>": USAGE / CALLS edges leaving a .tf file that the
+ * module resolver did not make. */
+static char *gpf_tf_refs(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.name || ' -> ' || t.file_path || ' ' || t.name || ' ' || e.type || ' ' || "
+            "json_extract(e.properties,'$.ref') || ':' || json_extract(e.properties,'$.line') AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type IN ('USAGE','DEPENDS_ON') AND "
+            "json_extract(e.properties,'$.via')='terraform' ORDER BY x)), '') || char(10) || "
+            "'other tf edges ' || (SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+            "WHERE e.project=?1 AND e.type IN ('USAGE','CALLS') AND s.file_path LIKE '%.tf' AND "
+            "coalesce(json_extract(e.properties,'$.via'),'') != 'terraform')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A Terraform reference (var.X, local.X, module.X, data.T.N, T.N) USAGEs,
+ * from the top-level block holding it, the block declaring it in the same
+ * directory -- the module, all its .tf files -- with the reference kind and
+ * line; an entry of the block's depends_on list is a DEPENDS_ON (beside a
+ * USAGE where the block also uses the object). A bare label (`variable prefix {}`) names its block like a quoted
+ * one. A name mentioned in string text, a `/ *` glob inside an
+ * interpolation, a reference to the block holding it, and a directory
+ * declaring nothing of the name make no edge; the generic name matcher
+ * makes none at all for a .tf file. */
+TEST(probe_terraform_refs_resolve_in_their_module) {
+    static const GpfFile files[] = {
+        {"infra/variables.tf",
+         "variable \"region\" {}\nvariable prefix {\n  default = \"x\"\n}\n"
+         "variable \"unused\" {\n  description = \"see var.region\"\n}\n"},
+        {"infra/main.tf",
+         "locals {\n  name = \"${var.prefix}-svc\"\n  full = \"${local.name}-${var.region}\"\n}\n"
+         "resource \"aws_s3_bucket\" \"logs\" {\n  bucket = local.full\n}\n"
+         "resource \"aws_s3_bucket_policy\" \"logs\" {\n  bucket = aws_s3_bucket.logs.id\n"
+         "  policy = data.aws_iam_policy_document.p.json\n"
+         "  depends_on = [aws_s3_bucket.logs]\n}\n"
+         "data \"aws_iam_policy_document\" \"p\" {\n  statement {\n"
+         "    resources = [\"${aws_s3_bucket.logs.arn}/*\"]\n  }\n}\n"
+         "module \"net\" {\n  source = \"./net\"\n  region = var.region\n"
+         "  depends_on = [\n    aws_s3_bucket_policy.logs,\n  ]\n}\n"
+         "output \"net\" {\n  value = module.net.id\n}\n"},
+        {"infra/net/main.tf",
+         "variable \"region\" {}\nresource \"aws_vpc\" \"v\" {\n  tags = { r = var.region }\n}\n"},
+        {"other/x.tf", "resource \"null_resource\" \"n\" {\n  triggers = { r = var.region }\n}\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_tf_refs(files, n);
+    static const char want[] =
+        "infra/main.tf data.aws_iam_policy_document.p -> infra/main.tf resource.aws_s3_bucket.logs "
+        "USAGE resource:15\n"
+        "infra/main.tf locals -> infra/variables.tf variable.prefix USAGE var:2\n"
+        "infra/main.tf locals -> infra/variables.tf variable.region USAGE var:3\n"
+        "infra/main.tf module.net -> infra/main.tf resource.aws_s3_bucket_policy.logs "
+        "DEPENDS_ON resource:22\n"
+        "infra/main.tf module.net -> infra/variables.tf variable.region USAGE var:20\n"
+        "infra/main.tf output.net -> infra/main.tf module.net USAGE module:26\n"
+        "infra/main.tf resource.aws_s3_bucket.logs -> infra/main.tf locals USAGE local:6\n"
+        "infra/main.tf resource.aws_s3_bucket_policy.logs -> infra/main.tf "
+        "data.aws_iam_policy_document.p USAGE data:10\n"
+        "infra/main.tf resource.aws_s3_bucket_policy.logs -> infra/main.tf "
+        "resource.aws_s3_bucket.logs DEPENDS_ON resource:11\n"
+        "infra/main.tf resource.aws_s3_bucket_policy.logs -> infra/main.tf "
+        "resource.aws_s3_bucket.logs USAGE resource:9\n"
+        "infra/net/main.tf resource.aws_vpc.v -> infra/net/main.tf variable.region USAGE var:3\n"
+        "other tf edges 0";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "terraform refs got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("terraform refs");
+    }
+    free(got);
+    PASS();
+}
+
+/* A Terraform / OpenTofu module file (.tf, .tofu) extracts its blocks but no
+ * generic calls or usages -- its references are the module resolver's -- while
+ * any other HCL file (Packer, Nomad, Terragrunt .hcl) keeps them. */
+TEST(probe_terraform_module_files_extract_no_generic_refs) {
+    static const char src[] = "locals {\n  watched = [1]\n  result = length(watched)\n}\n";
+    static const char *const names[] = {"main.tf", "main.tofu", "main.hcl"};
+    int calls[3];
+    int usages[3];
+    int defs[3];
+    for (int i = 0; i < 3; i++) {
+        CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_HCL, "probe", names[i],
+                                            0, NULL, NULL);
+        ASSERT_NOT_NULL(r);
+        calls[i] = r->calls.count;
+        usages[i] = r->usages.count;
+        defs[i] = r->defs.count;
+        cbm_free_result(r);
+    }
+    for (int i = 0; i < 2; i++) {
+        ASSERT_EQ(calls[i], 0);
+        ASSERT_EQ(usages[i], 0);
+        ASSERT_GT(defs[i], 0);
+    }
+    ASSERT_GT(calls[2], 0);
+    ASSERT_GT(usages[2], 0);
+    PASS();
+}
+
 /* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
  * "edgeless routes <n>": the Route nodes no edge touches. */
 static char *gpf_script_http(const GpfFile *files, int nfiles) {
@@ -5218,6 +5335,8 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_script_http_request_calls_its_route);
     RUN_TEST(probe_kustomize_patches_override_their_base);
     RUN_TEST(probe_kustomize_helm_charts_deploy_their_chart);
+    RUN_TEST(probe_terraform_refs_resolve_in_their_module);
+    RUN_TEST(probe_terraform_module_files_extract_no_generic_refs);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);

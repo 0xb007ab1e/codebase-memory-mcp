@@ -1379,15 +1379,15 @@ TEST(pipeline_nix_scoped_binding_calls_resolve) {
 /* Terraform reference resolution, end to end.
  *
  * An HCL block names itself with its labels appended -- find_hcl_block_name
- * mints "resource.aws_instance.web" -- while its QN's last dot segment is
- * bare "web", and a reference written `aws_instance.web.id` reaches the
- * by-name index through that tail. HCL is therefore a language where the
- * definition name and the QN tail are different strings, and an index keyed on
- * either one alone drops every cross-resource reference in the file.
+ * mints "resource.aws_instance.web" -- and the module resolver
+ * (pass_terraform.c) finds the block a reference `aws_instance.web.id` names
+ * by recomputing that QN from the declaring file and the name. The reference
+ * USAGEs it from the block holding it, `resource.aws_eip.ip`; the file itself
+ * USAGEs nothing (a .tf file is no longer served by the generic by-name index).
  *
- * This has to be a pipeline test: the registry is shared by every language
- * and nothing in the HCL extractor mentions the index key, so the two halves
- * can disagree with every extraction-level assertion still green.
+ * This has to be a pipeline test: the extractor mints the name and the
+ * resolver recomputes the QN, so the two halves can disagree with every
+ * extraction-level assertion still green.
  */
 TEST(pipeline_hcl_block_reference_resolves_to_its_block) {
     if (setup_test_repo() != 0) {
@@ -1422,7 +1422,9 @@ TEST(pipeline_hcl_block_reference_resolves_to_its_block) {
     ASSERT_NOT_NULL(ts);
     const char *tf_project = cbm_pipeline_project_name(tp);
 
-    ASSERT(cross_file_edge_exists(ts, tf_project, "main", "resource.aws_instance.web", "USAGE"));
+    ASSERT(cross_file_edge_exists(ts, tf_project, "resource.aws_eip.ip",
+                                  "resource.aws_instance.web", "USAGE"));
+    ASSERT(!cross_file_edge_exists(ts, tf_project, "main", "resource.aws_instance.web", "USAGE"));
 
     cbm_store_close(ts);
     cbm_pipeline_free(tp);
