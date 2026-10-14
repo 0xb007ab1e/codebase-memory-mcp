@@ -4154,6 +4154,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     /* Shell and Make deploy commands, against the nodes linked above. */
     cbm_pipeline_pass_shell(ctx, files, file_count);
     cbm_pipeline_pass_terraform(ctx, files, file_count);
+    cbm_pipeline_pass_ansible(ctx, files, file_count);
     cbm_pipeline_pass_docker(ctx, files, file_count);
     /* The variables a container sets, to the readers in its own image. */
     (void)cbm_pipeline_env_join(ctx);

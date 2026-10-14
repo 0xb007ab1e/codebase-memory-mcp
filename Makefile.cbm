@@ -540,6 +540,7 @@ PIPELINE_SRCS = \
     src/pipeline/pass_operator.c \
     src/pipeline/pass_shell.c \
     src/pipeline/pass_terraform.c \
+    src/pipeline/pass_ansible.c \
     src/pipeline/pass_docker.c \
     src/pipeline/pass_envjoin.c \
     src/pipeline/pass_ci.c \

@@ -1492,6 +1492,47 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
 
 static void write_temp_file(const char *dir, const char *name, const char *content);
 
+/* An Ansible task file included by an UNCHANGED file is edited, its body
+ * only. The includer is not re-parsed, so its IMPORTS edge must survive the
+ * edited file's re-index: an edge into a node the repair re-creates would be
+ * lost (the Terraform layer needed closure_terraform_decline for that). */
+TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    write_temp_file(g_tmpdir, "roles/app/tasks/main.yml",
+                    "- name: setup\n  include_tasks: setup.yml\n");
+    write_temp_file(g_tmpdir, "roles/app/tasks/setup.yml", "- name: s\n  debug:\n    msg: one\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_incr_ansible.db", g_tmpdir);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    cbm_store_t *s1 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s1);
+    ASSERT_TRUE(cross_file_edge_exists(s1, cbm_pipeline_project_name(p1), "main.yml",
+                                       "roles/app/tasks/setup.yml", "IMPORTS"));
+    cbm_store_close(s1);
+    cbm_pipeline_free(p1);
+
+    write_temp_file(g_tmpdir, "roles/app/tasks/setup.yml",
+                    "- name: s\n  debug:\n    msg: two words\n");
+
+    cbm_pipeline_t *p2 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    ASSERT_TRUE(cross_file_edge_exists(s2, cbm_pipeline_project_name(p2), "main.yml",
+                                       "roles/app/tasks/setup.yml", "IMPORTS"));
+    cbm_store_close(s2);
+    cbm_pipeline_free(p2);
+
+    teardown_test_repo();
+    PASS();
+}
+
 /* Regression: a Terraform module's output read lives in one file
  * (infra/outputs.tf: module.net.vpc_id) and the module's source in another
  * (infra/main.tf). Pointing the source elsewhere edits main.tf alone; the
@@ -23193,6 +23234,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_hcl_block_reference_resolves_to_its_block);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module);
+    RUN_TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file);
     RUN_TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);

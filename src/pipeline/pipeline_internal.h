@@ -1298,10 +1298,22 @@ bool cbm_build_path(const char *rel);
 void cbm_build_sites(CBMArena *a, const char *rel, const char *src, size_t len, const char *dotenv,
                      cbm_build_site_fn fn, void *ud);
 
-/* Terraform / OpenTofu modules (pass_terraform.c): a helm_release DEPLOYS its
- * chart. Run at the end of the K8s pass, over the same files. */
+/* Terraform / OpenTofu / Terragrunt (pass_terraform.c): references, module
+ * calls, tfvars, Terragrunt units; a helm_release DEPLOYS its chart. Run at
+ * the end of the K8s pass, over the same files. */
 void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                  int file_count);
+
+/* Ansible (pass_ansible.c): a playbook or task file IMPORTS the playbooks,
+ * task files and roles its directives name. Run at the end of the K8s pass,
+ * over the same files. */
+void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                               int file_count);
+
+/* `v` (a path; "./" and "../" allowed) from repository directory `dir`, as a
+ * repository path into out; false past the root or when it does not fit
+ * (pass_terraform.c). */
+bool cbm_repo_rel_join(const char *dir, const char *v, char *out, size_t sz);
 
 /* The Image node of image reference `ref` (its normalised repository:
  * docker.io for no registry host, library/ for an official image; tag and
@@ -1508,7 +1520,9 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      {via:tfvars} the variable block of its own directory; a Terragrunt
  *      unit's include / read_terragrunt_config IMPORTS {via:terragrunt} the
  *      file it names, a dependency DEPENDS_ON the other unit
- *      (pass_terraform.c, extract_unified.c, extract_defs.c). An index built
+ *      (pass_terraform.c, extract_unified.c, extract_defs.c); an Ansible
+ *      playbook / task file IMPORTS {via:ansible} the playbooks, task files
+ *      and roles its directives name (pass_ansible.c). An index built
  *      before holds none of them, so it rebuilds once on upgrade. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
 

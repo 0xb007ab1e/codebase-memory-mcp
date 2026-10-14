@@ -182,6 +182,10 @@ static bool tf_repo_path(const char *mdir, const char *v, char *out, size_t sz) 
     return true;
 }
 
+bool cbm_repo_rel_join(const char *dir, const char *v, char *out, size_t sz) {
+    return tf_repo_path(dir, v, out, sz);
+}
+
 /* Chart.yaml path -> its (local) Chart node. */
 static CBMHashTable *tf_chart_index(cbm_pipeline_ctx_t *ctx) {
     CBMHashTable *ix = cbm_ht_create(0);

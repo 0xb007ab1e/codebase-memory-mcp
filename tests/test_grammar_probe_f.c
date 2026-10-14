@@ -3098,6 +3098,79 @@ TEST(probe_terragrunt_units_compose_their_files) {
     PASS();
 }
 
+/* Every Ansible IMPORTS edge as "<file> <type> <label>:<target> <local_name>:<line>". */
+static char *gpf_ansible(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "e.type || ' ' || t.label || ':' || t.file_path || ' ' || "
+            "json_extract(e.properties,'$.local_name') || ':' || "
+            "json_extract(e.properties,'$.line') AS x FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+            "json_extract(e.properties,'$.via')='ansible' ORDER BY x)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A playbook or task file (a YAML file whose top level is a sequence)
+ * IMPORTS {local_name: <directive>} what its directives name: import_playbook
+ * a playbook from its directory; include_tasks / import_tasks a task file
+ * from its directory, else from its role's tasks/ (also inside a block:);
+ * roles: items and include_role / import_role a role's Folder, roles/<name>
+ * at or above its directory. A templated target, an empty directive, and a
+ * mapping-topped file (values, CI) with the same keys, make none. */
+TEST(probe_ansible_files_import_what_they_name) {
+    static const GpfFile files[] = {
+        {"site.yml", "- name: Install\n  import_playbook: playbooks/cluster.yml\n"},
+        {"playbooks/cluster.yml",
+         "- hosts: all\n  roles:\n    - common\n    - role: web\n      when: false\n"
+         "    - \"{{ dyn }}\"\n  tasks:\n    - name: a\n      include_tasks: tasks/extra.yml\n"
+         "    - name: b\n      ansible.builtin.import_role:\n        name: db\n"},
+        {"playbooks/tasks/extra.yml", "- name: x\n  debug:\n    msg: hi\n"},
+        {"roles/common/tasks/main.yml",
+         "- name: setup\n  include_tasks: setup.yml\n- name: nested\n  block:\n"
+         "    - name: inner\n      import_tasks: other.yml\n"},
+        {"roles/common/tasks/setup.yml", "- name: s\n  debug:\n    msg: s\n"},
+        {"roles/common/tasks/other.yml", "- name: o\n  debug:\n    msg: o\n"},
+        {"roles/common/handlers/main.yml", "- name: h\n  include_tasks: setup.yml\n"},
+        {"roles/web/tasks/main.yml",
+         "- name: w\n  debug:\n    msg: w\n- name: empty\n  include_tasks:\n"},
+        {"roles/db/tasks/main.yml", "- name: d\n  debug:\n    msg: d\n"},
+        {"values.yaml", "include: playbooks/tasks/extra.yml\n"
+                        "users:\n  - name: ops\n    roles:\n      - common\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_ansible(files, n);
+    static const char want[] =
+        "playbooks/cluster.yml IMPORTS Folder:roles/common roles:3\n"
+        "playbooks/cluster.yml IMPORTS Folder:roles/db import_role:11\n"
+        "playbooks/cluster.yml IMPORTS Folder:roles/web roles:4\n"
+        "playbooks/cluster.yml IMPORTS Module:playbooks/tasks/extra.yml include_tasks:9\n"
+        "roles/common/handlers/main.yml IMPORTS Module:roles/common/tasks/setup.yml "
+        "include_tasks:2\n"
+        "roles/common/tasks/main.yml IMPORTS Module:roles/common/tasks/other.yml import_tasks:6\n"
+        "roles/common/tasks/main.yml IMPORTS Module:roles/common/tasks/setup.yml include_tasks:2\n"
+        "site.yml IMPORTS Module:playbooks/cluster.yml import_playbook:2";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "ansible got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("ansible");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
  * "edgeless routes <n>": the Route nodes no edge touches. */
 static char *gpf_script_http(const GpfFile *files, int nfiles) {
@@ -5540,6 +5613,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_terraform_module_calls_import_their_source);
     RUN_TEST(probe_terraform_tfvars_override_their_variables);
     RUN_TEST(probe_terragrunt_units_compose_their_files);
+    RUN_TEST(probe_ansible_files_import_what_they_name);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
