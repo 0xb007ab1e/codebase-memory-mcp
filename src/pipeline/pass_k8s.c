@@ -554,10 +554,12 @@ static bool k8s_cluster_scoped(const char *kind) {
  * not NULL) is the namespace a kustomize build gives it. `version` (NULL or
  * "": none) is the version of its apiVersion, which the key leaves out;
  * `labels` (NULL: none) its metadata.labels as "k=v,k2=v2" (extract_k8s.c:
- * nothing JSON escapes in it). NULL for a QN without a well-formed key (the
- * caller keeps the plain source tag). */
+ * nothing JSON escapes in it); `ecosystem` (NULL: a manifest's) what
+ * declares it otherwise -- "terraform" (pass_terraform.c), plain text. NULL
+ * for a QN without a well-formed key (the caller keeps the plain source
+ * tag). */
 static char *k8s_resource_props(const char *qn, const char *effective_ns, const char *version,
-                                const char *labels) {
+                                const char *labels, const char *ecosystem) {
     enum { K8S_KEY_PARTS = 4, K8S_ESC = 6 * K8S_LABEL_LEN };
     const char *key = qn ? strstr(qn, "::") : NULL;
     if (!key) {
@@ -597,8 +599,11 @@ static char *k8s_resource_props(const char *qn, const char *effective_ns, const 
     if (!props) {
         return NULL;
     }
-    int w =
-        snprintf(props, n, "{\"source\":\"k8s\",\"group\":\"%s\",\"kind\":\"%s\"", esc[0], esc[1]);
+    int w = snprintf(props, n, "{\"source\":\"k8s\"");
+    if (ecosystem && ecosystem[0]) {
+        w += snprintf(props + w, n - (size_t)w, ",\"ecosystem\":\"%s\"", ecosystem);
+    }
+    w += snprintf(props + w, n - (size_t)w, ",\"group\":\"%s\",\"kind\":\"%s\"", esc[0], esc[1]);
     if (esc[5][0]) {
         w += snprintf(props + w, n - (size_t)w, ",\"version\":\"%s\"", esc[5]);
     }
@@ -611,6 +616,11 @@ static char *k8s_resource_props(const char *qn, const char *effective_ns, const 
     snprintf(props + w, n - (size_t)w, ",\"obj_key\":\"%s/%s/%s/%s\"}", esc[0], esc[1], esc[4],
              esc[3]);
     return props;
+}
+
+char *cbm_k8s_resource_props(const char *qn, const char *effective_ns, const char *version,
+                             const char *labels, const char *ecosystem) {
+    return k8s_resource_props(qn, effective_ns, version, labels, ecosystem);
 }
 
 /* The string property `key` of node `n` (as k8s_resource_props writes it:
@@ -1171,9 +1181,12 @@ static void k8s_apply_effective_namespaces(cbm_pipeline_ctx_t *ctx, k8s_bundles_
             continue; /* no build sets a namespace: the declared one stands */
         }
         char version[K8S_LABEL_LEN];
+        char ecosystem[K8S_LABEL_LEN];
         k8s_node_prop(n, "version", version, sizeof(version));
+        k8s_node_prop(n, "ecosystem", ecosystem, sizeof(ecosystem));
         char *labels = k8s_node_prop_dup(n, "labels");
-        char *props = k8s_resource_props(n->qualified_name, agree ? eff : "?", version, labels);
+        char *props =
+            k8s_resource_props(n->qualified_name, agree ? eff : "?", version, labels, ecosystem);
         cbm_free(CBM_MEM_CLASS_OTHER, labels);
         if (props) {
             (void)cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)n, props);
@@ -2427,7 +2440,7 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, c
                 labels = kv[SKIP_ONE];
             }
         }
-        char *props = k8s_resource_props(def->qualified_name, NULL, version, labels);
+        char *props = k8s_resource_props(def->qualified_name, NULL, version, labels, NULL);
         int64_t node_id = cbm_gbuf_upsert_node(
             ctx->gbuf, "Resource", def->name, def->qualified_name, rel_path, (int)def->start_line,
             (int)def->end_line, props ? props : "{\"source\":\"k8s\"}");
@@ -4130,6 +4143,10 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
         }
     }
     cbm_free(CBM_MEM_CLASS_OTHER, prep);
+
+    /* Kubernetes objects Terraform declares (pass_terraform.c), before the
+     * bundles and the joins: references meet them like manifest objects. */
+    cbm_pipeline_tf_k8s_objects(ctx, files, file_count);
 
     /* Connect Services to the workloads their selectors target (INFRA_MAPS),
      * inside the bundles that deploy them together. */

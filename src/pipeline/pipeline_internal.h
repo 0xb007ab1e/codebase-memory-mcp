@@ -1304,6 +1304,17 @@ void cbm_build_sites(CBMArena *a, const char *rel, const char *src, size_t len, 
 void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                  int file_count);
 
+/* Kubernetes objects Terraform declares (pass_terraform.c): a
+ * kubernetes_<type> resource with a literal name is a Resource of the K8s
+ * identity scheme, ecosystem terraform. Run by the K8s pass before its joins. */
+void cbm_pipeline_tf_k8s_objects(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                 int file_count);
+
+/* A Resource's properties from its identity QN (pass_k8s.c,
+ * k8s_resource_props); `ecosystem` NULL for a manifest's. Caller frees. */
+char *cbm_k8s_resource_props(const char *qn, const char *effective_ns, const char *version,
+                             const char *labels, const char *ecosystem);
+
 /* Ansible (pass_ansible.c): a playbook or task file IMPORTS the playbooks,
  * task files and roles its directives name. Run at the end of the K8s pass,
  * over the same files. */
@@ -1520,7 +1531,9 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      {via:tfvars} the variable block of its own directory (or, inferred,
  *      of the nearest ancestor module declaring its names); a Terragrunt
  *      unit's include / read_terragrunt_config IMPORTS {via:terragrunt} the
- *      file it names, a dependency DEPENDS_ON the other unit
+ *      file it names, a dependency DEPENDS_ON the other unit; a
+ *      kubernetes_* resource with a literal name is a Resource
+ *      {ecosystem:terraform} its block DEPLOYS
  *      (pass_terraform.c, extract_unified.c, extract_defs.c); an Ansible
  *      playbook / task file IMPORTS {via:ansible} the playbooks, task files
  *      and roles its directives name (pass_ansible.c). An index built

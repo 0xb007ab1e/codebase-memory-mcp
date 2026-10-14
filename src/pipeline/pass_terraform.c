@@ -862,12 +862,12 @@ static tf_mod_t *tf_mod_parse(cbm_pipeline_ctx_t *ctx, CBMArena *arena, TSParser
     return m;
 }
 
-/* Folder path -> its Folder node. */
-static CBMHashTable *tf_folder_index(cbm_pipeline_ctx_t *ctx) {
+/* path -> node, over the nodes of one label (Folder, File). */
+static CBMHashTable *tf_label_index(cbm_pipeline_ctx_t *ctx, const char *label) {
     CBMHashTable *ix = cbm_ht_create(0);
     const cbm_gbuf_node_t **nodes = NULL;
     int n = 0;
-    if (ix && cbm_gbuf_find_by_label(ctx->gbuf, "Folder", &nodes, &n) == 0) {
+    if (ix && cbm_gbuf_find_by_label(ctx->gbuf, label, &nodes, &n) == 0) {
         for (int i = 0; i < n; i++) {
             if (nodes[i]->file_path) {
                 cbm_ht_set(ix, nodes[i]->file_path, (void *)nodes[i]);
@@ -976,7 +976,7 @@ static int tf_link_repo(cbm_pipeline_ctx_t *ctx, TSParser *parser, const char *c
         }
         i = j;
     }
-    CBMHashTable *folders = calls > 0 ? tf_folder_index(ctx) : NULL;
+    CBMHashTable *folders = calls > 0 ? tf_label_index(ctx, "Folder") : NULL;
     int edges = 0;
     for (int k = 0; k < nm; k++) {
         edges += tf_mod_link(list[k], mods, folders);
@@ -1402,7 +1402,7 @@ static int tg_link_units(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     }
     if (nu > 0 && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_HCL))) {
         qsort((void *)units, (size_t)nu, sizeof(*units), tg_cmp_str);
-        g.folders = tf_folder_index(ctx);
+        g.folders = tf_label_index(ctx, "Folder");
         for (int i = 0; i < nu; i++) {
             tg_unit(&g, parser, units[i]);
         }
@@ -1416,6 +1416,291 @@ static int tg_link_units(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)units);
     cbm_arena_destroy(&arena);
     return g.edges;
+}
+
+/* ── Kubernetes objects Terraform declares (PHASE 6 P6.5) ──────────── */
+
+/* resource "kubernetes_<type>[_vN]" "N" declares the object of the kind its
+ * type names -- a kubernetes_manifest the apiVersion / kind of its manifest
+ * -- with metadata name and namespace from string literals. It is a
+ * Resource of the K8s identity scheme (IDENTITY.md: <file-base>::<group>/
+ * <Kind>/<ns or ->/<name>), with a manifest object's properties plus
+ * `ecosystem: terraform`; its file DEFINES it and the block DEPLOYS
+ * {via: terraform, line} it. A computed name (var., local., an
+ * interpolation) is unknown: no Resource. Types acting on an object declared
+ * elsewhere (owner references, readiness waits, label / annotation patches)
+ * declare none. Run before the K8s joins: references meet these objects like
+ * manifest ones. */
+
+typedef struct {
+    const char *type; /* after "kubernetes_", without a _vN suffix */
+    const char *group;
+    const char *kind;
+} tf_k8s_kind_t;
+
+static const tf_k8s_kind_t TF_K8S_KINDS[] = {
+    {"namespace", "core", "Namespace"},
+    {"service", "core", "Service"},
+    {"service_account", "core", "ServiceAccount"},
+    {"default_service_account", "core", "ServiceAccount"},
+    {"config_map", "core", "ConfigMap"},
+    {"secret", "core", "Secret"},
+    {"persistent_volume_claim", "core", "PersistentVolumeClaim"},
+    {"persistent_volume", "core", "PersistentVolume"},
+    {"pod", "core", "Pod"},
+    {"limit_range", "core", "LimitRange"},
+    {"resource_quota", "core", "ResourceQuota"},
+    {"endpoints", "core", "Endpoints"},
+    {"replication_controller", "core", "ReplicationController"},
+    {"deployment", "apps", "Deployment"},
+    {"stateful_set", "apps", "StatefulSet"},
+    {"daemonset", "apps", "DaemonSet"},
+    {"daemon_set", "apps", "DaemonSet"},
+    {"job", "batch", "Job"},
+    {"cron_job", "batch", "CronJob"},
+    {"cluster_role", "rbac.authorization.k8s.io", "ClusterRole"},
+    {"cluster_role_binding", "rbac.authorization.k8s.io", "ClusterRoleBinding"},
+    {"role", "rbac.authorization.k8s.io", "Role"},
+    {"role_binding", "rbac.authorization.k8s.io", "RoleBinding"},
+    {"network_policy", "networking.k8s.io", "NetworkPolicy"},
+    {"ingress", "networking.k8s.io", "Ingress"},
+    {"ingress_class", "networking.k8s.io", "IngressClass"},
+    {"storage_class", "storage.k8s.io", "StorageClass"},
+    {"csi_driver", "storage.k8s.io", "CSIDriver"},
+    {"priority_class", "scheduling.k8s.io", "PriorityClass"},
+    {"horizontal_pod_autoscaler", "autoscaling", "HorizontalPodAutoscaler"},
+    {"pod_disruption_budget", "policy", "PodDisruptionBudget"},
+    {"runtime_class", "node.k8s.io", "RuntimeClass"},
+    {"mutating_webhook_configuration", "admissionregistration.k8s.io",
+     "MutatingWebhookConfiguration"},
+    {"validating_webhook_configuration", "admissionregistration.k8s.io",
+     "ValidatingWebhookConfiguration"},
+    {"api_service", "apiregistration.k8s.io", "APIService"},
+    {"certificate_signing_request", "certificates.k8s.io", "CertificateSigningRequest"},
+};
+
+/* "kubernetes_<type>[_vN[beta|alphaM]]": <type> into out; false for another
+ * provider's type. */
+static bool tf_k8s_type(const char *rtype, char *out, size_t sz) {
+    static const char PREFIX[] = "kubernetes_";
+    if (strncmp(rtype, PREFIX, sizeof(PREFIX) - SKIP_ONE) != 0) {
+        return false;
+    }
+    snprintf(out, sz, "%s", rtype + sizeof(PREFIX) - SKIP_ONE);
+    char *v = strrchr(out, '_');
+    if (v && v[SKIP_ONE] == 'v' && v[PAIR_LEN] >= '0' && v[PAIR_LEN] <= '9') {
+        *v = '\0';
+    }
+    return out[0] != '\0';
+}
+
+/* A string literal's text (no interpolation, no ${path.module}); false else. */
+static bool tf_literal(const char *src, TSNode n, char *out, size_t sz) {
+    return tf_string(src, "", n, out, sz) && !strchr(out, '\x01');
+}
+
+/* The value of `key` in an object expression (keys bare or quoted). */
+static TSNode tf_object_get(const char *src, TSNode expr, const char *key) {
+    TSNode n = expr;
+    while ((tf_type(n, "expression") || tf_type(n, "collection_value")) &&
+           ts_node_named_child_count(n) > 0) {
+        n = ts_node_named_child(n, 0);
+    }
+    for (uint32_t i = 0; tf_type(n, "object") && i < ts_node_named_child_count(n); i++) {
+        TSNode el = ts_node_named_child(n, i);
+        if (!tf_type(el, "object_elem")) {
+            continue;
+        }
+        TSNode k = ts_node_child_by_field_name(el, "key", sizeof("key") - SKIP_ONE);
+        char text[CBM_SZ_64];
+        bool named = tf_literal(src, k, text, sizeof(text));
+        if (!named) {
+            TSNode id = k;
+            while ((tf_type(id, "expression") || tf_type(id, "variable_expr")) &&
+                   ts_node_named_child_count(id) > 0) {
+                id = ts_node_named_child(id, 0);
+            }
+            named = tf_type(id, "identifier") && tf_text_is(src, id, key);
+            text[0] = '\0';
+        }
+        if ((named && !text[0]) || (text[0] && strcmp(text, key) == 0)) {
+            return ts_node_child_by_field_name(el, "val", sizeof("val") - SKIP_ONE);
+        }
+    }
+    return (TSNode){0};
+}
+
+/* The expression of attribute `key` in a block body, or a null node. */
+static TSNode tf_body_attr(const char *src, TSNode body, const char *key) {
+    for (uint32_t i = 0; !ts_node_is_null(body) && i < ts_node_named_child_count(body); i++) {
+        TSNode at = ts_node_named_child(body, i);
+        if (tf_type(at, "attribute") && ts_node_named_child_count(at) >= PAIR_LEN &&
+            tf_text_is(src, ts_node_named_child(at, 0), key)) {
+            return ts_node_named_child(at, SKIP_ONE);
+        }
+    }
+    return (TSNode){0};
+}
+
+/* The body of the nested block `name` in a block body, or a null node. */
+static TSNode tf_body_block(const char *src, TSNode body, const char *name) {
+    for (uint32_t i = 0; !ts_node_is_null(body) && i < ts_node_named_child_count(body); i++) {
+        TSNode b = ts_node_named_child(body, i);
+        if (!tf_type(b, "block") || ts_node_named_child_count(b) == 0 ||
+            !tf_text_is(src, ts_node_named_child(b, 0), name)) {
+            continue;
+        }
+        for (uint32_t j = 0; j < ts_node_named_child_count(b); j++) {
+            if (tf_type(ts_node_named_child(b, j), "body")) {
+                return ts_node_named_child(b, j);
+            }
+        }
+    }
+    return (TSNode){0};
+}
+
+/* One top-level block of a .tf file: the object it declares, if any. */
+static void tf_k8s_block(cbm_pipeline_ctx_t *ctx, CBMArena *a, const char *src, const char *rel,
+                         const char *base, int64_t file_id, TSNode block) {
+    TSNode body;
+    const char *bname = tf_block_name(a, src, block, &body);
+    static const char RES[] = "resource.";
+    char rtype[CBM_SZ_128];
+    char type[CBM_SZ_128];
+    if (!bname || ts_node_is_null(body) || strncmp(bname, RES, sizeof(RES) - SKIP_ONE) != 0) {
+        return;
+    }
+    const char *dot = strchr(bname + sizeof(RES) - SKIP_ONE, '.');
+    snprintf(rtype, sizeof(rtype), "%.*s", dot ? (int)(dot - bname - (sizeof(RES) - SKIP_ONE)) : 0,
+             bname + sizeof(RES) - SKIP_ONE);
+    if (!tf_k8s_type(rtype, type, sizeof(type))) {
+        return;
+    }
+    char group[CBM_SZ_256] = "";
+    char kind[CBM_SZ_128] = "";
+    char version[CBM_SZ_64] = "";
+    char name[CBM_SZ_256] = "";
+    char ns[CBM_SZ_256] = "";
+    if (strcmp(type, "manifest") == 0) {
+        TSNode m = tf_body_attr(src, body, "manifest");
+        char av[CBM_SZ_256];
+        TSNode meta = tf_object_get(src, m, "metadata");
+        if (!tf_literal(src, tf_object_get(src, m, "kind"), kind, sizeof(kind)) ||
+            !tf_literal(src, tf_object_get(src, m, "apiVersion"), av, sizeof(av)) ||
+            !tf_literal(src, tf_object_get(src, meta, "name"), name, sizeof(name))) {
+            return;
+        }
+        const char *slash = strchr(av, '/');
+        if (slash) {
+            snprintf(group, sizeof(group), "%.*s", (int)(slash - av), av);
+        } else {
+            snprintf(group, sizeof(group), "core");
+        }
+        snprintf(version, sizeof(version), "%s", slash ? slash + SKIP_ONE : av);
+        if (!tf_literal(src, tf_object_get(src, meta, "namespace"), ns, sizeof(ns))) {
+            ns[0] = '\0';
+        }
+    } else {
+        const tf_k8s_kind_t *k = NULL;
+        for (size_t i = 0; i < sizeof(TF_K8S_KINDS) / sizeof(TF_K8S_KINDS[0]) && !k; i++) {
+            k = strcmp(TF_K8S_KINDS[i].type, type) == 0 ? &TF_K8S_KINDS[i] : NULL;
+        }
+        TSNode meta = tf_body_block(src, body, "metadata");
+        if (!k) {
+            return;
+        }
+        snprintf(group, sizeof(group), "%s", k->group);
+        snprintf(kind, sizeof(kind), "%s", k->kind);
+        if (strcmp(type, "default_service_account") == 0) {
+            snprintf(name, sizeof(name), "default");
+        } else if (!tf_literal(src, tf_body_attr(src, meta, "name"), name, sizeof(name))) {
+            return;
+        }
+        if (!tf_literal(src, tf_body_attr(src, meta, "namespace"), ns, sizeof(ns))) {
+            ns[0] = '\0';
+        }
+    }
+    if (strchr(name, '/') || strchr(ns, '/') || strchr(kind, '/') || !name[0] || !kind[0]) {
+        return; /* the identity key splits on "/" */
+    }
+    const char *qn =
+        cbm_arena_sprintf(a, "%s::%s/%s/%s/%s", base, group, kind, ns[0] ? ns : "-", name);
+    const char *rname = cbm_arena_sprintf(a, "%s/%s", kind, name);
+    char *props = qn ? cbm_k8s_resource_props(qn, NULL, version, NULL, "terraform") : NULL;
+    int64_t id = props ? cbm_gbuf_upsert_node(ctx->gbuf, "Resource", rname, qn, rel,
+                                              (int)ts_node_start_point(block).row + SKIP_ONE,
+                                              (int)ts_node_end_point(block).row + SKIP_ONE, props)
+                       : 0;
+    cbm_free(CBM_MEM_CLASS_OTHER, props);
+    if (id <= 0) {
+        return;
+    }
+    if (file_id > 0) {
+        cbm_gbuf_insert_edge(ctx->gbuf, file_id, id, "DEFINES", "{}");
+    }
+    const char *bqn = cbm_fqn_compute(a, ctx->project_name, rel, bname);
+    const cbm_gbuf_node_t *bnode = bqn ? cbm_gbuf_find_by_qn(ctx->gbuf, bqn) : NULL;
+    if (bnode && bnode->id != id) {
+        char eprops[CBM_SZ_64];
+        snprintf(eprops, sizeof(eprops), "{\"via\":\"terraform\",\"line\":%d}",
+                 (int)ts_node_start_point(block).row + SKIP_ONE);
+        cbm_gbuf_insert_edge(ctx->gbuf, bnode->id, id, "DEPLOYS", eprops);
+    }
+}
+
+void cbm_pipeline_tf_k8s_objects(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                 int file_count) {
+    TSParser *parser = NULL;
+    CBMHashTable *file_nodes = NULL;
+    for (int i = 0; i < file_count; i++) {
+        const char *rel = files[i].rel_path;
+        if (files[i].language != CBM_LANG_HCL || !tf_is_module_file(rel)) {
+            continue;
+        }
+        size_t len = 0;
+        char *src = tf_read(files[i].path, &len);
+        if (!src || !strstr(src, "kubernetes_")) {
+            cbm_free(CBM_MEM_CLASS_OTHER, src);
+            continue;
+        }
+        if (!parser) {
+            parser = ts_parser_new();
+            file_nodes = tf_label_index(ctx, "File");
+            if (!parser || !ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_HCL))) {
+                cbm_free(CBM_MEM_CLASS_OTHER, src);
+                break;
+            }
+        }
+        /* the file base: the File node's QN without ".__file__" (IDENTITY.md) */
+        static const char FILE_SUFFIX[] = ".__file__";
+        const cbm_gbuf_node_t *file = file_nodes ? cbm_ht_get(file_nodes, rel) : NULL;
+        size_t fl = file && file->qualified_name ? strlen(file->qualified_name) : 0;
+        size_t sl = sizeof(FILE_SUFFIX) - SKIP_ONE;
+        CBMArena arena;
+        cbm_arena_init_lazy(&arena, CBM_SZ_4K);
+        const char *base = fl > sl && strcmp(file->qualified_name + fl - sl, FILE_SUFFIX) == 0
+                               ? cbm_arena_strndup(&arena, file->qualified_name, fl - sl)
+                               : NULL;
+        TSTree *tree = base ? ts_parser_parse_string(parser, NULL, src, (uint32_t)len) : NULL;
+        TSNode body = tree ? tf_root_body(ts_tree_root_node(tree)) : (TSNode){0};
+        for (uint32_t j = 0; !ts_node_is_null(body) && j < ts_node_named_child_count(body); j++) {
+            TSNode b = ts_node_named_child(body, j);
+            if (tf_type(b, "block")) {
+                tf_k8s_block(ctx, &arena, src, rel, base, file->id, b);
+            }
+        }
+        cbm_arena_destroy(&arena);
+        if (tree) {
+            ts_tree_delete(tree);
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, src);
+    }
+    if (parser) {
+        ts_parser_delete(parser);
+    }
+    if (file_nodes) {
+        cbm_ht_free(file_nodes);
+    }
 }
 
 void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,

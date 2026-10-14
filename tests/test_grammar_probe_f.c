@@ -3181,6 +3181,101 @@ TEST(probe_ansible_files_import_what_they_name) {
     PASS();
 }
 
+/* Every Resource a Terraform block DEPLOYS as "<block> DEPLOYS <name>
+ * <obj_key> v=<version>", then "terraform resources <n>": the Resources
+ * marked ecosystem terraform, then each INFRA_MAPS edge into one of them as
+ * "<label>:<name> INFRA_MAPS <name>". */
+static char *gpf_tf_k8s(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.name || ' DEPLOYS ' || "
+            "t.name || ' ' || json_extract(t.properties,'$.obj_key') || ' v=' || "
+            "coalesce(json_extract(t.properties,'$.version'), '-') AS x FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+            "e.type='DEPLOYS' AND t.label='Resource' AND "
+            "json_extract(e.properties,'$.via')='terraform' ORDER BY x)), '') || char(10) || "
+            "'terraform resources ' || (SELECT COUNT(*) FROM nodes WHERE project=?1 AND "
+            "label='Resource' AND json_extract(properties,'$.ecosystem')='terraform') || "
+            "coalesce((SELECT group_concat(y, '') FROM (SELECT char(10) || s.label || ':' || s.name "
+            "|| ' INFRA_MAPS ' || t.name AS y FROM edges e JOIN nodes s ON s.id=e.source_id JOIN "
+            "nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type='INFRA_MAPS' AND "
+            "json_extract(t.properties,'$.ecosystem')='terraform' ORDER BY y)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A kubernetes_<type> resource (also _vN) with a literal metadata name is a
+ * Resource of the K8s identity scheme, ecosystem terraform, its block
+ * DEPLOYS it: the kind its type names, or a kubernetes_manifest's own
+ * apiVersion / kind. The name and namespace come from the object's own
+ * metadata only (never spec's), a default service account's is `default`;
+ * a cluster-scoped kind's obj_key says `_`. A
+ * computed name, and a type acting on an object declared elsewhere
+ * (kubernetes_annotations), make none. A manifest of the same bundle
+ * references it like a manifest's object: the Ingress maps to the Service. */
+TEST(probe_terraform_kubernetes_objects_are_resources) {
+    static const GpfFile files[] = {
+        {"k8s/main.tf",
+         "resource \"kubernetes_namespace_v1\" \"apps\" {\n  metadata {\n    name = \"apps\"\n  }\n}\n"
+         "resource \"kubernetes_deployment\" \"web\" {\n  metadata {\n    name      = \"web\"\n"
+         "    namespace = \"apps\"\n  }\n  spec {\n    template {\n      metadata {\n"
+         "        name = \"inner\"\n      }\n    }\n  }\n}\n"
+         "resource \"kubernetes_manifest\" \"cert\" {\n  manifest = {\n"
+         "    \"apiVersion\" = \"cert-manager.io/v1\"\n    \"kind\"       = \"Certificate\"\n"
+         "    \"metadata\" = {\n      \"name\"      = \"tls\"\n      \"namespace\" = \"apps\"\n"
+         "    }\n  }\n}\n"
+         "resource \"kubernetes_service\" \"computed\" {\n  metadata {\n    name = var.name\n  }\n}\n"
+         "resource \"kubernetes_api_service\" \"metrics\" {\n  metadata {\n"
+         "    name = \"v1beta1.metrics.k8s.io\"\n  }\n  spec {\n    service {\n"
+         "      name      = \"metrics-server\"\n      namespace = \"kube-system\"\n    }\n  }\n}\n"
+         "resource \"kubernetes_annotations\" \"patch\" {\n  api_version = \"v1\"\n"
+         "  kind        = \"ConfigMap\"\n  metadata {\n    name = \"cm\"\n  }\n}\n"
+         "resource \"kubernetes_default_service_account\" \"sa\" {\n  metadata {\n"
+         "    namespace = \"apps\"\n  }\n}\n"
+         "resource \"kubernetes_service_v1\" \"web\" {\n  metadata {\n    name      = \"web\"\n"
+         "    namespace = \"apps\"\n  }\n}\n"
+         "variable \"name\" {}\n"},
+        {"k8s/ingress.yaml",
+         "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: web\n"
+         "  namespace: apps\nspec:\n  rules:\n    - http:\n        paths:\n          - path: /\n"
+         "            pathType: Prefix\n            backend:\n              service:\n"
+         "                name: web\n                port:\n                  number: 80\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_tf_k8s(files, n);
+    static const char want[] =
+        "resource.kubernetes_api_service.metrics DEPLOYS APIService/v1beta1.metrics.k8s.io "
+        "apiregistration.k8s.io/APIService/_/v1beta1.metrics.k8s.io v=-\n"
+        "resource.kubernetes_default_service_account.sa DEPLOYS ServiceAccount/default "
+        "core/ServiceAccount/apps/default v=-\n"
+        "resource.kubernetes_deployment.web DEPLOYS Deployment/web apps/Deployment/apps/web v=-\n"
+        "resource.kubernetes_manifest.cert DEPLOYS Certificate/tls "
+        "cert-manager.io/Certificate/apps/tls v=v1\n"
+        "resource.kubernetes_namespace_v1.apps DEPLOYS Namespace/apps core/Namespace/_/apps v=-\n"
+        "resource.kubernetes_service_v1.web DEPLOYS Service/web core/Service/apps/web v=-\n"
+        "terraform resources 6\n"
+        "Resource:Ingress/web INFRA_MAPS Service/web\n"
+        "Route:*/ INFRA_MAPS Service/web";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "terraform k8s got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("terraform k8s");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
  * "edgeless routes <n>": the Route nodes no edge touches. */
 static char *gpf_script_http(const GpfFile *files, int nfiles) {
@@ -5624,6 +5719,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_terraform_tfvars_override_their_variables);
     RUN_TEST(probe_terragrunt_units_compose_their_files);
     RUN_TEST(probe_ansible_files_import_what_they_name);
+    RUN_TEST(probe_terraform_kubernetes_objects_are_resources);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
