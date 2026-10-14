@@ -432,10 +432,11 @@ static TSNode tf_root_body(TSNode root) {
  * module.X.Y (also module.X[i].Y, module.X[*].Y) USAGEs {ref: output}, beside
  * module.X, the `output "Y"` of it.
  *
- * A .tfvars file sets variables of the module in its own directory: each
- * assignment to a declared variable OVERRIDEs {via: tfvars, line} its
- * `variable` block (a file elsewhere is applied by a -var-file on some
- * command line, which is nothing the repository's Terraform states). */
+ * A .tfvars file sets variables of the module in its own directory -- or,
+ * when that declares none of its names, of the nearest ancestor directory's
+ * module that does (applied by a -var-file the repository does not state:
+ * the edge says `inferred`): each assignment to a declared variable
+ * OVERRIDEs {via: tfvars, line} its `variable` block. */
 
 typedef struct {
     char *file;      /* the referencing file */
@@ -876,32 +877,70 @@ static CBMHashTable *tf_folder_index(cbm_pipeline_ctx_t *ctx) {
     return ix;
 }
 
-/* A .tfvars file sets variables of the module in its own directory: each
- * top-level assignment whose name the module declares OVERRIDEs
- * {via: tfvars, line}, from the file's Variable of that name, the
- * `variable` block. */
-static int tf_link_tfvars(tf_mod_t *m, TSParser *parser, const char *rel) {
+/* The module of the first of `d` and its ancestors (d is cut in place)
+ * declaring one of `vnames[0..n)`; NULL when none does. */
+static tf_mod_t *tf_tfvars_module(CBMHashTable *mods, char *d, const char *const *vnames, int n) {
+    for (;;) {
+        tf_mod_t *m = cbm_ht_get(mods, d);
+        for (int k = 0; m && k < n; k++) {
+            if (vnames[k] && cbm_ht_get(m->decls, vnames[k])) {
+                return m;
+            }
+        }
+        if (!d[0]) {
+            return NULL;
+        }
+        char *s = strrchr(d, '/');
+        if (s) {
+            *s = '\0';
+        } else {
+            d[0] = '\0';
+        }
+    }
+}
+
+/* A .tfvars file sets variables of a module: the one in its own directory
+ * when that declares one of its names, else the nearest ancestor directory's
+ * that does (a file there is applied by a -var-file the repository does not
+ * state: the edge says `inferred`). Each top-level assignment whose name the
+ * module declares OVERRIDEs {via: tfvars, line}, from the file's Variable of
+ * that name, the `variable` block. */
+static int tf_link_tfvars(CBMArena *arena, TSParser *parser, CBMHashTable *mods,
+                          const char *repo_path, const char *rel) {
     char path[CBM_SZ_2K];
-    snprintf(path, sizeof(path), "%s/%s", m->ctx->repo_path, rel);
+    snprintf(path, sizeof(path), "%s/%s", repo_path, rel);
     size_t len = 0;
     char *src = tf_read(path, &len);
     TSTree *tree = src ? ts_parser_parse_string(parser, NULL, src, (uint32_t)len) : NULL;
     TSNode body = tree ? tf_root_body(ts_tree_root_node(tree)) : (TSNode){0};
-    int edges = 0;
-    for (uint32_t i = 0; !ts_node_is_null(body) && i < ts_node_named_child_count(body); i++) {
+    uint32_t nc = ts_node_is_null(body) ? 0 : ts_node_named_child_count(body);
+    const char **vnames = nc ? cbm_arena_alloc(arena, (size_t)nc * sizeof(*vnames)) : NULL;
+    TSNode *attrs = nc ? cbm_arena_alloc(arena, (size_t)nc * sizeof(*attrs)) : NULL;
+    int n = 0;
+    for (uint32_t i = 0; vnames && attrs && i < nc; i++) {
         TSNode at = ts_node_named_child(body, i);
-        if (!tf_type(at, "attribute") || ts_node_named_child_count(at) == 0) {
-            continue;
+        if (tf_type(at, "attribute") && ts_node_named_child_count(at) > 0) {
+            const char *key = tf_text(arena, src, ts_node_named_child(at, 0));
+            vnames[n] = key ? cbm_arena_sprintf(arena, "variable.%s", key) : NULL;
+            attrs[n++] = at;
         }
-        const char *key = tf_text(m->arena, src, ts_node_named_child(at, 0));
-        const char *vname = key ? cbm_arena_sprintf(m->arena, "variable.%s", key) : NULL;
-        const char *vfile = vname ? cbm_ht_get(m->decls, vname) : NULL;
-        int64_t from = vfile ? tf_def_node(m, rel, key) : 0;
-        int64_t to = from > 0 ? tf_def_node(m, vfile, vname) : 0;
+    }
+    const char *slash = strrchr(rel, '/');
+    char d[CBM_SZ_1K];
+    snprintf(d, sizeof(d), "%.*s", slash ? (int)(slash - rel) : 0, rel);
+    size_t own = strlen(d);
+    tf_mod_t *m = n > 0 ? tf_tfvars_module(mods, d, vnames, n) : NULL;
+    int edges = 0;
+    for (int k = 0; m && k < n; k++) {
+        const char *vfile = vnames[k] ? cbm_ht_get(m->decls, vnames[k]) : NULL;
+        const char *key = vfile ? vnames[k] + sizeof("variable.") - SKIP_ONE : NULL;
+        int64_t from = key ? tf_def_node(m, rel, key) : 0;
+        int64_t to = from > 0 ? tf_def_node(m, vfile, vnames[k]) : 0;
         if (to > 0) {
             char props[CBM_SZ_128];
-            snprintf(props, sizeof(props), "{\"via\":\"tfvars\",\"line\":%d}",
-                     (int)ts_node_start_point(at).row + SKIP_ONE);
+            snprintf(props, sizeof(props), "{\"via\":\"tfvars\",%s\"line\":%d}",
+                     strlen(d) == own ? "" : "\"inferred\":true,",
+                     (int)ts_node_start_point(attrs[k]).row + SKIP_ONE);
             cbm_gbuf_insert_edge(m->ctx->gbuf, from, to, "OVERRIDE", props);
             edges++;
         }
@@ -915,7 +954,7 @@ static int tf_link_tfvars(tf_mod_t *m, TSParser *parser, const char *rel) {
 
 /* Every module directory, `paths[0..pn)` sorted by directory: parse all,
  * then link each -- a reference may read an output of another directory --
- * and the .tfvars files `vpaths[0..vn)` to the module of their directory. */
+ * and the .tfvars files `vpaths[0..vn)` to the module whose variables they set. */
 static int tf_link_repo(cbm_pipeline_ctx_t *ctx, TSParser *parser, const char *const *paths, int pn,
                         const char *const *vpaths, int vn) {
     CBMArena arena;
@@ -943,11 +982,7 @@ static int tf_link_repo(cbm_pipeline_ctx_t *ctx, TSParser *parser, const char *c
         edges += tf_mod_link(list[k], mods, folders);
     }
     for (int k = 0; mods && k < vn; k++) {
-        const char *slash = strrchr(vpaths[k], '/');
-        char dir[CBM_SZ_1K];
-        snprintf(dir, sizeof(dir), "%.*s", slash ? (int)(slash - vpaths[k]) : 0, vpaths[k]);
-        tf_mod_t *m = cbm_ht_get(mods, dir);
-        edges += m ? tf_link_tfvars(m, parser, vpaths[k]) : 0;
+        edges += tf_link_tfvars(&arena, parser, mods, ctx->repo_path, vpaths[k]);
     }
     for (int k = 0; k < nm; k++) {
         tf_mod_free(list[k]);

@@ -1517,7 +1517,8 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      its block like a quoted one; a module call with a local source
  *      IMPORTS its directory's Folder (the root: the Project) and module.X.Y
  *      USAGEs {ref:output} the output there; a .tfvars assignment OVERRIDEs
- *      {via:tfvars} the variable block of its own directory; a Terragrunt
+ *      {via:tfvars} the variable block of its own directory (or, inferred,
+ *      of the nearest ancestor module declaring its names); a Terragrunt
  *      unit's include / read_terragrunt_config IMPORTS {via:terragrunt} the
  *      file it names, a dependency DEPENDS_ON the other unit
  *      (pass_terraform.c, extract_unified.c, extract_defs.c); an Ansible

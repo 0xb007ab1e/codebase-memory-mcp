@@ -2974,7 +2974,8 @@ TEST(probe_terraform_module_calls_import_their_source) {
     PASS();
 }
 
-/* Every tfvars OVERRIDE edge as "<file> <name> -> <file> <block> <line>". */
+/* Every tfvars OVERRIDE edge as "<file> <name> -> <file> <block> <line>",
+ * " inferred" appended when the edge says so. */
 static char *gpf_tf_tfvars(const GpfFile *files, int nfiles) {
     GpfProj lp;
     cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
@@ -2984,9 +2985,11 @@ static char *gpf_tf_tfvars(const GpfFile *files, int nfiles) {
         const char *sql =
             "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
             "s.name || ' -> ' || t.file_path || ' ' || t.name || ' ' || "
-            "json_extract(e.properties,'$.line') AS x FROM edges e JOIN nodes s ON "
-            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
-            "e.type='OVERRIDE' AND json_extract(e.properties,'$.via')='tfvars' ORDER BY x)), '')";
+            "json_extract(e.properties,'$.line') || CASE WHEN "
+            "json_extract(e.properties,'$.inferred') THEN ' inferred' ELSE '' END AS x FROM edges e "
+            "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 "
+            "AND e.type='OVERRIDE' AND json_extract(e.properties,'$.via')='tfvars' ORDER BY x)), "
+            "'')";
         if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
             if (sqlite3_step(st) == SQLITE_ROW) {
@@ -3001,19 +3004,26 @@ static char *gpf_tf_tfvars(const GpfFile *files, int nfiles) {
 
 /* A .tfvars file's assignment to a variable the module of its own directory
  * declares OVERRIDEs {via: tfvars, line} that `variable` block, from the
- * file's Variable of the name. An undeclared name, and a file in a directory
- * without Terraform files (applied by a -var-file the repository does not
- * state), make none. */
+ * file's Variable of the name. A file whose directory declares none of its
+ * names -- no Terraform there, or a module that does not declare them --
+ * sets the nearest ancestor module's that does (applied by a -var-file the
+ * repository does not state: `inferred`). An undeclared name, and a file
+ * with no declaring module above it, make none. */
 TEST(probe_terraform_tfvars_override_their_variables) {
     static const GpfFile files[] = {
         {"stack/variables.tf", "variable \"region\" {}\nvariable \"size\" {\n  default = 1\n}\n"},
         {"stack/terraform.tfvars", "region  = \"eu\"\nsize    = 3\nunknown = \"x\"\n"},
         {"stack/prod/prod.tfvars", "region = \"us\"\n"},
+        {"stack/sub/main.tf", "resource \"null_resource\" \"x\" {}\n"},
+        {"stack/sub/sub.tfvars", "size = 9\n"},
         {"other.tfvars", "region = \"ap\"\n"}};
     int n = (int)(sizeof(files) / sizeof(files[0]));
     char *got = gpf_tf_tfvars(files, n);
-    static const char want[] = "stack/terraform.tfvars region -> stack/variables.tf variable.region 1\n"
-                               "stack/terraform.tfvars size -> stack/variables.tf variable.size 2";
+    static const char want[] =
+        "stack/prod/prod.tfvars region -> stack/variables.tf variable.region 1 inferred\n"
+        "stack/sub/sub.tfvars size -> stack/variables.tf variable.size 1 inferred\n"
+        "stack/terraform.tfvars region -> stack/variables.tf variable.region 1\n"
+        "stack/terraform.tfvars size -> stack/variables.tf variable.size 2";
     if (!got || strcmp(got, want) != 0) {
         fprintf(stderr, "terraform tfvars got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
         free(got);
