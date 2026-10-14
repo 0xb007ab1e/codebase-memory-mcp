@@ -74,10 +74,21 @@ enum {
     ST_HANDLER_PROP_LEN = 9,
     ST_BFS_CTE_ROW_MULTIPLIER = 8,
     ST_BFS_MAX_CTE_ROWS = 4096,
+    /* SQLite database header (fileformat2 §1.3) */
+    ST_DB_HEADER_LEN = 100,
+    ST_HDR_WRITE_VERSION = 18, /* 1 = rollback journal, 2 = WAL */
+    ST_HDR_READ_VERSION = 19,
+    ST_HDR_ROLLBACK = 1,
+    ST_HDR_CHANGE_COUNTER = 24,
+    ST_HDR_PAGE_COUNT = 28,
+    ST_BE_SHIFT_8 = 8,
+    ST_BE_SHIFT_16 = 16,
+    ST_BE_SHIFT_24 = 24,
 };
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "store/store.h"
+#include "store/graph_mem.h"
 
 #include <stdatomic.h>
 #include "foundation/compat_fs.h"
@@ -128,6 +139,14 @@ struct cbm_store {
     char errbuf[CBM_SZ_512];
     bool read_batch;                /* a read batch's transaction is open */
     uint64_t read_batch_started_ms; /* when it was last (re)begun */
+    /* In-memory adjacency (graph_mem.h). Only a read-only query store of a
+     * sealed (rollback-journal) DB qualifies, keyed by its generation and
+     * file state (store_rollback_file_state). Acquired on the first walk,
+     * released at close. */
+    bool query_store;
+    bool graph_mem_tried;
+    cbm_graph_mem_t *graph_mem;
+    cbm_graph_mem_types_t graph_mem_degree_mask; /* search's in_deg/out_deg types */
 
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
@@ -1189,6 +1208,7 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     }
 
     s->db_path = heap_strdup(db_path);
+    s->query_store = true;
 
     /* Security: block ATTACH/DETACH to prevent file creation via SQL injection. */
     sqlite3_set_authorizer(s->db, store_authorizer, NULL);
@@ -1467,6 +1487,7 @@ void cbm_store_close(cbm_store_t *s) {
     /* Use sqlite3_close_v2 — auto-deallocates when last statement finalizes.
      * Prevents ASan false-positive leaks from sqlite3 internal state. */
     sqlite3_close_v2(s->db);
+    cbm_graph_mem_release(s->graph_mem);
     safe_str_free(&s->db_path);
     free(s);
 }
@@ -3114,11 +3135,12 @@ static void scan_node(sqlite3_stmt *stmt, cbm_node_t *n) {
     n->properties_json = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_8));
 }
 
+static const char st_find_node_by_id_sql[] =
+    "SELECT id, project, label, name, qualified_name, file_path, "
+    "start_line, end_line, properties FROM nodes WHERE id = ?1;";
+
 int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out) {
-    sqlite3_stmt *stmt =
-        prepare_cached(s, &s->stmt_find_node_by_id,
-                       "SELECT id, project, label, name, qualified_name, file_path, "
-                       "start_line, end_line, properties FROM nodes WHERE id = ?1;");
+    sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_find_node_by_id, st_find_node_by_id_sql);
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -6634,6 +6656,100 @@ int cbm_store_restore_from(cbm_store_t *dst, cbm_store_t *src) {
     return CBM_STORE_OK;
 }
 
+/* ── In-memory adjacency ─────────────────────────────────────────── */
+
+/* The edge types search_graph's in_deg/out_deg count (cbm_store_search). */
+static const char *const st_degree_types[] = {"CALLS", "USAGE", "CALL_REFERENCE", "INHERITS",
+                                              "IMPLEMENTS"};
+
+/* cbm_adj_degree(id, inbound): the in-memory twin of search's two
+ * correlated COUNT(*) subqueries over st_degree_types. */
+static void sqlite_graph_mem_degree(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const cbm_store_t *s = sqlite3_user_data(ctx);
+    sqlite3_result_int(ctx, cbm_graph_mem_degree(s->graph_mem, sqlite3_value_int64(argv[0]),
+                                                 sqlite3_value_int(argv[SKIP_ONE]) != 0,
+                                                 s->graph_mem_degree_mask));
+}
+
+static uint32_t st_be32(const unsigned char *p) {
+    return ((uint32_t)p[0] << ST_BE_SHIFT_24) | ((uint32_t)p[SKIP_ONE] << ST_BE_SHIFT_16) |
+           ((uint32_t)p[ST_COL_2] << ST_BE_SHIFT_8) | (uint32_t)p[ST_COL_3];
+}
+
+/* The committed state of a rollback-journal DB: its header's change counter
+ * and page count, read through SQLite's own file handle while this
+ * connection's read transaction holds the SHARED lock, so no commit can land
+ * mid-read. Every rollback-mode commit bumps the counter (it is how SQLite
+ * tells other connections their page cache is stale), and switching into or
+ * out of WAL is itself such a commit. That makes the state exact where the
+ * store generation is not: the cross-repo pass writes CROSS_* edges straight
+ * into other projects' published DBs without stamping a generation. A
+ * WAL-mode file is refused — a WAL commit need not touch the header — which
+ * is the state of a published DB after any in-place writer switched it to
+ * WAL; it keeps the SQL path until the next publish seals it again. */
+static bool store_rollback_file_state(cbm_store_t *s, char *out, size_t out_sz) {
+    sqlite3_file *file = NULL;
+    unsigned char hdr[ST_DB_HEADER_LEN];
+    if (sqlite3_file_control(s->db, "main", SQLITE_FCNTL_FILE_POINTER, (void *)&file) !=
+            SQLITE_OK ||
+        !file || !file->pMethods ||
+        file->pMethods->xRead(file, hdr, (int)sizeof(hdr), 0) != SQLITE_OK) {
+        return false;
+    }
+    if (hdr[ST_HDR_WRITE_VERSION] != ST_HDR_ROLLBACK ||
+        hdr[ST_HDR_READ_VERSION] != ST_HDR_ROLLBACK) {
+        return false;
+    }
+    snprintf(out, out_sz, "c%u.p%u", st_be32(hdr + ST_HDR_CHANGE_COUNTER),
+             st_be32(hdr + ST_HDR_PAGE_COUNT));
+    return true;
+}
+
+/* This store's adjacency layer, or NULL for the SQL path; tried once per
+ * store. The layer's version is the store generation plus the file state, and
+ * both — like a miss's edge scan — are read inside one read transaction, so a
+ * layer holds exactly the edges of the version it is keyed to. */
+static cbm_graph_mem_t *store_graph_mem(cbm_store_t *s) {
+    if (s->graph_mem_tried) {
+        return s->graph_mem;
+    }
+    s->graph_mem_tried = true;
+    if (!s->query_store || !s->db || !s->db_path) {
+        return NULL;
+    }
+    bool own_txn = sqlite3_get_autocommit(s->db) != 0;
+    if (own_txn && sqlite3_exec(s->db, "BEGIN DEFERRED;", NULL, NULL, NULL) != SQLITE_OK) {
+        return NULL;
+    }
+    char generation[CBM_SZ_128];
+    char state[CBM_SZ_64];
+    char version[CBM_SZ_256];
+    /* The generation read is the transaction's first read: the SHARED lock
+     * the file-state read relies on is held from here on. */
+    if (cbm_store_generation(s, generation, sizeof(generation)) == CBM_STORE_OK &&
+        strcmp(generation, "legacy") != 0 && store_rollback_file_state(s, state, sizeof(state))) {
+        snprintf(version, sizeof(version), "%s/%s", generation, state);
+        s->graph_mem = cbm_graph_mem_acquire(s->db, s->db_path, version);
+    }
+    if (own_txn) {
+        (void)sqlite3_exec(s->db, "COMMIT;", NULL, NULL, NULL);
+    }
+    if (s->graph_mem &&
+        sqlite3_create_function(s->db, "cbm_adj_degree", ST_COL_2,
+                                SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_DIRECTONLY, s,
+                                sqlite_graph_mem_degree, NULL, NULL) != SQLITE_OK) {
+        cbm_graph_mem_release(s->graph_mem);
+        s->graph_mem = NULL;
+    }
+    if (s->graph_mem) {
+        s->graph_mem_degree_mask =
+            cbm_graph_mem_type_mask(s->graph_mem, st_degree_types,
+                                    (int)(sizeof(st_degree_types) / sizeof(st_degree_types[0])));
+    }
+    return s->graph_mem;
+}
+
 /* ── Search ─────────────────────────────────────────────────────── */
 
 /* Convert a glob pattern to SQL LIKE pattern. */
@@ -7226,6 +7342,16 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
                               "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND "
                               "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
                               "'IMPLEMENTS')) AS out_deg ";
+    /* A degree filter evaluates both counts for EVERY candidate row (787k
+     * Functions on the kernel: two B-tree seeks each, 1.9 s per pass). The
+     * adjacency layer answers them from RAM; the query is otherwise the same,
+     * so filter, order, page and total are unchanged. */
+    bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0);
+    if (has_degree_filter && store_graph_mem(s)) {
+        select_cols = "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+                      "n.file_path, n.start_line, n.end_line, n.properties, "
+                      "cbm_adj_degree(n.id, 1) AS in_deg, cbm_adj_degree(n.id, 0) AS out_deg ";
+    }
 
     char where[CBM_SZ_2K] = "";
     search_bind_t binds[ST_SEARCH_MAX_BINDS];
@@ -7242,7 +7368,6 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     }
 
     /* Degree filters */
-    bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0);
     search_apply_degree_filter(sql, sizeof(sql), params);
 
     /* Count query — stripped of per-row edge subqueries for the common (no-degree-filter)
@@ -7531,43 +7656,47 @@ static int bfs_cte_row_limit_for_depth(int max_results, int max_depth) {
     return (int)scaled;
 }
 
-static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
-                     const char **edge_types, int edge_type_count, int max_depth, int max_results,
-                     bool trail, int max_edges, cbm_traverse_result_t *out) {
-    memset(out, 0, sizeof(*out));
-    if (max_results < 0) {
-        max_results = 0;
+/* One store_bfs walk, shared by its SQL and in-memory paths. */
+typedef struct {
+    int64_t start_id;
+    bool inbound;
+    const char *types_clause;
+    const char **edge_types;
+    int edge_type_count;
+    int max_depth;
+    int max_results;
+    int probe_limit; /* max_results + 1: saturation stays observable */
+    bool trail;
+} bfs_query_t;
+
+typedef struct {
+    cbm_node_hop_t *visited;
+    int count;
+    int cap;
+} bfs_rows_t;
+
+static void bfs_rows_init(bfs_rows_t *rows) {
+    rows->cap = ST_INIT_CAP_16;
+    rows->count = 0;
+    rows->visited = malloc(rows->cap * sizeof(cbm_node_hop_t));
+}
+
+static cbm_node_hop_t *bfs_rows_next(bfs_rows_t *rows) {
+    if (rows->count >= rows->cap) {
+        rows->cap *= ST_GROWTH;
+        rows->visited = safe_realloc(rows->visited, rows->cap * sizeof(cbm_node_hop_t));
     }
+    return &rows->visited[rows->count++];
+}
 
-    cbm_node_t root = {0};
-    int rc = cbm_store_find_node_by_id(s, start_id, &root);
-    if (rc != CBM_STORE_OK) {
-        return rc;
-    }
-    out->root = root;
-
-    char types_clause[CBM_SZ_512];
-    bfs_build_types_clause(edge_type_count, types_clause, (int)sizeof(types_clause));
-
-    /* Build recursive CTE for BFS */
+/* The recursive CTE: trail (relationship-unique, for Cypher) or shortest-path. */
+static int bfs_visit_sql(cbm_store_t *s, const bfs_query_t *q, bfs_rows_t *rows, int *cte_rows,
+                         int *cte_row_limit) {
     char sql[CBM_SZ_4K];
-    const char *join_cond;
-    const char *next_id;
-    bool is_inbound = (direction != NULL) && (strcmp(direction, "inbound") == 0);
-
-    if (is_inbound) {
-        join_cond = "e.target_id = bfs.node_id";
-        next_id = "e.source_id";
-    } else {
-        join_cond = "e.source_id = bfs.node_id";
-        next_id = "e.target_id";
-    }
-
-    /* One extra row makes max_results saturation observable on both branches. */
-    int probe_limit = max_results < INT_MAX ? max_results + SKIP_ONE : max_results;
-    int cte_row_limit = 0;
-    if (trail) {
-        cte_row_limit = bfs_cte_row_limit_for_depth(max_results, max_depth);
+    const char *join_cond = q->inbound ? "e.target_id = bfs.node_id" : "e.source_id = bfs.node_id";
+    const char *next_id = q->inbound ? "e.source_id" : "e.target_id";
+    if (q->trail) {
+        *cte_row_limit = bfs_cte_row_limit_for_depth(q->max_results, q->max_depth);
         snprintf(sql, sizeof(sql),
                  "WITH RECURSIVE bfs(node_id, hop, edge_path) AS ("
                  "  SELECT %lld, 0, ''"
@@ -7592,8 +7721,8 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
                  "(SELECT count(*) FROM bfs) "
                  "FROM bfs JOIN nodes n ON n.id = bfs.node_id "
                  "WHERE bfs.hop > 0 ORDER BY bfs.hop, n.id LIMIT %d;",
-                 (long long)start_id, next_id, join_cond, types_clause, max_depth,
-                 cte_row_limit + SKIP_ONE, probe_limit);
+                 (long long)q->start_id, next_id, join_cond, q->types_clause, q->max_depth,
+                 *cte_row_limit + SKIP_ONE, q->probe_limit);
     } else {
         snprintf(sql, sizeof(sql),
                  /* SHORTEST-PATH semantics: the UNION dedupes (node, hop) pairs.
@@ -7616,52 +7745,130 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
                  "GROUP BY n.id "
                  "ORDER BY hop, n.id "
                  "LIMIT %d;",
-                 (long long)start_id, next_id, join_cond, types_clause, max_depth, probe_limit);
+                 (long long)q->start_id, next_id, join_cond, q->types_clause, q->max_depth,
+                 q->probe_limit);
     }
 
     sqlite3_stmt *stmt = NULL;
-    rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
-    if (rc != SQLITE_OK) {
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "bfs prepare");
         return CBM_STORE_ERR;
     }
 
     /* Bind edge type parameters */
-    if (edge_type_count > 0) {
-        for (int i = 0; i < edge_type_count; i++) {
-            bind_text(stmt, i + SKIP_ONE, edge_types[i]);
+    if (q->edge_type_count > 0) {
+        for (int i = 0; i < q->edge_type_count; i++) {
+            bind_text(stmt, i + SKIP_ONE, q->edge_types[i]);
         }
     } else {
         bind_text(stmt, SKIP_ONE, "CALLS");
     }
 
-    int cap = ST_INIT_CAP_16;
-    int n = 0;
-    int cte_rows = 0;
-    cbm_node_hop_t *visited = malloc(cap * sizeof(cbm_node_hop_t));
-
+    bfs_rows_init(rows);
     int scan_rc15;
     while ((scan_rc15 = sqlite3_step(stmt)) == SQLITE_ROW) {
-        if (n >= cap) {
-            cap *= ST_GROWTH;
-            visited = safe_realloc(visited, cap * sizeof(cbm_node_hop_t));
+        cbm_node_hop_t *row = bfs_rows_next(rows);
+        scan_node(stmt, &row->node);
+        row->hop = sqlite3_column_int(stmt, ST_COL_9);
+        if (q->trail) {
+            *cte_rows = sqlite3_column_int(stmt, ST_COL_10);
         }
-        scan_node(stmt, &visited[n].node);
-        visited[n].hop = sqlite3_column_int(stmt, ST_COL_9);
-        if (trail) {
-            cte_rows = sqlite3_column_int(stmt, ST_COL_10);
-        }
-        n++;
     }
     if (scan_rc15 != SQLITE_DONE) { /* SCANCHK:15:stmt */
         store_set_error_sqlite(s, "row scan aborted");
         sqlite3_finalize(stmt);
-        out->visited = visited;
-        out->visited_count = n;
         return CBM_STORE_ERR;
     }
-
     sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+/* The shortest-path walk from the adjacency layer: the same rows as the CTE's
+ * JOIN nodes + ORDER BY hop, n.id + LIMIT, because cbm_graph_mem_bfs yields
+ * every reached id at its minimal hop in (hop, id) order and the node rows are
+ * read here in that order. An id with no node row is skipped, as the JOIN
+ * skips it. */
+static int bfs_visit_mem(cbm_store_t *s, const cbm_graph_mem_t *gm, const bfs_query_t *q,
+                         bfs_rows_t *rows) {
+    static const char *const calls_only[] = {"CALLS"};
+    bool typed = q->edge_type_count > 0;
+    cbm_graph_mem_types_t mask = cbm_graph_mem_type_mask(gm, typed ? q->edge_types : calls_only,
+                                                         typed ? q->edge_type_count : SKIP_ONE);
+    cbm_graph_mem_hop_t *hops = NULL;
+    int hop_count = 0;
+    if (!cbm_graph_mem_bfs(gm, q->start_id, q->inbound, mask, q->max_depth, &hops, &hop_count)) {
+        store_set_error(s, "bfs: adjacency walk out of memory");
+        return CBM_STORE_ERR;
+    }
+    bfs_rows_init(rows);
+    int rc = CBM_STORE_OK;
+    for (int i = 0; i < hop_count && rows->count < q->probe_limit && rc == CBM_STORE_OK; i++) {
+        sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_find_node_by_id, st_find_node_by_id_sql);
+        if (!stmt) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        sqlite3_bind_int64(stmt, SKIP_ONE, hops[i].id);
+        int step = sqlite3_step(stmt);
+        if (step == SQLITE_ROW) {
+            cbm_node_hop_t *row = bfs_rows_next(rows);
+            scan_node(stmt, &row->node);
+            row->hop = hops[i].hop;
+        } else if (step != SQLITE_DONE) {
+            store_set_error_sqlite(s, "bfs node row");
+            rc = CBM_STORE_ERR;
+        }
+        sqlite3_reset(stmt);
+    }
+    cbm_graph_mem_hops_free(hops);
+    return rc;
+}
+
+static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
+                     const char **edge_types, int edge_type_count, int max_depth, int max_results,
+                     bool trail, int max_edges, cbm_traverse_result_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (max_results < 0) {
+        max_results = 0;
+    }
+
+    cbm_node_t root = {0};
+    int rc = cbm_store_find_node_by_id(s, start_id, &root);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    out->root = root;
+
+    char types_clause[CBM_SZ_512];
+    bfs_build_types_clause(edge_type_count, types_clause, (int)sizeof(types_clause));
+
+    bfs_query_t q = {
+        .start_id = start_id,
+        .inbound = (direction != NULL) && (strcmp(direction, "inbound") == 0),
+        .types_clause = types_clause,
+        .edge_types = edge_types,
+        .edge_type_count = edge_type_count,
+        .max_depth = max_depth,
+        .max_results = max_results,
+        /* One extra row makes max_results saturation observable on both branches. */
+        .probe_limit = max_results < INT_MAX ? max_results + SKIP_ONE : max_results,
+        .trail = trail,
+    };
+    bfs_rows_t rows = {0};
+    int cte_rows = 0;
+    int cte_row_limit = 0;
+    /* A shortest-path walk is answered from the adjacency layer when this
+     * store has one; trail mode keeps its relationship-unique CTE. */
+    cbm_graph_mem_t *gm = trail ? NULL : store_graph_mem(s);
+    rc = gm ? bfs_visit_mem(s, gm, &q, &rows)
+            : bfs_visit_sql(s, &q, &rows, &cte_rows, &cte_row_limit);
+    cbm_node_hop_t *visited = rows.visited;
+    int n = rows.count;
+    if (rc != CBM_STORE_OK) {
+        out->visited = visited;
+        out->visited_count = n;
+        return rc;
+    }
 
     if (trail && cte_rows > cte_row_limit) {
         out->truncated = true;
