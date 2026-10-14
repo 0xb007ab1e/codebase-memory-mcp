@@ -1382,6 +1382,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                                  int file_count, const cbm_file_hash_t *baseline_manifest,
                                  int baseline_count, bool force_full_on_mismatch);
 
+/* The exact no-op test cbm_pipeline_run_incremental routes by, read-only on
+ * an already opened generation: true when that generation is current for the
+ * pipeline's mode and records exactly the baseline manifest. */
+bool cbm_pipeline_incremental_generation_exact(cbm_pipeline_t *p, cbm_store_t *store,
+                                               const cbm_file_hash_t *baseline_manifest,
+                                               int baseline_count);
+
 /* Exact semantic inputs for no-op/forced-full routing. The manifest contains
  * every discovered source plus repository controls actually consumed by
  * discovery, package mapping, path aliases, and extension overrides. */

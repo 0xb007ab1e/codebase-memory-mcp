@@ -5759,6 +5759,177 @@ TEST(pipeline_concurrent_sweep_must_not_remove_inflight_stage) {
     PASS();
 }
 
+static int live_noop_run(const char *repo, const char *db_path, cbm_incremental_route_t *route) {
+    cbm_pipeline_incremental_test_reset_faults();
+    *route = CBM_INCREMENTAL_ROUTE_NONE;
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return CBM_NOT_FOUND;
+    }
+    int rc = cbm_pipeline_run(p);
+    *route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+/* An unchanged re-index proves the exact no-op on the LIVE generation. It
+ * never copies the database into a stage, seals the copy and renames it back
+ * (on a kernel-scale index that copy alone was a 19 GB write per call): the
+ * live file keeps its identity, size and mtime, no stage artifact remains,
+ * and the graph still serves. */
+TEST(pipeline_unchanged_reindex_leaves_live_generation_untouched) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_live_noop_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    char *project = cbm_project_name_from_path(tmp);
+    ASSERT_NOT_NULL(project);
+
+    cbm_incremental_route_t first_route;
+    int first_rc = live_noop_run(tmp, db_path, &first_route);
+    cbm_path_info_t before = {0};
+    struct stat before_st;
+    bool before_ok =
+        cbm_path_info_utf8(db_path, &before) == CBM_PATH_INFO_OK && stat(db_path, &before_st) == 0;
+
+    cbm_incremental_route_t noop_route;
+    int noop_rc = live_noop_run(tmp, db_path, &noop_route);
+    cbm_path_info_t after = {0};
+    struct stat after_st;
+    bool after_ok =
+        cbm_path_info_utf8(db_path, &after) == CBM_PATH_INFO_OK && stat(db_path, &after_st) == 0;
+    int defined_count = -1;
+    int absent_count = -1;
+    observe_named_generation(db_path, project, "StableGeneration", "NeverDefined", &defined_count,
+                             &absent_count);
+    int stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    cbm_pipeline_incremental_test_reset_faults();
+    free(project);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(first_rc, 0);
+    ASSERT_TRUE(before_ok);
+    ASSERT_EQ(noop_rc, 0);
+    ASSERT_EQ(noop_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_TRUE(after_ok);
+    ASSERT_TRUE(after_st.st_ino == before_st.st_ino);
+    ASSERT_TRUE(after.mtime_ns == before.mtime_ns);
+    ASSERT_TRUE(after.size == before.size);
+    ASSERT_EQ(stage_count, 0);
+    ASSERT_EQ(defined_count, 1);
+    ASSERT_EQ(absent_count, 0);
+    PASS();
+}
+
+/* The live proof answers only for an exact manifest. Every real change -- a
+ * same-size edit that keeps the original mtime, an addition, a deletion and
+ * a rename -- still routes past it into a rebuild that the graph shows, and
+ * only the unchanged re-index after them takes the no-op. */
+TEST(pipeline_live_noop_proof_never_hides_a_change) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_live_noop_change_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "alpha.py", "def AlphaDefined():\n    return 1\n");
+    write_temp_file(tmp, "beta.py", "def BetaDefined():\n    return 2\n");
+    char db_path[512];
+    char alpha_path[512];
+    char beta_path[512];
+    char gamma_path[512];
+    char delta_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    snprintf(alpha_path, sizeof(alpha_path), "%s/alpha.py", tmp);
+    snprintf(beta_path, sizeof(beta_path), "%s/beta.py", tmp);
+    snprintf(gamma_path, sizeof(gamma_path), "%s/gamma.py", tmp);
+    snprintf(delta_path, sizeof(delta_path), "%s/delta.py", tmp);
+    char *project = cbm_project_name_from_path(tmp);
+    ASSERT_NOT_NULL(project);
+
+    cbm_incremental_route_t initial_route;
+    int initial_rc = live_noop_run(tmp, db_path, &initial_route);
+
+    /* Same size, original mtime restored: only the bytes differ. */
+    cbm_path_info_t alpha_info = {0};
+    bool alpha_stat_ok = cbm_path_info_utf8(alpha_path, &alpha_info) == CBM_PATH_INFO_OK;
+    write_temp_file(tmp, "alpha.py", "def AlphbDefined():\n    return 1\n");
+    int mtime_rc = pipeline_test_set_mtime(alpha_path, (time_t)(alpha_info.mtime_ns / 1000000000),
+                                           (long)(alpha_info.mtime_ns % 1000000000));
+    cbm_path_info_t edited_info = {0};
+    bool edited_same_stat = cbm_path_info_utf8(alpha_path, &edited_info) == CBM_PATH_INFO_OK &&
+                            edited_info.size == alpha_info.size &&
+                            edited_info.mtime_ns == alpha_info.mtime_ns;
+    cbm_incremental_route_t modify_route;
+    int modify_rc = live_noop_run(tmp, db_path, &modify_route);
+    int old_alpha = -1;
+    int new_alpha = -1;
+    observe_named_generation(db_path, project, "AlphaDefined", "AlphbDefined", &old_alpha,
+                             &new_alpha);
+
+    write_temp_file(tmp, "gamma.py", "def GammaDefined():\n    return 3\n");
+    cbm_incremental_route_t add_route;
+    int add_rc = live_noop_run(tmp, db_path, &add_route);
+    int gamma_added = -1;
+    int unused = -1;
+    observe_named_generation(db_path, project, "GammaDefined", "NeverDefined", &gamma_added,
+                             &unused);
+
+    int unlink_rc = cbm_unlink(beta_path);
+    cbm_incremental_route_t delete_route;
+    int delete_rc = live_noop_run(tmp, db_path, &delete_route);
+    int beta_left = -1;
+    observe_named_generation(db_path, project, "BetaDefined", "NeverDefined", &beta_left, &unused);
+
+    int rename_rc = cbm_rename_replace(gamma_path, delta_path);
+    cbm_incremental_route_t rename_route;
+    int renamed_rc = live_noop_run(tmp, db_path, &rename_route);
+    int gamma_renamed = -1;
+    observe_named_generation(db_path, project, "GammaDefined", "NeverDefined", &gamma_renamed,
+                             &unused);
+    int old_path_hash = CBM_STORE_OK;
+    int new_path_hash = CBM_STORE_NOT_FOUND;
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (store) {
+        cbm_file_hash_t hash = {0};
+        old_path_hash = cbm_store_get_file_hash(store, project, "gamma.py", &hash);
+        cbm_store_clear_file_hash(&hash);
+        new_path_hash = cbm_store_get_file_hash(store, project, "delta.py", &hash);
+        cbm_store_clear_file_hash(&hash);
+        cbm_store_close(store);
+    }
+
+    cbm_incremental_route_t final_route;
+    int final_rc = live_noop_run(tmp, db_path, &final_route);
+    cbm_pipeline_incremental_test_reset_faults();
+    free(project);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(initial_rc, 0);
+    ASSERT_TRUE(alpha_stat_ok);
+    ASSERT_EQ(mtime_rc, 0);
+    ASSERT_TRUE(edited_same_stat);
+    ASSERT_EQ(modify_rc, 0);
+    ASSERT_TRUE(modify_route != CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(old_alpha, 0);
+    ASSERT_EQ(new_alpha, 1);
+    ASSERT_EQ(add_rc, 0);
+    ASSERT_TRUE(add_route != CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(gamma_added, 1);
+    ASSERT_EQ(unlink_rc, 0);
+    ASSERT_EQ(delete_rc, 0);
+    ASSERT_TRUE(delete_route != CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(beta_left, 0);
+    ASSERT_EQ(rename_rc, 0);
+    ASSERT_EQ(renamed_rc, 0);
+    ASSERT_TRUE(rename_route != CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(gamma_renamed, 1);
+    ASSERT_EQ(old_path_hash, CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(new_path_hash, CBM_STORE_OK);
+    ASSERT_EQ(final_rc, 0);
+    ASSERT_EQ(final_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    PASS();
+}
+
 static char g_route_log_capture[8192];
 static atomic_flag g_route_log_spin = ATOMIC_FLAG_INIT;
 
@@ -6368,15 +6539,15 @@ TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex) {
     ASSERT_EQ(reindex_observer.rename_calls, 1);
     ASSERT_EQ(reindex_observer.exports_before_publish, 0);
     ASSERT_EQ(reindex_observer.export_count, 1);
+    /* The no-ops are proven on the live generation and publish nothing; the
+     * artifact is still refreshed, from that already published database. */
     ASSERT_EQ(explicit_rc, 0);
     ASSERT_EQ(explicit_route, CBM_INCREMENTAL_ROUTE_NOOP);
-    ASSERT_EQ(explicit_observer.rename_calls, 1);
-    ASSERT_EQ(explicit_observer.exports_before_publish, 0);
+    ASSERT_EQ(explicit_observer.rename_calls, 0);
     ASSERT_EQ(explicit_observer.export_count, 1);
     ASSERT_EQ(unchanged_rc, 0);
     ASSERT_EQ(unchanged_route, CBM_INCREMENTAL_ROUTE_NOOP);
-    ASSERT_EQ(observer.rename_calls, 1);
-    ASSERT_EQ(observer.exports_before_publish, 0);
+    ASSERT_EQ(observer.rename_calls, 0);
     ASSERT_EQ(observer.export_count, 1);
     ASSERT_TRUE(journal_ok);
     ASSERT_STR_EQ(journal_mode, "delete");
@@ -18853,8 +19024,9 @@ TEST(incremental_downgrade_preserves_scope_and_artifact_across_change_noop_delet
     ASSERT_EQ(noop.rc, 0);
     ASSERT_EQ(noop.route, CBM_INCREMENTAL_ROUTE_NOOP);
     ASSERT_TRUE(noop.tools_excluded);
-    ASSERT_EQ(noop.publish.rename_calls, 1);
-    ASSERT_EQ(noop.publish.exports_before_publish, 0);
+    /* Proven on the live generation: nothing is published, the artifact is
+     * still refreshed from the live database. */
+    ASSERT_EQ(noop.publish.rename_calls, 0);
     ASSERT_EQ(noop.publish.export_count, 1);
 
     ASSERT_EQ(deleted.rc, 0);
@@ -23352,6 +23524,8 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_sweep_reclaims_orphans_of_other_projects_and_keeps_their_live_stages);
     RUN_TEST(pipeline_sweep_removes_dead_writer_stage_keeps_locked_stage);
     RUN_TEST(pipeline_concurrent_sweep_must_not_remove_inflight_stage);
+    RUN_TEST(pipeline_unchanged_reindex_leaves_live_generation_untouched);
+    RUN_TEST(pipeline_live_noop_proof_never_hides_a_change);
     RUN_TEST(pipeline_fresh_index_never_reports_invalid_existing_db);
     RUN_TEST(pipeline_source_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
