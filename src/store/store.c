@@ -9,6 +9,7 @@
 // for ISO timestamp
 
 #include <limits.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include "foundation/constants.h"
 #include "foundation/arena.h"
@@ -54,9 +55,13 @@ enum {
     ST_GLOB_MIN_LEN = 3,
     ST_GLOB_SKIP = 2,
     ST_MAX_LANG = 10,
-    ST_SEARCH_MAX_BINDS = 32, /* increased: LIKE pre-filter adds binds per pattern */
-    ST_LIKE_POOL_MAX = 12,    /* max malloc'd LIKE strings alive during one search */
-    ST_LIKE_HINT_MAX = 2,     /* max LIKE hints extracted per regex pattern */
+    ST_SEARCH_MAX_BINDS = 48,   /* LIKE pre-filters + anchored-name range bounds add binds */
+    ST_LIKE_POOL_MAX = 12,      /* max malloc'd LIKE strings alive during one search */
+    ST_LIKE_HINT_MAX = 2,       /* max LIKE hints extracted per regex pattern */
+    ST_NAME_RANGE_PREFIX = 64,  /* longest anchored name prefix seeked on */
+    ST_NAME_RANGE_LETTERS = 3,  /* case-insensitive: letters expanded into case variants */
+    ST_NAME_RANGE_MAX = 8,      /* 2^ST_NAME_RANGE_LETTERS name ranges (UNION ALL arms) */
+    ST_NAME_RANGE_ARM_SQL = 96, /* per-arm SQL beyond the select list and WHERE */
     ST_MAX_PKGS = 64,
     ST_INIT_CAP_4 = 4,
     ST_HEADER_PREFIX = 3,
@@ -6732,6 +6737,36 @@ int cbm_extract_like_hints(const char *pattern, char **out, int max_out) {
     return count;
 }
 
+/* Patterns run as POSIX ERE without REG_NEWLINE, so '^' anchors at the start of
+ * the name only, and a pattern without '|' is one concatenation: every match
+ * begins with the literal run after the '^'. A following '*', '?', '{' may
+ * repeat the run's last character zero times and '+' may be combined with them
+ * (glibc reads "a+?" as "(a+)?"), so that character is dropped; so is the one
+ * before a backslash, which no rule here needs to interpret. */
+int cbm_regex_anchored_prefix(const char *pattern, char *out, int out_sz) {
+    if (!pattern || !out || out_sz <= 1 || pattern[0] != '^' || strchr(pattern, '|')) {
+        if (out && out_sz > 0) {
+            out[0] = '\0';
+        }
+        return 0;
+    }
+    int len = 0;
+    const char *p = pattern + SKIP_ONE;
+    while (*p && len < out_sz - SKIP_ONE) {
+        unsigned char c = (unsigned char)*p;
+        if (c < ' ' || c > '~' || strchr(".[]()*+?{}|^$\\", c)) {
+            break;
+        }
+        out[len++] = (char)c;
+        p++;
+    }
+    if (len > 0 && *p && strchr("*+?{\\", *p)) {
+        len--;
+    }
+    out[len] = '\0';
+    return len;
+}
+
 /* ── ensureCaseInsensitive / stripCaseFlag ────────────────────── */
 
 const char *cbm_ensure_case_insensitive(const char *pattern) {
@@ -7028,6 +7063,151 @@ static int search_build_where(const cbm_search_params_t *params, char *where, in
     return nparams;
 }
 
+/* Anchored name patterns ("^schedule$", "^kmalloc"): every matching name begins
+ * with the pattern's literal prefix (cbm_regex_anchored_prefix), so it lies in a
+ * half-open idx_nodes_name range [prefix, prefix with its last byte + 1). Under
+ * iregexp the prefix matches in any letter case: the process never calls
+ * setlocale, so the regex runs in the C locale and folds ASCII letters only, and
+ * each of the first ST_NAME_RANGE_LETTERS letters doubles the ranges. The ranges
+ * are ADDED to the full WHERE (LIKE hints and regex stay), so the rows are those
+ * of the plain query — which instead scans every name of the project. */
+typedef struct {
+    char lo[ST_NAME_RANGE_MAX][ST_NAME_RANGE_PREFIX];
+    char hi[ST_NAME_RANGE_MAX][ST_NAME_RANGE_PREFIX];
+    int count;
+} search_name_ranges_t;
+
+static bool name_range_letter(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+static char name_range_case(char c, bool lower) {
+    if (lower && c >= 'A' && c <= 'Z') {
+        return (char)(c - 'A' + 'a');
+    }
+    if (!lower && c >= 'a' && c <= 'z') {
+        return (char)(c - 'a' + 'A');
+    }
+    return c;
+}
+
+static int search_name_ranges(const cbm_search_params_t *p, search_name_ranges_t *r) {
+    r->count = 0;
+    /* Without the project the index cannot seek the name; degree filters wrap
+     * the query in a subselect this rewrite leaves alone. */
+    if (!p->project || !p->name_pattern || p->min_degree >= 0 || p->max_degree >= 0) {
+        return 0;
+    }
+    char prefix[ST_NAME_RANGE_PREFIX];
+    int len = cbm_regex_anchored_prefix(p->name_pattern, prefix, (int)sizeof(prefix));
+    if (len == 0) {
+        return 0;
+    }
+    /* A pattern the regex function rejects fails the plain query once a row
+     * reaches the regex; fewer rows reach it here, so it keeps the plain query. */
+    int flags = CBM_REG_EXTENDED | CBM_REG_NOSUB | (p->case_sensitive ? 0 : CBM_REG_ICASE);
+    cbm_regex_t re;
+    if (cbm_regcomp(&re, p->name_pattern, flags) != 0) {
+        return 0;
+    }
+    cbm_regfree(&re);
+    int letters = 0;
+    if (!p->case_sensitive) {
+        int k = 0;
+        for (; k < len; k++) {
+            if (name_range_letter(prefix[k])) {
+                if (letters == ST_NAME_RANGE_LETTERS) {
+                    break;
+                }
+                letters++;
+            }
+        }
+        len = k;
+    }
+    int variants = SKIP_ONE << letters;
+    for (int v = 0; v < variants; v++) {
+        int bit = letters - SKIP_ONE;
+        for (int i = 0; i < len; i++) {
+            char c = prefix[i];
+            if (!p->case_sensitive && name_range_letter(c)) {
+                /* Variant 0 is all upper case: ranges in ascending byte order. */
+                c = name_range_case(c, ((v >> bit) & SKIP_ONE) != 0);
+                bit--;
+            }
+            r->lo[v][i] = c;
+            r->hi[v][i] = c;
+        }
+        r->lo[v][len] = '\0';
+        r->hi[v][len] = '\0';
+        r->hi[v][len - SKIP_ONE]++; /* printable ASCII: never wraps */
+    }
+    r->count = variants;
+    return variants;
+}
+
+/* Main and count SQL over the name ranges: one UNION ALL arm per range, each
+ * the plain WHERE plus its range, so every arm seeks idx_nodes_name. The arms
+ * are disjoint and each yields (name, id) order, so ORDER BY 4, 1 (n.name,
+ * n.id) merges them without a sort and the per-row degree subqueries run only
+ * for rows the page emits; the count sums the per-range counts. On false
+ * (allocation, bind slots) nothing is bound and the plain query runs. */
+/* Append to buf[0..cap) at *len; false (nothing written past cap) when it
+ * does not fit. */
+static bool search_sql_append(char *buf, size_t cap, size_t *len, const char *fmt, ...) {
+    if (*len >= cap) {
+        return false;
+    }
+    va_list args;
+    va_start(args, fmt);
+    int wrote = vsnprintf(buf + *len, cap - *len, fmt, args);
+    va_end(args);
+    if (wrote < 0 || (size_t)wrote >= cap - *len) {
+        return false;
+    }
+    *len += (size_t)wrote;
+    return true;
+}
+
+static bool search_build_ranged_sql(const char *select_cols, const char *where,
+                                    const search_name_ranges_t *r, int limit, int offset,
+                                    search_bind_t *binds, int *bind_idx, char **out_sql,
+                                    char **out_count_sql) {
+    if (*bind_idx + (r->count * ST_COL_2) > ST_SEARCH_MAX_BINDS) {
+        return false;
+    }
+    size_t cap = (strlen(select_cols) + strlen(where) + ST_NAME_RANGE_ARM_SQL) * (size_t)r->count +
+                 ST_NAME_RANGE_ARM_SQL;
+    char *sql = cbm_alloc(CBM_MEM_CLASS_STORE, cap);
+    char *cnt = cbm_alloc(CBM_MEM_CLASS_STORE, cap);
+    int first_bind = *bind_idx;
+    size_t sl = 0;
+    size_t cl = 0;
+    bool ok = sql && cnt && search_sql_append(cnt, cap, &cl, "SELECT ");
+    for (int i = 0; ok && i < r->count; i++) {
+        int lo = *bind_idx + SKIP_ONE;
+        where_bind_text(binds, bind_idx, r->lo[i]);
+        where_bind_text(binds, bind_idx, r->hi[i]);
+        ok = search_sql_append(sql, cap, &sl,
+                               "%s%s FROM nodes n WHERE (%s) AND n.name >= ?%d AND n.name < ?%d",
+                               i > 0 ? " UNION ALL " : "", select_cols, where, lo, lo + SKIP_ONE) &&
+             search_sql_append(cnt, cap, &cl,
+                               "%s(SELECT COUNT(*) FROM nodes n WHERE (%s) AND n.name >= ?%d AND "
+                               "n.name < ?%d)",
+                               i > 0 ? " + " : "", where, lo, lo + SKIP_ONE);
+    }
+    ok = ok && search_sql_append(sql, cap, &sl, " ORDER BY 4, 1 LIMIT %d OFFSET %d", limit, offset);
+    if (!ok) {
+        /* Nothing is bound: the caller runs the plain query. */
+        *bind_idx = first_bind;
+        cbm_free(CBM_MEM_CLASS_STORE, sql);
+        cbm_free(CBM_MEM_CLASS_STORE, cnt);
+        return false;
+    }
+    *out_sql = sql;
+    *out_count_sql = cnt;
+    return true;
+}
+
 int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_search_output_t *out) {
     memset(out, 0, sizeof(*out));
     if (!s || !s->db) {
@@ -7088,9 +7268,21 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
              id_col, limit, offset);
     strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
 
+    /* Anchored name pattern: the same rows through idx_nodes_name seeks. */
+    search_name_ranges_t name_ranges;
+    char *ranged_sql = NULL;
+    char *ranged_count_sql = NULL;
+    if (nparams > 0 && search_name_ranges(params, &name_ranges) > 0) {
+        (void)search_build_ranged_sql(select_cols, where, &name_ranges, limit, offset, binds,
+                                      &bind_idx, &ranged_sql, &ranged_count_sql);
+    }
+    const char *main_sql = ranged_sql ? ranged_sql : sql;
+    const char *total_sql = ranged_count_sql ? ranged_count_sql : count_sql;
+
     /* Execute count query */
     sqlite3_stmt *cnt_stmt = NULL;
-    int rc = sqlite3_prepare_v2(s->db, count_sql, CBM_NOT_FOUND, &cnt_stmt, NULL);
+    int rc = sqlite3_prepare_v2(s->db, total_sql, CBM_NOT_FOUND, &cnt_stmt, NULL);
+    cbm_free(CBM_MEM_CLASS_STORE, ranged_count_sql); /* prepare_v2 copies the text */
     if (rc == SQLITE_OK) {
         for (int i = 0; i < bind_idx; i++) {
             bind_text(cnt_stmt, i + SKIP_ONE, binds[i].text);
@@ -7103,7 +7295,8 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
 
     /* Execute main query */
     sqlite3_stmt *main_stmt = NULL;
-    rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &main_stmt, NULL);
+    rc = sqlite3_prepare_v2(s->db, main_sql, CBM_NOT_FOUND, &main_stmt, NULL);
+    cbm_free(CBM_MEM_CLASS_STORE, ranged_sql);
     if (rc != SQLITE_OK) {
         store_set_error_sqlite(s, "search prepare");
         like_pool_free(&like_pool);
@@ -7956,6 +8149,25 @@ int cbm_store_count_edges_scoped(cbm_store_t *s, const char *project, const char
     return n;
 }
 
+/* Per-label and per-type counts. GROUP BY over the (project, label) index
+ * decodes every entry to compare its group key; stepping through the distinct
+ * values with MIN(col) > previous seeks and counting each value's index range
+ * is ~1.6x faster (kernel, 8.5M nodes: 0.26 -> 0.16 s; 16.9M edges: 0.54 ->
+ * 0.32 s). The values reach ORDER BY in the ascending order GROUP BY emitted
+ * them in, so tied counts keep their order. label and type are NOT NULL. */
+static const char ST_LABEL_COUNTS_SQL[] =
+    "WITH RECURSIVE v(x) AS (SELECT MIN(label) FROM nodes WHERE project = ?1 UNION ALL "
+    "SELECT (SELECT MIN(label) FROM nodes WHERE project = ?1 AND label > v.x) FROM v "
+    "WHERE v.x IS NOT NULL) "
+    "SELECT x, (SELECT COUNT(*) FROM nodes WHERE project = ?1 AND label = v.x) AS c "
+    "FROM v WHERE x IS NOT NULL ORDER BY c DESC;";
+static const char ST_TYPE_COUNTS_SQL[] =
+    "WITH RECURSIVE v(x) AS (SELECT MIN(type) FROM edges WHERE project = ?1 UNION ALL "
+    "SELECT (SELECT MIN(type) FROM edges WHERE project = ?1 AND type > v.x) FROM v "
+    "WHERE v.x IS NOT NULL) "
+    "SELECT x, (SELECT COUNT(*) FROM edges WHERE project = ?1 AND type = v.x) AS c "
+    "FROM v WHERE x IS NOT NULL ORDER BY c DESC;";
+
 /* with_props=false skips the per-label/per-type JSON property-key discovery:
  * those json_each() scans walk EVERY row of each label/type (minutes-scale on
  * multi-million-node graphs) and get_architecture only needs the counts. */
@@ -7968,8 +8180,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
 
     /* Node labels */
     {
-        const char *sql = "SELECT label, COUNT(*) FROM nodes WHERE project = ?1 GROUP BY label "
-                          "ORDER BY COUNT(*) DESC;";
+        const char *sql = ST_LABEL_COUNTS_SQL;
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
             if (stmt) {
@@ -8041,8 +8252,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
 
     /* Edge types */
     {
-        const char *sql = "SELECT type, COUNT(*) FROM edges WHERE project = ?1 GROUP BY type ORDER "
-                          "BY COUNT(*) DESC;";
+        const char *sql = ST_TYPE_COUNTS_SQL;
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
             if (stmt) {
@@ -9013,15 +9223,24 @@ static int arch_packages(cbm_store_t *s, const char *project, const char *path,
     char like[CBM_SZ_512];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char sqlbuf[ST_SQL_BUF];
+    /* GROUP BY +n.name, not n.name: with a bare column the planner walks
+     * idx_nodes_name over EVERY node of the project to get groups in name order,
+     * with a table lookup per node to test the label (6.3 s on the 8.5M-node
+     * kernel graph, for 5 Package nodes). The unary plus keeps the value and its
+     * BINARY collation but not the index, so the rows come from the
+     * idx_nodes_label seek. The ORDER BY sorter keeps tied counts in group
+     * emission order, which was name order from the index; a sorted GROUP BY
+     * follows the ORDER BY direction instead, so the name tie-break is explicit. */
     const char *base = "SELECT n.name, COUNT(*) as cnt FROM nodes n "
                        "WHERE n.project=?1 AND n.label='Package'";
     if (scoped) {
         snprintf(sqlbuf, sizeof(sqlbuf),
                  "%s AND (n.file_path = ?2 OR n.file_path LIKE ?3) "
-                 "GROUP BY n.name ORDER BY cnt DESC LIMIT 15",
+                 "GROUP BY +n.name ORDER BY cnt DESC, +n.name LIMIT 15",
                  base);
     } else {
-        snprintf(sqlbuf, sizeof(sqlbuf), "%s GROUP BY n.name ORDER BY cnt DESC LIMIT 15", base);
+        snprintf(sqlbuf, sizeof(sqlbuf), "%s GROUP BY +n.name ORDER BY cnt DESC, +n.name LIMIT 15",
+                 base);
     }
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sqlbuf, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {

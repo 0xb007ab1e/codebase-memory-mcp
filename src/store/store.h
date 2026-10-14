@@ -1243,6 +1243,13 @@ char *cbm_glob_to_like(const char *pattern);
  * Each out[i] is malloc'd — caller must free each string. */
 int cbm_extract_like_hints(const char *pattern, char **out, int max_out);
 
+/* Literal prefix every match of an anchored POSIX ERE must begin with: the
+ * plain printable-ASCII run after a leading '^', minus its last character when
+ * a quantifier or escape follows it. Returns its length (written NUL-terminated
+ * to out); 0 when the pattern is not anchored, contains '|', or starts with an
+ * operator. Case is kept as written. */
+int cbm_regex_anchored_prefix(const char *pattern, char *out, int out_sz);
+
 /* Prepend (?i) to a regex pattern if not already present.
  * Returns a static buffer — do NOT free. */
 const char *cbm_ensure_case_insensitive(const char *pattern);
