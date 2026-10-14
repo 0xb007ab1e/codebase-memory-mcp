@@ -478,6 +478,16 @@ int cbm_store_commit(cbm_store_t *s);
 /* Rollback the current transaction. */
 int cbm_store_rollback(cbm_store_t *s);
 
+/* Read batch: run the reads that follow in one deferred read transaction,
+ * renewed every 100 ms so a writer is never held back longer, instead of one
+ * lock round trip per statement. Begin returns false (and does nothing) when
+ * a transaction is already open. For read-only work only; end it before any
+ * write, transaction or read scope on the same store. Close ends it. */
+bool cbm_store_read_batch_begin(cbm_store_t *s);
+void cbm_store_read_batch_end(cbm_store_t *s);
+/* Test seam: make an open read batch due for renewal at its next statement. */
+void cbm_store_read_batch_expire_for_test(cbm_store_t *s);
+
 /* Stable request read scope. Borrows an exclusively owned, single-thread
  * store and callback context. Refuses a transaction, busy statement or owned
  * progress handler; idle cached statements are allowed. Saves query_only and

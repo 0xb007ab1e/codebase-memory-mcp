@@ -313,6 +313,30 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
     return 0;
 }
 
+int cbm_git_branch_resolve(const char *path, bool *is_git, char **branch) {
+    if (!is_git || !branch) {
+        return CBM_NOT_FOUND;
+    }
+    *is_git = false;
+    *branch = NULL;
+    if (!path || !path[0]) {
+        return CBM_NOT_FOUND;
+    }
+    if (!cbm_is_dir(path)) {
+        return 0;
+    }
+    char *worktree_root = NULL;
+    if (git_capture(path, "rev-parse --show-toplevel", &worktree_root) != 0) {
+        return 0;
+    }
+    free(worktree_root);
+    *is_git = true;
+    if (git_capture(path, "symbolic-ref --quiet --short HEAD", branch) != 0) {
+        *branch = git_strdup("DETACHED");
+    }
+    return *branch ? 0 : CBM_NOT_FOUND;
+}
+
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx) {
     const char *project = project_name && project_name[0] ? project_name : "project";
     const char *slug = "working-tree";

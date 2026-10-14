@@ -121,6 +121,8 @@ struct cbm_store {
     const void *progress_owner; /* exclusive native progress guard token */
     const char *db_path;        /* heap-allocated, or NULL for :memory: */
     char errbuf[CBM_SZ_512];
+    bool read_batch;                /* a read batch's transaction is open */
+    uint64_t read_batch_started_ms; /* when it was last (re)begun */
 
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
@@ -207,10 +209,60 @@ static char *heap_strdup(const char *s) {
 }
 
 /* Prepare a statement (cached). If already prepared, reset+clear. */
+/* ── Read batch ────────────────────────────────────────────────────
+ * A read tool issues thousands of small statements. In autocommit mode each
+ * one takes and drops the database file lock and stats the journal and WAL
+ * files — most of a whole-graph count(*)'s time. A read batch runs them in one
+ * deferred read transaction, renewed every ST_READ_BATCH_MS at the next
+ * statement: a writer never waits behind the batch much longer than that, and
+ * every statement still reads data committed at most that long ago (while the
+ * batch holds a rollback-journal database's shared lock, no commit happens).
+ * Committing a read transaction is allowed with read statements still
+ * stepping; their lock is then held until they finish, as before. */
+enum { ST_READ_BATCH_MS = 100 };
+
+bool cbm_store_read_batch_begin(cbm_store_t *s) {
+    if (!s || !s->db || s->read_batch || !sqlite3_get_autocommit(s->db)) {
+        return false;
+    }
+    if (sqlite3_exec(s->db, "BEGIN DEFERRED;", NULL, NULL, NULL) != SQLITE_OK) {
+        return false;
+    }
+    s->read_batch = true;
+    s->read_batch_started_ms = cbm_now_ms();
+    return true;
+}
+
+void cbm_store_read_batch_end(cbm_store_t *s) {
+    if (!s || !s->read_batch) {
+        return;
+    }
+    s->read_batch = false;
+    if (s->db && !sqlite3_get_autocommit(s->db)) {
+        (void)sqlite3_exec(s->db, "COMMIT;", NULL, NULL, NULL);
+    }
+}
+
+void cbm_store_read_batch_expire_for_test(cbm_store_t *s) {
+    if (s && s->read_batch) {
+        uint64_t now = cbm_now_ms();
+        s->read_batch_started_ms = now > ST_READ_BATCH_MS ? now - ST_READ_BATCH_MS : 0;
+    }
+}
+
+static void read_batch_renew(cbm_store_t *s) {
+    if (!s->read_batch || cbm_now_ms() - s->read_batch_started_ms < ST_READ_BATCH_MS) {
+        return;
+    }
+    cbm_store_read_batch_end(s);
+    (void)cbm_store_read_batch_begin(s);
+}
+
 static sqlite3_stmt *prepare_cached(cbm_store_t *s, sqlite3_stmt **slot, const char *sql) {
     if (!s || !s->db) {
         return NULL;
     }
+    read_batch_renew(s);
     if (*slot) {
         sqlite3_reset(*slot);
         sqlite3_clear_bindings(*slot);
@@ -1363,6 +1415,7 @@ void cbm_store_close(cbm_store_t *s) {
     if (!s) {
         return;
     }
+    cbm_store_read_batch_end(s);
 
     /* Checkpoint WAL before close to prevent orphan WAL accumulation.
      * Best-effort — silently skips if concurrent reader holds a lock. */

@@ -20,6 +20,10 @@ typedef struct {
 } cbm_git_context_t;
 
 int cbm_git_context_resolve(const char *path, cbm_git_context_t *out);
+/* Only the is_git and branch fields of cbm_git_context_resolve, from the same
+ * two git commands it uses for them (2 git processes instead of 7). *branch
+ * is heap-owned, NULL when path is not in a git work tree. */
+int cbm_git_branch_resolve(const char *path, bool *is_git, char **branch);
 void cbm_git_context_free(cbm_git_context_t *ctx);
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx);
 int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_size);

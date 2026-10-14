@@ -5580,6 +5580,257 @@ TEST(cypher_fifty_union_branches) {
     PASS();
 }
 
+/* ── ORDER BY, DISTINCT and grouping against a reference ───────────
+ * These were bubble sorts and linear duplicate/group scans — seconds to
+ * minutes on a 30k-row result. The results must stay exactly the old ones: a
+ * stable sort of the unsorted rows, first-occurrence DISTINCT, first-seen
+ * group order. Each case derives that reference from the engine's own
+ * unsorted rows, on a graph built for ties, duplicates and large groups. */
+
+enum { REF_NODES = 400, REF_NAMES = 97 };
+
+static cbm_store_t *setup_reference_store(void) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    int64_t ids[REF_NODES];
+    for (int i = 0; i < REF_NODES; i++) {
+        char name[32];
+        char qn[32];
+        char file[32];
+        snprintf(name, sizeof(name), "fn_%02d", (i * 7) % REF_NAMES); /* repeated names */
+        snprintf(qn, sizeof(qn), "test.n%d", i);
+        snprintf(file, sizeof(file), "f%02d.c", i % 13);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = file,
+                        .start_line = (i * 31) % 50, /* tied lines */
+                        .end_line = 60};
+        ids[i] = cbm_store_upsert_node(s, &n);
+    }
+    /* Every node calls both hubs (n0, n1: ~400 callers, 97 distinct names,
+     * past the hashed COUNT(DISTINCT) threshold) and one more node. */
+    for (int i = 0; i < REF_NODES; i++) {
+        int targets[3] = {0, 1, (i * i + 3) % REF_NODES};
+        for (int t = 0; t < 3; t++) {
+            if (targets[t] != i) {
+                cbm_edge_t e = {.project = "test",
+                                .source_id = ids[i],
+                                .target_id = ids[targets[t]],
+                                .type = "CALLS"};
+                cbm_store_insert_edge(s, &e);
+            }
+        }
+    }
+    return s;
+}
+
+typedef int (*ref_cmp_fn)(const cbm_cypher_result_t *r, int a, int b);
+
+/* The reference order: an insertion sort that moves a row before an earlier
+ * one only when the earlier one compares greater — stable, like the old
+ * bubble sorts. */
+static void ref_stable_order(const cbm_cypher_result_t *r, int *order, ref_cmp_fn cmp) {
+    for (int i = 0; i < r->row_count; i++) {
+        order[i] = i;
+    }
+    for (int i = 1; i < r->row_count; i++) {
+        for (int j = i; j > 0 && cmp(r, order[j - 1], order[j]) > 0; j--) {
+            int swap = order[j];
+            order[j] = order[j - 1];
+            order[j - 1] = swap;
+        }
+    }
+}
+
+/* Columns 0 (name) and 1 (line): line descending, then name ascending. */
+static int ref_line_desc_name(const cbm_cypher_result_t *r, int a, int b) {
+    long la = strtol(r->rows[a][1], NULL, 10);
+    long lb = strtol(r->rows[b][1], NULL, 10);
+    int cmp = (lb > la) - (lb < la);
+    return cmp != 0 ? cmp : strcmp(r->rows[a][0], r->rows[b][0]);
+}
+
+static int ref_all_equal(const cbm_cypher_result_t *r, int a, int b) {
+    (void)r;
+    (void)a;
+    (void)b;
+    return 0;
+}
+
+/* `sorted` must hold the rows of `unsorted` in the reference order. */
+static bool ref_rows_in_order(const cbm_cypher_result_t *sorted,
+                              const cbm_cypher_result_t *unsorted, ref_cmp_fn cmp) {
+    if (sorted->row_count != unsorted->row_count || sorted->col_count != unsorted->col_count ||
+        unsorted->row_count < REF_NODES) {
+        return false;
+    }
+    int order[REF_NODES * 4];
+    ref_stable_order(unsorted, order, cmp);
+    for (int i = 0; i < sorted->row_count; i++) {
+        for (int c = 0; c < sorted->col_count; c++) {
+            if (strcmp(sorted->rows[i][c], unsorted->rows[order[i]][c]) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool ref_query(cbm_store_t *s, const char *query, cbm_cypher_result_t *out) {
+    memset(out, 0, sizeof(*out));
+    return cbm_cypher_execute(s, query, "test", 0, out) == 0 && !out->truncated;
+}
+
+TEST(cypher_order_by_is_the_stable_reference_order) {
+    cbm_store_t *s = setup_reference_store();
+    cbm_cypher_result_t plain;
+    cbm_cypher_result_t sorted;
+    ASSERT_TRUE(ref_query(s, "MATCH (f:Function) RETURN f.name, f.start_line", &plain));
+
+    /* RETURN: numeric key descending, ties broken by the next key. */
+    ASSERT_TRUE(ref_query(
+        s, "MATCH (f:Function) RETURN f.name, f.start_line ORDER BY f.start_line DESC, f.name",
+        &sorted));
+    ASSERT_TRUE(ref_rows_in_order(&sorted, &plain, ref_line_desc_name));
+    cbm_cypher_result_free(&sorted);
+
+    /* WITH: the same keys through a projection. */
+    ASSERT_TRUE(ref_query(s,
+                          "MATCH (f:Function) WITH f.name AS n, f.start_line AS l "
+                          "ORDER BY l DESC, n RETURN n, l",
+                          &sorted));
+    ASSERT_TRUE(ref_rows_in_order(&sorted, &plain, ref_line_desc_name));
+    cbm_cypher_result_free(&sorted);
+    cbm_cypher_result_free(&plain);
+
+    /* All keys tied: both sorts keep the unsorted order. */
+    ASSERT_TRUE(ref_query(s, "MATCH (f:Function) RETURN f.name, f.label", &plain));
+    ASSERT_TRUE(
+        ref_query(s, "MATCH (f:Function) RETURN f.name, f.label ORDER BY f.label", &sorted));
+    ASSERT_TRUE(ref_rows_in_order(&sorted, &plain, ref_all_equal));
+    cbm_cypher_result_free(&sorted);
+    ASSERT_TRUE(ref_query(
+        s, "MATCH (f:Function) WITH f.name AS n, f.label AS l ORDER BY l RETURN n, l", &sorted));
+    ASSERT_TRUE(ref_rows_in_order(&sorted, &plain, ref_all_equal));
+    cbm_cypher_result_free(&sorted);
+    cbm_cypher_result_free(&plain);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* `got` must be the first occurrence of every value in column 0 of `all`. */
+static bool ref_first_occurrences(const cbm_cypher_result_t *got, const cbm_cypher_result_t *all) {
+    int kept = 0;
+    for (int i = 0; i < all->row_count; i++) {
+        bool seen = false;
+        for (int j = 0; j < i && !seen; j++) {
+            seen = strcmp(all->rows[i][0], all->rows[j][0]) == 0;
+        }
+        if (seen) {
+            continue;
+        }
+        if (kept >= got->row_count || strcmp(got->rows[kept][0], all->rows[i][0]) != 0) {
+            return false;
+        }
+        kept++;
+    }
+    return kept == got->row_count;
+}
+
+TEST(cypher_distinct_keeps_first_occurrences) {
+    cbm_store_t *s = setup_reference_store();
+    cbm_cypher_result_t all;
+    cbm_cypher_result_t got;
+    ASSERT_TRUE(ref_query(s, "MATCH (f:Function) RETURN f.name", &all));
+    ASSERT_TRUE(ref_query(s, "MATCH (f:Function) RETURN DISTINCT f.name", &got));
+    ASSERT_EQ(got.row_count, REF_NAMES);
+    ASSERT_TRUE(ref_first_occurrences(&got, &all));
+    cbm_cypher_result_free(&got);
+    ASSERT_TRUE(ref_query(s, "MATCH (f:Function) WITH DISTINCT f.name AS n RETURN n", &got));
+    ASSERT_EQ(got.row_count, REF_NAMES);
+    ASSERT_TRUE(ref_first_occurrences(&got, &all));
+    cbm_cypher_result_free(&got);
+    cbm_cypher_result_free(&all);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* `got` (column 0 = callee, column 1 = count) must list the callees of
+ * `pairs` (column 0 = callee, column 1 = caller name) in first-seen order,
+ * each with its caller count — of distinct names when `distinct`. */
+static bool ref_groups_match(const cbm_cypher_result_t *got, const cbm_cypher_result_t *pairs,
+                             bool distinct) {
+    enum { REF_PAIRS_MAX = REF_NODES * 4 };
+    if (pairs->row_count > REF_PAIRS_MAX) {
+        return false;
+    }
+    bool first_callee[REF_PAIRS_MAX];
+    bool first_pair[REF_PAIRS_MAX];
+    for (int k = 0; k < pairs->row_count; k++) {
+        first_callee[k] = true;
+        first_pair[k] = true;
+        for (int m = 0; m < k; m++) {
+            if (strcmp(pairs->rows[m][0], pairs->rows[k][0]) == 0) {
+                first_callee[k] = false;
+                first_pair[k] = first_pair[k] && strcmp(pairs->rows[m][1], pairs->rows[k][1]) != 0;
+            }
+        }
+    }
+    int groups = 0;
+    for (int i = 0; i < pairs->row_count; i++) {
+        if (!first_callee[i]) {
+            continue;
+        }
+        int count = 0;
+        for (int k = 0; k < pairs->row_count; k++) {
+            if (strcmp(pairs->rows[k][0], pairs->rows[i][0]) == 0) {
+                count += !distinct || first_pair[k] ? 1 : 0;
+            }
+        }
+        char want[16];
+        snprintf(want, sizeof(want), "%d", count);
+        if (groups >= got->row_count || strcmp(got->rows[groups][0], pairs->rows[i][0]) != 0 ||
+            strcmp(got->rows[groups][1], want) != 0) {
+            return false;
+        }
+        groups++;
+    }
+    return groups == got->row_count;
+}
+
+TEST(cypher_grouping_keeps_first_seen_groups) {
+    cbm_store_t *s = setup_reference_store();
+    cbm_cypher_result_t pairs;
+    cbm_cypher_result_t got;
+    ASSERT_TRUE(ref_query(
+        s, "MATCH (a)-[:CALLS]->(b:Function) RETURN b.qualified_name, a.name", &pairs));
+    ASSERT_GT(pairs.row_count, REF_NODES * 2);
+
+    ASSERT_TRUE(ref_query(
+        s, "MATCH (a)-[:CALLS]->(b:Function) RETURN b.qualified_name, count(a) AS c", &got));
+    ASSERT_TRUE(ref_groups_match(&got, &pairs, false));
+    cbm_cypher_result_free(&got);
+
+    ASSERT_TRUE(ref_query(s,
+                          "MATCH (a)-[:CALLS]->(b:Function) "
+                          "RETURN b.qualified_name, count(DISTINCT a.name) AS c",
+                          &got));
+    ASSERT_TRUE(ref_groups_match(&got, &pairs, true));
+    cbm_cypher_result_free(&got);
+
+    ASSERT_TRUE(ref_query(s,
+                          "MATCH (a)-[:CALLS]->(b:Function) WITH b.qualified_name AS q, "
+                          "count(DISTINCT a.name) AS c RETURN q, c",
+                          &got));
+    ASSERT_TRUE(ref_groups_match(&got, &pairs, true));
+    cbm_cypher_result_free(&got);
+    cbm_cypher_result_free(&pairs);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════ */
 
 SUITE(cypher) {
@@ -5823,4 +6074,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_chain_with_unbound_alias_keeps_seed);
     RUN_TEST(cypher_many_union_branches);
     RUN_TEST(cypher_fifty_union_branches);
+    RUN_TEST(cypher_order_by_is_the_stable_reference_order);
+    RUN_TEST(cypher_distinct_keeps_first_occurrences);
+    RUN_TEST(cypher_grouping_keeps_first_seen_groups);
 }
