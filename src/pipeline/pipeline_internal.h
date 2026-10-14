@@ -1316,10 +1316,15 @@ char *cbm_k8s_resource_props(const char *qn, const char *effective_ns, const cha
                              const char *labels, const char *ecosystem);
 
 /* Ansible (pass_ansible.c): a playbook or task file IMPORTS the playbooks,
- * task files and roles its directives name. Run at the end of the K8s pass,
- * over the same files. */
+ * task files and roles its directives name; its tasks and handlers are
+ * Functions, a notify CALLS the handlers it names. Run at the end of the
+ * K8s pass, over the same files. */
 void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                int file_count);
+
+/* Does a YAML text's first content line start a sequence item (pass_ansible.c)?
+ * The incremental planner's test for Ansible content. */
+bool cbm_ansible_is_sequence(const char *src);
 
 /* `v` (a path; "./" and "../" allowed) from repository directory `dir`, as a
  * repository path into out; false past the root or when it does not fit
@@ -1539,8 +1544,10 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      {ecosystem:terraform} its block DEPLOYS
  *      (pass_terraform.c, extract_unified.c, extract_defs.c); an Ansible
  *      playbook / task file IMPORTS {via:ansible} the playbooks, task files
- *      and roles its directives name (pass_ansible.c). An index built
- *      before holds none of them, so it rebuilds once on upgrade. */
+ *      and roles its directives name, its tasks and handlers are Functions
+ *      {source:ansible} and a notify CALLS {via:notify} the handlers it names
+ *      (pass_ansible.c). An index built before holds none of them, so it
+ *      rebuilds once on upgrade. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
 
 typedef struct {

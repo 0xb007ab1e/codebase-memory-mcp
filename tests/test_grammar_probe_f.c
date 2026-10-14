@@ -3373,6 +3373,117 @@ TEST(probe_kustomize_name_prefix_makes_variants) {
     PASS();
 }
 
+/* Every Ansible task / handler as "<file>:<line> <kind> <name> [<module>]",
+ * then every notify as "<task> -> <handler file>:<handler> @<line>", then
+ * "functions <n> defined <m>". */
+static char *gpf_ansible_tasks(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT file_path || ':' || "
+            "start_line || ' ' || json_extract(properties,'$.kind') || ' ' || name || ' [' || "
+            "json_extract(properties,'$.module') || ']' AS x FROM nodes WHERE project=?1 AND "
+            "label='Function' AND json_extract(properties,'$.source')='ansible' ORDER BY "
+            "file_path, start_line)), '') || char(10) || coalesce((SELECT group_concat(y, "
+            "char(10)) FROM (SELECT s.name || ' -> ' || t.file_path || ':' || t.name || ' @' || "
+            "json_extract(e.properties,'$.line') AS y FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+            "e.type='CALLS' AND json_extract(e.properties,'$.via')='notify' ORDER BY y)), '') || "
+            "char(10) || 'functions ' || (SELECT COUNT(*) FROM nodes WHERE project=?1 AND "
+            "label='Function' AND json_extract(properties,'$.source')='ansible') || ' defined ' "
+            "|| (SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND e.type='DEFINES' AND s.label='File' AND "
+            "json_extract(t.properties,'$.source')='ansible')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* An Ansible task (or handler) is a Function, named by its `name:` (else its
+ * module), {source: ansible, kind, module}, which its file DEFINES:
+ * a playbook's pre_tasks / tasks / post_tasks / handlers, a role's tasks/
+ * and handlers/ files, and files an Ansible file includes; a block's tasks
+ * (block, rescue, always), never the block itself. A notify CALLS {via:
+ * notify, line} each handler of that name or listen topic in the task's own
+ * role (a nested role is the directory before its tasks/), else in its file.
+ * A YAML list that is no Ansible (a JSON patch) holds none. */
+TEST(probe_ansible_tasks_are_functions) {
+    static const GpfFile files[] = {
+        {"site.yml",
+         "- hosts: all\n  pre_tasks:\n    - name: Prep\n      command: /bin/true\n"
+         "  roles:\n    - web\n  handlers:\n    - name: reload all\n"
+         "      service: name=x state=reloaded\n  tasks:\n    - name: Ping\n      ping:\n"
+         "      notify: reload all\n- import_playbook: other.yml\n"},
+        {"other.yml",
+         "- hosts: db\n  tasks:\n    - debug: msg=hi\n    - include_tasks: tasks/common.yml\n"},
+        {"tasks/common.yml",
+         "- name: Common\n  shell: echo c\n- name: \"Say \\\"hi\\\"\"\n  debug:\n    msg: x\n"
+         "- name: 'it''s'\n  debug:\n    msg: y\n- name: Act\n  action: shell echo a\n"},
+        {"roles/web/tasks/main.yml",
+         "- name: Install web\n  package:\n    name: nginx\n  notify:\n    - restart web\n"
+         "    - web changed\n- block:\n    - name: Inside block\n      template:\n"
+         "        src: a.j2\n        dest: /etc/a\n      notify: restart web\n  rescue:\n"
+         "    - name: Rescue it\n      debug:\n        msg: failed\n  always:\n"
+         "    - name: Always it\n      ansible.builtin.file:\n        path: /tmp/x\n"
+         "        state: absent\n- include_tasks: extra.yml\n"},
+        {"roles/web/tasks/extra.yml", "- name: Extra\n  command: echo hi\n"},
+        {"roles/web/handlers/main.yml",
+         "- name: restart web\n  service:\n    name: nginx\n    state: restarted\n"
+         "- name: log change\n  debug:\n    msg: changed\n  listen: web changed\n"},
+        {"roles/apps/csi/tasks/main.yml", "- name: Csi\n  command: x\n  notify: restart csi\n"},
+        {"roles/apps/csi/handlers/main.yml", "- name: restart csi\n  command: y\n"},
+        {"roles/apps/lb/handlers/main.yml", "- name: restart csi\n  command: w\n"},
+        {"roles/other/handlers/main.yml", "- name: restart csi\n  command: z\n"},
+        {"patches/ops.yaml", "- op: add\n  path: /x\n  value: 1\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_ansible_tasks(files, n);
+    static const char want[] =
+        "other.yml:3 task debug [debug]\n"
+        "other.yml:4 task include_tasks [include_tasks]\n"
+        "roles/apps/csi/handlers/main.yml:1 handler restart csi [command]\n"
+        "roles/apps/csi/tasks/main.yml:1 task Csi [command]\n"
+        "roles/apps/lb/handlers/main.yml:1 handler restart csi [command]\n"
+        "roles/other/handlers/main.yml:1 handler restart csi [command]\n"
+        "roles/web/handlers/main.yml:1 handler restart web [service]\n"
+        "roles/web/handlers/main.yml:5 handler log change [debug]\n"
+        "roles/web/tasks/extra.yml:1 task Extra [command]\n"
+        "roles/web/tasks/main.yml:1 task Install web [package]\n"
+        "roles/web/tasks/main.yml:8 task Inside block [template]\n"
+        "roles/web/tasks/main.yml:14 task Rescue it [debug]\n"
+        "roles/web/tasks/main.yml:18 task Always it [file]\n"
+        "roles/web/tasks/main.yml:22 task include_tasks [include_tasks]\n"
+        "site.yml:3 task Prep [command]\n"
+        "site.yml:8 handler reload all [service]\n"
+        "site.yml:11 task Ping [ping]\n"
+        "tasks/common.yml:1 task Common [shell]\n"
+        "tasks/common.yml:3 task Say \"hi\" [debug]\n"
+        "tasks/common.yml:6 task it's [debug]\n"
+        "tasks/common.yml:9 task Act [shell]\n"
+        "Csi -> roles/apps/csi/handlers/main.yml:restart csi @3\n"
+        "Inside block -> roles/web/handlers/main.yml:restart web @12\n"
+        "Install web -> roles/web/handlers/main.yml:log change @4\n"
+        "Install web -> roles/web/handlers/main.yml:restart web @4\n"
+        "Ping -> site.yml:reload all @13\n"
+        "functions 21 defined 21";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "ansible tasks got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("ansible tasks");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
  * "edgeless routes <n>": the Route nodes no edge touches. */
 static char *gpf_script_http(const GpfFile *files, int nfiles) {
@@ -5818,6 +5929,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_ansible_files_import_what_they_name);
     RUN_TEST(probe_terraform_kubernetes_objects_are_resources);
     RUN_TEST(probe_kustomize_name_prefix_makes_variants);
+    RUN_TEST(probe_ansible_tasks_are_functions);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);

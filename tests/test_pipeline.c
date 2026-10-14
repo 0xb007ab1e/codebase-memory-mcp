@@ -1533,6 +1533,65 @@ TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file) {
     PASS();
 }
 
+/* The CALLS edges an Ansible notify draws (via notify); -1 on a query error. */
+static int ansible_notify_calls(cbm_store_t *s, const char *project) {
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT COUNT(*) FROM edges WHERE project=?1 AND type='CALLS' AND "
+                           "json_extract(properties,'$.via')='notify'",
+                           -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* A task's notify CALLS the handlers of its role in another file. Editing
+ * either file alone must land on the full graph: the handler file (a listen
+ * topic renamed: one handler stops answering) re-creates its handlers, the
+ * unchanged task file is not re-walked; the task file (a notifying task
+ * added) is re-walked without the unchanged handler file. Both decline to
+ * the full rebuild (closure_ansible_decline); the repair route kept a stale
+ * edge in the first and lost every notify of the edited file in the second. */
+TEST(pipeline_incremental_keeps_ansible_notifies_across_files) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    write_temp_file(g_tmpdir, "roles/app/tasks/main.yml",
+                    "- name: configure\n  command: /bin/true\n  notify: restart app\n");
+    write_temp_file(g_tmpdir, "roles/app/handlers/main.yml",
+                    "- name: h1\n  command: one\n  listen: restart app\n"
+                    "- name: h2\n  command: two\n  listen: restart app\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_incr_notify.db", g_tmpdir);
+    int want[] = {2, 1, 2};
+    for (int step = 0; step < 3; step++) {
+        if (step == 1) {
+            write_temp_file(g_tmpdir, "roles/app/handlers/main.yml",
+                            "- name: h1\n  command: one\n  listen: restart app\n"
+                            "- name: h2\n  command: two\n  listen: something else\n");
+        } else if (step == 2) {
+            write_temp_file(g_tmpdir, "roles/app/tasks/main.yml",
+                            "- name: configure\n  command: /bin/true\n  notify: restart app\n"
+                            "- name: reconfigure\n  command: /bin/false\n  notify: restart app\n");
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(s);
+        int calls = ansible_notify_calls(s, cbm_pipeline_project_name(p));
+        cbm_store_close(s);
+        cbm_pipeline_free(p);
+        ASSERT_EQ(calls, want[step]);
+    }
+    teardown_test_repo();
+    PASS();
+}
+
 /* Regression: a Terraform module's output read lives in one file
  * (infra/outputs.tf: module.net.vpc_id) and the module's source in another
  * (infra/main.tf). Pointing the source elsewhere edits main.tf alone; the
@@ -23235,6 +23294,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module);
     RUN_TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file);
+    RUN_TEST(pipeline_incremental_keeps_ansible_notifies_across_files);
     RUN_TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);

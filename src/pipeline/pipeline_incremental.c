@@ -32,6 +32,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
+#include "foundation/limits.h" /* cbm_max_file_bytes */
 #include "foundation/platform.h"
 #include "foundation/sha256.h"
 
@@ -2538,6 +2539,62 @@ static const char *closure_terraform_decline(char **paths, int n) {
     return NULL;
 }
 
+/* Ansible (pass_ansible.c): a task's notify CALLS the handlers of its role
+ * in another file, and whether a file is Ansible at all can hang on another
+ * file's include. The repair recomputes the changed files only, so a
+ * changed or deleted file that held Ansible tasks, or a changed YAML file
+ * whose top level is a sequence (it may be Ansible now), declines to the
+ * full rebuild. Returns the reason, or NULL. */
+static const char *closure_ansible_decline(cbm_store_t *store, const char *project,
+                                           const char *repo_path, char **paths, int n_changed,
+                                           int n_deleted) {
+    for (int i = 0; i < n_changed + n_deleted; i++) {
+        const char *rel = paths[i];
+        cbm_node_t *nodes = NULL;
+        int count = 0;
+        if (cbm_store_find_nodes_by_file(store, project, rel, &nodes, &count) != CBM_STORE_OK) {
+            return "ansible_lookup_failed";
+        }
+        bool held = false;
+        for (int j = 0; j < count && !held; j++) {
+            held = nodes[j].label && strcmp(nodes[j].label, "Function") == 0 &&
+                   nodes[j].properties_json &&
+                   strstr(nodes[j].properties_json, "\"source\":\"ansible\"");
+        }
+        cbm_store_free_nodes(nodes, count);
+        if (held) {
+            return "ansible_tasks_changed";
+        }
+        const char *dot = strrchr(rel, '.');
+        if (i >= n_changed || !dot || (strcmp(dot, ".yaml") != 0 && strcmp(dot, ".yml") != 0)) {
+            continue;
+        }
+        char path[CBM_SZ_4K];
+        snprintf(path, sizeof(path), "%s/%s", repo_path, rel);
+        FILE *f = cbm_fopen(path, "rb");
+        if (!f) {
+            continue;
+        }
+        (void)fseek(f, 0, SEEK_END);
+        long size = ftell(f);
+        (void)fseek(f, 0, SEEK_SET);
+        char *text = size > 0 && size <= cbm_max_file_bytes()
+                         ? cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)size + SKIP_ONE)
+                         : NULL;
+        size_t got = text ? fread(text, SKIP_ONE, (size_t)size, f) : 0;
+        (void)fclose(f);
+        if (text) {
+            text[got] = '\0';
+        }
+        bool sequence = text && cbm_ansible_is_sequence(text);
+        cbm_free(CBM_MEM_CLASS_OTHER, text);
+        if (sequence) {
+            return "ansible_content_changed";
+        }
+    }
+    return NULL;
+}
+
 /* The env join (pass_envjoin.c) reads each image's files from its
  * Dockerfile's Module, stored with the ignore patterns of its context: an
  * ignore file changing, or a deletion of a file an image copies (which
@@ -2760,6 +2817,11 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         goto done;
     }
     decline = closure_terraform_decline(changed_paths, n_changed + n_deleted);
+    if (decline) {
+        goto done;
+    }
+    decline = closure_ansible_decline(store, project, cbm_pipeline_repo_path(p), changed_paths,
+                                      n_changed, n_deleted);
     if (decline) {
         goto done;
     }
