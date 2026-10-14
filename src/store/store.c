@@ -3348,6 +3348,280 @@ int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char
                               project, file_path, out, count);
 }
 
+/* ── Streamed node scan ──────────────────────────────────────────────
+ * cbm_store_find_nodes / cbm_store_find_nodes_by_label materialise every row
+ * at once: 8.5 M kernel nodes with all their strings are 4.9 GB before the
+ * caller sees the first one. The scan below hands the same rows out a page at
+ * a time, and resets each page's statement before returning it, so no read
+ * lock outlives a page: a writer waits behind one page, as behind one eager
+ * lookup, never behind the caller's whole query.
+ *
+ * Pages continue by keyset along the index the eager query walks, so they
+ * concatenate to the eager order:
+ *   all nodes  idx_nodes_file (project, file_path): the NULL file_path rows by
+ *              id (index order puts NULL first), then by (file_path, id). A
+ *              page continues with the rest of its last row's file (by id),
+ *              then with the files after it: two exact index seeks, where a
+ *              (file_path, id) row-value bound seeks the file only and would
+ *              rescan a large file from its start on every page;
+ *   one label  idx_nodes_label (project, label): by id.
+ * open checks that plan with EXPLAIN QUERY PLAN on the eager query itself.
+ * Any other plan (a changed schema, planner statistics) falls back to the
+ * eager scan handed out in batches: the same rows, without the saving. */
+#define NODE_SCAN_COLS                                                                   \
+    "SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, " \
+    "properties FROM nodes "
+
+typedef enum {
+    NODE_SCAN_LABEL,      /* label = ?2 AND id >= ?3 */
+    NODE_SCAN_NULL_FILE,  /* file_path IS NULL AND id >= ?2 */
+    NODE_SCAN_FILE_FIRST, /* file_path IS NOT NULL: the first file page */
+    NODE_SCAN_FILE_SAME,  /* file_path = ?2 AND id > ?3: the rest of the last file */
+    NODE_SCAN_FILE_AFTER, /* file_path > ?2: the files after it */
+    NODE_SCAN_STMTS,
+} node_scan_stmt_t;
+
+enum { NODE_SCAN_COL_FILE = 5 }; /* file_path in NODE_SCAN_COLS */
+
+static const char *const node_scan_sql[NODE_SCAN_STMTS] = {
+    NODE_SCAN_COLS "WHERE project = ?1 AND label = ?2 AND id >= ?3 ORDER BY id LIMIT ?4;",
+    NODE_SCAN_COLS "WHERE project = ?1 AND file_path IS NULL AND id >= ?2 ORDER BY id LIMIT ?3;",
+    NODE_SCAN_COLS "WHERE project = ?1 AND file_path IS NOT NULL ORDER BY file_path, id LIMIT ?2;",
+    NODE_SCAN_COLS "WHERE project = ?1 AND file_path = ?2 AND id > ?3 ORDER BY id LIMIT ?4;",
+    NODE_SCAN_COLS "WHERE project = ?1 AND file_path > ?2 ORDER BY file_path, id LIMIT ?3;",
+};
+
+struct cbm_store_node_scan {
+    cbm_store_t *store;
+    char *project;
+    char *label;
+    bool paged;
+    node_scan_stmt_t phase; /* LABEL, NULL_FILE, FILE_SAME or FILE_AFTER */
+    bool keyed;             /* last_id (and for files last_file) hold the previous page's end */
+    int64_t last_id;
+    sqlite3_value *last_file;
+    sqlite3_stmt *stmts[NODE_SCAN_STMTS];
+    bool done;
+    bool eager_failed; /* fallback: the eager scan itself failed; next reports it once */
+    cbm_node_t *eager; /* fallback: the eager scan's rows, handed out in order */
+    int eager_count;
+    int eager_next;
+};
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static atomic_int node_scan_test_fail_countdown = ATOMIC_VAR_INIT(CBM_NOT_FOUND);
+
+void cbm_store_node_scan_test_fail_page_after(int successful_pages) {
+    atomic_store(&node_scan_test_fail_countdown, successful_pages);
+}
+#endif
+
+/* True when SQLite runs `sql` as the single index search `plan`. */
+static bool node_scan_plan_is(cbm_store_t *s, const char *sql, const char *plan) {
+    char eqp[CBM_SZ_512];
+    snprintf(eqp, sizeof(eqp), "EXPLAIN QUERY PLAN %s", sql);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, eqp, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    int rows = 0;
+    bool match = false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *detail = (const char *)sqlite3_column_text(stmt, ST_COL_3);
+        match = rows == 0 && detail && strcmp(detail, plan) == 0;
+        rows++;
+    }
+    sqlite3_finalize(stmt);
+    return match && rows == SKIP_ONE;
+}
+
+cbm_store_node_scan_t *cbm_store_node_scan_open(cbm_store_t *s, const char *project,
+                                                const char *label) {
+    if (!s || !s->db) {
+        return NULL;
+    }
+    cbm_store_node_scan_t *scan = cbm_calloc(CBM_MEM_CLASS_STORE, sizeof(*scan));
+    if (!scan) {
+        return NULL;
+    }
+    scan->store = s;
+    scan->project = cbm_mem_strdup(CBM_MEM_CLASS_STORE, project);
+    scan->label = cbm_mem_strdup(CBM_MEM_CLASS_STORE, label);
+    if ((project && !scan->project) || (label && !scan->label)) {
+        cbm_store_node_scan_close(scan);
+        return NULL;
+    }
+    scan->phase = label ? NODE_SCAN_LABEL : NODE_SCAN_NULL_FILE; /* NULL file_path rows first */
+    if (label) {
+        scan->paged =
+            node_scan_plan_is(s, NODE_SCAN_COLS "WHERE project = ?1 AND label = ?2;",
+                              "SEARCH nodes USING INDEX idx_nodes_label (project=? AND label=?)");
+    } else {
+        scan->paged = node_scan_plan_is(s, NODE_SCAN_COLS "WHERE project = ?1;",
+                                        "SEARCH nodes USING INDEX idx_nodes_file (project=?)");
+    }
+    if (!scan->paged) {
+        int rc = label ? cbm_store_find_nodes_by_label(s, project, label, &scan->eager,
+                                                       &scan->eager_count)
+                       : cbm_store_find_nodes(s, project, &scan->eager, &scan->eager_count);
+        scan->eager_failed = rc != CBM_STORE_OK;
+    }
+    return scan;
+}
+
+bool cbm_store_node_scan_paged(const cbm_store_node_scan_t *scan) {
+    return scan && scan->paged;
+}
+
+/* The current phase has no rows left. The NULL file_path rows hand over to
+ * the files, the rest of a file to the files after it; a label's rows and
+ * the files after the last one end the scan. */
+static void node_scan_phase_done(cbm_store_node_scan_t *scan) {
+    if (scan->phase == NODE_SCAN_NULL_FILE) {
+        scan->keyed = false;
+        scan->phase = NODE_SCAN_FILE_AFTER;
+    } else if (scan->phase == NODE_SCAN_FILE_SAME) {
+        scan->phase = NODE_SCAN_FILE_AFTER; /* after last_file */
+    } else {
+        scan->done = true;
+    }
+}
+
+static void node_scan_bind(cbm_store_node_scan_t *scan, sqlite3_stmt *stmt, node_scan_stmt_t which,
+                           int max) {
+    int col = SKIP_ONE;
+    bind_text(stmt, col++, scan->project);
+    if (which == NODE_SCAN_LABEL) {
+        bind_text(stmt, col++, scan->label);
+    }
+    if (which == NODE_SCAN_FILE_SAME || which == NODE_SCAN_FILE_AFTER) {
+        sqlite3_bind_value(stmt, col++, scan->last_file);
+    }
+    if (which == NODE_SCAN_LABEL || which == NODE_SCAN_NULL_FILE) {
+        sqlite3_bind_int64(stmt, col++, scan->keyed ? scan->last_id + SKIP_ONE : INT64_MIN);
+    } else if (which == NODE_SCAN_FILE_SAME) {
+        sqlite3_bind_int64(stmt, col++, scan->last_id);
+    }
+    sqlite3_bind_int(stmt, col, max);
+}
+
+/* One page of the current phase into out[0..max). A short page ends the
+ * phase; the statement is reset before returning either way. */
+static int node_scan_page(cbm_store_node_scan_t *scan, cbm_node_t *out, int max, int *got) {
+    *got = 0;
+    cbm_store_t *s = scan->store;
+    node_scan_stmt_t which = scan->phase;
+    if (which == NODE_SCAN_FILE_AFTER && !scan->keyed) {
+        which = NODE_SCAN_FILE_FIRST;
+    }
+    bool after_id =
+        which == NODE_SCAN_LABEL || which == NODE_SCAN_NULL_FILE || which == NODE_SCAN_FILE_SAME;
+    if (after_id && scan->keyed && scan->last_id == INT64_MAX) {
+        node_scan_phase_done(scan); /* nothing can follow the largest id */
+        return CBM_STORE_OK;
+    }
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (graph_compare_test_countdown_fires(&node_scan_test_fail_countdown)) {
+        snprintf(s->errbuf, sizeof(s->errbuf), "node scan aborted: injected page failure");
+        return CBM_STORE_ERR;
+    }
+#endif
+    read_batch_renew(s);
+    sqlite3_stmt **slot = &scan->stmts[which];
+    if (!*slot &&
+        sqlite3_prepare_v2(s->db, node_scan_sql[which], CBM_NOT_FOUND, slot, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "node scan prepare");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = *slot;
+    node_scan_bind(scan, stmt, which, max);
+
+    int n = 0;
+    int rc = SQLITE_ROW;
+    while (n < max && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        scan_node(stmt, &out[n]);
+        n++;
+    }
+    bool failed = n < max && rc != SQLITE_DONE;
+    if (n == max) { /* the statement still sits on the page's last row */
+        scan->keyed = true;
+        scan->last_id = out[n - SKIP_ONE].id;
+        if (which == NODE_SCAN_FILE_FIRST || which == NODE_SCAN_FILE_AFTER) {
+            /* a new last file: continue with the rest of it */
+            sqlite3_value_free(scan->last_file);
+            scan->last_file = sqlite3_value_dup(sqlite3_column_value(stmt, NODE_SCAN_COL_FILE));
+            failed = !scan->last_file;
+            scan->phase = NODE_SCAN_FILE_SAME;
+        }
+    }
+    sqlite3_reset(stmt);
+    if (failed) {
+        store_set_error_sqlite(s, "node scan aborted");
+        for (int i = 0; i < n; i++) {
+            cbm_node_free_fields(&out[i]);
+        }
+        return CBM_STORE_ERR;
+    }
+    if (n < max) {
+        node_scan_phase_done(scan);
+    }
+    *got = n;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_node_scan_next(cbm_store_node_scan_t *scan, cbm_node_t *out, int max, int *count) {
+    *count = 0;
+    if (!scan || max <= 0) {
+        return CBM_STORE_OK;
+    }
+    if (scan->eager_failed) {
+        scan->eager_failed = false; /* reported once; the scan then reads as exhausted */
+        return CBM_STORE_ERR;
+    }
+    if (!scan->paged) {
+        int left = scan->eager_count - scan->eager_next;
+        int n = left < max ? left : max;
+        if (n > 0) {
+            memcpy(out, scan->eager + scan->eager_next, (size_t)n * sizeof(cbm_node_t));
+            memset(scan->eager + scan->eager_next, 0, (size_t)n * sizeof(cbm_node_t));
+            scan->eager_next += n;
+        }
+        *count = n;
+        return CBM_STORE_OK;
+    }
+    int n = 0;
+    while (n < max && !scan->done) {
+        int got = 0;
+        if (node_scan_page(scan, out + n, max - n, &got) != CBM_STORE_OK) {
+            /* A failed page yields no rows from this call and ends the scan;
+             * cbm_store_error() names the failure. */
+            for (int i = 0; i < n; i++) {
+                cbm_node_free_fields(&out[i]);
+            }
+            scan->done = true;
+            return CBM_STORE_ERR;
+        }
+        n += got;
+    }
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+void cbm_store_node_scan_close(cbm_store_node_scan_t *scan) {
+    if (!scan) {
+        return;
+    }
+    for (int i = 0; i < NODE_SCAN_STMTS; i++) {
+        sqlite3_finalize(scan->stmts[i]);
+    }
+    sqlite3_value_free(scan->last_file);
+    cbm_store_free_nodes(scan->eager, scan->eager_count); /* rows not handed out */
+    cbm_free(CBM_MEM_CLASS_STORE, scan->project);
+    cbm_free(CBM_MEM_CLASS_STORE, scan->label);
+    cbm_free(CBM_MEM_CLASS_STORE, scan);
+}
+
 typedef struct {
     cbm_store_cancel_fn cancel;
     void *context;

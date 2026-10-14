@@ -5831,6 +5831,267 @@ TEST(cypher_grouping_keeps_first_seen_groups) {
     PASS();
 }
 
+/* ── Streamed execution: chunks of start nodes give the single pass ──
+ *
+ * execute_single runs the start nodes through the pipeline in chunks rather
+ * than materialising every binding first (kernel count(*): 18 GB RSS). The
+ * chunked run must be indistinguishable from one pass over the whole start
+ * set: same rows in the same order, first-seen group order, ORDER BY ties,
+ * DISTINCT, LIMIT / max_rows truncation and OPTIONAL fallback rows. Each query
+ * runs as one chunk (the reference) and in chunks of 1, 7, 64 and the
+ * production default, so chunk boundaries fall inside groups and inside
+ * every start node's expansion order. */
+
+static int stream_run(cbm_store_t *s, const char *query, int max_rows, int chunk,
+                      cbm_cypher_result_t *out) {
+    memset(out, 0, sizeof(*out));
+    cbm_cypher_test_set_stream_chunk(chunk);
+    int rc = cbm_cypher_execute(s, query, "test", max_rows, out);
+    cbm_cypher_test_set_stream_chunk(0);
+    return rc;
+}
+
+static bool stream_same_str(const char *a, const char *b) {
+    return (!a && !b) || (a && b && strcmp(a, b) == 0);
+}
+
+static bool stream_results_equal(const cbm_cypher_result_t *a, const cbm_cypher_result_t *b) {
+    if (a->col_count != b->col_count || a->row_count != b->row_count ||
+        a->truncated != b->truncated || !stream_same_str(a->warning, b->warning) ||
+        !stream_same_str(a->error, b->error)) {
+        return false;
+    }
+    for (int c = 0; c < a->col_count; c++) {
+        if (strcmp(a->columns[c], b->columns[c]) != 0) {
+            return false;
+        }
+    }
+    for (int r = 0; r < a->row_count; r++) {
+        for (int c = 0; c < a->col_count; c++) {
+            if (strcmp(a->rows[r][c], b->rows[r][c]) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* True when every chunk size reproduces the single-pass result, which is
+ * left in *ref for the caller's own checks (caller frees). */
+static bool stream_matches_single_pass(cbm_store_t *s, const char *query, int max_rows,
+                                       cbm_cypher_result_t *ref) {
+    static const int chunks[] = {1, 7, 64, 0 /* production default */};
+    int ref_rc = stream_run(s, query, max_rows, INT_MAX, ref);
+    bool same = ref_rc == 0;
+    for (size_t i = 0; same && i < sizeof(chunks) / sizeof(chunks[0]); i++) {
+        cbm_cypher_result_t got;
+        int rc = stream_run(s, query, max_rows, chunks[i], &got);
+        same = rc == ref_rc && stream_results_equal(ref, &got);
+        if (!same) {
+            printf("  chunk %d differs from the single pass: %s\n", chunks[i], query);
+        }
+        cbm_cypher_result_free(&got);
+    }
+    return same;
+}
+
+/* Every pipeline consumer across chunk boundaries: unsorted rows, global and
+ * grouped aggregates (groups fed from many chunks), DISTINCT, late WHERE,
+ * collect, WITH aggregation and WITH sorting, RETURN * with and without a
+ * WITH, the default projection, edge variables and variable-length hops. */
+TEST(cypher_stream_chunks_match_single_pass) {
+    static const char *const queries[] = {
+        "MATCH (a)-[:CALLS]->(b) RETURN a.name, b.qualified_name",
+        "MATCH (a)-[:CALLS]->(b) RETURN count(*)",
+        "MATCH (a)-[:CALLS]->(b:Function) RETURN b.qualified_name, count(a) AS c ORDER BY c DESC",
+        "MATCH (a:Function)-[:CALLS]->(b) RETURN b.name, count(DISTINCT a.name) AS c",
+        "MATCH (a)-[:CALLS]->(b) RETURN DISTINCT b.name",
+        "MATCH (a)-[:CALLS]->(b) WHERE b.start_line > 20 RETURN a.name, b.name, b.start_line",
+        "MATCH (a)-[:CALLS]->(b) RETURN b.name, collect(a.name) AS cs",
+        ("MATCH (a:Function)-[:CALLS]->(b) WITH b, count(a) AS c WHERE c > 1 "
+         "RETURN b.name, c ORDER BY c DESC LIMIT 20"),
+        "MATCH (a)-[:CALLS]->(b) WITH a.name AS n, b.start_line AS l ORDER BY l DESC RETURN n, l",
+        "MATCH (a)-[:CALLS]->(b) WITH DISTINCT b.name AS n RETURN n",
+        "MATCH (a)-[:CALLS]->(b) RETURN *",
+        "MATCH (a)-[:CALLS]->(b) WITH a.name AS n RETURN *",
+        "MATCH (a)-[:CALLS]->(b)",
+        "MATCH (a)-[r:CALLS]->(b) RETURN type(r), a.name ORDER BY a.name",
+        "MATCH (a)-[:CALLS*1..2]->(b) RETURN a.name, b.name",
+    };
+    cbm_store_t *s = setup_reference_store();
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
+        cbm_cypher_result_t ref;
+        ASSERT_TRUE(stream_matches_single_pass(s, queries[i], 0, &ref));
+        ASSERT_GT(ref.row_count, 0);
+        ASSERT_FALSE(ref.truncated);
+        cbm_cypher_result_free(&ref);
+    }
+    cbm_store_close(s);
+    PASS();
+}
+
+/* OPTIONAL fallback rows (a start node with no match keeps its row, target
+ * unbound) sit between the expanded rows of their neighbours in every chunk
+ * layout; the multi-pattern form keeps its single pass. */
+TEST(cypher_stream_optional_across_chunks) {
+    cbm_store_t *s = setup_reference_store();
+    cbm_cypher_result_t ref;
+    ASSERT_TRUE(stream_matches_single_pass(
+        s, "OPTIONAL MATCH (a)<-[:CALLS]-(b) RETURN a.name, b.name", 0, &ref));
+    int fallback = 0;
+    for (int r = 0; r < ref.row_count; r++) {
+        fallback += ref.rows[r][1][0] == '\0' ? 1 : 0;
+    }
+    ASSERT_GT(fallback, 0);             /* uncalled nodes keep a row */
+    ASSERT_GT(ref.row_count, fallback); /* and called nodes expand */
+    cbm_cypher_result_free(&ref);
+
+    ASSERT_TRUE(stream_matches_single_pass(
+        s, "OPTIONAL MATCH (a)<-[:CALLS]-(b) RETURN a.qualified_name, count(b) AS c", 0, &ref));
+    ASSERT_EQ(ref.row_count, REF_NODES);
+    cbm_cypher_result_free(&ref);
+
+    ASSERT_TRUE(stream_matches_single_pass(
+        s, "MATCH (a:Function) OPTIONAL MATCH (a)<-[:CALLS]-(b) RETURN a.name, count(b)", 0, &ref));
+    ASSERT_GT(ref.row_count, 0);
+    cbm_cypher_result_free(&ref);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A LIMIT or the max_rows budget fills up in one chunk while later chunks
+ * still arrive: they must add nothing, and truncation is reported exactly
+ * when the single pass reports it (engine budget yes, explicit LIMIT no). */
+TEST(cypher_stream_limit_and_max_rows_across_chunks) {
+    cbm_store_t *s = setup_reference_store();
+    cbm_cypher_result_t ref;
+    ASSERT_TRUE(stream_matches_single_pass(
+        s, "MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name LIMIT 25", 0, &ref));
+    ASSERT_EQ(ref.row_count, 25);
+    ASSERT_FALSE(ref.truncated);
+    cbm_cypher_result_free(&ref);
+
+    ASSERT_TRUE(stream_matches_single_pass(
+        s, "MATCH (a)-[:CALLS]->(b) RETURN DISTINCT b.name LIMIT 30", 0, &ref));
+    ASSERT_EQ(ref.row_count, 30);
+    cbm_cypher_result_free(&ref);
+
+    ASSERT_TRUE(stream_matches_single_pass(
+        s, "MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name SKIP 5 LIMIT 10", 0, &ref));
+    ASSERT_EQ(ref.row_count, 10);
+    cbm_cypher_result_free(&ref);
+
+    static const char *const budgeted[] = {
+        "MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name",
+        "MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name ORDER BY b.name",
+        "MATCH (a)-[:CALLS]->(b) RETURN *",
+        "MATCH (a)-[:CALLS]->(b)",
+    };
+    for (size_t i = 0; i < sizeof(budgeted) / sizeof(budgeted[0]); i++) {
+        ASSERT_TRUE(stream_matches_single_pass(s, budgeted[i], 30, &ref));
+        ASSERT_EQ(ref.row_count, 30);
+        ASSERT_TRUE(ref.truncated);
+        cbm_cypher_result_free(&ref);
+    }
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A start-node scan that fails part-way fails the whole query: the rows read
+ * before the failure must not answer it as if they were all of them. Pages
+ * hold 7 rows at chunk 7; the store seam fails a page after earlier pages
+ * delivered rows (the all-nodes scan's first page is its empty NULL
+ * file_path pass, hence one more page before the fault). */
+TEST(cypher_stream_scan_failure_fails_query) {
+    static const struct {
+        const char *query;
+        int pages_before_fault;
+    } cases[] = {
+        {"MATCH (a:Function)-[:CALLS]->(b) RETURN a.name, b.name", 1},
+        {"MATCH (a:Function)-[:CALLS]->(b) RETURN count(*)", 1},
+        {"MATCH (n) RETURN n.name", 2},
+    };
+    cbm_store_t *s = setup_reference_store();
+    cbm_cypher_result_t r;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT_EQ(stream_run(s, cases[i].query, 0, 7, &r), 0);
+        ASSERT_GT(r.row_count, 0);
+        cbm_cypher_result_free(&r);
+
+        cbm_store_node_scan_test_fail_page_after(cases[i].pages_before_fault);
+        int rc = stream_run(s, cases[i].query, 0, 7, &r);
+        cbm_store_node_scan_test_fail_page_after(-1);
+        ASSERT_TRUE(rc != 0);
+        ASSERT_NOT_NULL(r.error);
+        ASSERT_TRUE(strstr(r.error, "reading the graph failed") != NULL);
+        ASSERT_TRUE(strstr(r.error, "injected page failure") != NULL);
+        ASSERT_EQ(r.row_count, 0);
+        cbm_cypher_result_free(&r);
+    }
+    /* The failure does not outlive its query. */
+    ASSERT_EQ(stream_run(s, cases[0].query, 0, 7, &r), 0);
+    ASSERT_GT(r.row_count, 0);
+    ASSERT_NULL(r.error);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The production chunk boundary itself: a start set of 2.5 chunks, a ring of
+ * calls plus five hubs whose caller groups straddle both boundaries. */
+TEST(cypher_stream_default_chunk_boundary) {
+    enum { STREAM_NODES = 2600, STREAM_HUBS = 5 };
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    static int64_t ids[STREAM_NODES];
+    for (int i = 0; i < STREAM_NODES; i++) {
+        char name[32];
+        char qn[32];
+        snprintf(name, sizeof(name), "fn_%d", i % 211);
+        snprintf(qn, sizeof(qn), "test.s%d", i);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "ring.c",
+                        .start_line = i % 37};
+        ids[i] = cbm_store_upsert_node(s, &n);
+    }
+    for (int i = 0; i < STREAM_NODES; i++) {
+        cbm_edge_t ring = {.project = "test",
+                           .source_id = ids[i],
+                           .target_id = ids[(i + 1) % STREAM_NODES],
+                           .type = "CALLS"};
+        cbm_edge_t hub = {.project = "test",
+                          .source_id = ids[i],
+                          .target_id = ids[i % STREAM_HUBS],
+                          .type = "CALLS"};
+        cbm_store_insert_edge(s, &ring);
+        if (i >= STREAM_HUBS) { /* no hub self-loops */
+            cbm_store_insert_edge(s, &hub);
+        }
+    }
+    static const char *const queries[] = {
+        "MATCH (a)-[:CALLS]->(b) RETURN count(*)",
+        "MATCH (a)-[:CALLS]->(b) RETURN a.qualified_name, b.qualified_name",
+        "MATCH (a:Function)-[:CALLS]->(b) RETURN b.qualified_name, count(a) AS c ORDER BY c DESC",
+        "MATCH (a)-[:CALLS]->(b) WITH b.name AS n, count(DISTINCT a.name) AS c RETURN n, c",
+        "MATCH (a)-[:CALLS]->(b) RETURN DISTINCT b.name LIMIT 300",
+    };
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
+        cbm_cypher_result_t ref;
+        ASSERT_TRUE(stream_matches_single_pass(s, queries[i], 0, &ref));
+        ASSERT_GT(ref.row_count, 0);
+        cbm_cypher_result_free(&ref);
+    }
+    cbm_cypher_result_t ref;
+    ASSERT_TRUE(stream_matches_single_pass(s, queries[0], 0, &ref));
+    ASSERT_STR_EQ(ref.rows[0][0], "5195"); /* 2600 ring + 2595 hub edges */
+    cbm_cypher_result_free(&ref);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════ */
 
 SUITE(cypher) {
@@ -6077,4 +6338,10 @@ SUITE(cypher) {
     RUN_TEST(cypher_order_by_is_the_stable_reference_order);
     RUN_TEST(cypher_distinct_keeps_first_occurrences);
     RUN_TEST(cypher_grouping_keeps_first_seen_groups);
+    /* Streamed execution: chunked start set == single pass */
+    RUN_TEST(cypher_stream_chunks_match_single_pass);
+    RUN_TEST(cypher_stream_optional_across_chunks);
+    RUN_TEST(cypher_stream_limit_and_max_rows_across_chunks);
+    RUN_TEST(cypher_stream_default_chunk_boundary);
+    RUN_TEST(cypher_stream_scan_failure_fails_query);
 }

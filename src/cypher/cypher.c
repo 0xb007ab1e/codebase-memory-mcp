@@ -1830,7 +1830,7 @@ static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_
     } while (check(p, TOK_COMMA));
 
     /* Projection is materialized per row into fixed-width stack arrays sized at
-     * CBM_SZ_32 columns (execute_return_simple and its siblings). Bound the
+     * CBM_SZ_32 columns (ret_sink_feed_rows and its siblings). Bound the
      * parsed item count to that width so an over-wide RETURN is rejected here
      * instead of writing past those arrays downstream.
      *
@@ -2619,6 +2619,28 @@ static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
     b->var_count++;
 }
 
+/* binding_set for a node the caller owns and is done with: the binding takes
+ * its strings instead of copying them, and *node is left empty, so the
+ * caller's node_fields_free of it is a no-op. A binding with no free slot
+ * takes nothing, as binding_set stores nothing. */
+static void binding_take_node(binding_t *b, const char *var, cbm_node_t *node) {
+    for (int i = 0; i < b->var_count; i++) {
+        if (strcmp(b->var_names[i], var) == 0) {
+            node_fields_free(&b->var_nodes[i]);
+            b->var_nodes[i] = *node;
+            memset(node, 0, sizeof(*node));
+            return;
+        }
+    }
+    if (b->var_count >= CYP_MAX_VARS) {
+        return;
+    }
+    b->var_names[b->var_count] = var; /* not owned — points to AST string */
+    b->var_nodes[b->var_count] = *node;
+    memset(node, 0, sizeof(*node));
+    b->var_count++;
+}
+
 static const char *eval_multiarg_func(binding_t *b, const cbm_return_item_t *item, char *buf,
                                       size_t bufsz);
 
@@ -3162,6 +3184,9 @@ static _Thread_local bool g_cypher_timed_out = false;
 /* Sticky for one cbm_cypher_execute call. Unlike row_count, this survives caps
  * that happen before DISTINCT, aggregation, ORDER BY, or the final projection. */
 static _Thread_local bool g_cypher_truncated = false;
+/* Set when the streamed start-node scan failed in this execution: the query
+ * fails with this store error rather than answer from the rows read so far. */
+static _Thread_local char g_cypher_scan_error[CBM_SZ_512];
 static _Thread_local int64_t g_cypher_deadline_override_ms = -1; /* test hook; <0 = default */
 
 #ifdef CBM_ENABLE_TEST_SEAMS
@@ -3508,7 +3533,7 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
         (*match_count)++; /* a real neighbour exists, OOM or not */
         binding_t nb = {0};
         binding_copy(&nb, b);
-        binding_set(&nb, to_var, &found);
+        binding_take_node(&nb, to_var, &found);
         if (rel_var) {
             binding_set_edge(&nb, rel_var, &edges[ei]);
         }
@@ -4737,33 +4762,57 @@ static void with_agg_free(with_agg_t *aggs, int agg_cnt, int item_count) {
     free(aggs);
 }
 
-/* Execute WITH aggregation path */
-static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings, int bind_count,
-                                   binding_t **vbindings, int *vcount) {
-    int agg_cap = CBM_SZ_256;
-    with_agg_t *aggs = calloc(agg_cap, sizeof(with_agg_t));
-    int agg_cnt = 0;
-    cypher_key_index_t groups = {0};
+/* WITH as a consumer of the binding stream (execute_chunk): aggregation groups
+ * and projected rows accumulate across feeds in input order, so a chunked run
+ * keeps the first-seen group order and row order of a single pass. */
+typedef struct {
+    cbm_return_clause_t *wc; /* NULL: the query has no WITH */
+    bool has_agg;
+    bool fed_any;
+    cbm_store_t *store; /* the first fed binding's store */
+    with_agg_t *aggs;
+    int agg_cnt;
+    int agg_cap;
+    cypher_key_index_t groups;
+    binding_t *vbindings; /* simple projection: one row per binding (mem core, class OTHER) */
+    int vcount;
+    int vcap;
+    bool oom; /* a row buffer could not grow: the query fails */
+} with_sink_t;
 
-    for (int bi = 0; bi < bind_count; bi++) {
-        char key[CBM_SZ_1K] = "";
-        with_agg_build_key(wc, &bindings[bi], key, sizeof(key));
-        int found =
-            with_agg_find_or_create(&aggs, &agg_cnt, &agg_cap, &groups, wc, &bindings[bi], key);
-        with_agg_accumulate(&aggs[found], wc, &bindings[bi]);
-    }
-    key_index_free(&groups);
-
-    *vbindings = safe_realloc(*vbindings, (agg_cnt + SKIP_ONE) * sizeof(binding_t));
-    if (!*vbindings) {
-        with_agg_free(aggs, agg_cnt, wc->count);
+static void with_sink_init(with_sink_t *s, cbm_return_clause_t *wc) {
+    memset(s, 0, sizeof(*s));
+    s->wc = wc;
+    if (!wc) {
         return;
+    }
+    for (int i = 0; i < wc->count; i++) {
+        if (is_aggregate_func(wc->items[i].func)) {
+            s->has_agg = true;
+            break;
+        }
+    }
+    if (s->has_agg) {
+        s->agg_cap = CBM_SZ_256;
+        s->aggs = calloc(s->agg_cap, sizeof(with_agg_t));
+    }
+}
+
+/* One projected row per aggregation group, in first-seen group order. */
+static binding_t *with_agg_rows(with_sink_t *s, int *vcount) {
+    cbm_return_clause_t *wc = s->wc;
+    with_agg_t *aggs = s->aggs;
+    int agg_cnt = s->agg_cnt;
+    binding_t *vbindings =
+        cbm_alloc(CBM_MEM_CLASS_OTHER, ((size_t)agg_cnt + SKIP_ONE) * sizeof(binding_t));
+    if (!vbindings) {
+        return NULL;
     }
     for (int a = 0; a < agg_cnt; a++) {
         binding_t vb = {0};
         /* Carry the store so node_prop can re-fetch a carried node's properties
          * (and compute in_degree/out_degree) on the projected virtual binding. */
-        vb.store = (bind_count > 0) ? bindings[0].store : NULL;
+        vb.store = s->store;
         for (int ci = 0; ci < wc->count; ci++) {
             char name_buf[CBM_SZ_256];
             const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
@@ -4781,9 +4830,9 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
                 with_add_vbinding_var(&vb, alias, aggs[a].group_vals[ci]);
             }
         }
-        (*vbindings)[(*vcount)++] = vb;
+        vbindings[(*vcount)++] = vb;
     }
-    with_agg_free(aggs, agg_cnt, wc->count);
+    return vbindings;
 }
 
 /* Execute WITH simple (non-aggregate) projection */
@@ -4807,6 +4856,49 @@ static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, in
         }
         vbindings[(*vcount)++] = vb;
     }
+}
+
+static void with_sink_feed(with_sink_t *s, binding_t *bindings, int bind_count) {
+    if (bind_count > 0 && !s->fed_any) {
+        s->fed_any = true;
+        s->store = bindings[0].store;
+    }
+    if (!s->has_agg) {
+        if (s->vcount + bind_count + SKIP_ONE > s->vcap) {
+            int need = s->vcount + bind_count + SKIP_ONE;
+            int cap = s->vcap * CYP_GROWTH_2 > need ? s->vcap * CYP_GROWTH_2 : need;
+            binding_t *grown =
+                cbm_realloc(CBM_MEM_CLASS_OTHER, s->vbindings, (size_t)cap * sizeof(binding_t));
+            if (!grown) {
+                s->oom = true; /* the query fails rather than lose rows */
+                return;
+            }
+            s->vbindings = grown;
+            s->vcap = cap;
+        }
+        execute_with_simple(s->wc, bindings, bind_count, s->vbindings, &s->vcount);
+        return;
+    }
+    for (int bi = 0; bi < bind_count; bi++) {
+        char key[CBM_SZ_1K] = "";
+        with_agg_build_key(s->wc, &bindings[bi], key, sizeof(key));
+        int found = with_agg_find_or_create(&s->aggs, &s->agg_cnt, &s->agg_cap, &s->groups, s->wc,
+                                            &bindings[bi], key);
+        with_agg_accumulate(&s->aggs[found], s->wc, &bindings[bi]);
+    }
+}
+
+/* Release a WITH sink that will not be finished (a failed query). */
+static void with_sink_free(with_sink_t *s) {
+    if (s->has_agg) {
+        key_index_free(&s->groups);
+        with_agg_free(s->aggs, s->agg_cnt, s->wc->count);
+    }
+    for (int i = 0; i < s->vcount; i++) {
+        binding_free(&s->vbindings[i]);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, s->vbindings);
+    memset(s, 0, sizeof(*s));
 }
 
 /* Apply post-WITH WHERE filter */
@@ -4875,30 +4967,20 @@ static void with_apply_distinct(cbm_return_clause_t *wc, binding_t *vbindings, i
     key_index_free(&seen);
 }
 
-static void execute_with_clause(cbm_query_t *q, binding_t **bindings_ptr, int *bind_count_ptr) {
-    cbm_return_clause_t *wc = q->with_clause;
-    if (!wc) {
-        return;
+/* The WITH output once every binding has been fed: projected rows (one per
+ * group or per binding), de-duplicated, sorted, skipped/limited and filtered
+ * by the post-WITH WHERE. The caller owns the returned rows. */
+static binding_t *with_sink_finish(with_sink_t *s, cbm_query_t *q, int *out_count) {
+    cbm_return_clause_t *wc = s->wc;
+    binding_t *vbindings = s->vbindings;
+    int vcount = s->vcount;
+    if (s->has_agg) {
+        key_index_free(&s->groups);
+        vcount = 0;
+        vbindings = with_agg_rows(s, &vcount);
+        with_agg_free(s->aggs, s->agg_cnt, wc->count);
     }
-    binding_t *bindings = *bindings_ptr;
-    int bind_count = *bind_count_ptr;
-
-    binding_t *vbindings = malloc((bind_count + SKIP_ONE) * sizeof(binding_t));
-    int vcount = 0;
-
-    bool has_agg = false;
-    for (int i = 0; i < wc->count; i++) {
-        if (is_aggregate_func(wc->items[i].func)) {
-            has_agg = true;
-            break;
-        }
-    }
-
-    if (has_agg) {
-        execute_with_aggregate(wc, bindings, bind_count, &vbindings, &vcount);
-    } else {
-        execute_with_simple(wc, bindings, bind_count, vbindings, &vcount);
-    }
+    memset(s, 0, sizeof(*s));
 
     /* WITH DISTINCT: dedup projected rows (no-op for aggregation, which already
      * collapses to one row per group). */
@@ -4908,17 +4990,12 @@ static void execute_with_clause(cbm_query_t *q, binding_t **bindings_ptr, int *b
 
     with_sort_skip_limit(wc, vbindings, &vcount);
 
-    for (int bi = 0; bi < bind_count; bi++) {
-        binding_free(&bindings[bi]);
-    }
-    free(bindings);
-
     if (q->post_with_where) {
         filter_bindings_where(q->post_with_where, vbindings, &vcount);
     }
 
-    *bindings_ptr = vbindings;
-    *bind_count_ptr = vcount;
+    *out_count = vcount;
+    return vbindings;
 }
 
 /* ── Execute a single query (no UNION recursion) ──────────────── */
@@ -5004,71 +5081,80 @@ static void project_star_row(binding_t *b, const char **vars, int vc, const char
     }
 }
 
+/* ── RETURN as a consumer of the binding stream ───────────────────
+ * execute_chunk feeds the projection chunk by chunk. Each projection walks its
+ * input in order and keeps its state between feeds (row cap, DISTINCT set,
+ * aggregation groups, bindings seen), so a chunked run yields exactly the
+ * rows, row order, first-seen group order and truncation of a single pass
+ * over all bindings. A query with a WITH feeds the WITH rows once. */
+typedef enum {
+    RET_SINK_DEFAULT, /* no RETURN: name, qualified_name, label per pattern-0 var */
+    RET_SINK_SIMPLE,
+    RET_SINK_AGG,
+    RET_SINK_STAR,
+    RET_SINK_STAR_AFTER_WITH,
+} ret_sink_kind_t;
+
+typedef struct ret_agg_entry ret_agg_entry_t;
+
+typedef struct {
+    cbm_return_clause_t *ret; /* NULL for the default projection */
+    result_builder_t *rb;
+    int max_rows;
+    ret_sink_kind_t kind;
+    bool has_agg;
+    bool done;   /* the row cap is full, or the deadline tripped: later rows add nothing */
+    int64_t fed; /* bindings fed so far */
+    int cap;     /* projection row cap */
+    bool cap_is_engine_budget;
+    rb_distinct_t seen;
+    const char *vars[CBM_SZ_32]; /* projected variables, or the WITH names of RETURN * */
+    int vc;
+    char names[CYP_MAX_VARS][CBM_SZ_128]; /* RETURN * after WITH: computed names */
+    ret_agg_entry_t *aggs;
+    int agg_count;
+    int agg_cap;
+    cypher_key_index_t groups;
+} ret_sink_t;
+
 /* RETURN * after a WITH.
  *
  * The pattern's variables are out of scope by this point — the WITH replaced
  * them with the names it made. Each of those names holds one value, not a
  * node, so each is ONE column rather than the four a node variable gets.
  *
- * Reading the pattern here instead is the fault this function exists to avoid:
- * it named variables the bindings no longer hold, found nothing for every one
- * of them, and answered a full result of empty strings with no error. */
-static void execute_return_star_after_with(cbm_query_t *q, binding_t *bindings, int bind_count,
-                                           int max_rows, result_builder_t *rb) {
+ * Reading the pattern here instead is the fault this projection exists to
+ * avoid: it named variables the bindings no longer hold, found nothing for
+ * every one of them, and answered a full result of empty strings with no
+ * error. */
+static void ret_sink_init_star_after_with(ret_sink_t *s, const cbm_query_t *q) {
     cbm_return_clause_t *wc = q->with_clause;
-    char name_bufs[CYP_MAX_VARS][CBM_SZ_128];
-    const char *cols[CYP_MAX_VARS];
+    s->kind = RET_SINK_STAR_AFTER_WITH;
     /* parse_return_or_with refuses a WITH wider than CYP_MAX_VARS, so this
-     * clamp cannot fire. It stays as the bound this function relies on. */
-    int col_n = wc->count < CYP_MAX_VARS ? wc->count : CYP_MAX_VARS;
-    for (int i = 0; i < col_n; i++) {
-        cols[i] = resolve_item_alias(&wc->items[i], name_bufs[i], sizeof(name_bufs[i]));
+     * clamp cannot fire. It stays as the bound this projection relies on. */
+    s->vc = wc->count < CYP_MAX_VARS ? wc->count : CYP_MAX_VARS;
+    for (int i = 0; i < s->vc; i++) {
+        s->vars[i] = resolve_item_alias(&wc->items[i], s->names[i], sizeof(s->names[i]));
     }
-    rb_set_columns(rb, cols, col_n);
-    rb_distinct_t seen;
-    rb_distinct_init(&seen, q->ret && q->ret->distinct);
-    for (int bi = 0; bi < bind_count; bi++) {
-        const char *vals[CYP_MAX_VARS];
-        for (int i = 0; i < col_n; i++) {
-            cbm_node_t *vn = binding_get(&bindings[bi], cols[i]);
-            vals[i] = vn && vn->name ? vn->name : "";
-        }
-        if (!rb_add_row_capped(rb, &seen, vals, max_rows)) {
-            g_cypher_truncated = true;
-            break;
-        }
-    }
-    rb_distinct_free(&seen);
+    rb_set_columns(s->rb, s->vars, s->vc);
+    s->cap = s->max_rows;
+    s->cap_is_engine_budget = true;
+    rb_distinct_init(&s->seen, s->ret->distinct);
 }
 
-static void execute_return_star(cbm_query_t *q, binding_t *bindings, int bind_count, int max_rows,
-                                result_builder_t *rb) {
-    if (q->with_clause) {
-        execute_return_star_after_with(q, bindings, bind_count, max_rows, rb);
-        return;
-    }
-    const char *vars[CBM_SZ_32];
-    int vc = collect_pattern_vars(q, vars, CBM_SZ_32);
-    build_star_columns(rb, vars, vc);
-    int projection_cap = max_rows;
-    bool cap_is_engine_budget = true;
-    cbm_return_clause_t *ret = q->ret;
-    if (ret && ret->limit >= 0 && ret->limit <= max_rows && ret->order_key_count == 0 &&
+static void ret_sink_init_star(ret_sink_t *s, cbm_query_t *q) {
+    s->kind = RET_SINK_STAR;
+    s->vc = collect_pattern_vars(q, s->vars, CBM_SZ_32);
+    build_star_columns(s->rb, s->vars, s->vc);
+    cbm_return_clause_t *ret = s->ret;
+    s->cap = s->max_rows;
+    s->cap_is_engine_budget = true;
+    if (ret->limit >= 0 && ret->limit <= s->max_rows && ret->order_key_count == 0 &&
         ret->skip <= 0) {
-        projection_cap = ret->limit; /* DISTINCT: the cap counts distinct rows (#1364) */
-        cap_is_engine_budget = false;
+        s->cap = ret->limit; /* DISTINCT: the cap counts distinct rows (#1364) */
+        s->cap_is_engine_budget = false;
     }
-    rb_distinct_t seen;
-    rb_distinct_init(&seen, ret && ret->distinct);
-    for (int bi = 0; bi < bind_count; bi++) {
-        const char *vals[CBM_SZ_128];
-        project_star_row(&bindings[bi], vars, vc, vals);
-        if (!rb_add_row_capped(rb, &seen, vals, projection_cap)) {
-            g_cypher_truncated = g_cypher_truncated || cap_is_engine_budget;
-            break;
-        }
-    }
-    rb_distinct_free(&seen);
+    rb_distinct_init(&s->seen, ret->distinct);
 }
 
 /* Format an aggregate value into buf based on function name */
@@ -5110,8 +5196,8 @@ static void format_agg_value(const char *func, int count, double sum, double min
     }
 }
 
-/* RETURN aggregation entry */
-typedef struct {
+/* RETURN aggregation entry (ret_agg_entry_t, declared with ret_sink_t) */
+struct ret_agg_entry {
     char group_key[CBM_SZ_1K];
     const char **group_vals;
     double *sums;
@@ -5120,7 +5206,7 @@ typedef struct {
     char ***collect_lists;
     int *collect_counts;
     CBMHashTable **distinct_sets; /* per-item hash over a COUNT(DISTINCT) list (lazy) */
-} ret_agg_entry_t;
+};
 
 /* Initialize a new RETURN aggregation group */
 static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item_count,
@@ -5273,17 +5359,13 @@ static void ret_agg_emit_row(cbm_return_clause_t *ret, ret_agg_entry_t *agg, res
     rb_add_row(rb, row);
 }
 
-static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, int bind_count,
-                               result_builder_t *rb) {
-    int agg_cap = CBM_SZ_256;
-    ret_agg_entry_t *aggs = calloc(agg_cap, sizeof(ret_agg_entry_t));
-    int agg_count = 0;
-    cypher_key_index_t groups = {0};
-
-    for (int bi = 0; bi < bind_count; bi++) {
+static void ret_sink_feed_agg(ret_sink_t *s, binding_t *bindings, int bind_count) {
+    cbm_return_clause_t *ret = s->ret;
+    for (int bi = 0; bi < bind_count && !s->done; bi++) {
         /* #601: a whole-graph GROUP BY visits every binding. Abort if we blow
          * the wall-clock budget. */
-        if ((bi & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
+        if (((s->fed + bi) & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
+            s->done = true;
             break;
         }
         char key[CBM_SZ_1K] = "";
@@ -5291,29 +5373,23 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
         char valbufs[CBM_SZ_32][CBM_SZ_512];
         ret_agg_build_key(ret, &bindings[bi], key, sizeof(key), vals, valbufs);
 
-        int found = key_index_find(&groups, key);
-        for (int a = 0; found == KEY_INDEX_UNKNOWN && a < agg_count; a++) {
-            if (strcmp(aggs[a].group_key, key) == 0) {
+        int found = key_index_find(&s->groups, key);
+        for (int a = 0; found == KEY_INDEX_UNKNOWN && a < s->agg_count; a++) {
+            if (strcmp(s->aggs[a].group_key, key) == 0) {
                 found = a;
             }
         }
         if (found < 0) {
-            if (agg_count >= agg_cap) {
-                agg_cap *= PAIR_LEN;
-                aggs = safe_realloc(aggs, agg_cap * sizeof(ret_agg_entry_t));
+            if (s->agg_count >= s->agg_cap) {
+                s->agg_cap *= PAIR_LEN;
+                s->aggs = safe_realloc(s->aggs, s->agg_cap * sizeof(ret_agg_entry_t));
             }
-            found = agg_count++;
-            ret_agg_init_group(&aggs[found], key, ret->count, vals);
-            key_index_add(&groups, aggs[found].group_key, found);
+            found = s->agg_count++;
+            ret_agg_init_group(&s->aggs[found], key, ret->count, vals);
+            key_index_add(&s->groups, s->aggs[found].group_key, found);
         }
-        ret_agg_accumulate(&aggs[found], ret, &bindings[bi]);
+        ret_agg_accumulate(&s->aggs[found], ret, &bindings[bi]);
     }
-    key_index_free(&groups);
-
-    for (int a = 0; a < agg_count; a++) {
-        ret_agg_emit_row(ret, &aggs[a], rb);
-    }
-    ret_agg_free(aggs, agg_count, ret->count);
 }
 
 /* Build RETURN column names from items */
@@ -5346,30 +5422,30 @@ static void build_return_columns(result_builder_t *rb, cbm_return_clause_t *ret)
     }
 }
 
-/* Execute simple (non-aggregate) RETURN projection */
-static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings, int bind_count,
-                                  int max_rows, result_builder_t *rb) {
-    int proj_cap = max_rows;
-    bool cap_is_engine_budget = true;
-    if (ret->limit >= 0 && ret->order_key_count == 0 && ret->skip <= 0) {
-        proj_cap = ret->limit; /* DISTINCT: the cap counts distinct rows (#1364) */
-        cap_is_engine_budget = false;
-    }
-    rb_distinct_t seen;
-    rb_distinct_init(&seen, ret->distinct);
-    for (int bi = 0; bi < bind_count; bi++) {
-        const char *vals[CBM_SZ_32];
+/* Row projections (simple RETURN, RETURN *, RETURN * after WITH): one row per
+ * binding until the row cap is full. */
+static void ret_sink_feed_rows(ret_sink_t *s, binding_t *bindings, int bind_count) {
+    for (int bi = 0; bi < bind_count && !s->done; bi++) {
+        const char *vals[CBM_SZ_128];
         char func_bufs[CBM_SZ_32][CBM_SZ_512];
-        for (int ci = 0; ci < ret->count; ci++) {
-            vals[ci] =
-                project_item(&bindings[bi], &ret->items[ci], func_bufs[ci], sizeof(func_bufs[ci]));
+        if (s->kind == RET_SINK_SIMPLE) {
+            for (int ci = 0; ci < s->ret->count; ci++) {
+                vals[ci] = project_item(&bindings[bi], &s->ret->items[ci], func_bufs[ci],
+                                        sizeof(func_bufs[ci]));
+            }
+        } else if (s->kind == RET_SINK_STAR) {
+            project_star_row(&bindings[bi], s->vars, s->vc, vals);
+        } else {
+            for (int i = 0; i < s->vc; i++) {
+                cbm_node_t *vn = binding_get(&bindings[bi], s->vars[i]);
+                vals[i] = vn && vn->name ? vn->name : "";
+            }
         }
-        if (!rb_add_row_capped(rb, &seen, vals, proj_cap)) {
-            g_cypher_truncated = g_cypher_truncated || cap_is_engine_budget;
-            break;
+        if (!rb_add_row_capped(s->rb, &s->seen, vals, s->cap)) {
+            g_cypher_truncated = g_cypher_truncated || s->cap_is_engine_budget;
+            s->done = true;
         }
     }
-    rb_distinct_free(&seen);
 }
 
 /* Build default 3-column headers (name, qualified_name, label) per variable */
@@ -5392,24 +5468,26 @@ static void build_default_columns(result_builder_t *rb, const char **vars, int v
 }
 
 /* Default projection when no RETURN clause */
-static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings, int bind_count,
-                                       int max_rows, result_builder_t *rb) {
-    const char *vars[CYP_MAX_VARS];
-    int vc = 0;
+static void ret_sink_init_default(ret_sink_t *s, const cbm_pattern_t *pat0) {
+    s->kind = RET_SINK_DEFAULT;
     for (int ni = 0; ni < pat0->node_count; ni++) {
         if (pat0->nodes[ni].variable) {
-            if (vc < CYP_MAX_VARS) {
-                vars[vc++] = pat0->nodes[ni].variable;
+            if (s->vc < CYP_MAX_VARS) {
+                s->vars[s->vc++] = pat0->nodes[ni].variable;
             } else {
                 g_cypher_truncated = true;
             }
         }
     }
-    build_default_columns(rb, vars, vc);
-    for (int bi = 0; bi < bind_count && rb->row_count < max_rows; bi++) {
+    build_default_columns(s->rb, s->vars, s->vc);
+}
+
+static void ret_sink_feed_default(ret_sink_t *s, binding_t *bindings, int bind_count) {
+    result_builder_t *rb = s->rb;
+    for (int bi = 0; bi < bind_count && rb->row_count < s->max_rows; bi++) {
         const char *vals[CYP_COL_BUF];
-        for (int v = 0; v < vc; v++) {
-            cbm_node_t *n = binding_get(&bindings[bi], vars[v]);
+        for (int v = 0; v < s->vc; v++) {
+            cbm_node_t *n = binding_get(&bindings[bi], s->vars[v]);
             vals[(size_t)v * CYP_EDGE_COLS] = n && n->name ? n->name : "";
             vals[((size_t)v * CYP_EDGE_COLS) + SKIP_ONE] =
                 n && n->qualified_name ? n->qualified_name : "";
@@ -5417,9 +5495,98 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
         }
         rb_add_row(rb, vals);
     }
-    if (bind_count > max_rows) {
-        g_cypher_truncated = true;
+}
+
+static void ret_sink_init(ret_sink_t *s, cbm_query_t *q, int max_rows, result_builder_t *rb) {
+    memset(s, 0, sizeof(*s));
+    s->ret = q->ret;
+    s->rb = rb;
+    s->max_rows = max_rows;
+    rb_init(rb);
+    cbm_return_clause_t *ret = q->ret;
+    if (!ret) {
+        ret_sink_init_default(s, &q->patterns[0]);
+        return;
     }
+    for (int i = 0; i < ret->count; i++) {
+        if (is_aggregate_func(ret->items[i].func)) {
+            s->has_agg = true;
+            break;
+        }
+    }
+    if (ret->star) {
+        if (q->with_clause) {
+            ret_sink_init_star_after_with(s, q);
+        } else {
+            ret_sink_init_star(s, q);
+        }
+        return;
+    }
+    build_return_columns(rb, ret);
+    if (s->has_agg) {
+        s->kind = RET_SINK_AGG;
+        s->agg_cap = CBM_SZ_256;
+        s->aggs = calloc(s->agg_cap, sizeof(ret_agg_entry_t));
+        return;
+    }
+    s->kind = RET_SINK_SIMPLE;
+    s->cap = max_rows;
+    s->cap_is_engine_budget = true;
+    if (ret->limit >= 0 && ret->order_key_count == 0 && ret->skip <= 0) {
+        s->cap = ret->limit; /* DISTINCT: the cap counts distinct rows (#1364) */
+        s->cap_is_engine_budget = false;
+    }
+    rb_distinct_init(&s->seen, ret->distinct);
+}
+
+static void ret_sink_feed(ret_sink_t *s, binding_t *bindings, int bind_count) {
+    if (s->kind == RET_SINK_DEFAULT) {
+        ret_sink_feed_default(s, bindings, bind_count);
+    } else if (s->kind == RET_SINK_AGG) {
+        ret_sink_feed_agg(s, bindings, bind_count);
+    } else {
+        ret_sink_feed_rows(s, bindings, bind_count);
+    }
+    s->fed += bind_count;
+}
+
+/* Release the sink's own state; the projected rows stay in the builder. */
+static void ret_sink_free(ret_sink_t *s) {
+    if (s->kind == RET_SINK_AGG) {
+        key_index_free(&s->groups);
+        ret_agg_free(s->aggs, s->agg_count, s->ret->count);
+        s->aggs = NULL;
+        s->agg_count = 0;
+    }
+    rb_distinct_free(&s->seen);
+}
+
+/* Emit the aggregation groups, then DISTINCT / ORDER BY / SKIP / LIMIT. */
+static void ret_sink_finish(ret_sink_t *s) {
+    result_builder_t *rb = s->rb;
+    cbm_return_clause_t *ret = s->ret;
+    if (s->kind == RET_SINK_DEFAULT) {
+        if (s->fed > s->max_rows) {
+            g_cypher_truncated = true;
+        }
+        return;
+    }
+    if (s->kind == RET_SINK_AGG) {
+        for (int a = 0; a < s->agg_count; a++) {
+            ret_agg_emit_row(ret, &s->aggs[a], rb);
+        }
+    }
+    ret_sink_free(s);
+
+    /* The simple and star projections de-duplicate while projecting (#1364);
+     * only aggregate rows still need the post-pass. */
+    if (ret->distinct && s->has_agg && !ret->star) {
+        rb_apply_distinct(rb);
+    }
+    rb_apply_order_by(rb, ret);
+    bool limit_is_engine_budget = ret->limit < 0;
+    rb_apply_skip_limit(rb, ret->skip, limit_is_engine_budget ? s->max_rows : ret->limit,
+                        limit_is_engine_budget);
 }
 
 /* Worst-case binding_t slot count for a node cross-join: one row per
@@ -5612,7 +5779,7 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                     match_count++;
                     binding_t nb = {0};
                     binding_copy(&nb, b);
-                    binding_set(&nb, start_var, &found);
+                    binding_take_node(&nb, start_var, &found);
                     if (rel->variable) {
                         binding_set_edge(&nb, rel->variable, &edges[ei]);
                     }
@@ -5687,39 +5854,6 @@ static int expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const 
         }
     }
     return 0;
-}
-
-/* Project RETURN clause results */
-static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, binding_t *bindings,
-                                  int bind_count, int max_rows, result_builder_t *rb) {
-    bool has_agg = false;
-    for (int i = 0; i < ret->count; i++) {
-        if (is_aggregate_func(ret->items[i].func)) {
-            has_agg = true;
-            break;
-        }
-    }
-
-    if (ret->star) {
-        execute_return_star(q, bindings, bind_count, max_rows, rb);
-    } else {
-        build_return_columns(rb, ret);
-        if (has_agg) {
-            execute_return_agg(ret, bindings, bind_count, rb);
-        } else {
-            execute_return_simple(ret, bindings, bind_count, max_rows, rb);
-        }
-    }
-
-    /* The simple and star projections de-duplicate while projecting (#1364);
-     * only aggregate rows still need the post-pass. */
-    if (ret->distinct && has_agg && !ret->star) {
-        rb_apply_distinct(rb);
-    }
-    rb_apply_order_by(rb, ret);
-    bool limit_is_engine_budget = ret->limit < 0;
-    rb_apply_skip_limit(rb, ret->skip, limit_is_engine_budget ? max_rows : ret->limit,
-                        limit_is_engine_budget);
 }
 
 /* ── Planner: seed a single-hop pattern from its selective end ──────────────
@@ -5828,33 +5962,247 @@ static void cypher_plan_seed_from_selective_end(cbm_query_t *q) {
     }
 }
 
-static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
-                          result_builder_t *rb) {
-    cypher_plan_seed_from_selective_end(q);
-    cbm_pattern_t *pat0 = &q->patterns[0];
+/* ── Streamed execution ──────────────────────────────────────────────
+ *
+ * The start nodes run through the pipeline (pattern-0 hops, late WHERE, WITH,
+ * RETURN) in chunks of CYPHER_STREAM_CHUNK instead of materialising every
+ * binding of the whole set first. On the kernel graph (7.5 M nodes, 1.9 M
+ * CALLS edges) `MATCH (a)-[:CALLS]->(b) RETURN count(*)` held a deep-copied
+ * binding per start node and per expanded row at once: 23 GB RSS, killed in a
+ * 12 GB container. Each hop emits a binding's expansions in the order of its
+ * input bindings, and every consumer keeps its state between chunks, so the
+ * concatenated chunk outputs are the single-pass output, order included.
+ *
+ * Additional MATCH patterns keep one pass: they pick their join strategy from
+ * the first binding of the whole set and refuse a cross join by its size. */
+#define CYPHER_STREAM_CHUNK 1024
 
-    /* Step 1: Scan initial nodes */
-    cbm_node_t *scanned = NULL;
-    int scan_count = 0;
-    scan_pattern_nodes(store, project, &pat0->nodes[0], &scanned, &scan_count);
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local int g_cypher_stream_chunk = 0; /* test override; 0 = default */
+
+void cbm_cypher_test_set_stream_chunk(int start_nodes) {
+    g_cypher_stream_chunk = start_nodes;
+}
+#endif
+
+static int cypher_stream_chunk(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_cypher_stream_chunk > 0) {
+        return g_cypher_stream_chunk;
+    }
+#endif
+    return CYPHER_STREAM_CHUNK;
+}
+
+typedef struct {
+    with_sink_t with;
+    ret_sink_t ret;
+} cypher_sink_t;
+
+static void sink_feed(cypher_sink_t *s, binding_t *bindings, int bind_count) {
+    if (s->with.wc) {
+        with_sink_feed(&s->with, bindings, bind_count);
+    } else {
+        ret_sink_feed(&s->ret, bindings, bind_count);
+    }
+}
+
+static void sink_finish(cypher_sink_t *s, cbm_query_t *q) {
+    if (s->with.wc) {
+        int vcount = 0;
+        binding_t *vbindings = with_sink_finish(&s->with, q, &vcount);
+        ret_sink_feed(&s->ret, vbindings, vcount);
+        for (int bi = 0; bi < vcount; bi++) {
+            binding_free(&vbindings[bi]);
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, vbindings);
+    }
+    ret_sink_finish(&s->ret);
+}
+
+static void sink_free(cypher_sink_t *s) {
+    if (s->with.wc) {
+        with_sink_free(&s->with);
+    }
+    ret_sink_free(&s->ret);
+}
+
+/* Pattern 0's start nodes in scan_pattern_nodes' order, pulled a chunk at a
+ * time from the store's streamed scan instead of materialised up front: a
+ * label alternation reads each label's scan in turn, and the inline property
+ * filter drops nodes as they arrive. */
+typedef struct {
+    cbm_store_t *store;
+    const char *project;
+    const cbm_node_pattern_t *node;
+    char *labels; /* label alternation "A|B": strtok_r copy, else NULL */
+    char *labels_save;
+    bool labels_started;
+    cbm_store_node_scan_t *scan;
+    bool done;
+    bool failed; /* the scan could not be read to its end: the query fails */
+} start_source_t;
+
+/* A start-node scan failed part-way. The rows read so far must not answer the
+ * query as if they were all of them: record the store's error for
+ * cbm_cypher_execute, which fails the query with it. */
+static void start_source_fail(start_source_t *src, const char *why) {
+    src->failed = true;
+    src->done = true;
+    snprintf(g_cypher_scan_error, sizeof(g_cypher_scan_error), "%s",
+             why && why[0] ? why : "unknown store error");
+    cbm_log_error("cypher.scan_failed", "error", g_cypher_scan_error);
+}
+
+static void start_source_open(start_source_t *src, cbm_store_t *store, const char *project,
+                              const cbm_node_pattern_t *node) {
+    memset(src, 0, sizeof(*src));
+    src->store = store;
+    src->project = project;
+    src->node = node;
+    if (node->label && strchr(node->label, '|')) {
+        src->labels = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, node->label);
+        if (!src->labels) {
+            start_source_fail(src, "out of memory");
+        }
+        return; /* one scan per label, opened as the previous one ends */
+    }
+    src->scan = cbm_store_node_scan_open(store, project, node->label);
+    if (!src->scan) {
+        start_source_fail(src, cbm_store_error(store));
+    }
+}
+
+/* Open the next label's scan of an alternation; false when none is left. */
+static bool start_source_next_label(start_source_t *src) {
+    char *tok = strtok_r(src->labels_started ? NULL : src->labels, "|", &src->labels_save);
+    src->labels_started = true;
+    if (!tok) {
+        return false;
+    }
+    src->scan = cbm_store_node_scan_open(src->store, src->project, tok);
+    if (!src->scan) {
+        start_source_fail(src, cbm_store_error(src->store));
+    }
+    return true;
+}
+
+/* Fill out[0..max) with the next start nodes. Fewer than max only once the
+ * scan is exhausted or has failed. */
+static int start_source_next(start_source_t *src, cbm_node_t *out, int max) {
+    const cbm_node_pattern_t *node = src->node;
+    int got = 0;
+    while (got < max && !src->done) {
+        if (!src->scan) {
+            if (!src->labels || !start_source_next_label(src)) {
+                src->done = true;
+            }
+            continue;
+        }
+        int n = 0;
+        if (cbm_store_node_scan_next(src->scan, out + got, max - got, &n) != CBM_STORE_OK) {
+            start_source_fail(src, cbm_store_error(src->store));
+            break;
+        }
+        if (n == 0) {
+            cbm_store_node_scan_close(src->scan);
+            src->scan = NULL;
+            src->done = !src->labels;
+            continue;
+        }
+        /* Apply inline property filters — free rejected nodes' strings */
+        int kept = got;
+        for (int i = got; i < got + n; i++) {
+            if (node->prop_count == 0 ||
+                check_inline_props(&out[i], node->props, node->prop_count, src->store)) {
+                if (kept != i) {
+                    out[kept] = out[i];
+                }
+                kept++;
+            } else {
+                node_fields_free(&out[i]);
+            }
+        }
+        got = kept;
+    }
+    return got;
+}
+
+static void start_source_close(start_source_t *src) {
+    cbm_store_node_scan_close(src->scan);
+    cbm_free(CBM_MEM_CLASS_OTHER, src->labels);
+    memset(src, 0, sizeof(*src));
+}
+
+/* Release a start-node batch: the strings the store gave each node (left
+ * empty once moved into a binding) and the array itself. */
+static void start_nodes_free(cbm_node_t *nodes, int count) {
+    for (int i = 0; nodes && i < count; i++) {
+        node_fields_free(&nodes[i]);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, nodes);
+}
+
+/* Pull up to `chunk` start nodes (INT_MAX: all of them) into *out. */
+static int pull_start_nodes(start_source_t *src, int chunk, cbm_node_t **out, int *count) {
+    int cap = chunk < CYPHER_STREAM_CHUNK ? chunk : CYPHER_STREAM_CHUNK;
+    cbm_node_t *nodes = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)cap * sizeof(cbm_node_t));
+    int n = 0;
+    while (nodes) {
+        n += start_source_next(src, nodes + n, cap - n);
+        if (n < cap || cap == chunk) {
+            break; /* scan exhausted, or the chunk is full */
+        }
+        int grown_cap = cap > chunk / PAIR_LEN ? chunk : cap * PAIR_LEN;
+        cbm_node_t *grown =
+            cbm_realloc(CBM_MEM_CLASS_OTHER, nodes, (size_t)grown_cap * sizeof(cbm_node_t));
+        if (!grown) {
+            start_nodes_free(nodes, n);
+            nodes = NULL;
+            break;
+        }
+        nodes = grown;
+        cap = grown_cap;
+    }
+    *out = nodes;
+    *count = nodes ? n : 0;
+    return nodes ? 0 : CBM_NOT_FOUND;
+}
+
+/* Run the next chunk of start nodes through the pipeline into the sink. The
+ * start nodes' strings move into their bindings and are released with them.
+ * *start_index is the chunk's position in the whole start set. */
+static int execute_chunk(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
+                         start_source_t *src, int chunk, int *start_index, cypher_sink_t *sink) {
+    cbm_pattern_t *pat0 = &q->patterns[0];
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    if (pull_start_nodes(src, chunk, &nodes, &node_count) != 0) {
+        return CBM_NOT_FOUND; /* start node array refused */
+    }
+    if (src->failed) {
+        start_nodes_free(nodes, node_count);
+        return CBM_NOT_FOUND; /* the scan failed: no answer from part of it */
+    }
 
     /* Build initial bindings with early WHERE */
-    int bind_cap = scan_count > max_rows ? scan_count : (max_rows > 0 ? max_rows : SKIP_ONE);
+    int bind_cap = node_count;
     binding_t *bindings = malloc(((size_t)bind_cap + SKIP_ONE) * sizeof(binding_t));
     if (!bindings) {
-        cbm_store_free_nodes(scanned, scan_count);
+        start_nodes_free(nodes, node_count);
         return CBM_NOT_FOUND; /* initial binding array refused */
     }
     int bind_count = 0;
     const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : CYP_ANON_HEAD_VAR;
 
-    for (int i = 0; i < scan_count && bind_count < bind_cap; i++) {
-        if ((i & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
+    int first = *start_index;
+    for (int i = 0; i < node_count; i++) {
+        if (((first + i) & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
             break;
         }
         binding_t b = {0};
         b.store = store;
-        binding_set(&b, var_name, &scanned[i]);
+        binding_take_node(&b, var_name, &nodes[i]);
         bool pass = eval_where_partial(q->where, &b) != CYP_PARTIAL_FALSE;
         if (pass) {
             bindings[bind_count++] = b;
@@ -5862,44 +6210,64 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
             binding_free(&b);
         }
     }
+    *start_index = first + node_count;
+    start_nodes_free(nodes, node_count); /* + strings of nodes a deadline left untaken */
 
-    /* Step 2: Expand first pattern's relationships */
+    /* Expand first pattern's relationships */
     expand_pattern_rels(store, pat0, &bindings, &bind_count, &bind_cap, &var_name,
                         q->pattern_optional[0]);
 
-    /* Step 2b: Additional patterns */
-    if (expand_additional_patterns(store, q, project, max_rows, &bindings, &bind_count,
-                                   &bind_cap) != 0) {
-        for (int bi = 0; bi < bind_count; bi++) {
-            binding_free(&bindings[bi]);
+    /* Additional patterns */
+    int rc =
+        expand_additional_patterns(store, q, project, max_rows, &bindings, &bind_count, &bind_cap);
+    if (rc == 0) {
+        /* Late WHERE */
+        if (q->where && (pat0->rel_count > 0 || q->pattern_count > SKIP_ONE)) {
+            filter_bindings_where(q->where, bindings, &bind_count);
         }
-        free(bindings);
-        cbm_store_free_nodes(scanned, scan_count);
-        return CBM_NOT_FOUND; /* cross-join allocation refused/failed */
-    }
-
-    /* Step 3: Late WHERE */
-    if (q->where && (pat0->rel_count > 0 || q->pattern_count > SKIP_ONE)) {
-        filter_bindings_where(q->where, bindings, &bind_count);
-    }
-
-    /* Step 3b: WITH clause */
-    execute_with_clause(q, &bindings, &bind_count);
-
-    /* Step 4: Project results */
-    rb_init(rb);
-    if (q->ret) {
-        execute_return_clause(q, q->ret, bindings, bind_count, max_rows, rb);
-    } else {
-        execute_default_projection(pat0, bindings, bind_count, max_rows, rb);
+        sink_feed(sink, bindings, bind_count);
+        if (sink->with.oom) {
+            rc = CBM_NOT_FOUND; /* a WITH row buffer could not grow */
+        }
     }
 
     for (int bi = 0; bi < bind_count; bi++) {
         binding_free(&bindings[bi]);
     }
     free(bindings);
-    cbm_store_free_nodes(scanned, scan_count);
-    return 0;
+    return rc != 0 ? CBM_NOT_FOUND : 0; /* an allocation was refused or failed */
+}
+
+static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
+                          result_builder_t *rb) {
+    cypher_plan_seed_from_selective_end(q);
+    cbm_pattern_t *pat0 = &q->patterns[0];
+
+    /* Step 1: Scan initial nodes, streamed */
+    start_source_t src;
+    start_source_open(&src, store, project, &pat0->nodes[0]);
+
+    cypher_sink_t sink;
+    with_sink_init(&sink.with, q->with_clause);
+    ret_sink_init(&sink.ret, q, max_rows, rb);
+
+    /* Steps 2-4 per chunk: expand, late WHERE, WITH / RETURN. The pipeline
+     * runs at least once, so an empty scan still reaches the additional
+     * patterns and the projection exactly as a single pass does. */
+    int chunk = q->pattern_count > SKIP_ONE ? INT_MAX : cypher_stream_chunk();
+    int rc = 0;
+    int start_index = 0;
+    do {
+        rc = execute_chunk(store, q, project, max_rows, &src, chunk, &start_index, &sink);
+    } while (rc == 0 && !src.done && !g_cypher_timed_out);
+    start_source_close(&src);
+
+    if (rc == 0) {
+        sink_finish(&sink, q);
+    } else {
+        sink_free(&sink);
+    }
+    return rc;
 }
 
 /* ── Main entry point ─────────────────────────────────────────── */
@@ -6147,6 +6515,18 @@ static char *check_projection_scope(const cbm_query_t *q) {
     return NULL;
 }
 
+/* The error of an execution execute_single aborted: a failed start-node scan
+ * names the store's error, anything else was an allocation. */
+static char *cypher_abort_error(void) {
+    if (g_cypher_scan_error[0]) {
+        char buf[CBM_SZ_1K];
+        snprintf(buf, sizeof(buf), "query aborted: reading the graph failed (%s)",
+                 g_cypher_scan_error);
+        return heap_strdup(buf);
+    }
+    return heap_strdup("query aborted: out of memory or an allocation limit was reached");
+}
+
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
                        cbm_cypher_result_t *out) {
     memset(out, 0, sizeof(*out));
@@ -6154,6 +6534,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     g_cypher_trail_truncated = 0;
     g_cypher_truncated = false;
     g_cypher_regex_refused = false;
+    g_cypher_scan_error[0] = '\0';
     cypher_deadline_arm(); /* #601: start the wall-clock budget for this query */
     /* max_rows sizes the initial binding array: non-positive means the
      * ceiling, and nothing above the ceiling is ever materialized anyway. */
@@ -6182,7 +6563,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
         rb_free(&rb);
         cbm_query_free(q);
         out->truncated = g_cypher_truncated;
-        out->error = heap_strdup("query aborted: out of memory or an allocation limit was reached");
+        out->error = cypher_abort_error();
         return CBM_NOT_FOUND;
     }
 
@@ -6195,8 +6576,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
             rb_free(&rb2);
             cbm_query_free(q);
             out->truncated = g_cypher_truncated;
-            out->error =
-                heap_strdup("query aborted: out of memory or an allocation limit was reached");
+            out->error = cypher_abort_error();
             return CBM_NOT_FOUND;
         }
         /* Concatenate rows from rb2 into rb */

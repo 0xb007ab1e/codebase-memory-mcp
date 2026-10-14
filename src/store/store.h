@@ -625,6 +625,29 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count);
 
+/* Streamed node scan: the rows of cbm_store_find_nodes (label NULL) or
+ * cbm_store_find_nodes_by_label, in the same order, a batch at a time. Pages
+ * are keyset queries along the eager query's index, and no read lock is held
+ * between calls. open returns NULL on error. next fills out[0..max) and sets
+ * *count; a count of 0 means the scan is exhausted. The caller frees each
+ * returned node with cbm_node_free_fields. A failed read returns
+ * CBM_STORE_ERR with no rows from that call and ends the scan;
+ * cbm_store_error() names the failure. paged is false when the eager query's
+ * plan is not the one the pages reproduce: the scan then hands out the eager
+ * scan's rows (same order, no memory saving). Close the scan before closing
+ * the store. */
+typedef struct cbm_store_node_scan cbm_store_node_scan_t;
+cbm_store_node_scan_t *cbm_store_node_scan_open(cbm_store_t *s, const char *project,
+                                                const char *label);
+int cbm_store_node_scan_next(cbm_store_node_scan_t *scan, cbm_node_t *out, int max, int *count);
+bool cbm_store_node_scan_paged(const cbm_store_node_scan_t *scan);
+void cbm_store_node_scan_close(cbm_store_node_scan_t *scan);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* One-shot fault: after this many successful pages (of any scan), the next
+ * page fails like a SQLite step error; -1 disables the seam. */
+void cbm_store_node_scan_test_fail_page_after(int successful_pages);
+#endif
+
 /* Return a stable, paginated outline for one exact repository-relative file.
  * File/folder/container nodes are excluded. labels may be NULL when
  * label_count is zero; otherwise labels are exact-match filters. The query is
