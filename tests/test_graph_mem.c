@@ -12,6 +12,8 @@
 #include "test_helpers.h"
 #include <foundation/compat_thread.h>
 #include <foundation/mem.h>
+#include <foundation/mem_core.h>
+#include <mcp/mcp.h>
 #include <store/graph_mem.h>
 #include <store/store.h>
 #include <sqlite3.h>
@@ -598,6 +600,131 @@ TEST(graph_mem_concurrent_requests_build_once) {
     PASS();
 }
 
+/* Idle eviction reads this clock through the seam: tests move time instead
+ * of waiting for it. */
+static uint64_t g_gmt_now_ms;
+
+static uint64_t gmt_fake_clock(void) {
+    return g_gmt_now_ms;
+}
+
+static void gmt_clock_pin(uint64_t now_ms) {
+    g_gmt_now_ms = now_ms;
+    cbm_graph_mem_set_clock_for_testing(gmt_fake_clock);
+}
+
+TEST(graph_mem_idle_layer_evicted_after_idle_time) {
+    gmt_fixture_t f;
+    ASSERT_TRUE(gmt_fixture_build(&f));
+    uint64_t builds = cbm_graph_mem_build_count();
+    size_t saved = gmt_budget_pin(gmt_budget_roomy());
+    const uint64_t t0 = 1000000;
+    gmt_clock_pin(t0);
+    cbm_mem_class_flush_thread();
+    size_t class_before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_GRAPH_CACHE);
+
+    int first = gmt_request(f.db, f.ids[0]); /* built and released at t0 */
+    cbm_mem_class_flush_thread();
+    size_t class_cached = cbm_mem_class_live_bytes(CBM_MEM_CLASS_GRAPH_CACHE);
+    g_gmt_now_ms = t0 + CBM_GRAPH_MEM_IDLE_EVICT_MS - 1;
+    cbm_graph_mem_evict_expired();
+    int cached_just_before = cbm_graph_mem_cached_count();
+    g_gmt_now_ms = t0 + CBM_GRAPH_MEM_IDLE_EVICT_MS;
+    cbm_graph_mem_evict_expired();
+    int cached_at_expiry = cbm_graph_mem_cached_count();
+    size_t bytes_at_expiry = cbm_graph_mem_cached_bytes();
+    cbm_mem_class_flush_thread();
+    size_t class_evicted = cbm_mem_class_live_bytes(CBM_MEM_CLASS_GRAPH_CACHE);
+    /* The next walk builds again: eviction is a cache miss, not an error. */
+    int again = gmt_request(f.db, f.ids[0]);
+    uint64_t built = cbm_graph_mem_build_count() - builds;
+
+    cbm_graph_mem_set_clock_for_testing(NULL);
+    cbm_mem_set_budget_for_tests(saved);
+    gmt_fixture_free(&f);
+
+    ASSERT_GT(first, 0);
+    /* The layer is charged to its own class and given back in full. */
+    ASSERT_GT(class_cached, class_before);
+    ASSERT_EQ(class_evicted, class_before);
+    ASSERT_EQ(cached_just_before, 1);
+    ASSERT_EQ(cached_at_expiry, 0);
+    ASSERT_EQ(bytes_at_expiry, 0);
+    ASSERT_EQ(again, first);
+    ASSERT_EQ(built, 2);
+    PASS();
+}
+
+/* Idle time counts from the LAST release: a layer a request still holds is
+ * never evicted, however old its build. */
+TEST(graph_mem_held_layer_is_not_idle) {
+    gmt_fixture_t f;
+    ASSERT_TRUE(gmt_fixture_build(&f));
+    size_t saved = gmt_budget_pin(gmt_budget_roomy());
+    const uint64_t t0 = 5000000;
+    gmt_clock_pin(t0);
+
+    cbm_store_t *held = cbm_store_open_path_query(f.db);
+    int walked = held ? gmt_visited(held, f.ids[0]) : -1; /* acquired at t0, still held */
+    g_gmt_now_ms = t0 + 3 * (uint64_t)CBM_GRAPH_MEM_IDLE_EVICT_MS;
+    cbm_graph_mem_evict_expired();
+    int cached_while_held = cbm_graph_mem_cached_count();
+    const uint64_t released_at = g_gmt_now_ms;
+    cbm_store_close(held); /* released now: idle from here */
+    cbm_graph_mem_evict_expired();
+    int cached_after_release = cbm_graph_mem_cached_count();
+    g_gmt_now_ms = released_at + CBM_GRAPH_MEM_IDLE_EVICT_MS;
+    cbm_graph_mem_evict_expired();
+    int cached_after_idle = cbm_graph_mem_cached_count();
+
+    cbm_graph_mem_set_clock_for_testing(NULL);
+    cbm_mem_set_budget_for_tests(saved);
+    gmt_fixture_free(&f);
+
+    ASSERT_GT(walked, 0);
+    ASSERT_EQ(cached_while_held, 1);
+    ASSERT_EQ(cached_after_release, 1);
+    ASSERT_EQ(cached_after_idle, 0);
+    PASS();
+}
+
+/* The daemon has no timer: the next request is the clock. Any MCP request —
+ * here one for a tool that does not exist — sweeps expired layers on its way
+ * out, and a walk on another DB sweeps them on its way in. */
+TEST(graph_mem_next_request_evicts_expired_layers) {
+    gmt_fixture_t f;
+    gmt_fixture_t g;
+    ASSERT_TRUE(gmt_fixture_build(&f));
+    ASSERT_TRUE(gmt_fixture_build(&g));
+    size_t saved = gmt_budget_pin(gmt_budget_roomy());
+    const uint64_t t0 = 9000000;
+    gmt_clock_pin(t0);
+
+    (void)gmt_request(f.db, f.ids[0]);
+    g_gmt_now_ms = t0 + CBM_GRAPH_MEM_IDLE_EVICT_MS;
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *reply = srv ? cbm_mcp_handle_tool(srv, "no_such_tool", "{}") : NULL;
+    int cached_after_mcp = cbm_graph_mem_cached_count();
+    free(reply);
+    cbm_mcp_server_free(srv);
+
+    (void)gmt_request(f.db, f.ids[0]); /* f rebuilt at t0 + idle */
+    g_gmt_now_ms += CBM_GRAPH_MEM_IDLE_EVICT_MS;
+    (void)gmt_request(g.db, g.ids[0]); /* acquiring g retires the expired f */
+    int cached_after_walk = cbm_graph_mem_cached_count();
+
+    cbm_graph_mem_set_clock_for_testing(NULL);
+    cbm_mem_set_budget_for_tests(saved);
+    gmt_fixture_free(&f);
+    gmt_fixture_free(&g);
+
+    ASSERT_NOT_NULL(srv);
+    ASSERT_NOT_NULL(reply);
+    ASSERT_EQ(cached_after_mcp, 0);
+    ASSERT_EQ(cached_after_walk, 1); /* only g */
+    PASS();
+}
+
 SUITE(graph_mem) {
     RUN_TEST(graph_mem_bfs_matches_sql_on_every_shape);
     RUN_TEST(graph_mem_degree_search_matches_sql);
@@ -606,4 +733,7 @@ SUITE(graph_mem) {
     RUN_TEST(graph_mem_over_budget_keeps_sql_path);
     RUN_TEST(graph_mem_legacy_generation_keeps_sql_path);
     RUN_TEST(graph_mem_concurrent_requests_build_once);
+    RUN_TEST(graph_mem_idle_layer_evicted_after_idle_time);
+    RUN_TEST(graph_mem_held_layer_is_not_idle);
+    RUN_TEST(graph_mem_next_request_evicts_expired_layers);
 }

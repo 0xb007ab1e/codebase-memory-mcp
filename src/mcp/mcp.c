@@ -59,6 +59,7 @@ enum {
 #include "mcp/architecture_jobs.h"
 #include "mcp/test_impact.h"
 #include "mcp/test_impact_engine.h"
+#include "store/graph_mem.h"
 #include "store/store.h"
 #include "store/store_impact.h"
 #include <sqlite3.h>
@@ -20618,6 +20619,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     cbm_mem_phase_mark("request.release_store");
     release_request_store(srv);
+    /* Adjacency layers nobody used for a while go now: the next request is
+     * the daemon's clock, so no timer thread is needed (store/graph_mem.h). */
+    cbm_graph_mem_evict_expired();
     cbm_mem_phase_mark("idle");
     /* One census per completed request, so growth can be attributed to a POOL
      * rather than inferred from a process total (#581). Emitted after the

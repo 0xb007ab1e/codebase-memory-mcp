@@ -19,12 +19,15 @@
  *
  * Lifetime: the daemon closes its query stores after every request, so layers
  * live in a process-wide registry, shared by refcount across request threads.
- * Every byte is allocated through the memory core (CBM_MEM_CLASS_STORE) and
- * the registry is bounded: the layers together stay under a quarter of the
- * memory budget, idle ones are evicted oldest-first to make room, and a layer
- * that still would not fit (or that would push the process over its budget) is
- * not built — the caller keeps the SQL path. A build is all-or-nothing: a
- * failed or refused build leaves no partial layer behind.
+ * Every byte is allocated through the memory core (CBM_MEM_CLASS_GRAPH_CACHE)
+ * and the registry is bounded: the layers together stay under a quarter of
+ * the memory budget, unheld ones are evicted oldest-first to make room, and a
+ * layer that still would not fit (or that would push the process over its
+ * budget) is not built — the caller keeps the SQL path. A build is
+ * all-or-nothing: a failed or refused build leaves no partial layer behind.
+ * A layer nobody held for CBM_GRAPH_MEM_IDLE_EVICT_MS is evicted on the next
+ * request (no timer thread), and the daemon subtracts the resident bytes from
+ * what it hands index workers (cbm_graph_mem_cached_bytes).
  */
 #ifndef CBM_GRAPH_MEM_H
 #define CBM_GRAPH_MEM_H
@@ -81,15 +84,39 @@ int cbm_graph_mem_degree(const cbm_graph_mem_t *g, int64_t id, bool inbound,
 /* Bytes this layer holds (all through the memory core). */
 size_t cbm_graph_mem_bytes(const cbm_graph_mem_t *g);
 
+/* ── Idle eviction ──────────────────────────────────────────────── */
+
+/* How long a layer may sit unheld before it goes. Ten minutes outlasts the
+ * gaps between an agent's graph calls within one task (seconds to a few
+ * minutes), so a working session keeps its layer, while a session that moved
+ * on stops pinning it (237 MB for the kernel). A wrong guess costs one rebuild
+ * — about 1.2-1.5 s on the 17 GB kernel index, tens of ms on ordinary repos —
+ * against ten minutes of held memory. */
+enum { CBM_GRAPH_MEM_IDLE_EVICT_MS = 10 * 60 * 1000 };
+
+/* Evict every layer unheld for CBM_GRAPH_MEM_IDLE_EVICT_MS. The daemon calls
+ * it at the end of every request and acquire runs it too: a daemon that stops
+ * asking stops paying, with no timer thread. */
+void cbm_graph_mem_evict_expired(void);
+
 /* ── Registry introspection (tests, diagnostics) ─────────────────── */
 
-/* Layers currently held by the registry, and their total bytes. */
+/* Layers currently held by the registry, and their total bytes — every
+ * resident layer, held or not, which is what index-worker budgets give up. */
 int cbm_graph_mem_cached_count(void);
 size_t cbm_graph_mem_cached_bytes(void);
 /* Builds completed since process start: a test's proof that a call hit the
  * cache (unchanged) or built (incremented). */
 uint64_t cbm_graph_mem_build_count(void);
-/* Drop every idle layer (refs == 0). Held layers stay until released. */
+/* Drop every unheld layer (refs == 0), however recently used. */
 void cbm_graph_mem_drop_idle(void);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* The clock idle eviction reads; NULL restores cbm_now_ms. Tests move time
+ * instead of waiting for it. */
+void cbm_graph_mem_set_clock_for_testing(uint64_t (*now_ms)(void));
+/* Pin cbm_graph_mem_cached_bytes to `bytes`; 0 restores the live reading. */
+void cbm_graph_mem_set_cached_bytes_for_testing(size_t bytes);
+#endif
 
 #endif /* CBM_GRAPH_MEM_H */

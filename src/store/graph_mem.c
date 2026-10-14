@@ -39,7 +39,8 @@ struct cbm_graph_mem {
     bool ready;    /* built; false while its builder runs */
     bool detached; /* unlinked from the registry; freed at the last release */
     uint64_t last_use;
-    size_t bytes; /* reserved estimate while building, actual once ready */
+    uint64_t idle_since_ms; /* when the last reference went away */
+    size_t bytes;           /* reserved estimate while building, actual once ready */
 
     /* The graph, immutable once ready. Offsets cover node ids 0..n_ids-1:
      * the out-edges of id u are out_nbr/out_type[out_off[u] .. out_off[u+1]). */
@@ -67,12 +68,30 @@ static sqlite3_mutex *gm_registry_mutex(void) {
     return sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_APP2);
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static uint64_t (*g_clock_seam)(void);
+static size_t g_cached_bytes_seam;
+void cbm_graph_mem_set_clock_for_testing(uint64_t (*now_ms)(void)) {
+    g_clock_seam = now_ms;
+}
+void cbm_graph_mem_set_cached_bytes_for_testing(size_t bytes) {
+    g_cached_bytes_seam = bytes;
+}
+static uint64_t gm_now_ms(void) {
+    return g_clock_seam ? g_clock_seam() : cbm_now_ms();
+}
+#else
+static uint64_t gm_now_ms(void) {
+    return cbm_now_ms();
+}
+#endif
+
 static void *gm_alloc(size_t bytes) {
-    return cbm_alloc(CBM_MEM_CLASS_STORE, bytes ? bytes : 1);
+    return cbm_alloc(CBM_MEM_CLASS_GRAPH_CACHE, bytes ? bytes : 1);
 }
 
 static void gm_free_ptr(void *p) {
-    cbm_free(CBM_MEM_CLASS_STORE, p);
+    cbm_free(CBM_MEM_CLASS_GRAPH_CACHE, p);
 }
 
 static void gm_free_graph(cbm_graph_mem_t *g) {
@@ -166,6 +185,31 @@ static bool gm_make_room(size_t bytes) {
     return cbm_mem_charged() + bytes <= budget;
 }
 
+/* Retire every layer no request has held for CBM_GRAPH_MEM_IDLE_EVICT_MS.
+ * Returns the bytes given back. */
+static size_t gm_evict_expired_locked(uint64_t now) {
+    size_t freed = 0;
+    cbm_graph_mem_t *g = g_layers;
+    while (g) {
+        cbm_graph_mem_t *next = g->next;
+        if (g->ready && g->refs == 0 && now >= g->idle_since_ms &&
+            now - g->idle_since_ms >= CBM_GRAPH_MEM_IDLE_EVICT_MS) {
+            freed += g->bytes;
+            gm_retire(g);
+        }
+        g = next;
+    }
+    return freed;
+}
+
+static void gm_log_evicted(size_t freed) {
+    if (freed > 0) {
+        char bytes[CBM_SZ_32];
+        (void)snprintf(bytes, sizeof(bytes), "%zu", freed);
+        cbm_log_info("graph_mem.evict", "reason", "idle", "bytes", bytes);
+    }
+}
+
 /* ── Build ──────────────────────────────────────────────────────── */
 
 static bool gm_bounds(sqlite3 *db, int64_t *max_node, int64_t *max_edge) {
@@ -226,7 +270,7 @@ static bool gm_grow_u32(uint32_t **arr, size_t *cap, size_t need) {
     while (next < need) {
         next *= GM_GROWTH;
     }
-    uint32_t *grown = cbm_realloc(CBM_MEM_CLASS_STORE, *arr, next * sizeof(uint32_t));
+    uint32_t *grown = cbm_realloc(CBM_MEM_CLASS_GRAPH_CACHE, *arr, next * sizeof(uint32_t));
     if (!grown) {
         return false;
     }
@@ -264,12 +308,12 @@ static bool gm_scan_row(cbm_graph_mem_t *g, gm_scan_t *sc, sqlite3_stmt *st) {
     }
     if (g->n_edges >= sc->edge_cap) {
         size_t next = sc->edge_cap ? sc->edge_cap * GM_GROWTH : 1;
-        uint32_t *nbr = cbm_realloc(CBM_MEM_CLASS_STORE, g->out_nbr, next * sizeof(uint32_t));
+        uint32_t *nbr = cbm_realloc(CBM_MEM_CLASS_GRAPH_CACHE, g->out_nbr, next * sizeof(uint32_t));
         if (!nbr) {
             return false;
         }
         g->out_nbr = nbr;
-        uint8_t *types = cbm_realloc(CBM_MEM_CLASS_STORE, g->out_type, next);
+        uint8_t *types = cbm_realloc(CBM_MEM_CLASS_GRAPH_CACHE, g->out_type, next);
         if (!types) {
             return false;
         }
@@ -294,7 +338,7 @@ static bool gm_scan_row(cbm_graph_mem_t *g, gm_scan_t *sc, sqlite3_stmt *st) {
  * back. Iterating sources in id order keeps every in-list sorted by source. */
 static bool gm_build_inbound(cbm_graph_mem_t *g) {
     size_t n_ids = g->n_ids;
-    g->in_off = cbm_calloc(CBM_MEM_CLASS_STORE, (n_ids + 1) * sizeof(uint32_t));
+    g->in_off = cbm_calloc(CBM_MEM_CLASS_GRAPH_CACHE, (n_ids + 1) * sizeof(uint32_t));
     g->in_nbr = gm_alloc((size_t)g->n_edges * sizeof(uint32_t));
     g->in_type = gm_alloc(g->n_edges);
     if (!g->in_off || !g->in_nbr || !g->in_type) {
@@ -361,8 +405,8 @@ static bool gm_build(cbm_graph_mem_t *g, sqlite3 *db, int64_t max_node, int64_t 
     /* max(edges.id) over-counts after deletions; give the slack back. */
     if (g->n_edges < sc.edge_cap) {
         size_t keep = g->n_edges ? g->n_edges : 1;
-        uint32_t *nbr = cbm_realloc(CBM_MEM_CLASS_STORE, g->out_nbr, keep * sizeof(uint32_t));
-        uint8_t *types = nbr ? cbm_realloc(CBM_MEM_CLASS_STORE, g->out_type, keep) : NULL;
+        uint32_t *nbr = cbm_realloc(CBM_MEM_CLASS_GRAPH_CACHE, g->out_nbr, keep * sizeof(uint32_t));
+        uint8_t *types = nbr ? cbm_realloc(CBM_MEM_CLASS_GRAPH_CACHE, g->out_type, keep) : NULL;
         if (nbr) {
             g->out_nbr = nbr;
         }
@@ -397,11 +441,11 @@ static cbm_graph_mem_t *gm_take(cbm_graph_mem_t *hit) {
 }
 
 static cbm_graph_mem_t *gm_new_entry(const char *db_path, const char *version, size_t est) {
-    cbm_graph_mem_t *g = cbm_calloc(CBM_MEM_CLASS_STORE, sizeof(*g));
+    cbm_graph_mem_t *g = cbm_calloc(CBM_MEM_CLASS_GRAPH_CACHE, sizeof(*g));
     if (!g) {
         return NULL;
     }
-    g->path = cbm_mem_strdup(CBM_MEM_CLASS_STORE, db_path);
+    g->path = cbm_mem_strdup(CBM_MEM_CLASS_GRAPH_CACHE, db_path);
     if (!g->path) {
         gm_free_ptr(g);
         return NULL;
@@ -416,11 +460,14 @@ cbm_graph_mem_t *cbm_graph_mem_acquire(sqlite3 *db, const char *db_path, const c
     if (!db || !db_path || !version || !version[0] || strlen(version) >= GM_VERSION_MAX) {
         return NULL;
     }
+    uint64_t now = gm_now_ms();
     sqlite3_mutex *mu = gm_registry_mutex();
     sqlite3_mutex_enter(mu);
+    size_t freed = gm_evict_expired_locked(now);
     cbm_graph_mem_t *hit = gm_find(db_path, version);
     cbm_graph_mem_t *taken = hit ? gm_take(hit) : NULL;
     sqlite3_mutex_leave(mu);
+    gm_log_evicted(freed);
     if (hit) {
         return taken;
     }
@@ -496,14 +543,27 @@ void cbm_graph_mem_release(cbm_graph_mem_t *g) {
     if (!g) {
         return;
     }
+    uint64_t now = gm_now_ms();
     sqlite3_mutex *mu = gm_registry_mutex();
     sqlite3_mutex_enter(mu);
     g->refs--;
+    if (g->refs == 0) {
+        g->idle_since_ms = now;
+    }
     if (g->refs == 0 && g->detached) {
         g_total_bytes -= g->bytes;
         gm_destroy(g);
     }
     sqlite3_mutex_leave(mu);
+}
+
+void cbm_graph_mem_evict_expired(void) {
+    uint64_t now = gm_now_ms();
+    sqlite3_mutex *mu = gm_registry_mutex();
+    sqlite3_mutex_enter(mu);
+    size_t freed = gm_evict_expired_locked(now);
+    sqlite3_mutex_leave(mu);
+    gm_log_evicted(freed);
 }
 
 /* ── Queries ────────────────────────────────────────────────────── */
@@ -557,7 +617,7 @@ static size_t gm_set_home(uint32_t id, size_t mask) {
 
 static bool gm_set_grow(gm_set_t *s) {
     size_t cap = s->cap ? s->cap * GM_GROWTH : GM_SET_MIN_CAP;
-    uint32_t *slots = cbm_calloc(CBM_MEM_CLASS_STORE, cap * sizeof(uint32_t));
+    uint32_t *slots = cbm_calloc(CBM_MEM_CLASS_GRAPH_CACHE, cap * sizeof(uint32_t));
     if (!slots) {
         return false;
     }
@@ -619,7 +679,7 @@ static bool gm_hops_push(gm_hops_t *h, uint32_t id, int hop) {
     if (h->count == h->cap) {
         size_t next = h->cap ? h->cap * GM_GROWTH : GM_SET_MIN_CAP;
         cbm_graph_mem_hop_t *rows =
-            cbm_realloc(CBM_MEM_CLASS_STORE, h->rows, next * sizeof(cbm_graph_mem_hop_t));
+            cbm_realloc(CBM_MEM_CLASS_GRAPH_CACHE, h->rows, next * sizeof(cbm_graph_mem_hop_t));
         if (!rows) {
             return false;
         }
@@ -742,6 +802,11 @@ int cbm_graph_mem_cached_count(void) {
 }
 
 size_t cbm_graph_mem_cached_bytes(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_cached_bytes_seam) {
+        return g_cached_bytes_seam;
+    }
+#endif
     sqlite3_mutex *mu = gm_registry_mutex();
     sqlite3_mutex_enter(mu);
     size_t bytes = g_total_bytes;
