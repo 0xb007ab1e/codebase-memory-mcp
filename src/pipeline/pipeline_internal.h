@@ -349,6 +349,37 @@ typedef struct {
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
 void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
 
+/* The env join's inputs held by the unchanged files of an incremental
+ * repair (pass_envjoin.c), read from the store before the K8s pass; ids are
+ * the stored rows, i.e. the repair buffer's proxies. */
+typedef struct {
+    int64_t node;      /* a Dockerfile Module */
+    const char *path;  /* its file */
+    const char *props; /* its properties (image_files, image_ignore) */
+} cbm_envjoin_set_row_t;
+
+typedef struct {
+    int64_t owner; /* USAGE {ref:image} source */
+    int64_t image; /* its Image */
+    const char *props;
+} cbm_envjoin_img_row_t;
+
+typedef struct {
+    int64_t reader; /* CONFIGURES {strategy:env_access} source */
+    const char *file;
+    const char *key; /* the global EnvVar's name */
+} cbm_envjoin_reader_row_t;
+
+typedef struct {
+    CBMArena arena; /* owns every string and array */
+    cbm_envjoin_set_row_t *sets;
+    int set_count;
+    cbm_envjoin_img_row_t *imgs;
+    int img_count;
+    cbm_envjoin_reader_row_t *readers;
+    int reader_count;
+} cbm_envjoin_base_t;
+
 /* Shared context passed to each pass function.
  * Derived from cbm_pipeline_t fields during run. */
 typedef struct {
@@ -397,6 +428,10 @@ typedef struct {
     /* Stem collisions of the discovered files: which Module definitions take
      * `qn#ext`. Borrowed for the extraction phase; NULL elsewhere. */
     const cbm_stem_marks_t *stem_marks;
+
+    /* An incremental repair: the env join's inputs held by the unchanged
+     * files (pass_envjoin.c). Borrowed; NULL in a full run. */
+    const cbm_envjoin_base_t *envjoin_base;
 
     /* Sequential cross-LSP registry arena. The lsp_cross pass builds its
      * shared per-language registries here; resolved_calls entries may BORROW
@@ -1230,7 +1265,8 @@ typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
  * (repository path; NULL: no build, or unknown), the service names its
  * depends_on and links list, and the names of the environment variables its
  * environment sets (map keys / list items' names -- never a value), with
- * their 1-based lines. */
+ * their 1-based lines and the service name each value addresses (a bare
+ * name, `name:port`, a URL's host; NULL: none -- cbm_env_address). */
 typedef struct {
     const char *name;
     const char *image;
@@ -1239,6 +1275,7 @@ typedef struct {
     int ndeps;
     const char **env;
     const int *env_lines;
+    const char **env_hosts;
     int nenv;
     int line;
     int end_line;
@@ -1261,10 +1298,38 @@ bool cbm_build_path(const char *rel);
 void cbm_build_sites(CBMArena *a, const char *rel, const char *src, size_t len, const char *dotenv,
                      cbm_build_site_fn fn, void *ud);
 
-/* Terraform / OpenTofu modules (pass_terraform.c): a helm_release DEPLOYS its
- * chart. Run at the end of the K8s pass, over the same files. */
+/* Terraform / OpenTofu / Terragrunt (pass_terraform.c): references, module
+ * calls, tfvars, Terragrunt units; a helm_release DEPLOYS its chart. Run at
+ * the end of the K8s pass, over the same files. */
 void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                  int file_count);
+
+/* Kubernetes objects Terraform declares (pass_terraform.c): a
+ * kubernetes_<type> resource with a literal name is a Resource of the K8s
+ * identity scheme, ecosystem terraform. Run by the K8s pass before its joins. */
+void cbm_pipeline_tf_k8s_objects(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                 int file_count);
+
+/* A Resource's properties from its identity QN (pass_k8s.c,
+ * k8s_resource_props); `ecosystem` NULL for a manifest's. Caller frees. */
+char *cbm_k8s_resource_props(const char *qn, const char *effective_ns, const char *version,
+                             const char *labels, const char *ecosystem);
+
+/* Ansible (pass_ansible.c): a playbook or task file IMPORTS the playbooks,
+ * task files and roles its directives name; its tasks and handlers are
+ * Functions, a notify CALLS the handlers it names. Run at the end of the
+ * K8s pass, over the same files. */
+void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                               int file_count);
+
+/* Does a YAML text's first content line start a sequence item (pass_ansible.c)?
+ * The incremental planner's test for Ansible content. */
+bool cbm_ansible_is_sequence(const char *src);
+
+/* `v` (a path; "./" and "../" allowed) from repository directory `dir`, as a
+ * repository path into out; false past the root or when it does not fit
+ * (pass_terraform.c). */
+bool cbm_repo_rel_join(const char *dir, const char *v, char *out, size_t sz);
 
 /* The Image node of image reference `ref` (its normalised repository:
  * docker.io for no registry host, library/ for an official image; tag and
@@ -1288,6 +1353,16 @@ int64_t cbm_pipeline_env_setter(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *
  * builds on (FROM, COPY --from). Run at the end of the K8s pass. */
 void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                               int file_count);
+
+/* The env join (pass_envjoin.c): a container's EnvVar CONFIGURES {strategy:
+ * env_read} each reader of its name inside the files the container's image
+ * is built from. Recomputes every such edge; after the Docker pass. Returns
+ * how many. */
+int cbm_pipeline_env_join(cbm_pipeline_ctx_t *ctx);
+
+/* Whether a Dockerfile Module's properties (image_files) copy `path` into
+ * the image, ignore patterns aside. */
+bool cbm_envjoin_props_hold(const char *props, const char *path);
 
 /* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
 int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
@@ -1439,8 +1514,41 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      spelled `proj.pkg.foo/`, or, where the directory is a Java/Go package,
  *      the file's Module is `proj.pkg.foo#sh`. The Module the Folder used to
  *      swallow is a node again. An index built before holds neither, so it
+ *      rebuilds once on upgrade.
+ *   9: a container's variable reaches its program: the EnvVar a container
+ *      sets CONFIGURES {strategy:env_read} the readers of its name inside the
+ *      files the container's image is built from (pass_envjoin.c); a K8s
+ *      image reference says its container (USAGE {ref:image, container}) and
+ *      a Dockerfile's Module its image's files (image_context, image_files,
+ *      image_ignore). A workload or compose service CONNECTS_TO the Service
+ *      its environment addresses (extract_k8s.c, pass_docker.c). A script's
+ *      curl / wget HTTP_CALLS the Route of the URL it states (pass_shell.c).
+ *      A kustomize patch OVERRIDEs the objects of its build it changes, its
+ *      file an IMPORTS of the kustomization; a Resource keeps the version of
+ *      its apiVersion and its labels; a kustomization DEPLOYS the charts it inflates
+ *      (helmCharts); an object a namePrefix / nameSuffix renames has a
+ *      variant Resource {ecosystem:kustomize} with its deployed name, which
+ *      OVERRIDEs {via:namePrefix|nameSuffix} it (extract_k8s.c,
+ *      pass_k8s.c). A Terraform reference
+ *      USAGEs {ref, via:terraform}, from its block, the block of its module
+ *      (directory) declaring it (one in depends_on: DEPENDS_ON), instead of
+ *      the generic name matcher's USAGE / CALLS; a bare block label names
+ *      its block like a quoted one; a module call with a local source
+ *      IMPORTS its directory's Folder (the root: the Project) and module.X.Y
+ *      USAGEs {ref:output} the output there; a .tfvars assignment OVERRIDEs
+ *      {via:tfvars} the variable block of its own directory (or, inferred,
+ *      of the nearest ancestor module declaring its names); a Terragrunt
+ *      unit's include / read_terragrunt_config IMPORTS {via:terragrunt} the
+ *      file it names, a dependency DEPENDS_ON the other unit; a
+ *      kubernetes_* resource with a literal name is a Resource
+ *      {ecosystem:terraform} its block DEPLOYS
+ *      (pass_terraform.c, extract_unified.c, extract_defs.c); an Ansible
+ *      playbook / task file IMPORTS {via:ansible} the playbooks, task files
+ *      and roles its directives name, its tasks and handlers are Functions
+ *      {source:ansible} and a notify CALLS {via:notify} the handlers it names
+ *      (pass_ansible.c). An index built before holds none of them, so it
  *      rebuilds once on upgrade. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 8 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -1536,6 +1644,10 @@ int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *
  * on failure. */
 int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const char *label,
                                 const char *const *edge_types);
+/* Delete the project's `label` nodes that carry no file and that no edge of
+ * any type touches (a Route whose last caller and handler were purged);
+ * returns how many, or -1 on failure. */
+int cbm_delta_drop_edgeless(cbm_store_t *store, const char *project, const char *label);
 /* An Image's build edges (Image -DEPENDS_ON {via:build}-> Dockerfile,
  * pass_docker.c) belong to the build configuration declaring them, not to
  * either end: every run recomputes them whole from all build files, the
@@ -1543,6 +1655,22 @@ int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const c
  * between pre-existing nodes. */
 #define CBM_BUILD_EDGE_TYPE "DEPENDS_ON"
 #define CBM_BUILD_EDGE_SOURCE "Image"
+/* The env join's edges (EnvVar -CONFIGURES {strategy:env_read}-> reader,
+ * pass_envjoin.c) likewise: no other producer draws CONFIGURES from an
+ * EnvVar, every run recomputes them whole. */
+#define CBM_ENVJOIN_EDGE_TYPE "CONFIGURES"
+#define CBM_ENVJOIN_EDGE_SOURCE "EnvVar"
+
+/* The env join's inputs the store holds (the unchanged files of a closure
+ * repair, read after the purge), into `out` (its arena owns them); 0, or -1
+ * on failure. cbm_envjoin_base_free releases it. */
+int cbm_delta_envjoin_base(cbm_store_t *store, const char *project, cbm_envjoin_base_t *out);
+void cbm_envjoin_base_free(cbm_envjoin_base_t *b);
+/* 1 when a stored image copies one of `paths` (a deletion then changes
+ * which context the Dockerfile's sources resolve in), 0 when none, -1 on
+ * failure. */
+int cbm_delta_image_holds_any(cbm_store_t *store, const char *project, const char *const *paths,
+                              int path_count);
 
 /* The files whose File node the shell pass marked as running a container
  * build ({"declares_build":true}), into arena `a`; returns how many, or -1

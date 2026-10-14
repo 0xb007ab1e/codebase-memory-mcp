@@ -7192,18 +7192,19 @@ static char *find_hcl_block_name(CBMArena *a, TSNode node, const char *source) {
     // Append the block's quoted labels so each block gets a distinct,
     // query-friendly name: resource "aws_instance" "web" -> resource.aws_instance.web
     // rather than every resource collapsing to the bare keyword "resource" (#337).
-    // HCL stores labels as string_lit -> template_literal children.
+    // HCL stores quoted labels as string_lit -> template_literal children and
+    // bare ones (`variable region {}`, valid HCL) as identifiers after the
+    // keyword's own -- both name the block.
     uint32_t cc = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < cc; i++) {
         TSNode ch = ts_node_named_child(node, i);
-        if (strcmp(ts_node_type(ch), "string_lit") != 0) {
-            continue;
+        char *label = NULL;
+        if (strcmp(ts_node_type(ch), "string_lit") == 0) {
+            TSNode lit = cbm_find_child_by_kind(ch, "template_literal");
+            label = ts_node_is_null(lit) ? NULL : cbm_node_text(a, lit, source);
+        } else if (strcmp(ts_node_type(ch), "identifier") == 0 && !ts_node_eq(ch, id)) {
+            label = cbm_node_text(a, ch, source);
         }
-        TSNode lit = cbm_find_child_by_kind(ch, "template_literal");
-        if (ts_node_is_null(lit)) {
-            continue;
-        }
-        char *label = cbm_node_text(a, lit, source);
         if (!label || !label[0]) {
             continue;
         }

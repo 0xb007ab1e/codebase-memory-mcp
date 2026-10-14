@@ -2634,6 +2634,12 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
 #else
     const uint32_t budget_nodes = ctx->walk_budget_nodes;
 #endif
+    /* A Terraform / OpenTofu module file's references resolve inside its
+     * module directory (pass_terraform.c); a call or usage by name here would
+     * meet same-named blocks of any module and a builtin function's name. */
+    const char *ext = ctx->rel_path ? strrchr(ctx->rel_path, '.') : NULL;
+    bool tf_module = ctx->language == CBM_LANG_HCL && ext &&
+                     (strcmp(ext, ".tf") == 0 || strcmp(ext, ".tofu") == 0);
 
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
@@ -2659,8 +2665,11 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
             handle_string_constants(ctx, node, &state);
             handle_objectscript_type_map(ctx, node, &state);
             handle_url_builders(ctx, node, &state);
-            CBMInvocationDescriptor invocation = handle_calls(ctx, node, spec, &state);
-            handle_usages(ctx, node, spec, &state);
+            CBMInvocationDescriptor invocation =
+                tf_module ? (CBMInvocationDescriptor){0} : handle_calls(ctx, node, spec, &state);
+            if (!tf_module) {
+                handle_usages(ctx, node, spec, &state);
+            }
             handle_throws(ctx, node, spec, &state);
             handle_readwrites(ctx, node, spec, &state);
             handle_type_refs(ctx, node, spec, &state);

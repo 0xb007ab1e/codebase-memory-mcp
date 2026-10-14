@@ -8726,10 +8726,11 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
         "CROSS_GRAPHQL_CALLS", "CROSS_TRPC_CALLS"};
     /* topology: traffic (INFRA_MAPS), object references (USAGE), ordering
      * (DEPENDS_ON), controllers (HANDLES), what an object declares
-     * (DEFINES: an Ingress's routes) and what it deploys (DEPLOYS: a Flux
-     * Kustomization's path, a HelmRelease's chart) */
-    static const char *mode_topology[] = {"INFRA_MAPS", "USAGE",   "DEPENDS_ON",
-                                          "HANDLES",    "DEFINES", "DEPLOYS"};
+     * (DEFINES: an Ingress's routes), what it deploys (DEPLOYS: a Flux
+     * Kustomization's path, a HelmRelease's chart) and the services its
+     * containers' environment addresses (CONNECTS_TO) */
+    static const char *mode_topology[] = {"INFRA_MAPS", "USAGE",   "DEPENDS_ON", "HANDLES",
+                                          "DEFINES",    "DEPLOYS", "CONNECTS_TO"};
     /* deploy: what a CI job, script or Make rule starts (SPAWNS: scripts,
      * make targets, programs), calls (CALLS: shell functions) and puts on a
      * cluster (DEPLOYS) -- outbound from the job, inbound from a chart */

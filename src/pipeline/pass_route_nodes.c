@@ -78,6 +78,17 @@ static void route_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
     if (strcmp(edge->type, "HTTP_CALLS") != 0 && strcmp(edge->type, "ASYNC_CALLS") != 0) {
         return;
     }
+    /* A script's request (pass_shell.c) names its host and already ends at
+     * its Route, which keeps the host for one outside the repository: a
+     * path-only Route made from its url_path would meet a handler it never
+     * calls. A code client's edge names none and refreshes its Route here. */
+    char host_buf[CBM_SZ_256];
+    if (json_extract(edge->properties_json, "host", host_buf, sizeof(host_buf))) {
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gb, edge->target_id);
+        if (target && target->label && strcmp(target->label, "Route") == 0) {
+            return;
+        }
+    }
 
     /* Extract url_path from properties */
     char url_buf[CBM_SZ_512];
