@@ -3025,16 +3025,14 @@ static bool populate_project_record(const char *dir_path, bool include_stats,
      * index_status call away for the project you actually care about. */
     if (record->root_path[0]) {
         bool is_git = false;
-        char *branch = NULL;
-        (void)cbm_git_branch_resolve(record->root_path, &is_git, &branch);
-        if (is_git && branch) {
+        char branch[CBM_GIT_BRANCH_MAX];
+        (void)cbm_git_branch_resolve(record->root_path, &is_git, branch, sizeof(branch));
+        if (is_git && branch[0]) {
             record->branch = heap_strdup(branch);
             if (!record->branch) {
-                free(branch);
                 return false;
             }
         }
-        free(branch);
     }
     record->populated = true;
     return true;
@@ -12782,7 +12780,7 @@ static void root_containment_init(root_containment_t *containment, const char *r
 static void root_containment_free_key(const char *key, void *value, void *userdata) {
     (void)value;
     (void)userdata;
-    free((void *)key);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
 }
 
 static void root_containment_free(root_containment_t *containment) {
@@ -12807,7 +12805,7 @@ static bool root_containment_check(root_containment_t *containment, const char *
     if (!containment->verdicts) {
         containment->verdicts = cbm_ht_create(0);
     }
-    char *key = containment->verdicts ? heap_strdup(abs_path) : NULL;
+    char *key = containment->verdicts ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, abs_path) : NULL;
     if (key) {
         (void)cbm_ht_set(
             containment->verdicts, key,
@@ -15433,8 +15431,8 @@ static uint32_t search_result_index_hash(int64_t id, int capacity) {
 }
 
 static void search_result_index_free(search_result_index_t *index) {
-    free(index->ids);
-    free(index->slots);
+    cbm_free(CBM_MEM_CLASS_OTHER, index->ids);
+    cbm_free(CBM_MEM_CLASS_OTHER, index->slots);
     memset(index, 0, sizeof(*index));
 }
 
@@ -15452,13 +15450,26 @@ static int search_result_index_find(const search_result_index_t *index, int64_t 
     return CBM_NOT_FOUND;
 }
 
-static bool search_result_index_put(search_result_index_t *index, int64_t id, int value);
+/* Insert into a table with room (search_result_index_reserve succeeded). */
+static void search_result_index_insert(search_result_index_t *index, int64_t id, int value) {
+    uint32_t at = search_result_index_hash(id, index->capacity);
+    while (index->slots[at] != 0) {
+        at = (at + SKIP_ONE) & (uint32_t)(index->capacity - 1);
+    }
+    index->ids[at] = id;
+    index->slots[at] = value + SKIP_ONE;
+    index->count++;
+}
 
-static bool search_result_index_grow(search_result_index_t *index) {
+/* Make room for one more entry (at most half full), growing the table. */
+static bool search_result_index_reserve(search_result_index_t *index) {
+    if ((index->count + SKIP_ONE) * PAIR_LEN <= index->capacity) {
+        return true;
+    }
     int capacity = index->capacity ? index->capacity * PAIR_LEN : SEARCH_RESULT_INDEX_MIN_CAPACITY;
     search_result_index_t grown = {
-        .ids = calloc((size_t)capacity, sizeof(int64_t)),
-        .slots = calloc((size_t)capacity, sizeof(int)),
+        .ids = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)capacity * sizeof(int64_t)),
+        .slots = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)capacity * sizeof(int)),
         .capacity = capacity,
     };
     if (!grown.ids || !grown.slots) {
@@ -15467,26 +15478,11 @@ static bool search_result_index_grow(search_result_index_t *index) {
     }
     for (int i = 0; i < index->capacity; i++) {
         if (index->slots[i] != 0) {
-            (void)search_result_index_put(&grown, index->ids[i], index->slots[i] - SKIP_ONE);
+            search_result_index_insert(&grown, index->ids[i], index->slots[i] - SKIP_ONE);
         }
     }
     search_result_index_free(index);
     *index = grown;
-    return true;
-}
-
-static bool search_result_index_put(search_result_index_t *index, int64_t id, int value) {
-    if ((index->count + SKIP_ONE) * PAIR_LEN > index->capacity &&
-        !search_result_index_grow(index)) {
-        return false;
-    }
-    uint32_t at = search_result_index_hash(id, index->capacity);
-    while (index->slots[at] != 0) {
-        at = (at + SKIP_ONE) & (uint32_t)(index->capacity - 1);
-    }
-    index->ids[at] = id;
-    index->slots[at] = value + SKIP_ONE;
-    index->count++;
     return true;
 }
 
@@ -15507,6 +15503,11 @@ static bool add_to_search_results(search_result_t **sr, int *sr_count, int *sr_c
         *sr = grown;
         *sr_cap = next_capacity;
     }
+    /* Room in the index first, so nothing below can fail after the result's
+     * strings exist. */
+    if (!search_result_index_reserve(index)) {
+        return false;
+    }
     search_result_t *r = &(*sr)[*sr_count];
     if (!set_search_result_identity(r, n)) {
         return false;
@@ -15518,13 +15519,7 @@ static bool add_to_search_results(search_result_t **sr, int *sr_count, int *sr_c
         r->file = NULL;
         return false;
     }
-    if (!search_result_index_put(index, n->id, *sr_count)) {
-        free(r->qualified_name);
-        free(r->file);
-        free(r->match_lines);
-        memset(r, 0, sizeof(*r));
-        return false;
-    }
+    search_result_index_insert(index, n->id, *sr_count);
     (*sr_count)++;
     return true;
 }
@@ -15624,11 +15619,12 @@ static bool scan_and_classify_grep_matches(
     root_containment_init(&containment, root_path);
     search_result_index_t sr_index = {0};
     for (int i = 0; i < *sr_count; i++) {
-        if (!search_result_index_put(&sr_index, (*sr)[i].node_id, i)) {
+        if (!search_result_index_reserve(&sr_index)) {
             search_result_index_free(&sr_index);
             root_containment_free(&containment);
             return false;
         }
+        search_result_index_insert(&sr_index, (*sr)[i].node_id, i);
     }
     cbm_regex_t content_regex;
     bool content_regex_ready = use_regex && pattern &&
@@ -16054,16 +16050,16 @@ typedef struct {
 
 static void search_scan_patterns_free(search_scan_patterns_t *patterns) {
     for (int i = 0; i < patterns->count; i++) {
-        free(patterns->items[i]);
+        cbm_free(CBM_MEM_CLASS_OTHER, patterns->items[i]);
     }
     for (int i = 0; patterns->regexes && i < patterns->count; i++) {
         if (i < patterns->compiled && patterns->lengths[i] > 0) {
             cbm_regfree(&patterns->regexes[i]);
         }
     }
-    free(patterns->items);
-    free(patterns->lengths);
-    free(patterns->regexes);
+    cbm_free(CBM_MEM_CLASS_OTHER, patterns->items);
+    cbm_free(CBM_MEM_CLASS_OTHER, patterns->lengths);
+    cbm_free(CBM_MEM_CLASS_OTHER, patterns->regexes);
     memset(patterns, 0, sizeof(*patterns));
 }
 
@@ -16074,9 +16070,10 @@ static bool search_scan_patterns_parse(search_scan_patterns_t *patterns, const c
     for (const char *p = pattern; *p; p++) {
         count += *p == '\n' ? SKIP_ONE : 0;
     }
-    patterns->items = calloc((size_t)count, sizeof(char *));
-    patterns->lengths = calloc((size_t)count, sizeof(size_t));
-    patterns->regexes = use_regex ? calloc((size_t)count, sizeof(cbm_regex_t)) : NULL;
+    patterns->items = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)count * sizeof(char *));
+    patterns->lengths = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)count * sizeof(size_t));
+    patterns->regexes =
+        use_regex ? cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)count * sizeof(cbm_regex_t)) : NULL;
     if (!patterns->items || !patterns->lengths || (use_regex && !patterns->regexes)) {
         search_scan_patterns_free(patterns);
         return false;
@@ -16085,7 +16082,7 @@ static bool search_scan_patterns_parse(search_scan_patterns_t *patterns, const c
     for (int i = 0; i < count; i++) {
         const char *end = strchr(start, '\n');
         size_t length = end ? (size_t)(end - start) : strlen(start);
-        patterns->items[i] = malloc(length + SKIP_ONE);
+        patterns->items[i] = cbm_alloc(CBM_MEM_CLASS_OTHER, length + SKIP_ONE);
         if (!patterns->items[i]) {
             patterns->count = i;
             search_scan_patterns_free(patterns);
@@ -16272,7 +16269,8 @@ static mcp_scan_cause_t search_scan_buffer(cbm_mcp_server_t *srv, search_scan_si
     return MCP_SCAN_SUCCESS;
 }
 
-/* Read a whole file into *buffer (grown as needed), leaving one spare byte. */
+/* Read a whole file into *buffer (grown as needed, CBM_MEM_CLASS_EXTRACT),
+ * leaving one spare byte. */
 static bool search_scan_read_file(const char *path, char **buffer, size_t *capacity,
                                   size_t *length) {
     FILE *fp = cbm_fopen(path, "rb");
@@ -16288,7 +16286,7 @@ static bool search_scan_read_file(const char *path, char **buffer, size_t *capac
                 ok = false;
                 break;
             }
-            char *next = realloc(*buffer, grown);
+            char *next = cbm_realloc(CBM_MEM_CLASS_EXTRACT, *buffer, grown);
             if (!next) {
                 ok = false;
                 break;
@@ -16327,7 +16325,7 @@ static mcp_scan_cause_t search_scan_in_process(cbm_mcp_server_t *srv, const char
     size_t list_capacity = 0;
     size_t list_length = 0;
     if (!search_scan_read_file(filelist_path, &list, &list_capacity, &list_length)) {
-        free(list);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, list);
         search_scan_patterns_free(&patterns);
         return MCP_SCAN_COMMAND_FAILURE;
     }
@@ -16363,8 +16361,8 @@ static mcp_scan_cause_t search_scan_in_process(cbm_mcp_server_t *srv, const char
         cause = search_scan_buffer(srv, &sink, &patterns, use_regex, path, path_length, buffer,
                                    length, deadline_ms);
     }
-    free(buffer);
-    free(list);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, buffer);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, list);
     search_scan_patterns_free(&patterns);
     return cause;
 }

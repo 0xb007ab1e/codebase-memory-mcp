@@ -450,12 +450,11 @@ static bool branch_resolve_agrees(const char *path, const char *want) {
     cbm_git_context_t ctx = {0};
     (void)cbm_git_context_resolve(path, &ctx);
     bool is_git = false;
-    char *branch = NULL;
-    (void)cbm_git_branch_resolve(path, &is_git, &branch);
+    char branch[CBM_GIT_BRANCH_MAX];
+    (void)cbm_git_branch_resolve(path, &is_git, branch, sizeof(branch));
     bool agrees = is_git == ctx.is_git && is_git == (want != NULL) &&
-                  (!want || (branch && ctx.branch && strcmp(branch, want) == 0 &&
-                             strcmp(ctx.branch, want) == 0));
-    free(branch);
+                  (want ? (ctx.branch && strcmp(branch, want) == 0 && strcmp(ctx.branch, want) == 0)
+                        : branch[0] == '\0');
     cbm_git_context_free(&ctx);
     return agrees;
 }

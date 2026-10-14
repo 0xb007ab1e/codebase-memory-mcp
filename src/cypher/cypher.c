@@ -3733,7 +3733,7 @@ static void cypher_stable_sort(int *idx, int n, cypher_index_cmp_fn cmp, const v
     if (n < PAIR_LEN) {
         return;
     }
-    int *tmp = malloc((size_t)n * sizeof(int));
+    int *tmp = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)n * sizeof(int));
     if (!tmp) {
         for (int i = SKIP_ONE; i < n; i++) {
             for (int j = i; j > 0 && cmp(ctx, idx[j - SKIP_ONE], idx[j]) > 0; j--) {
@@ -3763,7 +3763,7 @@ static void cypher_stable_sort(int *idx, int n, cypher_index_cmp_fn cmp, const v
         }
         memcpy(idx, tmp, (size_t)n * sizeof(int));
     }
-    free(tmp);
+    cbm_free(CBM_MEM_CLASS_OTHER, tmp);
 }
 
 /* String key → the index it was first recorded with. Keys are copied: the
@@ -3797,13 +3797,13 @@ static void key_index_add(cypher_key_index_t *ix, const char *key, int index) {
     }
     if (ix->table && ix->count >= ix->cap) {
         int cap = ix->cap ? ix->cap * PAIR_LEN : CBM_SZ_256;
-        char **keys = realloc(ix->keys, (size_t)cap * sizeof(char *));
+        char **keys = cbm_realloc(CBM_MEM_CLASS_OTHER, ix->keys, (size_t)cap * sizeof(char *));
         if (keys) {
             ix->keys = keys;
             ix->cap = cap;
         }
     }
-    char *copy = ix->table && ix->count < ix->cap ? heap_strdup(key) : NULL;
+    char *copy = ix->table && ix->count < ix->cap ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key) : NULL;
     if (!copy) {
         ix->failed = true;
         return;
@@ -3817,9 +3817,9 @@ static void key_index_free(cypher_key_index_t *ix) {
         cbm_ht_free(ix->table);
     }
     for (int i = 0; i < ix->count; i++) {
-        free(ix->keys[i]);
+        cbm_free(CBM_MEM_CLASS_OTHER, ix->keys[i]);
     }
-    free(ix->keys);
+    cbm_free(CBM_MEM_CLASS_OTHER, ix->keys);
     memset(ix, 0, sizeof(*ix));
 }
 
@@ -3925,12 +3925,12 @@ static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *r
     }
     int n = rb->row_count;
     rb_order_ctx_t ctx = {.cols = cols, .numeric = numeric, .descs = descs, .keys = keys};
-    int *idx = malloc((size_t)n * sizeof(int));
-    const char ***rows = malloc((size_t)n * sizeof(const char **));
+    int *idx = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)n * sizeof(int));
+    const char ***rows = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)n * sizeof(const char **));
     if (!idx || !rows) {
         /* No scratch memory: insertion sort in place, same comparisons. */
-        free(idx);
-        free(rows);
+        cbm_free(CBM_MEM_CLASS_OTHER, idx);
+        cbm_free(CBM_MEM_CLASS_OTHER, rows);
         for (int i = SKIP_ONE; i < n; i++) {
             for (int j = i; j > 0 && rb_order_compare_rows(&ctx, rb->rows[j - SKIP_ONE],
                                                            rb->rows[j], NULL, NULL) > 0;
@@ -3942,7 +3942,7 @@ static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *r
         }
         return;
     }
-    int *values = malloc((size_t)n * (size_t)keys * sizeof(int));
+    int *values = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)n * (size_t)keys * sizeof(int));
     for (int r = 0; r < n; r++) {
         idx[r] = r;
         rows[r] = rb->rows[r];
@@ -3957,9 +3957,9 @@ static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *r
     for (int r = 0; r < n; r++) {
         rb->rows[r] = rows[idx[r]];
     }
-    free(values);
-    free(rows);
-    free(idx);
+    cbm_free(CBM_MEM_CLASS_OTHER, values);
+    cbm_free(CBM_MEM_CLASS_OTHER, rows);
+    cbm_free(CBM_MEM_CLASS_OTHER, idx);
 }
 
 static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit,
@@ -4008,7 +4008,7 @@ static const char *rb_row_key(const result_builder_t *rb, const char **row, char
         need += strlen(row[c]) + CBM_SZ_32;
     }
     if (need > *cap) {
-        char *grown = realloc(*buf, need);
+        char *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, *buf, need);
         if (!grown) {
             return NULL;
         }
@@ -4075,7 +4075,7 @@ static void rb_apply_distinct(result_builder_t *rb) {
     }
     rb->row_count = kept;
     key_index_free(&seen);
-    free(key_buf);
+    cbm_free(CBM_MEM_CLASS_OTHER, key_buf);
 }
 
 static void rb_free(result_builder_t *rb) {
@@ -4457,17 +4457,18 @@ static void sort_bindings(binding_t *vbindings, int count, const cbm_return_clau
     size_t keys = (size_t)wc->order_key_count;
     size_t cells = (size_t)count * keys;
     with_order_ctx_t ctx = {.wc = wc,
-                            .values = calloc(cells, sizeof(char *)),
-                            .numbered = calloc(cells, sizeof(bool)),
-                            .numbers = calloc(cells, sizeof(double))};
-    int *idx = malloc((size_t)count * sizeof(int));
-    binding_t *sorted = malloc((size_t)count * sizeof(binding_t));
+                            .values = cbm_calloc(CBM_MEM_CLASS_OTHER, cells * sizeof(char *)),
+                            .numbered = cbm_calloc(CBM_MEM_CLASS_OTHER, cells * sizeof(bool)),
+                            .numbers = cbm_calloc(CBM_MEM_CLASS_OTHER, cells * sizeof(double))};
+    int *idx = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)count * sizeof(int));
+    binding_t *sorted = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)count * sizeof(binding_t));
     bool ready = ctx.values && ctx.numbered && ctx.numbers && idx && sorted;
     for (int i = 0; ready && i < count; i++) {
         idx[i] = i;
         for (size_t k = 0; ready && k < keys; k++) {
             size_t cell = (size_t)i * keys + k;
-            ctx.values[cell] = heap_strdup(order_key_value(&vbindings[i], wc->order_keys[k]));
+            ctx.values[cell] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER,
+                                              order_key_value(&vbindings[i], wc->order_keys[k]));
             ready = ctx.values[cell] != NULL;
             char *end = NULL;
             ctx.numbers[cell] = ready ? strtod(ctx.values[cell], &end) : 0;
@@ -4493,13 +4494,13 @@ static void sort_bindings(binding_t *vbindings, int count, const cbm_return_clau
         }
     }
     for (size_t c = 0; ctx.values && c < cells; c++) {
-        free(ctx.values[c]);
+        cbm_free(CBM_MEM_CLASS_OTHER, ctx.values[c]);
     }
-    free(ctx.values);
-    free(ctx.numbered);
-    free(ctx.numbers);
-    free(idx);
-    free(sorted);
+    cbm_free(CBM_MEM_CLASS_OTHER, ctx.values);
+    cbm_free(CBM_MEM_CLASS_OTHER, ctx.numbered);
+    cbm_free(CBM_MEM_CLASS_OTHER, ctx.numbers);
+    cbm_free(CBM_MEM_CLASS_OTHER, idx);
+    cbm_free(CBM_MEM_CLASS_OTHER, sorted);
 }
 
 /* Apply skip and limit to a binding array, freeing discarded entries */
@@ -4629,7 +4630,8 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
     (*aggs)[found].maxs = calloc(wc->count, sizeof(double));
     (*aggs)[found].distinct_lists = calloc(wc->count, sizeof(char **));
     (*aggs)[found].distinct_n = calloc(wc->count, sizeof(int));
-    (*aggs)[found].distinct_sets = calloc(wc->count, sizeof(CBMHashTable *));
+    (*aggs)[found].distinct_sets =
+        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)wc->count * sizeof(CBMHashTable *));
     (*aggs)[found].group_nodes = calloc(wc->count, sizeof(cbm_node_t));
     for (int ci = 0; ci < wc->count; ci++) {
         (*aggs)[found].mins[ci] = CYP_DBL_MAX;
@@ -4724,7 +4726,7 @@ static void with_agg_free(with_agg_t *aggs, int agg_cnt, int item_count) {
         free(aggs[a].maxs);
         free(aggs[a].distinct_lists);
         free(aggs[a].distinct_n);
-        free(aggs[a].distinct_sets);
+        cbm_free(CBM_MEM_CLASS_OTHER, aggs[a].distinct_sets);
         if (aggs[a].group_nodes) {
             for (int ci = 0; ci < item_count; ci++) {
                 node_fields_free(&aggs[a].group_nodes[ci]);
@@ -5134,7 +5136,8 @@ static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item
     entry->maxs = calloc(item_count, sizeof(double));
     entry->collect_lists = calloc(item_count, sizeof(char **));
     entry->collect_counts = calloc(item_count, sizeof(int));
-    entry->distinct_sets = calloc(item_count, sizeof(CBMHashTable *));
+    entry->distinct_sets =
+        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)item_count * sizeof(CBMHashTable *));
     for (int ci = 0; ci < item_count; ci++) {
         entry->mins[ci] = CYP_DBL_MAX;
         entry->maxs[ci] = -CYP_DBL_MAX;
@@ -5217,7 +5220,7 @@ static void ret_agg_free(ret_agg_entry_t *aggs, int agg_count, int item_count) {
         free(aggs[a].maxs);
         free(aggs[a].collect_lists);
         free(aggs[a].collect_counts);
-        free(aggs[a].distinct_sets);
+        cbm_free(CBM_MEM_CLASS_OTHER, aggs[a].distinct_sets);
     }
     free(aggs);
 }
