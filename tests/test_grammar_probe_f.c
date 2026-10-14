@@ -3276,6 +3276,103 @@ TEST(probe_terraform_kubernetes_objects_are_resources) {
     PASS();
 }
 
+/* Every kustomize variant as "<variant> <QN key> <- <base file>:<base>
+ * via=<via> kust=<kustomization>:<line>", then "variants <n> defined <m>":
+ * the Resources marked ecosystem kustomize, and the DEFINES edges into
+ * them. */
+static char *gpf_kust_variants(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT v.name || ' ' || "
+            "substr(v.qualified_name, instr(v.qualified_name, '::') + 2) || ' <- ' || "
+            "b.file_path || ':' || b.name || ' via=' || json_extract(e.properties,'$.via') || "
+            "' kust=' || json_extract(e.properties,'$.kustomization') || ':' || "
+            "json_extract(e.properties,'$.line') AS x FROM edges e JOIN nodes v ON "
+            "v.id=e.source_id JOIN nodes b ON b.id=e.target_id WHERE e.project=?1 AND "
+            "e.type='OVERRIDE' AND json_extract(v.properties,'$.ecosystem')='kustomize' ORDER BY "
+            "x)), '') || char(10) || 'variants ' || (SELECT COUNT(*) FROM nodes WHERE project=?1 "
+            "AND label='Resource' AND json_extract(properties,'$.ecosystem')='kustomize') || "
+            "' defined ' || (SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN "
+            "nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type='DEFINES' AND "
+            "s.label='File' AND json_extract(t.properties,'$.ecosystem')='kustomize')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A kustomization's namePrefix / nameSuffix deploys its objects under other
+ * names: each renamed object gets a variant Resource with the deployed name
+ * (ecosystem kustomize), which the kustomization's File DEFINES and which
+ * OVERRIDEs {via: namePrefix | nameSuffix, kustomization, line} the object.
+ * Prefixes compose down the build (outer first), as do suffixes (inner
+ * first); the outermost namespace wins; a cluster-scoped kind keeps its
+ * own (none); CRDs, Namespaces and apiregistration APIServices keep their
+ * names (kustomize's skip list) and get none; a prefix with a `/` is no
+ * name part and renames nothing. */
+TEST(probe_kustomize_name_prefix_makes_variants) {
+    static const GpfFile files[] = {
+        {"base/kustomization.yaml",
+         "namespace: system\nnamePrefix: b-\nresources:\n- app.yaml\n- crd.yaml\n- ns.yaml\n"
+         "- apisvc.yaml\n- role.yaml\n"},
+        {"base/app.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: system\n"
+         "---\napiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: system\n"},
+        {"base/crd.yaml",
+         "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n"
+         "  name: widgets.example.com\n"},
+        {"base/ns.yaml", "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: system\n"},
+        {"base/apisvc.yaml",
+         "apiVersion: apiregistration.k8s.io/v1\nkind: APIService\nmetadata:\n"
+         "  name: v1.example.com\n"},
+        {"base/role.yaml",
+         "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n"
+         "  name: reader\n"},
+        {"overlay/kustomization.yaml",
+         "namespace: prod\nnamePrefix: p-\nnameSuffix: -x\nresources:\n- ../base\n"},
+        {"suffixed/kustomization.yaml", "nameSuffix: -s\nresources:\n- ../base\n"},
+        {"slashed/kustomization.yaml", "namePrefix: x/\nresources:\n- ../base\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_kust_variants(files, n);
+    static const char want[] =
+        "ClusterRole/b-reader rbac.authorization.k8s.io/ClusterRole/-/b-reader <- "
+        "base/role.yaml:ClusterRole/reader via=namePrefix kust=base/kustomization.yaml:2\n"
+        "ClusterRole/b-reader-s rbac.authorization.k8s.io/ClusterRole/-/b-reader-s <- "
+        "base/role.yaml:ClusterRole/reader via=nameSuffix kust=suffixed/kustomization.yaml:1\n"
+        "ClusterRole/p-b-reader-x rbac.authorization.k8s.io/ClusterRole/-/p-b-reader-x <- "
+        "base/role.yaml:ClusterRole/reader via=namePrefix kust=overlay/kustomization.yaml:2\n"
+        "Deployment/b-web apps/Deployment/system/b-web <- base/app.yaml:Deployment/web "
+        "via=namePrefix kust=base/kustomization.yaml:2\n"
+        "Deployment/b-web-s apps/Deployment/system/b-web-s <- base/app.yaml:Deployment/web "
+        "via=nameSuffix kust=suffixed/kustomization.yaml:1\n"
+        "Deployment/p-b-web-x apps/Deployment/prod/p-b-web-x <- base/app.yaml:Deployment/web "
+        "via=namePrefix kust=overlay/kustomization.yaml:2\n"
+        "Service/b-web core/Service/system/b-web <- base/app.yaml:Service/web via=namePrefix "
+        "kust=base/kustomization.yaml:2\n"
+        "Service/b-web-s core/Service/system/b-web-s <- base/app.yaml:Service/web "
+        "via=nameSuffix kust=suffixed/kustomization.yaml:1\n"
+        "Service/p-b-web-x core/Service/prod/p-b-web-x <- base/app.yaml:Service/web "
+        "via=namePrefix kust=overlay/kustomization.yaml:2\n"
+        "variants 9 defined 9";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "kustomize variants got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("kustomize variants");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
  * "edgeless routes <n>": the Route nodes no edge touches. */
 static char *gpf_script_http(const GpfFile *files, int nfiles) {
@@ -5720,6 +5817,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_terragrunt_units_compose_their_files);
     RUN_TEST(probe_ansible_files_import_what_they_name);
     RUN_TEST(probe_terraform_kubernetes_objects_are_resources);
+    RUN_TEST(probe_kustomize_name_prefix_makes_variants);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);

@@ -733,6 +733,9 @@ typedef struct {
     int file_cap;
     bool referenced; /* included by another kustomization */
     bool component;  /* `kind: Component`: patches the build including it */
+    char *prefix;    /* its `namePrefix:`, NULL when unset */
+    char *suffix;    /* its `nameSuffix:`, NULL when unset */
+    int rename_line; /* the line of its namePrefix, else nameSuffix; 0: neither */
 } k8s_kust_t;
 
 typedef struct {
@@ -776,23 +779,33 @@ static bool k8s_grow(void **items, int *cap, int count, size_t elem) {
     return true;
 }
 
-/* The value of a kustomization's top-level `key:` line into `val`; false
- * when it has none, or an empty one. */
-static bool k8s_kustomize_top(const char *source, const char *key, char *val, size_t val_sz) {
+/* The value of a kustomization's top-level `key:` line into `val`, its
+ * 1-based line into `*line` (when not NULL); false when it has none, or an
+ * empty one. */
+static bool k8s_kustomize_top_at(const char *source, const char *key, char *val, size_t val_sz,
+                                 int *line) {
     char head[CBM_SZ_64];
     int hl = snprintf(head, sizeof(head), "%s:", key);
-    for (const char *p = source; p && *p && hl > 0;) {
+    int at = SKIP_ONE;
+    for (const char *p = source; p && *p && hl > 0; at++) {
         const char *eol = strchr(p, '\n');
         size_t len = eol ? (size_t)(eol - p) : strlen(p);
         if (strncmp(p, head, (size_t)hl) == 0) {
-            char line[CBM_SZ_512];
-            snprintf(line, sizeof(line), "%.*s", (int)len, p);
+            char text[CBM_SZ_512];
+            snprintf(text, sizeof(text), "%.*s", (int)len, p);
             char k[CBM_SZ_64];
-            return k8s_split_kv(line, k, sizeof(k), val, val_sz) && val[0];
+            if (line) {
+                *line = at;
+            }
+            return k8s_split_kv(text, k, sizeof(k), val, val_sz) && val[0];
         }
         p = eol ? eol + SKIP_ONE : NULL;
     }
     return false;
+}
+
+static bool k8s_kustomize_top(const char *source, const char *key, char *val, size_t val_sz) {
+    return k8s_kustomize_top_at(source, key, val, val_sz, NULL);
 }
 
 /* The top-level `namespace:` of a kustomization, NULL when it sets none. */
@@ -810,19 +823,39 @@ static bool k8s_kustomize_component(const char *source) {
     return k8s_kustomize_top(source, "kind", val, sizeof(val)) && strcmp(val, "Component") == 0;
 }
 
-static void k8s_kusts_push(k8s_kusts_t *ks, const char *path, char *ns, bool component) {
+/* A kustomization's `namePrefix:` / `nameSuffix:` (`key`), NULL when it
+ * sets none -- or one with `/` or a blank in it, which is no name part; its
+ * line into `*line` when that is still 0. */
+static char *k8s_kustomize_name_part(const char *source, const char *key, int *line) {
+    char val[K8S_LABEL_LEN];
+    int at = 0;
+    if (!k8s_kustomize_top_at(source, key, val, sizeof(val), &at) || strpbrk(val, "/ \t")) {
+        return NULL;
+    }
+    if (*line == 0) {
+        *line = at;
+    }
+    return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, val);
+}
+
+static void k8s_kusts_push(k8s_kusts_t *ks, const char *path, const char *source) {
     if (!k8s_grow((void **)&ks->items, &ks->cap, ks->count, sizeof(*ks->items))) {
-        cbm_free(CBM_MEM_CLASS_OTHER, ns);
         return;
     }
-    ks->items[ks->count++] = (k8s_kust_t){
-        .path = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, path), .ns = ns, .component = component};
+    k8s_kust_t k = {.path = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, path),
+                    .ns = k8s_kustomize_namespace(source),
+                    .component = k8s_kustomize_component(source)};
+    k.prefix = k8s_kustomize_name_part(source, "namePrefix", &k.rename_line);
+    k.suffix = k8s_kustomize_name_part(source, "nameSuffix", &k.rename_line);
+    ks->items[ks->count++] = k;
 }
 
 static void k8s_kusts_free(k8s_kusts_t *ks) {
     for (int i = 0; i < ks->count; i++) {
         cbm_free(CBM_MEM_CLASS_OTHER, ks->items[i].path);
         cbm_free(CBM_MEM_CLASS_OTHER, ks->items[i].ns);
+        cbm_free(CBM_MEM_CLASS_OTHER, ks->items[i].prefix);
+        cbm_free(CBM_MEM_CLASS_OTHER, ks->items[i].suffix);
         cbm_free(CBM_MEM_CLASS_OTHER, ks->items[i].kids);
         cbm_free(CBM_MEM_CLASS_OTHER, (void *)ks->items[i].files);
     }
@@ -3960,6 +3993,174 @@ static void k8s_link_patches(cbm_pipeline_ctx_t *ctx, const k8s_kusts_t *ks, k8s
     }
 }
 
+/* kustomize's prefix / suffix transformers leave these names alone
+ * (api/internal/builtins/PrefixTransformer.go prefixFieldSpecsToSkip, the
+ * same list in SuffixTransformer.go). */
+static bool k8s_rename_skips(const char *group, const char *kind) {
+    return strcmp(kind, "CustomResourceDefinition") == 0 || strcmp(kind, "Namespace") == 0 ||
+           (strcmp(kind, "APIService") == 0 && strcmp(group, "apiregistration.k8s.io") == 0);
+}
+
+/* A kustomization on the way down a renaming build: the prefix and suffix
+ * the levels above and its own put around its objects' names, and the
+ * namespace the outermost level setting one gives them (NULL: their own). */
+typedef struct {
+    int kust;
+    const char *ns;
+    char pre[K8S_LABEL_LEN];
+    char suf[K8S_LABEL_LEN];
+} k8s_rename_frame_t;
+
+/* The variant of object `obj` the renaming build of `root` deploys: a
+ * Resource `Kind/<deployed name>` declared by the kustomization (`base`:
+ * its File QN without `.__file__`), ecosystem kustomize; the kustomization
+ * DEFINES it and it OVERRIDEs {via: namePrefix | nameSuffix, kustomization,
+ * line} the object. */
+static void k8s_rename_variant(cbm_pipeline_ctx_t *ctx, const k8s_kust_t *root, const char *base,
+                               int64_t kust_file, const k8s_rename_frame_t *f,
+                               const cbm_gbuf_node_t *obj) {
+    char kind[K8S_LABEL_LEN];
+    char group[K8S_LABEL_LEN];
+    char version[K8S_LABEL_LEN];
+    char declared[K8S_LABEL_LEN];
+    const char *name = NULL;
+    if (!k8s_kind_name(obj, kind, sizeof(kind), &name)) {
+        return;
+    }
+    k8s_node_prop(obj, "group", group, sizeof(group));
+    if (!group[0] || k8s_rename_skips(group, kind)) {
+        return;
+    }
+    k8s_node_prop(obj, "version", version, sizeof(version));
+    k8s_declared_ns(obj->qualified_name, declared, sizeof(declared));
+    const char *ns = k8s_cluster_scoped(kind) || !f->ns ? declared : f->ns;
+    char deployed[K8S_LABEL_LEN];
+    int dl = snprintf(deployed, sizeof(deployed), "%s%s%s", f->pre, name, f->suf);
+    char qn[CBM_SZ_2K];
+    char rname[CBM_SZ_256];
+    if (dl <= 0 || (size_t)dl >= sizeof(deployed) ||
+        snprintf(qn, sizeof(qn), "%s::%s/%s/%s/%s", base, group, kind, ns[0] ? ns : "-",
+                 deployed) >= (int)sizeof(qn) ||
+        snprintf(rname, sizeof(rname), "%s/%s", kind, deployed) >= (int)sizeof(rname)) {
+        return;
+    }
+    char *props = k8s_resource_props(qn, NULL, version, NULL, "kustomize");
+    int64_t id = props ? cbm_gbuf_upsert_node(ctx->gbuf, "Resource", rname, qn, root->path,
+                                              root->rename_line, root->rename_line, props)
+                       : 0;
+    cbm_free(CBM_MEM_CLASS_OTHER, props);
+    if (id <= 0 || id == obj->id) {
+        return;
+    }
+    if (kust_file > 0) {
+        cbm_gbuf_insert_edge(ctx->gbuf, kust_file, id, "DEFINES", "{}");
+    }
+    char ek[CBM_SZ_2K];
+    cbm_json_escape(ek, (int)sizeof(ek), root->path);
+    char eprops[CBM_SZ_2K + CBM_SZ_256];
+    snprintf(eprops, sizeof(eprops), "{\"via\":\"%s\",\"kustomization\":\"%s\",\"line\":%d}",
+             root->prefix ? "namePrefix" : "nameSuffix", ek, root->rename_line);
+    cbm_gbuf_insert_edge(ctx->gbuf, id, obj->id, "OVERRIDE", eprops);
+}
+
+/* Every object the build of renaming kustomization `root` reaches gets its
+ * variant: down the kustomizations it includes, each level's prefix inside
+ * the ones above, its namespace where none above sets one (a component's
+ * own transforms are not followed). `by_file`: Resource ids by manifest. */
+static void k8s_rename_build(cbm_pipeline_ctx_t *ctx, const k8s_kusts_t *ks, int root,
+                             CBMHashTable *by_file, int *seen, int mark) {
+    static const char FILE_SUFFIX[] = ".__file__";
+    const k8s_kust_t *r = &ks->items[root];
+    const cbm_gbuf_node_t *kf = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, r->path);
+    size_t ql = kf && kf->qualified_name ? strlen(kf->qualified_name) : 0;
+    size_t sl = sizeof(FILE_SUFFIX) - SKIP_ONE;
+    char base[CBM_SZ_1K];
+    if (ql <= sl || strcmp(kf->qualified_name + ql - sl, FILE_SUFFIX) != 0 ||
+        ql - sl >= sizeof(base)) {
+        return;
+    }
+    snprintf(base, sizeof(base), "%.*s", (int)(ql - sl), kf->qualified_name);
+    k8s_rename_frame_t *stack = NULL;
+    int depth = 0;
+    int cap = 0;
+    if (!k8s_grow((void **)&stack, &cap, depth, sizeof(*stack))) {
+        return;
+    }
+    stack[depth] = (k8s_rename_frame_t){.kust = root, .ns = r->ns};
+    snprintf(stack[depth].pre, sizeof(stack[depth].pre), "%s", r->prefix ? r->prefix : "");
+    snprintf(stack[depth].suf, sizeof(stack[depth].suf), "%s", r->suffix ? r->suffix : "");
+    depth++;
+    while (depth > 0) {
+        k8s_rename_frame_t f = stack[--depth];
+        if (seen[f.kust] == mark) {
+            continue;
+        }
+        seen[f.kust] = mark;
+        const k8s_kust_t *k = &ks->items[f.kust];
+        for (int i = 0; i < k->file_n; i++) {
+            const k8s_ids_t *objs = cbm_ht_get(by_file, k->files[i]);
+            for (int o = 0; objs && o < objs->count; o++) {
+                const cbm_gbuf_node_t *n = cbm_gbuf_find_by_id(ctx->gbuf, objs->items[o]);
+                if (n) {
+                    k8s_rename_variant(ctx, r, base, kf->id, &f, n);
+                }
+            }
+        }
+        for (int i = 0; i < k->kid_n; i++) {
+            const k8s_kust_t *kid = &ks->items[k->kids[i]];
+            const char *kp = kid->component || !kid->prefix ? "" : kid->prefix;
+            const char *kx = kid->component || !kid->suffix ? "" : kid->suffix;
+            if (!k8s_grow((void **)&stack, &cap, depth, sizeof(*stack))) {
+                break;
+            }
+            k8s_rename_frame_t *c = &stack[depth];
+            *c = (k8s_rename_frame_t){.kust = k->kids[i],
+                                      .ns = f.ns || kid->component ? f.ns : kid->ns};
+            if (snprintf(c->pre, sizeof(c->pre), "%s%s", f.pre, kp) < (int)sizeof(c->pre) &&
+                snprintf(c->suf, sizeof(c->suf), "%s%s", kx, f.suf) < (int)sizeof(c->suf)) {
+                depth++;
+            }
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, stack);
+}
+
+/* Kustomize namePrefix / nameSuffix -> a variant Resource per object a
+ * kustomization renames, with its deployed name, OVERRIDE -> the object.
+ * Minted after the joins: references inside a build use the declared names
+ * (kustomize rewrites them), so nothing joins a variant. */
+static void k8s_link_renames(cbm_pipeline_ctx_t *ctx, const k8s_kusts_t *ks) {
+    bool any = false;
+    for (int i = 0; i < ks->count && !any; i++) {
+        any = !ks->items[i].component && (ks->items[i].prefix || ks->items[i].suffix);
+    }
+    if (!any) {
+        return;
+    }
+    CBMHashTable *by_file = cbm_ht_create(0);
+    int *seen = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)ks->count * sizeof(int));
+    const cbm_gbuf_node_t **res = NULL;
+    int res_n = 0;
+    if (by_file && seen && cbm_gbuf_find_by_label(ctx->gbuf, "Resource", &res, &res_n) == 0) {
+        for (int i = 0; i < res_n; i++) {
+            if (res[i]->file_path) {
+                k8s_index_add(by_file, res[i]->file_path, res[i]->id);
+            }
+        }
+        int mark = 0;
+        for (int i = 0; i < ks->count; i++) {
+            if (!ks->items[i].component && (ks->items[i].prefix || ks->items[i].suffix)) {
+                k8s_rename_build(ctx, ks, i, by_file, seen, ++mark);
+            }
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, seen);
+    if (by_file) {
+        cbm_ht_foreach(by_file, k8s_free_ids_entry, NULL);
+        cbm_ht_free(by_file);
+    }
+}
+
 static void k8s_link_deploys(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundles_t *b,
                              const k8s_facts_t *f) {
     if (f->dep_n == 0 && f->hr_n == 0 && f->src_n == 0 && f->kchart_n == 0) {
@@ -4114,8 +4315,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                     helm_count++;
                     break;
                 case K8S_KUSTOMIZE:
-                    k8s_kusts_push(&kusts, rel, k8s_kustomize_namespace(p->source),
-                                   k8s_kustomize_component(p->source));
+                    k8s_kusts_push(&kusts, rel, p->source);
                     k8s_kustomize_keep(&facts, rel, p->res);
                     break;
                 case K8S_MANIFEST:
@@ -4160,6 +4360,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_link_images(ctx, &facts);
     k8s_link_envs(ctx, &facts);
     k8s_link_patches(ctx, &kusts, &facts);
+    k8s_link_renames(ctx, &kusts);
     k8s_facts_free(&facts);
     k8s_records_free(&recs);
     /* Link `file://` chart dependencies now that every Chart.yaml is read,

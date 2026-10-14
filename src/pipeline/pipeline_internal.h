@@ -1521,7 +1521,10 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      A kustomize patch OVERRIDEs the objects of its build it changes, its
  *      file an IMPORTS of the kustomization; a Resource keeps the version of
  *      its apiVersion and its labels; a kustomization DEPLOYS the charts it inflates
- *      (helmCharts) (extract_k8s.c, pass_k8s.c). A Terraform reference
+ *      (helmCharts); an object a namePrefix / nameSuffix renames has a
+ *      variant Resource {ecosystem:kustomize} with its deployed name, which
+ *      OVERRIDEs {via:namePrefix|nameSuffix} it (extract_k8s.c,
+ *      pass_k8s.c). A Terraform reference
  *      USAGEs {ref, via:terraform}, from its block, the block of its module
  *      (directory) declaring it (one in depends_on: DEPENDS_ON), instead of
  *      the generic name matcher's USAGE / CALLS; a bare block label names
