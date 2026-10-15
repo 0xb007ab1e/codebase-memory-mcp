@@ -574,7 +574,10 @@ static bool cross_repo_seed_bounded_scan(const cross_repo_fixture_t *fixture,
     return ok;
 }
 
-TEST(cross_repo_scan_bound_counts_examined_rows_not_matches) {
+/* No row count decides which calls are matched: the scans stopped after 4,096
+ * rows, so a call examined after 4,096 others never got its CROSS_HTTP_CALLS
+ * edge even though the target serves its route. */
+TEST(cross_repo_matches_calls_past_4096_rows) {
     cross_repo_fixture_t fixture;
     bool setup = cross_repo_fixture_begin(&fixture) &&
                  cross_repo_seed_bounded_scan(&fixture, "bounded-source", "bounded-target");
@@ -589,7 +592,7 @@ TEST(cross_repo_scan_bound_counts_examined_rows_not_matches) {
 
     ASSERT_FALSE(result.failed);
     ASSERT_EQ(result.projects_scanned, 1);
-    ASSERT_EQ(result.http_edges, 0);
+    ASSERT_EQ(result.http_edges, 1);
     PASS();
 }
 
@@ -952,7 +955,7 @@ SUITE(cross_repo) {
     RUN_TEST(cross_repo_named_pre768_target_fails_before_cleanup_issue2133);
     RUN_TEST(cross_repo_status_distinguishes_never_run_from_ran_without_links);
     RUN_TEST(cross_repo_wildcard_reports_skipped_pre768_store);
-    RUN_TEST(cross_repo_scan_bound_counts_examined_rows_not_matches);
+    RUN_TEST(cross_repo_matches_calls_past_4096_rows);
     RUN_TEST(cross_repo_propagates_delete_failure);
     RUN_TEST(cross_repo_failed_bidirectional_insert_is_not_counted);
     RUN_TEST(cross_repo_cancel_mid_run_keeps_completed_target_and_stops_before_later_target);

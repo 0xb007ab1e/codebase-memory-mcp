@@ -1732,6 +1732,7 @@ extern void suite_store_edges(void);
 extern void suite_store_impact(void);
 extern void suite_store_scope(void);
 extern void suite_store_graph_digest(void);
+extern void suite_graph_mem(void);
 extern void suite_test_impact(void);
 extern void suite_test_impact_profiles(void);
 extern void suite_test_impact_changes(void);
@@ -1779,6 +1780,7 @@ extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
+extern void suite_pipeline_objectscript_timeout(void);
 extern void suite_pipeline_conventions(void);
 extern void suite_pipeline_frozen(void);
 extern void suite_importance(void);
@@ -1812,6 +1814,7 @@ extern void suite_java_lsp_coverage(void);
 extern void suite_kotlin_lsp(void);
 extern void suite_rust_lsp(void);
 extern void suite_store_arch(void);
+extern void suite_architecture_projection(void);
 extern void suite_store_bulk(void);
 extern void suite_store_pragmas(void);
 extern void suite_store_checkpoint(void);
@@ -1836,6 +1839,7 @@ extern void suite_diagrams(void);
 extern void suite_openapi(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
+extern void suite_runtime_settings(void);
 extern void suite_agent_clients(void);
 extern void suite_agent_profiles(void);
 extern void suite_config_json_like(void);
@@ -1930,7 +1934,31 @@ const char *tf_runner_image(int argc, char **argv) {
     return argc > 0 && argv ? argv[0] : NULL;
 }
 
+const char *cbm_test_program_path;
+
 int main(int argc, char **argv) {
+    cbm_test_program_path = tf_runner_image(argc, argv);
+    if (argc >= 4 && argc % 2 == 0 && strcmp(argv[1], "__cbm_env_values") == 0) {
+        for (int i = 2; i < argc; i += 2) {
+            const char *value = getenv(argv[i]);
+            if (!value || strcmp(value, argv[i + 1]) != 0) {
+                return 61;
+            }
+        }
+        return 0;
+    }
+    if (argc >= 5 && strcmp(argv[1], "__cbm_env_isolation") == 0) {
+        const char *value = getenv(argv[2]);
+        if (!value || strcmp(value, argv[3]) != 0) {
+            return 61;
+        }
+        for (int i = 4; i < argc; i++) {
+            if (getenv(argv[i])) {
+                return 62;
+            }
+        }
+        return 0;
+    }
     /* #2003: never let a caller's GIT_DIR/GIT_INDEX_FILE/... redirect fixture
      * git commands at the caller's real repository. */
     th_clear_git_repo_env();
@@ -2167,6 +2195,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(store_impact);
     RUN_SELECTED_SUITE(store_scope);
     RUN_SELECTED_SUITE(store_graph_digest);
+    RUN_SELECTED_SUITE(graph_mem);
     RUN_SELECTED_SUITE(test_impact);
     RUN_SELECTED_SUITE(test_impact_profiles);
     RUN_SELECTED_SUITE(test_impact_changes);
@@ -2227,6 +2256,7 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(pipeline_objectscript_timeout);
     RUN_SELECTED_SUITE(pipeline_conventions);
     RUN_SELECTED_SUITE(pipeline_frozen);
     RUN_SELECTED_SUITE(importance);
@@ -2285,6 +2315,7 @@ int main(int argc, char **argv) {
 
     /* Architecture + ADR + Louvain */
     RUN_SELECTED_SUITE(store_arch);
+    RUN_SELECTED_SUITE(architecture_projection);
 
     /* HTTP link */
 
@@ -2320,6 +2351,7 @@ int main(int argc, char **argv) {
 
     /* CLI (install, update, config) */
     RUN_SELECTED_SUITE(cli);
+    RUN_SELECTED_SUITE(runtime_settings);
     RUN_SELECTED_SUITE(agent_clients);
     RUN_SELECTED_SUITE(agent_profiles);
     RUN_SELECTED_SUITE(config_json_like);

@@ -9,6 +9,8 @@
 #include "test_framework.h"
 #include "test_doc_mentions_helpers.h"
 
+#include "foundation/log.h"
+
 /* ── helpers of this file ────────────────────────────────────────── */
 
 static CBMFileResult *go_extract(const char *src, const char *rel) {
@@ -1258,17 +1260,30 @@ static void go_write_lookup_fixture(const char *repo) {
     free(big);
 }
 
-/* Write the lookup fixture below `tmp` and index it into `db`. */
+/* Write the lookup fixture below `tmp` and index it into `db`.
+ *
+ * Self-diagnosing: on windows-11-arm the suite once hung in local_rules before
+ * the pipeline's first info line (dry run 38186491924, 2026-10-12; not
+ * reproduced since). The setup therefore runs at debug level, where this
+ * helper, the pipeline's setup steps and every git child name themselves, so
+ * a hang ends on the step it is stuck in. */
 static int go_index_lookup(char *tmp, size_t tmp_cap, char *db, size_t db_cap) {
+    CBMLogLevel prev_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    int rc = -1;
+    cbm_log_debug("go_index_lookup", "step", "mkdtemp");
     snprintf(tmp, tmp_cap, "/tmp/cbm_dm_go_XXXXXX");
-    if (!cbm_mkdtemp(tmp)) {
-        return -1;
+    if (cbm_mkdtemp(tmp)) {
+        char repo[400];
+        snprintf(repo, sizeof(repo), "%s/repo", tmp);
+        cbm_log_debug("go_index_lookup", "step", "fixture", "dir", tmp);
+        go_write_lookup_fixture(repo);
+        snprintf(db, db_cap, "%s/go.db", tmp);
+        cbm_log_debug("go_index_lookup", "step", "index");
+        rc = dm_index(repo, db, NULL);
     }
-    char repo[400];
-    snprintf(repo, sizeof(repo), "%s/repo", tmp);
-    go_write_lookup_fixture(repo);
-    snprintf(db, db_cap, "%s/go.db", tmp);
-    return dm_index(repo, db, NULL);
+    cbm_log_set_level(prev_level);
+    return rc;
 }
 
 /* ── resolver: every reference form, in its first lookup level ───── */

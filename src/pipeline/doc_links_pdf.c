@@ -380,6 +380,16 @@ static int node_id_cmp(const void *a, const void *b) {
     return x->id < y->id ? -1 : x->id > y->id ? 1 : 0;
 }
 
+/* Two nodes of one definition: the same file, start line and name. */
+static bool same_definition(const cbm_gbuf_node_t *a, const cbm_gbuf_node_t *b) {
+    const char *a_file = a->file_path ? a->file_path : "";
+    const char *b_file = b->file_path ? b->file_path : "";
+    const char *a_name = a->name ? a->name : "";
+    const char *b_name = b->name ? b->name : "";
+    return a->start_line == b->start_line && strcmp(a_file, b_file) == 0 &&
+           strcmp(a_name, b_name) == 0;
+}
+
 /* The field test's _collapse: one entity's several nodes become one. */
 static const cbm_gbuf_node_t *collapse(const pdfr_index_t *x, nodeset_t *s) {
     if (s->n == 1) {
@@ -416,10 +426,7 @@ static const cbm_gbuf_node_t *collapse(const pdfr_index_t *x, nodeset_t *s) {
     }
     const cbm_gbuf_node_t *f = s->v[0];
     for (int i = 1; i < s->n; i++) {
-        const cbm_gbuf_node_t *n = s->v[i];
-        if (strcmp(n->file_path ? n->file_path : "", f->file_path ? f->file_path : "") != 0 ||
-            n->start_line != f->start_line ||
-            strcmp(n->name ? n->name : "", f->name ? f->name : "") != 0) {
+        if (!same_definition(s->v[i], f)) {
             return NULL;
         }
     }
