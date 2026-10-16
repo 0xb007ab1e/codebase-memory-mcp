@@ -1332,9 +1332,10 @@ bool cbm_ansible_is_sequence(const char *src);
  * (pass_terraform.c). */
 bool cbm_repo_rel_join(const char *dir, const char *v, char *out, size_t sz);
 
-/* The Image node of image reference `ref` (its normalised repository:
- * docker.io for no registry host, library/ for an official image; tag and
- * digest dropped), made when new; 0 for scratch or no image. */
+/* The Image node of image reference `ref` (its repository as written, tag
+ * and digest dropped; Docker Hub's host spellings as docker.io with library/
+ * for an official image; registry "unknown" when the reference names no
+ * host -- none is invented), made when new; 0 for scratch or no image. */
 int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref);
 
 /* A chart repository URL as an identity (pass_k8s.c): `url` trimmed, its
