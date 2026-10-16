@@ -118,6 +118,7 @@ jobs:
         env:
           CBM_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/cbm-artifact
           SMOKE_REQUIRE_UI: "1"
+          SMOKE_REQUIRE_WRAPPERS: "1"
 
       - name: Security audits
         run: |
@@ -224,6 +225,7 @@ jobs:
         env:
           SMOKE_ARCH: ${{ matrix.arch }}
           SMOKE_REQUIRE_UI: "1"
+          SMOKE_REQUIRE_WRAPPERS: "1"
         run: |
           export CBM_SMOKE_ARTIFACT_DIR="$(cygpath -u "$RUNNER_TEMP")/cbm-artifact"
           bash test-infrastructure/vm/vm-smoke.sh
@@ -301,6 +303,7 @@ jobs:
         env:
           CBM_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/cbm-artifact
           SMOKE_REQUIRE_UI: "1"
+          SMOKE_REQUIRE_WRAPPERS: "1"
 
       # The -portable binary is what all linux install/update paths now deliver;
       # it MUST start on old glibc (Debian 11 / RHEL 8 / Ubuntu 20.04). Runs it
