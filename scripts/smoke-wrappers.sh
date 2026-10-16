@@ -29,9 +29,11 @@ REQUIRE="${SMOKE_REQUIRE_WRAPPERS:-0}"
 EXE=""
 case "${OSTYPE:-}" in msys* | cygwin* | win32*) EXE=".exe" ;; esac
 
-WORK="${TMPDIR:-/tmp}/cbm-smoke-wrappers.$$.$RANDOM"
-mkdir -m 700 "$WORK"
-trap 'rm -rf "$WORK"' EXIT
+# mktemp -d sets 0700 at creation. `mkdir -m 700` changes the mode in a second
+# step, which MSYS2 cannot do under the smoke profile's owner-only DACL.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/cbm-smoke-wrappers.XXXXXX")"
+# Go writes its module cache read-only; restore write permission so it can be removed.
+trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 FAILED=0
 
 missing() { # wrapper, what
@@ -127,7 +129,11 @@ smoke_go() {
     fi
     local dir="$WORK/go" rc=0
     mkdir -p "$dir"
+    # All Go state stays under $WORK: a toolchain that GOTOOLCHAIN=auto downloads
+    # lands read-only in the module cache, which must not end up in the caller's
+    # HOME (the smoke harness could not delete its profile afterwards).
     (cd "$ROOT/pkg/go" && GOTOOLCHAIN="${GOTOOLCHAIN:-auto}" \
+        GOPATH="$dir/gopath" GOMODCACHE="$dir/gomodcache" GOCACHE="$dir/gocache" \
         go build -o "$dir/codebase-memory-mcp$EXE" ./cmd/codebase-memory-mcp) \
         >"$dir/install.log" 2>&1 || rc=$?
     if [ "$rc" -ne 0 ]; then
