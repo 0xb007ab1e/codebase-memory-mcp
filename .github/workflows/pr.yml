@@ -232,6 +232,7 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
+          SMOKE_REQUIRE_WRAPPERS: "1"
 
       - name: Build prod + smoke (macOS)
         if: matrix.os == 'macos-14'
@@ -242,6 +243,7 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
+          SMOKE_REQUIRE_WRAPPERS: "1"
 
       - name: Build prod + smoke (Windows)
         if: matrix.os == 'windows-latest'
@@ -252,6 +254,7 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
+          SMOKE_REQUIRE_WRAPPERS: "1"
 
   # ── Waste sanitizer, REPORT-ONLY: memory + CPU waste on this repository and
   #    the per-function scaling lane (Linux). Deliberately NOT in ci-ok's needs:
