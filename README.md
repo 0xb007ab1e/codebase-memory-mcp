@@ -2,7 +2,7 @@
 
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?branch=main&label=main%20CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/release.yml?branch=main&label=main%20CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/release.yml)
 [![C tests](https://img.shields.io/badge/C_tests-9388_cases-blue)](#tests)
 [![MCP tools](https://img.shields.io/badge/MCP_tools-17-blue)](#mcp-tools)
 [![Languages](https://img.shields.io/badge/languages-162-orange)](https://github.com/DeusData/codebase-memory-mcp)
