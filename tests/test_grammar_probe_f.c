@@ -4372,6 +4372,77 @@ TEST(probe_helm_templated_objects_are_resources) {
     PASS();
 }
 
+/* Every DEPLOYS edge out of a Chart and CONFIGURES edge into one, as
+ * "<source> -> <label>:<target> (<type>[ <ref>])", a File by its path,
+ * sorted, one per line. */
+static char *gpf_chart_edges(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT CASE WHEN "
+            "s.label='File' THEN s.file_path ELSE s.name END || ' -> ' || t.label || ':' || "
+            "t.name || ' (' || e.type || coalesce(' ' || json_extract(e.properties,'$.ref'), '') "
+            "|| ')' AS x FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND ((s.label='Chart' AND e.type='DEPLOYS') OR "
+            "(t.label='Chart' AND e.type='CONFIGURES')) ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A chart deploys what its templates render: Chart -DEPLOYS {via: chart}->
+ * each object of its templates/ (a subchart's objects are the subchart's),
+ * and each Image those objects name literally ({ref: image}) -- a templated
+ * image names none, and no values default is read. Its values files
+ * (values.yaml, values-*.yaml beside Chart.yaml) CONFIGURE it; a values file
+ * elsewhere (ci/) does not. */
+TEST(probe_helm_chart_deploys_its_objects) {
+    static const GpfFile files[] = {
+        {"charts/web/Chart.yaml", "apiVersion: v2\nname: web\nversion: 1.0.0\n"},
+        {"charts/web/values.yaml", "image:\n  repository: nginx\n  tag: \"1.27\"\nreplicas: 1\n"},
+        {"charts/web/values-prod.yaml", "replicas: 3\n"},
+        {"charts/web/ci/test-values.yaml", "replicas: 2\n"},
+        {"charts/web/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
+         "  replicas: {{ .Values.replicas }}\n  template:\n    spec:\n      containers:\n"
+         "        - name: web\n"
+         "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"
+         "        - name: side\n          image: ghcr.io/acme/sidecar:1\n"},
+        {"charts/web/templates/svc.yaml",
+         "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\nspec:\n  selector:\n"
+         "    app: web\n"},
+        {"charts/web/charts/db/Chart.yaml", "apiVersion: v2\nname: db\nversion: 0.1.0\n"},
+        {"charts/web/charts/db/templates/sts.yaml",
+         "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: db\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: db\n"
+         "          image: ghcr.io/acme/db:16\n"}};
+    char *got = gpf_chart_edges(files, 8);
+    static const char want[] = "charts/web/values-prod.yaml -> Chart:web (CONFIGURES)\n"
+                               "charts/web/values.yaml -> Chart:web (CONFIGURES)\n"
+                               "db -> Image:ghcr.io/acme/db (DEPLOYS image)\n"
+                               "db -> Resource:StatefulSet/db (DEPLOYS)\n"
+                               "web -> Image:ghcr.io/acme/sidecar (DEPLOYS image)\n"
+                               "web -> Resource:Deployment/web (DEPLOYS)\n"
+                               "web -> Resource:Service/web (DEPLOYS)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "chart edges got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("Chart DEPLOYS / CONFIGURES edge set");
+    }
+    free(got);
+    PASS();
+}
+
 /* A template's `include "name"` calls the define of that name in its chart
  * family -- the chart and its subcharts share one template namespace -- never
  * a same-named define of an unrelated chart; a define may also be written in
@@ -6180,6 +6251,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_go_installer_deploys_charts);
     RUN_TEST(probe_terraform_helm_release_deploys_its_chart);
     RUN_TEST(probe_helm_templated_objects_are_resources);
+    RUN_TEST(probe_helm_chart_deploys_its_objects);
     RUN_TEST(probe_helm_include_resolves_in_the_chart_family);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
     RUN_TEST(probe_k8s_selector_within_kustomize_build);

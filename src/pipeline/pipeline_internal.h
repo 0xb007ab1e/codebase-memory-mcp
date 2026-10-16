@@ -1057,6 +1057,9 @@ int cbm_parse_compile_commands(const char *json_data, const char *repo_path, cha
 /* File identification helpers */
 bool cbm_is_kustomize_file(const char *name);
 bool cbm_is_k8s_manifest(const char *name, const char *content);
+/* A Helm values file name: values.yaml / .yml, values-<x>.yaml / .yml
+ * (pass_k8s.c; beside Chart.yaml it CONFIGURES the chart). */
+bool cbm_helm_values_name(const char *base);
 
 /* Secret detection */
 bool cbm_is_secret_binding(const char *key, const char *value);
