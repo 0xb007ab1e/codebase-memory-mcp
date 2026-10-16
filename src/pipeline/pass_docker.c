@@ -11,9 +11,10 @@
  * ENV); a reference without a value leaves the image unknown, and an unknown
  * image is no edge.
  *
- * Image identity is the normalised repository: docker.io for an image
- * without a registry host, library/ for an official one-segment image;
- * tag and digest stay on the edge.
+ * Image identity is the repository as written, tag and digest dropped (they
+ * stay on the edge). Its registry is the host the reference names -- Docker
+ * Hub's spellings as docker.io, with library/ for an official one-segment
+ * image -- else "unknown": no host is invented for a reference naming none.
  *
  * PHASE 4 P4.1b: what the container runs. The last stage's ENTRYPOINT (else
  * CMD) SPAWNS -- from the Dockerfile's Module {api:dockerfile}:
@@ -268,7 +269,6 @@ static const char *dk_expand(dk_t *d, const dk_var_t *vars, const char *text) {
     return out;
 }
 
-/* The repository identity of image reference `ref` into out. */
 /* Only characters an image reference can hold (name, :tag, @digest) -- a
  * template's placeholder (`<.Values.image>`, `<tpl>`) or an expression is
  * no image. */
@@ -281,7 +281,15 @@ static bool dk_ref_chars(const char *ref) {
     return ref[0] != '\0';
 }
 
-static bool dk_normalize(const char *ref, char *out, size_t sz) {
+/* The registry of a reference that names no host. */
+static const char DK_REGISTRY_UNKNOWN[] = "unknown";
+
+/* The repository identity of image reference `ref` into out, the registry
+ * its host names into reg. A reference without a host is the repository as
+ * written, its registry unknown: docker.io is only Docker's default -- a
+ * short-name search list (Podman, CRI-O) or a local-only build tag resolves
+ * elsewhere or nowhere. */
+static bool dk_normalize(const char *ref, char *out, size_t sz, char *reg, size_t reg_sz) {
     if (!dk_ref_chars(ref)) {
         return false;
     }
@@ -300,15 +308,12 @@ static bool dk_normalize(const char *ref, char *out, size_t sz) {
         return false;
     }
     char *first_end = strchr(r, '/');
-    if (!first_end) {
-        snprintf(out, sz, "docker.io/library/%s", r);
-        return true;
-    }
-    size_t fl = (size_t)(first_end - r);
-    bool host = memchr(r, '.', fl) || memchr(r, ':', fl) ||
-                (fl == strlen("localhost") && strncmp(r, "localhost", fl) == 0);
+    size_t fl = first_end ? (size_t)(first_end - r) : 0;
+    bool host = first_end && (memchr(r, '.', fl) || memchr(r, ':', fl) ||
+                              (fl == strlen("localhost") && strncmp(r, "localhost", fl) == 0));
     if (!host) {
-        snprintf(out, sz, "docker.io/%s", r);
+        snprintf(out, sz, "%s", r);
+        snprintf(reg, reg_sz, "%s", DK_REGISTRY_UNKNOWN);
         return true;
     }
     const char *rest = first_end + SKIP_ONE;
@@ -318,8 +323,10 @@ static bool dk_normalize(const char *ref, char *out, size_t sz) {
         (fl == strlen("registry-1.docker.io") && strncmp(r, "registry-1.docker.io", fl) == 0);
     if (hub) {
         snprintf(out, sz, "docker.io/%s%s", strchr(rest, '/') ? "" : "library/", rest);
+        snprintf(reg, reg_sz, "docker.io");
     } else {
         snprintf(out, sz, "%.*s/%s", (int)fl, r, rest);
+        snprintf(reg, reg_sz, "%.*s", (int)fl, r);
     }
     return true;
 }
@@ -365,15 +372,20 @@ static int dk_stage_of(const dk_t *d, const char *ref) {
 
 int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref) {
     char repo[CBM_SZ_512];
-    if (!ref || dk_ieq(ref, "scratch") || !dk_normalize(ref, repo, sizeof(repo))) {
+    char reg[CBM_SZ_512];
+    if (!ref || dk_ieq(ref, "scratch") ||
+        !dk_normalize(ref, repo, sizeof(repo), reg, sizeof(reg))) {
         return 0;
     }
     char qn[CBM_SZ_1K];
     snprintf(qn, sizeof(qn), "__image__%s", repo);
     char esc_repo[CBM_SZ_1K];
+    char esc_reg[CBM_SZ_1K];
     cbm_json_escape(esc_repo, (int)sizeof(esc_repo), repo);
+    cbm_json_escape(esc_reg, (int)sizeof(esc_reg), reg);
     char node_props[CBM_SZ_2K];
-    snprintf(node_props, sizeof(node_props), "{\"repository\":\"%s\"}", esc_repo);
+    snprintf(node_props, sizeof(node_props), "{\"repository\":\"%s\",\"registry\":\"%s\"}",
+             esc_repo, esc_reg);
     return cbm_gbuf_upsert_node(ctx->gbuf, "Image", repo, qn, "", 0, 0, node_props);
 }
 
@@ -2054,7 +2066,7 @@ static int dk_hub_match(const char *tag, const char *const *comps, int nc) {
 }
 
 /* The Image of a component: `<repo>:<pattern>` (`*-frontend`: the
- * prefix's version masked) {repository, component, tag_pattern}. */
+ * prefix's version masked) {repository, registry, component, tag_pattern}. */
 static int64_t dk_hub_image(cbm_pipeline_ctx_t *ctx, const char *repo, const char *comp,
                             char pre_sep, char suf_sep) {
     char head[PAIR_LEN + SKIP_ONE] = {0};
@@ -2073,16 +2085,24 @@ static int64_t dk_hub_image(cbm_pipeline_ctx_t *ctx, const char *repo, const cha
     snprintf(pattern, sizeof(pattern), "%s%s%s", head, comp, tail);
     snprintf(name, sizeof(name), "%s:%s", repo, pattern);
     snprintf(qn, sizeof(qn), "__image__%s", name);
+    char same[CBM_SZ_1K];
+    char reg[CBM_SZ_512];
+    if (!dk_normalize(repo, same, sizeof(same), reg, sizeof(reg))) {
+        snprintf(reg, sizeof(reg), "%s", DK_REGISTRY_UNKNOWN);
+    }
     char esc_r[CBM_SZ_1K];
+    char esc_g[CBM_SZ_1K];
     char esc_c[CBM_SZ_1K];
     char esc_p[CBM_SZ_1K];
     cbm_json_escape(esc_r, (int)sizeof(esc_r), repo);
+    cbm_json_escape(esc_g, (int)sizeof(esc_g), reg);
     cbm_json_escape(esc_c, (int)sizeof(esc_c), comp);
     cbm_json_escape(esc_p, (int)sizeof(esc_p), pattern);
     char props[CBM_SZ_4K];
     snprintf(props, sizeof(props),
-             "{\"repository\":\"%s\",\"component\":\"%s\",\"tag_pattern\":\"%s\"}", esc_r, esc_c,
-             esc_p);
+             "{\"repository\":\"%s\",\"registry\":\"%s\",\"component\":\"%s\","
+             "\"tag_pattern\":\"%s\"}",
+             esc_r, esc_g, esc_c, esc_p);
     return cbm_gbuf_upsert_node(ctx->gbuf, "Image", name, qn, "", 0, 0, props);
 }
 

@@ -3980,10 +3980,10 @@ static char *incremental_compose_edit(bool legacy, cbm_incremental_route_t *rout
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/composeedit.db", tmp);
     static const char old_img[] = "SELECT COUNT(*) FROM nodes WHERE label='Image' AND "
-                                  "name='docker.io/acme/web-old'";
+                                  "name='acme/web-old'";
     static const char new_edge[] =
         "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id WHERE e.type='DEPENDS_ON' "
-        "AND s.name='docker.io/acme/web-new'";
+        "AND s.name='acme/web-new'";
     if (k8s_inc_index(tmp, db_path) != 0 || k8s_inc_count(db_path, old_img) != 1) {
         th_rmtree(tmp);
         return NULL;
@@ -4131,13 +4131,13 @@ static char *incremental_image_split(bool rename, cbm_incremental_route_t *route
     static const char to_repo[] =
         "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
         "t.id=e.target_id WHERE e.type='USAGE' AND s.name='Service/runner' AND "
-        "t.name='docker.io/acme/demo'";
+        "t.name='acme/demo'";
     static const char to_b[] =
         "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
         "t.id=e.target_id WHERE e.type='USAGE' AND s.name='Service/runner' AND "
-        "t.name='docker.io/acme/demo:*-b'";
+        "t.name='acme/demo:*-b'";
     static const char b_img[] =
-        "SELECT COUNT(*) FROM nodes WHERE label='Image' AND name='docker.io/acme/demo:*-b'";
+        "SELECT COUNT(*) FROM nodes WHERE label='Image' AND name='acme/demo:*-b'";
     if (k8s_inc_index(tmp, db_path) != 0 || k8s_inc_count(db_path, to_b) != 1) {
         th_rmtree(tmp);
         return NULL;
