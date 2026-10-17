@@ -7229,6 +7229,48 @@ TEST(extract_go_method_receiver_qualified_qn) {
     PASS();
 }
 
+/* Templ shares Go's method grammar (method_declaration with a receiver), but
+ * only Go method QNs are receiver-qualified (#1913); templ's call-scope QN
+ * stays flat. The method's def QN and the enclosing-function QN of a call
+ * inside it must agree, or the call has no source node and degrades to the
+ * File node. */
+TEST(extract_templ_method_qn_matches_call_scope) {
+    CBMFileResult *r = extract("package views\n"
+                               "\n"
+                               "type Page struct{}\n"
+                               "\n"
+                               "func (p Page) Title() string {\n"
+                               "\treturn helper()\n"
+                               "}\n"
+                               "\n"
+                               "func helper() string { return \"x\" }\n"
+                               "\n"
+                               "templ hello(name string) {\n"
+                               "\t<div>{ name }</div>\n"
+                               "}\n",
+                               CBM_LANG_TEMPL, "t", "x.templ");
+    ASSERT_NOT_NULL(r);
+    const char *title_qn = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && d->qualified_name && strcmp(d->name, "Title") == 0) {
+            title_qn = d->qualified_name;
+        }
+    }
+    const char *scope = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, "helper") == 0) {
+            scope = c->enclosing_func_qn;
+        }
+    }
+    ASSERT_NOT_NULL(title_qn);
+    ASSERT_NOT_NULL(scope);
+    ASSERT_STR_EQ(scope, title_qn);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* TS/JS/TSX receiver-aware flag (#592/#606; same intent as the Perl flag above).
  * A member call x.foo() with a non-this/super receiver is flagged is_method so
  * the resolver can suppress a weak short-name match (`re.test()` must not bind a
@@ -12301,6 +12343,7 @@ SUITE(extraction) {
     RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
     RUN_TEST(extract_go_selector_call_flags_is_method);
     RUN_TEST(extract_go_method_receiver_qualified_qn);
+    RUN_TEST(extract_templ_method_qn_matches_call_scope);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);

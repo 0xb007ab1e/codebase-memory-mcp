@@ -8650,6 +8650,41 @@ TEST(pipeline_html_embedded_member_call_stays_unbound) {
     PASS();
 }
 
+/* CALLS edges whose source and target QNs end with the given suffixes and
+ * whose serialized properties contain `props_fragment` (NULL: any edge). QN
+ * suffixes pin the exact node, not just a same-named one. */
+static int go_calls_between(cbm_store_t *s, const char *project, const char *caller_suffix,
+                            const char *callee_suffix, const char *props_fragment) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count);
+    size_t cs = strlen(caller_suffix);
+    size_t ts = strlen(callee_suffix);
+    int hits = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+            src.qualified_name && tgt.qualified_name) {
+            size_t sl = strlen(src.qualified_name);
+            size_t tl = strlen(tgt.qualified_name);
+            if (sl >= cs && tl >= ts && strcmp(src.qualified_name + sl - cs, caller_suffix) == 0 &&
+                strcmp(tgt.qualified_name + tl - ts, callee_suffix) == 0 &&
+                (!props_fragment ||
+                 (edges[i].properties_json && strstr(edges[i].properties_json, props_fragment)))) {
+                hits++;
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return hits;
+}
+
 TEST(pipeline_go_method_caller_keeps_lsp_join) {
     /* #1909: receiver-qualifying method QNs moves the def/textual-call QN to
      * package.Type.method — go_lsp's enclosing-function QN must move with it
@@ -8695,6 +8730,13 @@ TEST(pipeline_go_method_caller_keeps_lsp_join) {
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
     ASSERT_TRUE(cross_file_call_exists(s, project, "Install", "helper"));
+    /* Pinned to the receiver-qualified target in svc/helper.go and to an LSP
+     * strategy: a name-only binding, or one onto other.Decoy.helper, would
+     * still satisfy the by-name check above. */
+    ASSERT_GTE(go_calls_between(s, project, ".svc.Repo.Install", ".svc.Repo.helper",
+                                "\"strategy\":\"lsp_"),
+               1);
+    ASSERT_EQ(go_calls_between(s, project, ".svc.Repo.Install", ".other.Decoy.helper", NULL), 0);
     cbm_store_close(s);
     cbm_pipeline_free(p);
     th_rmtree(tmp);

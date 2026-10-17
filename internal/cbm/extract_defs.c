@@ -6696,8 +6696,13 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
              * call-scope side (compute_func_qn in extract_unified.c) mirrors
              * this formula, and go_lsp consumers read the def QN and
              * parent_class (receiver_type) verbatim, so resolution joins
-             * stay exact. */
-            def.qualified_name = cbm_arena_sprintf(a, "%s.%s", def.parent_class, name);
+             * stay exact. Go only: templ's Go-derived grammar reaches this
+             * branch too, but its call-scope QN (compute_func_qn) stays flat,
+             * and a def QN the calls do not share would orphan every call
+             * inside a templ method. */
+            if (ctx->language == CBM_LANG_GO) {
+                def.qualified_name = cbm_arena_sprintf(a, "%s.%s", def.parent_class, name);
+            }
         }
     }
 
