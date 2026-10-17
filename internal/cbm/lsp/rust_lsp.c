@@ -6323,7 +6323,10 @@ static void rust_resolve_against_registry(CBMArena *arena, const char *source, i
  * read-only, and shared across every Rust file's resolve (mirrors C/py/cs/ts).
  * Converts the pipeline's CBMLSPDef into CBMRustLSPDef inline (same field copy as
  * pass_lsp_cross.c's pxc_lspdefs_to_rust, including proven trait provenance).
- * module_qn=NULL is byte-identical because all_defs always carry def_module_qn. */
+ * module_qn=NULL is byte-identical because all_defs always carry def_module_qn.
+ * all_defs is mixed-language: only Rust defs are registered, exactly like the
+ * per-file conversion, so a Perl `new` or a C function can never become the
+ * target of a Rust call (the Go builder filters the same way). */
 CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, int def_count) {
     if (!arena)
         return NULL;
@@ -6331,29 +6334,34 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
     if (!reg)
         return NULL;
     CBMRustLSPDef *rdefs = NULL;
+    int n = 0;
     if (def_count > 0) {
         rdefs = (CBMRustLSPDef *)cbm_arena_alloc(arena, (size_t)def_count * sizeof(CBMRustLSPDef));
         if (!rdefs)
             return NULL;
         for (int i = 0; i < def_count; i++) {
-            rdefs[i].qualified_name = defs[i].qualified_name;
-            rdefs[i].short_name = defs[i].short_name;
-            rdefs[i].label = defs[i].label;
-            rdefs[i].receiver_type = defs[i].receiver_type;
-            rdefs[i].def_module_qn = defs[i].def_module_qn;
-            rdefs[i].return_types = defs[i].return_types;
-            rdefs[i].embedded_types = defs[i].embedded_types;
-            rdefs[i].field_defs = defs[i].field_defs;
-            rdefs[i].method_names_str = defs[i].method_names_str;
-            rdefs[i].signature_param_types = defs[i].signature_param_types;
-            rdefs[i].signature_param_count = defs[i].signature_param_count;
-            rdefs[i].trait_qn = defs[i].trait_qn;
-            rdefs[i].is_interface = defs[i].is_interface;
-            rdefs[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
-            rdefs[i].is_abstract = defs[i].is_abstract;
+            if (defs[i].lang != CBM_LANG_RUST) {
+                continue;
+            }
+            rdefs[n].qualified_name = defs[i].qualified_name;
+            rdefs[n].short_name = defs[i].short_name;
+            rdefs[n].label = defs[i].label;
+            rdefs[n].receiver_type = defs[i].receiver_type;
+            rdefs[n].def_module_qn = defs[i].def_module_qn;
+            rdefs[n].return_types = defs[i].return_types;
+            rdefs[n].embedded_types = defs[i].embedded_types;
+            rdefs[n].field_defs = defs[i].field_defs;
+            rdefs[n].method_names_str = defs[i].method_names_str;
+            rdefs[n].signature_param_types = defs[i].signature_param_types;
+            rdefs[n].signature_param_count = defs[i].signature_param_count;
+            rdefs[n].trait_qn = defs[i].trait_qn;
+            rdefs[n].is_interface = defs[i].is_interface;
+            rdefs[n].is_rust_impl_relation = defs[i].is_rust_impl_relation;
+            rdefs[n].is_abstract = defs[i].is_abstract;
+            n++;
         }
     }
-    rust_populate_cross_registry(reg, arena, rdefs, def_count, /*module_qn=*/NULL);
+    rust_populate_cross_registry(reg, arena, n > 0 ? rdefs : NULL, n, /*module_qn=*/NULL);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
 }
