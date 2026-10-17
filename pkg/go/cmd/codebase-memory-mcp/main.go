@@ -44,7 +44,7 @@ import (
 
 const (
 	repo              = "DeusData/codebase-memory-mcp"
-	version           = "0.12.0"
+	version           = "0.12.1"
 	windowsBinaryName = "codebase-memory-mcp.exe"
 
 	maxRedirects          = 5
