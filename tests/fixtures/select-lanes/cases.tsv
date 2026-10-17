@@ -6,6 +6,7 @@
 docs-only	CONTRIBUTING.md docs/BENCHMARK.md	T0a-docs	false	contracts security-static
 readme-runs-the-test-legs	README.md	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
 site-files-run-the-test-legs	docs/index.html docs/llms.txt	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
+npm-readme-runs-the-test-legs	pkg/npm/README.md	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
 issue-template-is-docs	.github/ISSUE_TEMPLATE/bug.yml	T0a-docs	false	contracts security-static
 local-infra	test-infrastructure/run.sh	T0b-nonproduct	false	contracts lint lint-mem security-static
 lint-config	scripts/memory-core-baseline.txt	T0b-nonproduct	false	contracts lint lint-mem security-static

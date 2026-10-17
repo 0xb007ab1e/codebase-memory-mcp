@@ -105,6 +105,18 @@ static bool te_is_runner_suite(te_ctx_t *c, const char *name) {
     return false;
 }
 
+/* Whether `path` is a runner file: one whose main runs suites. */
+static bool te_runner_file(te_ctx_t *c, const char *path) {
+    int n = 0;
+    const cbm_test_runner_suite_t *runner = cbm_test_model_runner_suites(c->model, &n);
+    for (int i = 0; path && i < n; i++) {
+        if (runner[i].file && strcmp(runner[i].file, path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* ── Fixtures (replay4 584-615) ──────────────────────────────────── */
 
 /* Test files: the files that define a suite. */
@@ -139,19 +151,75 @@ static bool te_ids_has(const te_ids_t *a, int64_t id) {
     return false;
 }
 
-/* Every line of a test file that contains `needle`: its enclosing
- * definition is a fixture case or a seed — unless it is one of `exclude`
- * (a role handler naming its own literal is not a test that spawns it). */
-static bool te_scan_literal_ex(te_ctx_t *c, const char *needle, te_ids_t *seeds, bool *cases,
-                               bool *hit, const te_ids_t *exclude);
-
-static bool te_scan_literal(te_ctx_t *c, const char *needle, te_ids_t *seeds, bool *cases,
-                            bool *hit) {
-    return te_scan_literal_ex(c, needle, seeds, cases, hit, NULL);
+static const char *te_skip_space(const char *p, const char *end) {
+    while (p < end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+    return p;
 }
 
-static bool te_scan_literal_ex(te_ctx_t *c, const char *needle, te_ids_t *seeds, bool *cases,
-                               bool *hit, const te_ids_t *exclude) {
+static bool te_ident_char(char ch) {
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+           ch == '_';
+}
+
+/* A `#define NAME ...` line: 1 with NAME copied out, 0 for any other line,
+ * -1 for a define whose name does not fit or does not parse. */
+static int te_define_name(const char *text, size_t len, char *name, size_t cap) {
+    static const char keyword[] = "define";
+    size_t klen = sizeof(keyword) - 1;
+    const char *end = text + len;
+    const char *p = te_skip_space(text, end);
+    if (p >= end || *p != '#') {
+        return 0;
+    }
+    p = te_skip_space(p + 1, end);
+    if ((size_t)(end - p) <= klen || memcmp(p, keyword, klen) != 0 ||
+        (p[klen] != ' ' && p[klen] != '\t')) {
+        return 0;
+    }
+    p = te_skip_space(p + klen, end);
+    const char *start = p;
+    while (p < end && te_ident_char(*p)) {
+        p++;
+    }
+    if (p == start || (size_t)(p - start) >= cap) {
+        return -1;
+    }
+    memcpy(name, start, (size_t)(p - start));
+    name[p - start] = '\0';
+    return 1;
+}
+
+/* Whether `needle` occurs in the line; an identifier only as a whole word. */
+static bool te_line_names(const char *text, size_t len, const char *needle, size_t nlen,
+                          bool ident) {
+    for (size_t i = 0; nlen && i + nlen <= len; i++) {
+        if (memcmp(text + i, needle, nlen) == 0 &&
+            (!ident || ((i == 0 || !te_ident_char(text[i - 1])) &&
+                        (i + nlen == len || !te_ident_char(text[i + nlen]))))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A macro that names a role literal through further macros: past this depth
+ * the tests that use it are unknown, and everything runs. */
+#define TE_DEFINE_DEPTH_MAX 4
+
+/* Every line of a test file that contains `needle`: its enclosing
+ * definition is a fixture case or a seed — unless it is one of `exclude`
+ * (a role handler naming its own literal is not a test that spawns it).
+ * A `#define NAME "literal"` line names nobody: the code that uses NAME does,
+ * so the scan follows NAME (a whole word) instead, through macros that name
+ * macros. A define it cannot follow runs everything. In a role's scan
+ * (`runner_cases`: the walk's sinks) a runner file's helper — the runner's own
+ * use of a role's marker — still seeds the walk but names no spawner: there,
+ * only a test case does (a sink, found by its start line like every case). */
+static bool te_scan_text(te_ctx_t *c, const char *needle, bool ident, int depth, te_ids_t *seeds,
+                         bool *cases, bool *hit, const te_ids_t *exclude,
+                         const te_ids_t *runner_cases) {
     int files = cbm_ti_source_file_count(c->source);
     size_t nlen = strlen(needle);
     for (int f = 0; f < files; f++) {
@@ -163,11 +231,26 @@ static bool te_scan_literal_ex(te_ctx_t *c, const char *needle, te_ids_t *seeds,
         for (int line = 1; line <= lines; line++) {
             size_t len = 0;
             const char *text = cbm_ti_source_line(c->source, f, line, &len);
-            bool found = false;
-            for (size_t i = 0; !found && nlen && i + nlen <= len; i++) {
-                found = memcmp(text + i, needle, nlen) == 0;
+            if (!text || !te_line_names(text, len, needle, nlen, ident)) {
+                continue;
             }
-            if (!found) {
+            char name[256];
+            int define = te_define_name(text, len, name, sizeof(name));
+            if (define > 0 && strcmp(name, needle) == 0) {
+                continue; /* the definition of the macro being followed */
+            }
+            if (define < 0 || (define > 0 && depth >= TE_DEFINE_DEPTH_MAX)) {
+                char note[400];
+                snprintf(note, sizeof(note),
+                         "%s:%d defines a macro naming %s that the scan cannot follow", path, line,
+                         needle);
+                return te_fallback(c, CBM_TEST_RESULT_FALLBACK_SELECTION_UNAVAILABLE, note);
+            }
+            if (define > 0) {
+                if (!te_scan_text(c, name, true, depth + 1, seeds, cases, hit, exclude,
+                                  runner_cases)) {
+                    return false;
+                }
                 continue;
             }
             bool ok = true;
@@ -180,8 +263,10 @@ static bool te_scan_literal_ex(te_ctx_t *c, const char *needle, te_ids_t *seeds,
             if (!d || te_ids_has(exclude, d->id)) {
                 continue;
             }
-            *hit = true;
             int ci = te_is_function(d) ? te_case_index(c, path, d->name) : -1;
+            if (!runner_cases || !te_runner_file(c, path) || te_ids_has(runner_cases, d->id)) {
+                *hit = true;
+            }
             if (ci >= 0) {
                 cases[ci] = true;
             } else if (!te_ids_push(c, seeds, d->id)) {
@@ -190,6 +275,18 @@ static bool te_scan_literal_ex(te_ctx_t *c, const char *needle, te_ids_t *seeds,
         }
     }
     return true;
+}
+
+static bool te_scan_literal(te_ctx_t *c, const char *needle, te_ids_t *seeds, bool *cases,
+                            bool *hit) {
+    return te_scan_text(c, needle, false, 0, seeds, cases, hit, NULL, NULL);
+}
+
+/* The scan for a role's literal: `exclude` holds the handlers and main,
+ * `sinks` the walk's sinks (every test case among them). */
+static bool te_scan_literal_ex(te_ctx_t *c, const char *needle, te_ids_t *seeds, bool *cases,
+                               bool *hit, const te_ids_t *exclude, const te_ids_t *sinks) {
+    return te_scan_text(c, needle, false, 0, seeds, cases, hit, exclude, sinks);
 }
 
 /* One fixture path: the path itself, then each parent down to the rule's
@@ -284,13 +381,6 @@ typedef struct {
     int role_cap;
 } te_sinks_t;
 
-static const char *te_skip_space(const char *p, const char *end) {
-    while (p < end && (*p == ' ' || *p == '\t')) {
-        p++;
-    }
-    return p;
-}
-
 /* One `TF_ROLE(phase, "literal", handler)` line. false: no entry here (the
  * macro's own #define included); *bad: an entry that does not parse. */
 static bool te_role_parse(const char *text, size_t len, char *literal, size_t literal_cap,
@@ -303,7 +393,7 @@ static bool te_role_parse(const char *text, size_t len, char *literal, size_t li
         return false;
     }
     const char *at = NULL;
-    for (const char *q = p; !at && q + macro_len <= end; q++) {
+    for (const char *q = p; !at && (size_t)(end - q) >= macro_len; q++) {
         at = memcmp(q, TE_ROLE_MACRO, macro_len) == 0 ? q : NULL;
     }
     if (!at) {
@@ -348,8 +438,7 @@ static bool te_role_parse(const char *text, size_t len, char *literal, size_t li
 }
 
 /* The handler's function node: the one Function of that name in a runner or
- * test file. 0 when there is none or more than one (then it is no sink, and
- * reaching it reaches main). */
+ * test file. 0 when there is none or more than one. */
 static bool te_role_handler(te_ctx_t *c, const char *name, int64_t *id) {
     cbm_node_t *nodes = NULL;
     int n = 0;
@@ -378,7 +467,10 @@ static bool te_role_handler(te_ctx_t *c, const char *name, int64_t *id) {
     return true;
 }
 
-/* The role table of one runner file: each entry's handler becomes a sink. */
+/* The role table of one runner file: each entry's handler becomes a sink.
+ * main dispatches through the table, so no edge leads from main to a handler:
+ * an entry the engine cannot read, or whose handler it cannot find, hides that
+ * role's spawners, and everything runs. */
 static bool te_runner_roles(te_ctx_t *c, const char *file, te_sinks_t *s) {
     int f = cbm_ti_source_find(c->source, file);
     int lines = f >= 0 ? cbm_ti_source_line_count(c->source, f) : 0;
@@ -389,16 +481,24 @@ static bool te_runner_roles(te_ctx_t *c, const char *file, te_sinks_t *s) {
         char handler[256];
         bool bad = false;
         if (!text ||
-            !te_role_parse(text, len, literal, sizeof(literal), handler, sizeof(handler), &bad) ||
-            bad) {
-            continue; /* not an entry, or one that does not parse: no sink */
+            !te_role_parse(text, len, literal, sizeof(literal), handler, sizeof(handler), &bad)) {
+            continue; /* not an entry */
+        }
+        char note[400];
+        if (bad) {
+            snprintf(note, sizeof(note), "%s:%d: a role table entry the engine cannot read", file,
+                     line);
+            return te_fallback(c, CBM_TEST_RESULT_FALLBACK_SELECTION_UNAVAILABLE, note);
         }
         int64_t id = 0;
         if (!te_role_handler(c, handler, &id)) {
             return false;
         }
         if (!id) {
-            continue;
+            snprintf(note, sizeof(note),
+                     "%s:%d: the role handler %s is no single function of the tests", file, line,
+                     handler);
+            return te_fallback(c, CBM_TEST_RESULT_FALLBACK_SELECTION_UNAVAILABLE, note);
         }
         if (!te_grow((void **)&s->roles, &s->role_cap, s->role_count, sizeof(*s->roles))) {
             return te_oom(c);
@@ -997,7 +1097,7 @@ static bool te_role_lift(te_ctx_t *c, cbm_impact_walk_t *walk, te_sinks_t *s, bo
             }
             r->scanned = true;
             te_ids_t seeds = {0};
-            ok = te_scan_literal_ex(c, r->literal, &seeds, cases, &r->named, &handlers);
+            ok = te_scan_literal_ex(c, r->literal, &seeds, cases, &r->named, &handlers, &s->sinks);
             if (ok && seeds.count) {
                 ok = cbm_impact_walk_run(walk, seeds.items, seeds.count) == CBM_STORE_OK ||
                      (te_fallback(c, CBM_TEST_RESULT_FALLBACK_ENGINE_SATURATED,
@@ -1056,9 +1156,11 @@ static void te_call_chain(const cbm_impact_walk_t *walk, int64_t id, const char 
  * edge: a platform variant, a route), the reached node main has a walked edge
  * to, or 0. An edge into a Field named like a suite main runs is no way in:
  * the C extractor takes the macro argument of RUN_SELECTED_SUITE(mcp) for a
- * use of some same-named data member (`char mcp[]` in an unrelated struct). */
-static bool te_main_reached(te_ctx_t *c, const cbm_impact_walk_t *walk, int64_t main_id,
-                            int64_t *way_in) {
+ * use of some same-named data member (`char mcp[]` in an unrelated struct).
+ * Nor is an edge into a sink (a role handler main calls, a suite, a test):
+ * the walk selects whoever runs it and never expands it. */
+static bool te_main_reached(te_ctx_t *c, const cbm_impact_walk_t *walk, const te_sinks_t *sinks,
+                            int64_t main_id, int64_t *way_in) {
     *way_in = 0;
     const cbm_impact_hit_t *self = cbm_impact_walk_hit(walk, main_id);
     if (!self) {
@@ -1089,12 +1191,25 @@ static bool te_main_reached(te_ctx_t *c, const cbm_impact_walk_t *walk, int64_t 
         const char *name = walked && to->qualified_name ? strrchr(to->qualified_name, '.') : NULL;
         bool suite_arg =
             name && to->label && strcmp(to->label, "Field") == 0 && te_is_runner_suite(c, name + 1);
-        if (walked && !suite_arg) {
+        if (walked && !suite_arg && !te_ids_has(&sinks->sinks, edges[e].target_id)) {
             *way_in = edges[e].target_id;
         }
     }
     cbm_store_free_edges(edges, n);
     return true;
+}
+
+/* Role lifts and parse gaps feed each other: a gap that a lift's walk names
+ * can reach a further handler, and a lift can reach a further gap. Both run
+ * until the walk stops growing (it only grows, so this ends). */
+static bool te_lift_fixpoint(te_ctx_t *c, cbm_impact_walk_t *walk, te_sinks_t *sinks,
+                             bool *fixture_cases) {
+    bool ok = true;
+    for (int before = -1; ok && cbm_impact_walk_count(walk) != before;) {
+        before = cbm_impact_walk_count(walk);
+        ok = te_parse_gaps(c, walk) && te_role_lift(c, walk, sinks, fixture_cases);
+    }
+    return ok;
 }
 
 bool te_reach(te_ctx_t *c) {
@@ -1104,11 +1219,11 @@ bool te_reach(te_ctx_t *c) {
     te_sinks_t sinks = {0};
     cbm_impact_walk_t *walk = NULL;
     bool ok = te_fixtures(c, &extra, &extra_count, &fixture_cases) && te_collect_sinks(c, &sinks) &&
-              te_walk(c, &sinks, extra, extra_count, &walk) && te_parse_gaps(c, walk) &&
-              te_role_lift(c, walk, &sinks, fixture_cases) && te_parse_gaps(c, walk);
+              te_walk(c, &sinks, extra, extra_count, &walk) &&
+              te_lift_fixpoint(c, walk, &sinks, fixture_cases);
     for (int i = 0; ok && i < sinks.runner_main.count; i++) {
         int64_t way_in = 0;
-        ok = te_main_reached(c, walk, sinks.runner_main.items[i], &way_in);
+        ok = te_main_reached(c, walk, &sinks, sinks.runner_main.items[i], &way_in);
         if (ok && way_in) {
             const cbm_impact_hit_t *m = cbm_impact_walk_hit(walk, sinks.runner_main.items[i]);
             const char *main_name =
@@ -1118,14 +1233,22 @@ bool te_reach(te_ctx_t *c) {
             int used =
                 snprintf(note, sizeof(note), "the change reaches the test runner's main: %s%s",
                          direct ? "" : main_name, direct ? "" : " -> ");
+            if (used < 0) {
+                note[0] = '\0';
+                used = 0;
+            } else if ((size_t)used >= sizeof(note)) {
+                used = (int)sizeof(note) - 1; /* a truncated prefix: no room for the chain */
+            }
             te_call_chain(walk, way_in, "", note + used, sizeof(note) - (size_t)used);
             ok = te_fallback(c, CBM_TEST_RESULT_FALLBACK_RUNNER_REACHED, note);
             break;
         }
     }
     /* After the runner check: the runner re-executing itself is a spawn too,
-     * and reaching its main through that is no change to the runner. */
-    ok = ok && te_spawn_lift(c, walk);
+     * and reaching its main through that is no change to the runner. What the
+     * spawn lift reaches is lifted like the rest: a handler that starts the
+     * product is first reached here. */
+    ok = ok && te_spawn_lift(c, walk) && te_lift_fixpoint(c, walk, &sinks, fixture_cases);
     ok = ok && te_reach_rows(c, walk, fixture_cases) && te_suite_triggers(c, walk) &&
          te_rule_triggers(c) && te_header_triggers(c);
     c->static_complete = ok;

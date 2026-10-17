@@ -674,6 +674,194 @@ TEST(test_impact_engine_role_literal_behind_a_define_selects_its_users) {
     PASS();
 }
 
+/* A macro that names that macro is followed too. A chain longer than the scan
+ * follows runs everything: the tests that use its last macro are unknown. */
+TEST(test_impact_engine_role_literal_behind_a_macro_chain) {
+    tie_fixture_t fx;
+    char *json = tie_answer_orphan_switch(&fx, "#define BETA_SWITCH \"__FX_ORPHAN_SWITCH\"\n"
+                                               "#define BETA_ALIAS BETA_SWITCH\n"
+                                               "TEST(beta_sets_switch) {\n"
+                                               "    const char *name = BETA_ALIAS;\n"
+                                               "    return name[0] == '_' ? 0 : 1;\n"
+                                               "}\n"
+                                               "TEST(beta_plain) {\n    return 0;\n}\n"
+                                               "SUITE(beta) {\n"
+                                               "    RUN_TEST(beta_sets_switch);\n"
+                                               "    RUN_TEST(beta_plain);\n"
+                                               "}\n");
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(strstr(json, "RUNNER_REACHED"));
+    ASSERT_TRUE(tie_suite_has(json, "beta", "STATIC"));
+    free(json);
+    tie_close(&fx);
+
+    json = tie_answer_orphan_switch(&fx, "#define BETA_M0 \"__FX_ORPHAN_SWITCH\"\n"
+                                         "#define BETA_M1 BETA_M0\n"
+                                         "#define BETA_M2 BETA_M1\n"
+                                         "#define BETA_M3 BETA_M2\n"
+                                         "#define BETA_M4 BETA_M3\n"
+                                         "#define BETA_M5 BETA_M4\n"
+                                         "TEST(beta_sets_switch) {\n"
+                                         "    const char *name = BETA_M5;\n"
+                                         "    return name[0] == '_' ? 0 : 1;\n"
+                                         "}\n"
+                                         "TEST(beta_plain) {\n    return 0;\n}\n"
+                                         "SUITE(beta) {\n"
+                                         "    RUN_TEST(beta_sets_switch);\n"
+                                         "    RUN_TEST(beta_plain);\n"
+                                         "}\n");
+    ASSERT_NOT_NULL(json);
+    ASSERT_TRUE(tie_top_decision(json, "run_all"));
+    ASSERT_NOT_NULL(strstr(json, "SELECTION_UNAVAILABLE"));
+    free(json);
+    tie_close(&fx);
+    PASS();
+}
+
+/* `src` with `insert` placed after `anchor` (which must occur in it) into
+ * `out`; false when it does not fit. */
+static bool tie_insert(char *out, size_t cap, const char *src, const char *anchor,
+                       const char *insert) {
+    const char *at = strstr(src, anchor);
+    if (!at) {
+        return false;
+    }
+    size_t head = (size_t)(at - src) + strlen(anchor);
+    int n = snprintf(out, cap, "%.*s%s%s", (int)head, src, insert, src + head);
+    return n > 0 && (size_t)n < cap;
+}
+
+static bool tie_runner_with(char *out, size_t cap, const char *anchor, const char *insert) {
+    return tie_insert(out, cap, tie_roles_main, anchor, insert);
+}
+
+/* The role fixture's runner with a suite of its own (`body`, placed after the
+ * role table), which main runs as the real runner runs runner_isolation. */
+static bool tie_runner_with_suite(char *out, size_t cap, const char *body) {
+    char first[4096];
+    return tie_runner_with(first, sizeof(first), "};\n", body) &&
+           tie_insert(out, cap, first, "    RUN_SELECTED_SUITE(matrix);\n",
+                      "    RUN_SELECTED_SUITE(runner_isolation);\n");
+}
+
+/* The role fixture with `runner` as its base, then a change to lib_value or
+ * lib_other; the answer (NULL on a fixture failure). */
+static char *tie_answer_runner(tie_fixture_t *fx, const char *runner, bool other) {
+    const char *base[] = {"branch", "--quiet", "-f", "main", "HEAD", NULL};
+    if (!tie_open_roles(fx) || !tie_write(fx, "tests/test_main.c", runner) ||
+        !tie_commit(fx, "the runner under test") || !tie_git(fx, base) ||
+        !tie_write(fx, "src/lib.c",
+                   other ? "int lib_value(void) {\n    return 1;\n}\n"
+                           "int lib_other(void) {\n    return 2 + 0;\n}\n"
+                           "int lib_third(void) {\n    return 3;\n}\n"
+                         : "int lib_value(void) {\n    return 1 + 0;\n}\n"
+                           "int lib_other(void) {\n    return 2;\n}\n"
+                           "int lib_third(void) {\n    return 3;\n}\n") ||
+        !tie_commit(fx, other ? "change lib_other" : "change lib_value")) {
+        return NULL;
+    }
+    char *json = tie_answer(fx);
+    if (json) {
+        printf("  note: %s\n", tie_last_note);
+    }
+    return json;
+}
+
+/* main dispatches through the role table, so no edge leads from main to a
+ * handler: an entry the engine cannot read, or whose handler is no single
+ * function, hides that role's spawners, and every change runs everything. */
+TEST(test_impact_engine_unusable_role_entry_runs_all) {
+    const char *anchor = "    TF_ROLE(0, \"__fx_orphan_role\", role_orphan),\n";
+    const char *const entries[] = {"    TF_ROLE(0, FX_GHOST_LITERAL, role_orphan),\n",
+                                   "    TF_ROLE(0, \"__fx_ghost_role\", role_ghost),\n"};
+    for (int k = 0; k < 2; k++) {
+        char runner[4096];
+        ASSERT_TRUE(tie_runner_with(runner, sizeof(runner), anchor, entries[k]));
+        tie_fixture_t fx;
+        char *json = tie_answer_runner(&fx, runner, false);
+        ASSERT_NOT_NULL(json);
+        ASSERT_TRUE(tie_top_decision(json, "run_all"));
+        ASSERT_NOT_NULL(strstr(json, "SELECTION_UNAVAILABLE"));
+        free(json);
+        tie_close(&fx);
+    }
+    PASS();
+}
+
+/* A handler first reached by the spawn lift (it starts the product, whose
+ * main the change reaches) is lifted like any other: its literal is named by
+ * no test here, so everything runs. */
+TEST(test_impact_engine_role_reached_by_the_spawn_lift_is_lifted) {
+    static const char product[] = "int lib_other(void);\n"
+                                  "int main(void) {\n"
+                                  "    return lib_other();\n"
+                                  "}\n";
+    const char *call = "    return lib_other();\n";
+    const char *at = strstr(tie_roles_main, call);
+    ASSERT_NOT_NULL(at);
+    char runner[4096];
+    int n = snprintf(runner, sizeof(runner),
+                     "#include <stdlib.h>\n%.*s    return system(\"./app --version\");\n%s",
+                     (int)(at - tie_roles_main), tie_roles_main, at + strlen(call));
+    ASSERT_TRUE(n > 0 && (size_t)n < sizeof(runner));
+    const char *const files[] = {
+        "tests/test_main.c",   runner,           "tests/test_beta.c", tie_roles_beta,
+        "tests/test_matrix.c", tie_roles_matrix, "src/lib.c",         tie_roles_lib,
+        "src/main.c",          product};
+    tie_fixture_t fx;
+    ASSERT_TRUE(tie_open_files(&fx, files, 5));
+    ASSERT_TRUE(tie_write(&fx, "src/lib.c",
+                          "int lib_value(void) {\n    return 1;\n}\n"
+                          "int lib_other(void) {\n    return 2 + 0;\n}\n"
+                          "int lib_third(void) {\n    return 3;\n}\n"));
+    ASSERT_TRUE(tie_commit(&fx, "change lib_other"));
+    char *json = tie_answer(&fx);
+    ASSERT_NOT_NULL(json);
+    if (!strstr(json, "RUNNER_REACHED")) {
+        printf("  note: %s\n  %.1600s\n", tie_last_note, json);
+    }
+    ASSERT_NOT_NULL(strstr(json, "RUNNER_REACHED"));
+    free(json);
+    tie_close(&fx);
+    PASS();
+}
+
+/* The runner's own use of a role's literal (its helper reading the marker)
+ * names no spawner, so a role only the runner names still runs everything;
+ * a test case in the runner file that names it is a spawner. */
+TEST(test_impact_engine_runner_helper_names_no_spawner) {
+    char runner[4096];
+    ASSERT_TRUE(
+        tie_runner_with_suite(runner, sizeof(runner),
+                              "static int runner_reads_marker(void) {\n"
+                              "    const char *s = \"__fx_orphan_role\";\n"
+                              "    return s[0] == '_' ? 0 : 1;\n"
+                              "}\n"
+                              "TEST(runner_plain) {\n    return 0;\n}\n"
+                              "SUITE(runner_isolation) {\n    RUN_TEST(runner_plain);\n}\n"));
+    tie_fixture_t fx;
+    char *json = tie_answer_runner(&fx, runner, true);
+    ASSERT_NOT_NULL(json);
+    ASSERT_TRUE(tie_top_decision(json, "run_all"));
+    ASSERT_NOT_NULL(strstr(json, "RUNNER_REACHED"));
+    free(json);
+    tie_close(&fx);
+
+    ASSERT_TRUE(tie_runner_with_suite(runner, sizeof(runner),
+                                      "TEST(runner_spawns_orphan) {\n"
+                                      "    const char *s = \"__fx_orphan_role\";\n"
+                                      "    return s[0] == '_' ? 0 : 1;\n"
+                                      "}\n"
+                                      "SUITE(runner_isolation) {\n"
+                                      "    RUN_TEST(runner_spawns_orphan);\n}\n"));
+    json = tie_answer_runner(&fx, runner, true);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(strstr(json, "RUNNER_REACHED"));
+    free(json);
+    tie_close(&fx);
+    PASS();
+}
+
 /* A struct member named like a suite: the extractor can take the macro argument
  * of RUN_SELECTED_SUITE(alpha) for a use of it. A changed member reaches main
  * only through that edge into a Field: no veto. */
@@ -691,6 +879,48 @@ TEST(test_impact_engine_field_call_is_no_way_into_main) {
         printf("  note: %s\n", tie_last_note);
     }
     ASSERT_NULL(strstr(json, "RUNNER_REACHED"));
+    free(json);
+    tie_close(&fx);
+    PASS();
+}
+
+/* main may call a role handler itself, as the runner's main calls the
+ * blocking-git probe. A reached handler is a sink whose spawners the role lift
+ * selects, so that call is no way into main. Here main is reached otherwise
+ * only through the edge into the suite-named member (above): no veto. */
+TEST(test_impact_engine_reached_role_handler_is_no_way_into_main) {
+    static const char shapes[] =
+        "typedef struct {\n    char alpha[8];\n    int sides;\n} shape_t;\n";
+    const char *anchor = "int main(int argc, char **argv) {\n";
+    const char *at = strstr(tie_roles_main, anchor);
+    ASSERT_NOT_NULL(at);
+    size_t head = (size_t)(at - tie_roles_main) + strlen(anchor);
+    char runner[4096];
+    int n = snprintf(runner, sizeof(runner),
+                     "%.*s    if (argc > 9) {\n        return role_probe(argc, argv);\n    }\n%s",
+                     (int)head, tie_roles_main, tie_roles_main + head);
+    ASSERT_TRUE(n > 0 && (size_t)n < sizeof(runner));
+    const char *const files[] = {"tests/test_main.c",   runner,
+                                 "tests/test_beta.c",   tie_roles_beta,
+                                 "tests/test_matrix.c", tie_roles_matrix,
+                                 "src/lib.c",           tie_roles_lib,
+                                 "tests/shapes.h",      shapes};
+    tie_fixture_t fx;
+    ASSERT_TRUE(tie_open_files(&fx, files, 5));
+    ASSERT_TRUE(tie_write(&fx, "tests/shapes.h",
+                          "typedef struct {\n    char alpha[16];\n    int sides;\n} shape_t;\n"));
+    ASSERT_TRUE(tie_write(&fx, "src/lib.c",
+                          "int lib_value(void) {\n    return 1 + 0;\n}\n"
+                          "int lib_other(void) {\n    return 2;\n}\n"
+                          "int lib_third(void) {\n    return 3;\n}\n"));
+    ASSERT_TRUE(tie_commit(&fx, "widen the member, change lib_value"));
+    char *json = tie_answer(&fx);
+    ASSERT_NOT_NULL(json);
+    if (strstr(json, "RUNNER_REACHED")) {
+        printf("  note: %s\n", tie_last_note);
+    }
+    ASSERT_NULL(strstr(json, "RUNNER_REACHED"));
+    ASSERT_TRUE(tie_suite_has(json, "beta", "STATIC")); /* spawns the probe role */
     free(json);
     tie_close(&fx);
     PASS();
@@ -1023,7 +1253,12 @@ SUITE(test_impact_engine) {
     RUN_TEST(test_impact_engine_unspawned_role_and_main_still_run_all);
     RUN_TEST(test_impact_engine_role_with_two_literals_selects_both_spawners);
     RUN_TEST(test_impact_engine_role_literal_behind_a_define_selects_its_users);
+    RUN_TEST(test_impact_engine_role_literal_behind_a_macro_chain);
+    RUN_TEST(test_impact_engine_unusable_role_entry_runs_all);
+    RUN_TEST(test_impact_engine_role_reached_by_the_spawn_lift_is_lifted);
+    RUN_TEST(test_impact_engine_runner_helper_names_no_spawner);
     RUN_TEST(test_impact_engine_field_call_is_no_way_into_main);
+    RUN_TEST(test_impact_engine_reached_role_handler_is_no_way_into_main);
     RUN_TEST(test_impact_engine_parse_gaps_reach_what_they_name);
     RUN_TEST(test_impact_engine_admitted_coverage_narrows_only_when_verified);
     RUN_TEST(test_impact_engine_coverage_reaches_unmapped_code_through_mapped_callers);

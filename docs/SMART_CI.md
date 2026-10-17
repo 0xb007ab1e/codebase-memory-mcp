@@ -26,7 +26,10 @@ cannot be affected. When it is unsure, it runs everything:
 - a shallow clone, a diff that cannot be read in full, or an invalid config;
 - no coverage map, or a coverage map that is not admitted (wrong commit, more
   than 7 days old, made for another platform or harness);
-- a change that reaches the test runner's `main`;
+- a change that reaches the test runner's `main`, or a test-runner role
+  (below) that no test names;
+- a role table entry the engine cannot read, or a macro naming a role's
+  literal that it cannot follow;
 - any failure of the selection job itself.
 
 Each of these makes the run cost more CI minutes. None of them loses coverage.
@@ -37,7 +40,7 @@ Each of these makes the run cost more CI minutes. None of them loses coverage.
 changed files ──► Layer 1: lane selector ──► which CI jobs run
                   (scripts/ci/select-lanes.sh, your own rules)
                                    │
-                                   ▼  (Linux test legs only, in this repo)
+                                   ▼  (the Linux x86_64 test leg only, in this repo)
 merge base + PR ─► Layer 2: test-impact engine ─► which suites / tests run
                   (codebase-memory-mcp test-impact select
                    + team-artifact bundle from main)
@@ -93,9 +96,9 @@ reports `run_all`. Static reachability alone never omits a suite.
    list, `--version`); `--skip-config` skips agent configuration, which a CI
    runner does not need. It has no version flag, so it is not a pin.
 
-   **Version note.** `v0.12.0` has `test-impact select`/`publish`. It does
-   not have `key: "path"`, `unreferenced`, `--vetoed-out` or `run_all_rules`;
-   they ship in the first release after `v0.12.0`. With `v0.12.0`, a config
+   **Version note.** `v0.12.0` and `v0.12.1` have `test-impact select`/`publish`.
+   They do not have `key: "path"`, `unreferenced`, `--vetoed-out` or
+   `run_all_rules`; those ship in a later release. With either version, a config
    that uses those keys is invalid, and every answer is `run_all`. Until that
    release, build the binary from source (`make -f Makefile.cbm cbm`), as this
    repository's producer and `select-tests` jobs do.
@@ -239,8 +242,9 @@ Leave this job out of your aggregate required check. What
 4. Runs `test-impact select` and writes `selection-engine.json`. It also
    writes a Markdown summary to the job's step summary.
 
-The engine reads `.codebase-memory.json` from the **merge base**, not from the
-PR. A PR cannot loosen its own selection. A PR that changes the config runs
+The engine reads `.codebase-memory.json` from the **selection base** (the merge
+base, or the ancestor whose bundle was admitted), not from the PR. A PR cannot
+loosen its own selection. A PR that changes the config runs
 everything (`builtin:test-impact-config`).
 
 ### (c) Gate job and the test job
@@ -328,16 +332,20 @@ TF_ROLE(TF_PHASE_SPAWNER, "CBM_INDEX_SUPERVISOR", tf_maybe_run_index_worker),
 
 The engine reads the table: a change that only a probe's handler reaches
 selects the tests whose source names one of that handler's literals (the argv
-the child gets, or a switch that lets production code start it). A reached
-handler that no test names, and a change reaching `main` any other way, still
-run everything; the engine note names the call chain into `main`.
+the child gets, or a switch that lets production code start it), also through
+a `#define` that names the literal. The runner's own use of a literal names no
+spawner. A reached handler that no test names, a table entry the engine cannot
+read, and a change reaching `main` any other way still run everything; the
+engine note names the call chain into `main`.
 
 **Only the legs the coverage speaks for should narrow.** Here the coverage
 comes from one Linux x86_64 clang-21 producer. Only the Linux x86_64 test leg
 downloads the selection (`runner.os == 'Linux' && runner.arch == 'X64'` in
 `_test.yml`). The arm64, macOS and Windows legs always run everything,
 because code under architecture or platform `#ifdef`s has static evidence
-only there.
+only there. That leg builds with gcc, not clang: code under a compiler `#if`
+has static evidence only too, and `--platform` names the producer's platform,
+so the engine's platform check admits the map by construction.
 
 ### (d) Flip the variable
 
@@ -423,7 +431,7 @@ Built-in rules, applied after yours:
 | `fixtures` → `referencing_tests`, `path_segment:2` | `tests/fixtures/<name>/...` selects the tests that mention the fixture, down to `tests/fixtures/<name>`. |
 | `contracts` → `ignore` | Shell, Python and data contract tests run in every leg's contract step, which is never narrowed. |
 | `notices` → `ignore` | Release notices. |
-| `repo-data` → `referencing_tests`, `path`, `unreferenced: ignore` | Scripts, docs and packaging. A C test that reads one of these files is selected. A file that no test names selects nothing. |
+| `repo-data` → `referencing_tests`, `path`, `unreferenced: ignore` | Scripts, docs and packaging. A C test whose source names one of these files (its path, as text) is selected. A file that no test names selects nothing. |
 
 `coverage.compatibility_paths` lists the harness and coverage tools. Changing
 the bytes of any of them, or the `--platform` label, makes the existing coverage

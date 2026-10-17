@@ -160,7 +160,7 @@ SECURITY_TOOLS = {"scripts/security-audit.sh", "scripts/security-allowlist.txt",
 # Repository files C tests read: the test legs run (a docs-only tier runs no C
 # suite, so test_cli's README/site contract would never see a README change).
 READ_BY_TESTS = {"scripts/security-vendored.sh", ".codebase-memory.json", "README.md",
-                 "docs/index.html", "docs/llms.txt"}
+                 "docs/index.html", "docs/llms.txt", "pkg/npm/README.md"}
 # The test legs' failure report (tests/test_failure_report_contract.sh).
 TEST_REPORT = {"scripts/suite-failure-report.sh"}
 # The release notices ship inside every archive.

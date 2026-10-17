@@ -42,8 +42,9 @@ done
 
 mkdir -p "$OUT"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-export CBM_RUNTIME_DIR="$(mktemp -d /tmp/cbm-rt.XXXXXX)" # sun_path must fit
+CBM_RUNTIME_DIR="$(mktemp -d /tmp/cbm-rt.XXXXXX)" # sun_path must fit
+export CBM_RUNTIME_DIR
+trap 'rm -rf "$WORK" "$CBM_RUNTIME_DIR"' EXIT
 export CBM_CACHE_DIR="$WORK/cache"
 mkdir -p "$WORK/engine" && chmod 700 "$WORK/engine"
 base="$(git -C "$ROOT" rev-parse "$BASE")"
@@ -70,8 +71,13 @@ if [ "$bundle_rc" -eq 3 ]; then
     if [ "$select_base" != "$base" ]; then
         # Exact-revert guard: a file main changed after A that the PR changes
         # back drops out of A..HEAD. Then A's map cannot speak for it: no coverage.
-        missing=$(comm -23 <(git -C "$ROOT" diff --no-renames --name-only "$base" HEAD | sort -u) \
-                           <(git -C "$ROOT" diff --no-renames --name-only "$select_base" HEAD | sort -u))
+        # A diff that fails proves nothing either: no coverage.
+        if git -C "$ROOT" diff --no-renames --name-only "$base" HEAD > "$WORK/pr-files.txt" &&
+            git -C "$ROOT" diff --no-renames --name-only "$select_base" HEAD > "$WORK/ancestor-files.txt"; then
+            missing=$(comm -23 <(sort -u "$WORK/pr-files.txt") <(sort -u "$WORK/ancestor-files.txt"))
+        else
+            missing="(git diff failed)"
+        fi
         distance=$(git -C "$ROOT" rev-list --first-parent --count "$select_base..$base")
         if [ -n "$missing" ]; then
             echo "::warning::test-impact: ancestor bundle $select_base unusable (the change reverts main's own change in: $(echo "$missing" | head -3 | tr '\n' ' ')): selecting without coverage"
