@@ -515,6 +515,11 @@ typedef struct {
     const char *const *lanes;
     int lane_count;
     int key_segment; /* zero-based path_segment:N; -1 for other actions */
+    /* referencing_tests only. key_path: the key is the changed path itself (no
+     * parent directories). unreferenced_ignore: a changed path no test names
+     * selects nothing instead of running everything. */
+    bool key_path;
+    bool unreferenced_ignore;
     bool builtin;
 } cbm_test_rule_t;
 
