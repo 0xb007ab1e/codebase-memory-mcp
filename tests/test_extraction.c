@@ -6886,8 +6886,8 @@ TEST(extract_perl_method_call_flags_is_method) {
     PASS();
 }
 
-/* Languages OUTSIDE the is_method flag set (only Perl and TS/JS/TSX set it) must
- * be unaffected: a Go method call never sets is_method. */
+/* Languages OUTSIDE the is_method flag set (Perl, Python, TS/JS/TSX and Go set
+ * it) must be unaffected: a Rust method call never sets is_method. */
 TEST(extract_flag_exempt_method_call_not_flagged_is_method) {
     /* Rust is flag-exempt: only Perl, Python, TS/JS and Go set is_method.
      * Guards the blast radius of the receiver-aware flags for every other

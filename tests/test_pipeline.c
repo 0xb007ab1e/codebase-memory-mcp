@@ -8650,13 +8650,11 @@ TEST(pipeline_html_embedded_member_call_stays_unbound) {
     PASS();
 }
 
-TEST(pipeline_go_receiver_suppresses_weak_method_edge) {
-    char tmp[256];
-    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_recv_XXXXXX");
-    if (!cbm_mkdtemp(tmp)) {
-        FAIL("tmpdir");
-    }
-
+/* Fixture for the #1906 Go selector-guard probes (sequential and parallel
+ * twins). pad_files > 0 adds filler Go files to push the index over
+ * MIN_FILES_FOR_PARALLEL, because the guard is wired into both resolvers
+ * (pass_calls.c and pass_parallel.c) and each needs its own probe. */
+static void write_go_receiver_fixture(const char *tmp, int pad_files) {
     /* go.mod makes project imports resolvable — real Go repos always have one,
      * and import reachability (the unique_name penalty) depends on it. */
     write_temp_file(tmp, "go.mod", "module example.com/myapp\n\ngo 1.22\n");
@@ -8715,6 +8713,22 @@ TEST(pipeline_go_receiver_suppresses_weak_method_edge) {
                     "func CallsLocal() int { return localHelper() }\n"
                     "\n"
                     "func UsesUtil() string { return util.Tag() }\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler/filler%d.go", i);
+        snprintf(body, sizeof(body), "package filler\n\nfunc Filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+TEST(pipeline_go_receiver_suppresses_weak_method_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_recv_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_receiver_fixture(tmp, 0);
 
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/go_recv.db", tmp);
@@ -8739,6 +8753,55 @@ TEST(pipeline_go_receiver_suppresses_weak_method_edge) {
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Parallel twin of the test above. The guard is wired into pass_parallel.c as
+ * well as pass_calls.c, but the four-file fixture only ever runs the
+ * sequential resolver, so the parallel hunk was bound by no test. Real
+ * repositories take the parallel path: >= MIN_FILES_FOR_PARALLEL (50) files
+ * plus CBM_WORKERS=4 force it, the shape of
+ * pipeline_python_receiver_parallel_suppresses_weak_method_edges. Same
+ * both-directions pin as the sequential test. */
+TEST(pipeline_go_receiver_parallel_suppresses_weak_method_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_recv_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_receiver_fixture(tmp, 52);
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_recv_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* NEGATIVE: the stdlib *os.File Close must not bind the project method. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "FileLen", "Close"));
+    /* POSITIVE: typed same-package, bare local and import-qualified calls
+     * survive the parallel resolver too. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "Boot", "Close"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "CallsLocal", "localHelper"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "UsesUtil", "Tag"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
     th_rmtree(tmp);
     PASS();
 }
@@ -23707,6 +23770,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_receiver_keeps_specific_unique_name_member_call);
     RUN_TEST(pipeline_html_embedded_member_call_stays_unbound);
     RUN_TEST(pipeline_go_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_go_receiver_parallel_suppresses_weak_method_edge);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method);

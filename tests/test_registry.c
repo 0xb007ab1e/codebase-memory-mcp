@@ -1673,6 +1673,16 @@ TEST(weak_call_guards_share_one_drop_list) {
                    strategies[i], member, binding);
         }
         ASSERT_EQ(member, binding);
+        /* The Go selector guard builds on the same list and narrows it in
+         * exactly one place at a penalized confidence (0.75 * 0.5): it keeps
+         * field_type_hint. Any other drift from the shared list fails here. */
+        bool go = cbm_go_suppress_weak_method_match(true, true, strategies[i], 0.375);
+        bool go_expected = member && strcmp(strategies[i], "field_type_hint") != 0;
+        if (go != go_expected) {
+            printf("  Go drop-list divergence on strategy \"%s\": go=%d expected=%d\n",
+                   strategies[i], go, go_expected);
+        }
+        ASSERT_EQ(go, go_expected);
     }
     PASS();
 }
