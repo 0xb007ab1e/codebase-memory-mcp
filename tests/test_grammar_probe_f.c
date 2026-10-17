@@ -1704,7 +1704,7 @@ TEST(probe_mcp_trace_run) {
     ASSERT_NOT_NULL(r);
     /* qualified names are grouped by prefix, split at a dot */
     ASSERT_NOT_NULL(strstr(r, "Deployment/-/server"));
-    ASSERT_NOT_NULL(strstr(r, "\"__image__docker\",\"rows\":[[\"io/acme/server\""));
+    ASSERT_NOT_NULL(strstr(r, "[\"__image__acme/server\"")); /* dotless: the whole QN */
     ASSERT_NOT_NULL(strstr(r, ".svc\",\"rows\":[[\"Dockerfile\""));   /* its Module */
     ASSERT_NOT_NULL(strstr(r, ".cmd.server\",\"rows\":[[\"main\"")); /* what it starts */
     ASSERT_NOT_NULL(strstr(r, "Deployment/-/server#env/server/LISTEN_PORT"));
@@ -1961,8 +1961,8 @@ static char *gpf_images(const GpfFile *files, int nfiles) {
     } while (0)
 
 /* A Dockerfile DEPENDS_ON each image it builds on: FROM and COPY --from,
- * with ARG defaults expanded, under the image's repository (docker.io and
- * library/ filled in, a registry host kept, tag and digest dropped). A stage
+ * with ARG defaults expanded, under the image's repository (as written: a
+ * registry host kept, none invented; tag and digest dropped). A stage
  * (by name or index), scratch and an ARG without a value are no image. */
 TEST(probe_dockerfile_bases_are_images) {
     static const GpfFile files[] = {
@@ -1979,9 +1979,69 @@ TEST(probe_dockerfile_bases_are_images) {
                            "COPY --from=registry.example.com:5000/team/tools:2 /bin/x /x\n"}};
     GPF_ASSERT_IMAGES(files, 1,
                       "@svc/Dockerfile -> docker.io/bitnami/kubectl (copy-from)\n"
-                      "@svc/Dockerfile -> docker.io/library/golang (from)\n"
                       "@svc/Dockerfile -> gcr.io/distroless/static (from)\n"
+                      "@svc/Dockerfile -> golang (from)\n"
                       "@svc/Dockerfile -> registry.example.com:5000/team/tools (copy-from)");
+    PASS();
+}
+
+/* Every Image node as "<name> [<registry>]", sorted, one per line. */
+static char *gpf_image_nodes(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql = "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT name || ' [' "
+                          "|| coalesce(json_extract(properties,'$.registry'), '-') || ']' AS x "
+                          "FROM nodes WHERE project=?1 AND label='Image' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* An image reference that names no registry host keeps it unknown: the Image
+ * is the repository as written, registry "unknown" -- never docker.io, which
+ * is only Docker's default (a short-name search list or a local-only build
+ * tag resolves elsewhere or nowhere). A stated host is kept, its Docker Hub
+ * spellings as docker.io with library/ for an official one-segment name.
+ * Every source alike: FROM, a K8s container, a compose service, a build tag. */
+TEST(probe_image_without_registry_host_stays_unknown) {
+    static const GpfFile files[] = {
+        {"svc/Dockerfile", "FROM nginx:1.27\nFROM acme/base:2 AS b\nFROM docker.io/redis:7 AS c\n"
+                           "FROM index.docker.io/acme/tool AS d\n"
+                           "FROM ghcr.io/acme/app@sha256:0123 AS e\n"
+                           "FROM localhost:5000/team/x AS f\n"},
+        {"app.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
+                     "  template:\n    spec:\n      containers:\n        - name: web\n"
+                     "          image: busybox:1.36\n        - name: side\n"
+                     "          image: quay.io/acme/sidecar:1\n"},
+        {"compose.yaml", "services:\n  web:\n    image: acme/web:1\n"},
+        {"build.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\ndocker build -t myapp:dev svc\n"}};
+    char *got = gpf_image_nodes(files, 4);
+    static const char want[] = "acme/base [unknown]\n"
+                               "acme/web [unknown]\n"
+                               "busybox [unknown]\n"
+                               "docker.io/acme/tool [docker.io]\n"
+                               "docker.io/library/redis [docker.io]\n"
+                               "ghcr.io/acme/app [ghcr.io]\n"
+                               "localhost:5000/team/x [localhost:5000]\n"
+                               "myapp [unknown]\n"
+                               "nginx [unknown]\n"
+                               "quay.io/acme/sidecar [quay.io]";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "image nodes got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("Image nodes and registries");
+    }
+    free(got);
     PASS();
 }
 
@@ -2000,10 +2060,10 @@ TEST(probe_dockerfile_variants_are_dockerfiles) {
         {"tools/Dockerfile.j2", "FROM {{ base_image }}\n"}};
     GPF_ASSERT_IMAGES(files, 7,
                       "@Containerfile -> quay.io/podman/stable (from)\n"
-                      "@svc/Dockerfile -> docker.io/library/alpine (from)\n"
-                      "@svc/Dockerfile-test -> docker.io/library/ubuntu (from)\n"
-                      "@svc/Dockerfile.debug -> docker.io/library/debian (from)\n"
-                      "@tools/pipeline.Dockerfile -> docker.io/library/node (from)");
+                      "@svc/Dockerfile -> alpine (from)\n"
+                      "@svc/Dockerfile-test -> ubuntu (from)\n"
+                      "@svc/Dockerfile.debug -> debian (from)\n"
+                      "@tools/pipeline.Dockerfile -> node (from)");
     PASS();
 }
 
@@ -2083,8 +2143,8 @@ TEST(probe_k8s_container_images_are_images) {
          "          image: <image-built-from-dockerfile>\n"}};
     char *got = gpf_image_users(files, 1);
     static const char want[] = "CronJob/nightly -> ghcr.io/acme/job\n"
-                               "Deployment/web -> docker.io/library/busybox\n"
-                               "Deployment/web -> docker.io/library/nginx\n"
+                               "Deployment/web -> busybox\n"
+                               "Deployment/web -> nginx\n"
                                "Widget/w -> quay.io/acme/widget";
     if (!got || strcmp(got, want) != 0) {
         fprintf(stderr, "image users got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
@@ -2145,10 +2205,10 @@ TEST(probe_build_configs_build_images_from_dockerfiles) {
                          "  missing:\n    image: acme/missing\n    build: ./nope\n"
                          "  unknown:\n    image: ${NOPE}/x\n    build: ./src/web\n"}};
     char *got = gpf_builds(files, 5);
-    static const char want[] = "docker.io/library/api -> src/api/Dockerfile.prod (skaffold)\n"
-                               "docker.io/library/dev-web -> src/web/Dockerfile (skaffold)\n"
-                               "docker.io/library/web -> src/web/Dockerfile (skaffold)\n"
-                               "ghcr.io/acme/frontend -> src/web/Dockerfile (compose)";
+    static const char want[] = "api -> src/api/Dockerfile.prod (skaffold)\n"
+                               "dev-web -> src/web/Dockerfile (skaffold)\n"
+                               "ghcr.io/acme/frontend -> src/web/Dockerfile (compose)\n"
+                               "web -> src/web/Dockerfile (skaffold)";
     if (!got || strcmp(got, want) != 0) {
         fprintf(stderr, "builds got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
         free(got);
@@ -2203,10 +2263,10 @@ TEST(probe_compose_services_are_resources) {
          "  worker:\n    build:\n      context: .\n      dockerfile: worker/Dockerfile\n"}};
     char *got = gpf_compose(files, 3);
     static const char want[] =
-        "Service/cache -> Image:docker.io/library/redis (USAGE image)\n"
+        "Service/cache -> Image:redis (USAGE image)\n"
         "Service/cache -> Service/db (DEPENDS_ON depends_on)\n"
-        "Service/db -> Image:docker.io/library/postgres (USAGE image)\n"
-        "Service/web -> Image:docker.io/acme/web (USAGE image)\n"
+        "Service/db -> Image:postgres (USAGE image)\n"
+        "Service/web -> Image:acme/web (USAGE image)\n"
         "Service/web -> Module:web/Dockerfile (DEPENDS_ON build)\n"
         "Service/web -> Service/cache (DEPENDS_ON depends_on)\n"
         "Service/web -> Service/db (DEPENDS_ON depends_on)\n"
@@ -2314,17 +2374,17 @@ TEST(probe_image_hub_splits_by_component) {
          "          image: acme/solo:2\n"}};
     enum { NF = sizeof(files) / sizeof(files[0]) };
     char *got = gpf_builds(files, NF);
-    static const char want_builds[] = "docker.io/acme/demo:*-a -> svc/a/Dockerfile (compose)\n"
-                                      "docker.io/acme/demo:*-b -> svc/b/Dockerfile (compose)\n"
-                                      "docker.io/acme/demo:*-c -> svc/c/Dockerfile (compose)\n"
-                                      "docker.io/acme/solo -> solo/Dockerfile (compose)\n"
-                                      "docker.io/acme/tool -> tool/Dockerfile (compose)\n"
-                                      "docker.io/acme/tool:test -> tool/Dockerfile.test (compose)\n"
-                                      "docker.io/acme/x -> w1/Dockerfile (compose)\n"
-                                      "docker.io/acme/x -> w2/Dockerfile.alt (compose)\n"
-                                      "docker.io/acme/x:*-v -> v/Dockerfile (compose)\n"
-                                      "docker.io/acme/y:*-p -> p/Dockerfile (compose)\n"
-                                      "docker.io/acme/y:*-q -> q/Dockerfile (compose)";
+    static const char want_builds[] = "acme/demo:*-a -> svc/a/Dockerfile (compose)\n"
+                                      "acme/demo:*-b -> svc/b/Dockerfile (compose)\n"
+                                      "acme/demo:*-c -> svc/c/Dockerfile (compose)\n"
+                                      "acme/solo -> solo/Dockerfile (compose)\n"
+                                      "acme/tool -> tool/Dockerfile (compose)\n"
+                                      "acme/tool:test -> tool/Dockerfile.test (compose)\n"
+                                      "acme/x -> w1/Dockerfile (compose)\n"
+                                      "acme/x -> w2/Dockerfile.alt (compose)\n"
+                                      "acme/x:*-v -> v/Dockerfile (compose)\n"
+                                      "acme/y:*-p -> p/Dockerfile (compose)\n"
+                                      "acme/y:*-q -> q/Dockerfile (compose)";
     if (!got || strcmp(got, want_builds) != 0) {
         fprintf(stderr, "builds got:\n%s\nwant:\n%s\n", got ? got : "(null)", want_builds);
         free(got);
@@ -2332,20 +2392,20 @@ TEST(probe_image_hub_splits_by_component) {
     }
     free(got);
     got = gpf_image_users(files, NF);
-    static const char want_users[] = "Deployment/b -> docker.io/acme/demo:*-b\n"
-                                     "Deployment/s -> docker.io/acme/solo\n"
-                                     "Deployment/z -> docker.io/acme/demo\n"
-                                     "Service/a -> docker.io/acme/demo:*-a\n"
-                                     "Service/b -> docker.io/acme/demo:*-b\n"
-                                     "Service/c -> docker.io/acme/demo:*-c\n"
-                                     "Service/p -> docker.io/acme/y:*-p\n"
-                                     "Service/q -> docker.io/acme/y:*-q\n"
-                                     "Service/solo -> docker.io/acme/solo\n"
-                                     "Service/tool -> docker.io/acme/tool\n"
-                                     "Service/tooltest -> docker.io/acme/tool:test\n"
-                                     "Service/v -> docker.io/acme/x:*-v\n"
-                                     "Service/w1 -> docker.io/acme/x\n"
-                                     "Service/w2 -> docker.io/acme/x";
+    static const char want_users[] = "Deployment/b -> acme/demo:*-b\n"
+                                     "Deployment/s -> acme/solo\n"
+                                     "Deployment/z -> acme/demo\n"
+                                     "Service/a -> acme/demo:*-a\n"
+                                     "Service/b -> acme/demo:*-b\n"
+                                     "Service/c -> acme/demo:*-c\n"
+                                     "Service/p -> acme/y:*-p\n"
+                                     "Service/q -> acme/y:*-q\n"
+                                     "Service/solo -> acme/solo\n"
+                                     "Service/tool -> acme/tool\n"
+                                     "Service/tooltest -> acme/tool:test\n"
+                                     "Service/v -> acme/x:*-v\n"
+                                     "Service/w1 -> acme/x\n"
+                                     "Service/w2 -> acme/x";
     if (!got || strcmp(got, want_users) != 0) {
         fprintf(stderr, "image users got:\n%s\nwant:\n%s\n", got ? got : "(null)", want_users);
         free(got);
@@ -4372,6 +4432,77 @@ TEST(probe_helm_templated_objects_are_resources) {
     PASS();
 }
 
+/* Every DEPLOYS edge out of a Chart and CONFIGURES edge into one, as
+ * "<source> -> <label>:<target> (<type>[ <ref>])", a File by its path,
+ * sorted, one per line. */
+static char *gpf_chart_edges(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT CASE WHEN "
+            "s.label='File' THEN s.file_path ELSE s.name END || ' -> ' || t.label || ':' || "
+            "t.name || ' (' || e.type || coalesce(' ' || json_extract(e.properties,'$.ref'), '') "
+            "|| ')' AS x FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND ((s.label='Chart' AND e.type='DEPLOYS') OR "
+            "(t.label='Chart' AND e.type='CONFIGURES')) ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A chart deploys what its templates render: Chart -DEPLOYS {via: chart}->
+ * each object of its templates/ (a subchart's objects are the subchart's),
+ * and each Image those objects name literally ({ref: image}) -- a templated
+ * image names none, and no values default is read. Its values files
+ * (values.yaml, values-*.yaml beside Chart.yaml) CONFIGURE it; a values file
+ * elsewhere (ci/) does not. */
+TEST(probe_helm_chart_deploys_its_objects) {
+    static const GpfFile files[] = {
+        {"charts/web/Chart.yaml", "apiVersion: v2\nname: web\nversion: 1.0.0\n"},
+        {"charts/web/values.yaml", "image:\n  repository: nginx\n  tag: \"1.27\"\nreplicas: 1\n"},
+        {"charts/web/values-prod.yaml", "replicas: 3\n"},
+        {"charts/web/ci/test-values.yaml", "replicas: 2\n"},
+        {"charts/web/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
+         "  replicas: {{ .Values.replicas }}\n  template:\n    spec:\n      containers:\n"
+         "        - name: web\n"
+         "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"
+         "        - name: side\n          image: ghcr.io/acme/sidecar:1\n"},
+        {"charts/web/templates/svc.yaml",
+         "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\nspec:\n  selector:\n"
+         "    app: web\n"},
+        {"charts/web/charts/db/Chart.yaml", "apiVersion: v2\nname: db\nversion: 0.1.0\n"},
+        {"charts/web/charts/db/templates/sts.yaml",
+         "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: db\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: db\n"
+         "          image: ghcr.io/acme/db:16\n"}};
+    char *got = gpf_chart_edges(files, 8);
+    static const char want[] = "charts/web/values-prod.yaml -> Chart:web (CONFIGURES)\n"
+                               "charts/web/values.yaml -> Chart:web (CONFIGURES)\n"
+                               "db -> Image:ghcr.io/acme/db (DEPLOYS image)\n"
+                               "db -> Resource:StatefulSet/db (DEPLOYS)\n"
+                               "web -> Image:ghcr.io/acme/sidecar (DEPLOYS image)\n"
+                               "web -> Resource:Deployment/web (DEPLOYS)\n"
+                               "web -> Resource:Service/web (DEPLOYS)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "chart edges got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("Chart DEPLOYS / CONFIGURES edge set");
+    }
+    free(got);
+    PASS();
+}
+
 /* A template's `include "name"` calls the define of that name in its chart
  * family -- the chart and its subcharts share one template namespace -- never
  * a same-named define of an unrelated chart; a define may also be written in
@@ -6143,6 +6274,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_mcp_trace_run);
     RUN_TEST(probe_mcp_trace_deploy);
     RUN_TEST(probe_dockerfile_bases_are_images);
+    RUN_TEST(probe_image_without_registry_host_stays_unknown);
     RUN_TEST(probe_dockerfile_variants_are_dockerfiles);
     RUN_TEST(probe_dockerfile_entrypoint_runs);
     RUN_TEST(probe_k8s_container_images_are_images);
@@ -6180,6 +6312,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_go_installer_deploys_charts);
     RUN_TEST(probe_terraform_helm_release_deploys_its_chart);
     RUN_TEST(probe_helm_templated_objects_are_resources);
+    RUN_TEST(probe_helm_chart_deploys_its_objects);
     RUN_TEST(probe_helm_include_resolves_in_the_chart_family);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
     RUN_TEST(probe_k8s_selector_within_kustomize_build);

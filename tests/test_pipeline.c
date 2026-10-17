@@ -3980,10 +3980,10 @@ static char *incremental_compose_edit(bool legacy, cbm_incremental_route_t *rout
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/composeedit.db", tmp);
     static const char old_img[] = "SELECT COUNT(*) FROM nodes WHERE label='Image' AND "
-                                  "name='docker.io/acme/web-old'";
+                                  "name='acme/web-old'";
     static const char new_edge[] =
         "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id WHERE e.type='DEPENDS_ON' "
-        "AND s.name='docker.io/acme/web-new'";
+        "AND s.name='acme/web-new'";
     if (k8s_inc_index(tmp, db_path) != 0 || k8s_inc_count(db_path, old_img) != 1) {
         th_rmtree(tmp);
         return NULL;
@@ -4131,13 +4131,13 @@ static char *incremental_image_split(bool rename, cbm_incremental_route_t *route
     static const char to_repo[] =
         "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
         "t.id=e.target_id WHERE e.type='USAGE' AND s.name='Service/runner' AND "
-        "t.name='docker.io/acme/demo'";
+        "t.name='acme/demo'";
     static const char to_b[] =
         "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
         "t.id=e.target_id WHERE e.type='USAGE' AND s.name='Service/runner' AND "
-        "t.name='docker.io/acme/demo:*-b'";
+        "t.name='acme/demo:*-b'";
     static const char b_img[] =
-        "SELECT COUNT(*) FROM nodes WHERE label='Image' AND name='docker.io/acme/demo:*-b'";
+        "SELECT COUNT(*) FROM nodes WHERE label='Image' AND name='acme/demo:*-b'";
     if (k8s_inc_index(tmp, db_path) != 0 || k8s_inc_count(db_path, to_b) != 1) {
         th_rmtree(tmp);
         return NULL;
@@ -4172,6 +4172,36 @@ TEST(incremental_image_split_change_rebuilds) {
     ASSERT_NOT_NULL(got);
     ASSERT_STR_EQ(got, "repo=0 b=1 bimg=1");
     free(got);
+    PASS();
+}
+
+/* A chart's values file CONFIGURES its Chart (pass_k8s.c). The edge is drawn
+ * by the K8s pass from the chart directory, which a closure repair of the
+ * values file alone does not see: an edit of it rebuilds, and the edge stays. */
+TEST(incremental_helm_values_edit_keeps_chart_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_helmvalues_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "chart/Chart.yaml", "apiVersion: v2\nname: web\nversion: 1.0.0\n");
+    write_temp_file(tmp, "chart/values.yaml", "replicas: 1\n");
+    write_temp_file(tmp, "chart/templates/svc.yaml",
+                    "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/helmvalues.db", tmp);
+    static const char edge[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id WHERE e.type='CONFIGURES' AND s.file_path='chart/values.yaml' AND "
+        "t.label='Chart'";
+    int before = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, edge) : -1;
+    write_temp_file(tmp, "chart/values.yaml", "replicas: 3\n");
+    int after = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, edge) : -1;
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    ASSERT_EQ(before, 1);
+    ASSERT_EQ(after, 1);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     PASS();
 }
 
@@ -23899,6 +23929,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_compose_edit_replaces_build_edges);
     RUN_TEST(incremental_env_edit_replaces_scoped_envvars);
     RUN_TEST(incremental_image_split_change_rebuilds);
+    RUN_TEST(incremental_helm_values_edit_keeps_chart_edge);
     RUN_TEST(incremental_compose_dotenv_change_rebuilds);
     RUN_TEST(incremental_dockerfile_edit_keeps_docker_build_edges);
     RUN_TEST(incremental_second_build_declarer_keeps_the_edge);

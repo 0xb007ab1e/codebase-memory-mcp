@@ -3631,6 +3631,145 @@ static int64_t k8s_external_chart(k8s_dep_link_t *l, const char *name, const cha
     return cbm_pipeline_external_chart(l->ctx, name, url, file);
 }
 
+/* ── A chart's own edges (PHASE 2 P2.4) ────────────────────────────── */
+
+bool cbm_helm_values_name(const char *base) {
+    size_t vl = K8S_SLEN("values");
+    if (!base || strncmp(base, "values", vl) != 0) {
+        return false;
+    }
+    const char *r = base + vl;
+    if (*r == '-') {
+        const char *dot = strrchr(r, '.');
+        if (!dot || dot == r + SKIP_ONE) {
+            return false;
+        }
+        r = dot;
+    }
+    return strcmp(r, ".yaml") == 0 || strcmp(r, ".yml") == 0;
+}
+
+/* Is `rel` a values file directly in chart dir `dir`? */
+static bool k8s_chart_values_file(const char *rel, const char *dir) {
+    size_t dl = strlen(dir);
+    if (dl && (strncmp(rel, dir, dl) != 0 || rel[dl] != '/')) {
+        return false;
+    }
+    const char *base = rel + (dl ? dl + SKIP_ONE : 0);
+    return !strchr(base, '/') && cbm_helm_values_name(base);
+}
+
+/* A chart deploys what its templates render: Chart -DEPLOYS {via: chart}->
+ * each Resource of <chart>/templates/ -- its nearest enclosing chart, so a
+ * subchart's objects are the subchart's. Its values files (values.yaml,
+ * values-<x>.yaml beside Chart.yaml) CONFIGURE {strategy: helm_values} it. */
+static void k8s_link_chart_contents(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b) {
+    if (!b->charts || cbm_ht_count(b->charts) == 0) {
+        return;
+    }
+    k8s_dep_link_t l = {.ctx = ctx, .charts = k8s_index_by_file(ctx, "Chart")};
+    if (!l.charts) {
+        return;
+    }
+    int configures = 0;
+    static const char *const labels[] = {"Resource", "File"};
+    for (size_t k = 0; k < sizeof(labels) / sizeof(labels[0]); k++) {
+        const cbm_gbuf_node_t **nodes = NULL;
+        int n = 0;
+        if (cbm_gbuf_find_by_label(ctx->gbuf, labels[k], &nodes, &n) != 0) {
+            continue;
+        }
+        for (int i = 0; i < n; i++) {
+            const char *fp = nodes[i]->file_path;
+            char dir[CBM_SZ_1K];
+            int64_t chart = 0;
+            if (fp && k8s_chart_of(b, fp, dir, sizeof(dir))) {
+                chart = k8s_chart_node(&l, dir);
+            }
+            if (chart <= 0) {
+                continue;
+            }
+            if (k == 0) {
+                char tpl[CBM_SZ_1K];
+                snprintf(tpl, sizeof(tpl), "%s%stemplates/", dir, dir[0] ? "/" : "");
+                if (strncmp(fp, tpl, strlen(tpl)) == 0) {
+                    k8s_deploys_edge(&l, chart, nodes[i]->id, "{\"via\":\"chart\"}");
+                }
+            } else if (k8s_chart_values_file(fp, dir)) {
+                cbm_gbuf_insert_edge(ctx->gbuf, nodes[i]->id, chart, "CONFIGURES",
+                                     "{\"strategy\":\"helm_values\"}");
+                configures++;
+            }
+        }
+    }
+    k8s_free_index(l.charts);
+    if (l.edges + configures > 0) {
+        cbm_log_info("pass.k8s.chart_contents", "deploys", itoa_k8s(l.edges), "values",
+                     itoa_k8s(configures));
+    }
+}
+
+/* Each Image a chart's objects name literally (their USAGE {ref: image}, after
+ * pass_docker.c moved references onto component Images): Chart -DEPLOYS
+ * {via: chart, ref: image}-> it. A templated image names no Image, and no
+ * values default is read. Edges are collected first: inserting while walking
+ * a chart's own DEPLOYS edges would grow the list being read. */
+static void k8s_link_chart_images(cbm_pipeline_ctx_t *ctx) {
+    const cbm_gbuf_node_t **charts = NULL;
+    int nc = 0;
+    if (cbm_gbuf_find_by_label(ctx->gbuf, "Chart", &charts, &nc) != 0 || nc == 0) {
+        return;
+    }
+    int64_t *pairs = NULL;
+    int np = 0;
+    int cap = 0;
+    for (int c = 0; c < nc; c++) {
+        const cbm_gbuf_edge_t **dep = NULL;
+        int nd = 0;
+        if (cbm_gbuf_find_edges_by_source_type(ctx->gbuf, charts[c]->id, "DEPLOYS", &dep, &nd) !=
+            0) {
+            continue;
+        }
+        for (int d = 0; d < nd; d++) {
+            const char *dp = dep[d]->properties_json;
+            if (!dp || !strstr(dp, "\"via\":\"chart\"") || strstr(dp, "\"ref\":")) {
+                continue;
+            }
+            const cbm_gbuf_edge_t **use = NULL;
+            int nu = 0;
+            if (cbm_gbuf_find_edges_by_source_type(ctx->gbuf, dep[d]->target_id, "USAGE", &use,
+                                                   &nu) != 0) {
+                continue;
+            }
+            for (int u = 0; u < nu; u++) {
+                const cbm_gbuf_node_t *img = cbm_gbuf_find_by_id(ctx->gbuf, use[u]->target_id);
+                const char *up = use[u]->properties_json;
+                if (!img || !img->label || strcmp(img->label, "Image") != 0 || !up ||
+                    !strstr(up, "\"ref\":\"image\"")) {
+                    continue;
+                }
+                if (np + PAIR_LEN > cap) {
+                    int ncap = cap ? cap * PAIR_LEN : CBM_SZ_64;
+                    int64_t *grown =
+                        cbm_realloc(CBM_MEM_CLASS_OTHER, pairs, (size_t)ncap * sizeof(*pairs));
+                    if (!grown) {
+                        break;
+                    }
+                    pairs = grown;
+                    cap = ncap;
+                }
+                pairs[np++] = charts[c]->id;
+                pairs[np++] = img->id;
+            }
+        }
+    }
+    for (int i = 0; i + SKIP_ONE < np; i += PAIR_LEN) {
+        cbm_gbuf_insert_edge(ctx->gbuf, pairs[i], pairs[i + SKIP_ONE], "DEPLOYS",
+                             "{\"via\":\"chart\",\"ref\":\"image\"}");
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, pairs);
+}
+
 /* A HelmRelease whose chartRef names OCIRepository `oci` (its USAGE edge
  * {"ref":"chartRef"}, resolved with the references) deploys the chart that
  * repository fetches: the external Chart of that OCI reference (its last
@@ -4517,6 +4656,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
      * then the templates' includes, which see those dependencies' defines. */
     k8s_link_local_deps(ctx, &local_deps);
     k8s_link_includes(ctx, &bundles, files, file_count);
+    k8s_link_chart_contents(ctx, &bundles);
     k8s_bundles_free(&bundles);
     k8s_kusts_free(&kusts);
     /* Shell and Make deploy commands, against the nodes linked above. */
@@ -4524,6 +4664,8 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     cbm_pipeline_pass_terraform(ctx, files, file_count);
     cbm_pipeline_pass_ansible(ctx, files, file_count);
     cbm_pipeline_pass_docker(ctx, files, file_count);
+    /* The Images a chart's objects use, once the image hubs moved them. */
+    k8s_link_chart_images(ctx);
     /* The variables a container sets, to the readers in its own image. */
     (void)cbm_pipeline_env_join(ctx);
 
