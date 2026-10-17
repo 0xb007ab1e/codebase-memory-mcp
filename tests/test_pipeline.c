@@ -14560,6 +14560,159 @@ TEST(pipeline_python_nested_def_local_after_incremental_issue1548) {
     PASS();
 }
 
+/* As pyn_edge, and the edge's properties also contain `fragment`. */
+static bool pyn_edge_with(cbm_store_t *s, const char *project, const char *src_rel,
+                          const char *tgt_rel, const char *type, const char *fragment) {
+    char sq[512];
+    char tq[512];
+    pyn_qn(sq, sizeof(sq), project, src_rel);
+    pyn_qn(tq, sizeof(tq), project, tgt_rel);
+    cbm_node_t src = {0};
+    cbm_node_t tgt = {0};
+    bool found = false;
+    if (cbm_store_find_node_by_qn(s, project, sq, &src) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(s, project, tq, &tgt) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, src.id, type, &edges, &ec);
+        for (int i = 0; i < ec && !found; i++) {
+            found = edges[i].target_id == tgt.id && edges[i].properties_json &&
+                    strstr(edges[i].properties_json, fragment);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    cbm_node_free_fields(&src);
+    cbm_node_free_fields(&tgt);
+    return found;
+}
+
+/* A local def shadows a module def of the same name (Python LEGB), in both
+ * orders of the two callers within one file: the registry's per-file resolve
+ * cache is keyed by the callee name only, so a caller-dependent answer must
+ * never come from it. The undecorated local is bound by the Python LSP itself
+ * (an lsp_* edge); a decorated one is no exact callable value, so the LSP
+ * shadows it and the registry's lexical_scope step binds it. */
+static const char pyn_shadow_local_first_py[] = "def helper():\n"
+                                                "    return 0\n"
+                                                "\n"
+                                                "def uses_local():\n"
+                                                "    def helper():\n"
+                                                "        return 1\n"
+                                                "    return helper()\n"
+                                                "\n"
+                                                "def uses_module():\n"
+                                                "    return helper()\n"
+                                                "\n"
+                                                "def uses_decorated():\n"
+                                                "    @staticmethod\n"
+                                                "    def helper():\n"
+                                                "        return 2\n"
+                                                "    return helper()\n";
+static const char pyn_shadow_module_first_py[] = "def helper():\n"
+                                                 "    return 0\n"
+                                                 "\n"
+                                                 "def uses_module():\n"
+                                                 "    return helper()\n"
+                                                 "\n"
+                                                 "def uses_local():\n"
+                                                 "    if True:\n"
+                                                 "        def helper():\n"
+                                                 "            return 1\n"
+                                                 "    return helper()\n";
+
+/* A class declared in a def is walked by the LSP under the def's QN: super()
+ * and self calls in its methods resolve through the class's own bases. */
+static const char pyn_local_class_methods_py[] = "class Base:\n"
+                                                 "    def greet(self):\n"
+                                                 "        return 1\n"
+                                                 "\n"
+                                                 "def factory():\n"
+                                                 "    class Local(Base):\n"
+                                                 "        def greet(self):\n"
+                                                 "            return super().greet()\n"
+                                                 "\n"
+                                                 "        def other(self):\n"
+                                                 "            return self.greet()\n"
+                                                 "    return Local\n";
+
+static int pyn_assert_shadowing(cbm_store_t *s, const char *project) {
+    ASSERT_TRUE(pyn_edge_with(s, project, "sc.factory.Local.greet", "sc.Base.greet", "CALLS",
+                              "\"strategy\":\"lsp_super\""));
+    ASSERT_TRUE(pyn_edge_with(s, project, "sc.factory.Local.other", "sc.factory.Local.greet",
+                              "CALLS", "\"strategy\":\"lsp_"));
+    const char *files[] = {"sa", "sb"};
+    for (int f = 0; f < 2; f++) {
+        char local_caller[64], local_def[64], module_caller[64], module_def[64];
+        snprintf(local_caller, sizeof(local_caller), "%s.uses_local", files[f]);
+        snprintf(local_def, sizeof(local_def), "%s.uses_local.helper", files[f]);
+        snprintf(module_caller, sizeof(module_caller), "%s.uses_module", files[f]);
+        snprintf(module_def, sizeof(module_def), "%s.helper", files[f]);
+        ASSERT_TRUE(pyn_edge_with(s, project, local_caller, local_def, "CALLS",
+                                  "\"strategy\":\"lsp_"));
+        ASSERT_FALSE(pyn_edge(s, project, local_caller, module_def, "CALLS"));
+        ASSERT_TRUE(pyn_edge(s, project, module_caller, module_def, "CALLS"));
+        ASSERT_FALSE(pyn_edge(s, project, module_caller, local_def, "CALLS"));
+    }
+    ASSERT_TRUE(pyn_edge_with(s, project, "sa.uses_decorated", "sa.uses_decorated.helper",
+                              "CALLS", "\"strategy\":\"lexical_scope\""));
+    ASSERT_FALSE(pyn_edge(s, project, "sa.uses_decorated", "sa.helper", "CALLS"));
+    return 0;
+}
+
+static int pyn_run_shadowing(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "sa.py", pyn_shadow_local_first_py);
+    write_temp_file(tmp, "sb.py", pyn_shadow_module_first_py);
+    write_temp_file(tmp, "sc.py", pyn_local_class_methods_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/shadow.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    int verdict = s ? pyn_assert_shadowing(s, cbm_pipeline_project_name(p)) : 1;
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    return verdict;
+}
+
+TEST(pipeline_python_local_def_shadows_module_def_issue1548) {
+    return pyn_run_shadowing(0);
+}
+
+TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548) {
+    return pyn_run_shadowing(52);
+}
+
 TEST(pipeline_python_project) {
     /* Port of TestPipelinePythonProject */
     const char *files[] = {"main.py", "utils.py"};
@@ -24059,6 +24212,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_import_never_binds_a_local_def_issue1548);
     RUN_TEST(pipeline_python_nested_defs_parallel_issue1548);
     RUN_TEST(pipeline_python_nested_def_local_after_incremental_issue1548);
+    RUN_TEST(pipeline_python_local_def_shadows_module_def_issue1548);
+    RUN_TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548);
     RUN_TEST(pipeline_header_include_target_is_independent_of_registration_order);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);

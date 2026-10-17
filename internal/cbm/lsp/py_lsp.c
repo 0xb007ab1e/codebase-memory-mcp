@@ -247,6 +247,8 @@ static void py_register_dict_literal(PyLSPContext *ctx, const char *name, TSNode
 static TSNode py_lookup_lambda(PyLSPContext *ctx, const char *name);
 static const char *py_lookup_dict_dispatch(PyLSPContext *ctx, const char *var, const char *key);
 static void py_process_function(PyLSPContext *ctx, TSNode func_node, const char *container_qn);
+static void py_process_class(PyLSPContext *ctx, TSNode class_node);
+static void py_process_class_in(PyLSPContext *ctx, TSNode class_node, const char *container_qn);
 typedef enum { PY_LOCAL_DEFS_BIND, PY_LOCAL_DEFS_PROCESS } PyLocalDefsMode;
 static void py_visit_local_defs(PyLSPContext *ctx, TSNode block, PyLocalDefsMode mode, int depth);
 
@@ -4443,6 +4445,8 @@ static void py_visit_local_defs(PyLSPContext *ctx, TSNode block, PyLocalDefsMode
         } else if (strcmp(ck, "class_definition") == 0) {
             if (mode == PY_LOCAL_DEFS_BIND)
                 py_bind_local_def(ctx, def, true);
+            else
+                py_process_class_in(ctx, def, ctx->enclosing_func_qn);
         } else if (py_is_statement_block(ck)) {
             py_visit_local_defs(ctx, c, mode, depth + 1);
         }
@@ -4614,7 +4618,10 @@ static void py_exec_class_definition(PyLSPContext *ctx, TSNode class_node) {
     py_scope_restore(ctx, saved_scope);
 }
 
-static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
+/* Walk a class's methods with the class qualified under `container_qn`: the
+ * module for a module-level class, the enclosing def for a class declared in
+ * a function body (#1548: extraction gives it the def's QN as prefix). */
+static void py_process_class_in(PyLSPContext *ctx, TSNode class_node, const char *container_qn) {
     if (!ctx || ctx->eval_failure)
         return;
     TSNode name_node = ts_node_child_by_field_name(class_node, "name", 4);
@@ -4625,7 +4632,8 @@ static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
         return;
 
     const char *prev_class = ctx->enclosing_class_qn;
-    ctx->enclosing_class_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
+    ctx->enclosing_class_qn = cbm_arena_sprintf(
+        ctx->arena, "%s.%s", container_qn ? container_qn : ctx->module_qn, cname);
 
     TSNode body = ts_node_child_by_field_name(class_node, "body", 4);
     if (!ts_node_is_null(body)) {
@@ -4697,6 +4705,10 @@ static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
     }
 
     ctx->enclosing_class_qn = prev_class;
+}
+
+static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
+    py_process_class_in(ctx, class_node, NULL);
 }
 
 /* Module bindings are replayed in source order before deferred function bodies
