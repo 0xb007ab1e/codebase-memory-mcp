@@ -1475,7 +1475,7 @@ const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void) {
  * function must never become a Rust call target (the Go registrar filters
  * the same way). *out_count gets the number kept. */
 static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs, int def_count,
-                                         int *out_count) {
+                                          int *out_count) {
     *out_count = 0;
     if (!defs || def_count <= 0)
         return NULL;
