@@ -6700,7 +6700,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
              * branch too, but its call-scope QN (compute_func_qn) stays flat,
              * and a def QN the calls do not share would orphan every call
              * inside a templ method. */
-            if (ctx->language == CBM_LANG_GO) {
+            if (ctx->language == CBM_LANG_GO && def.parent_class) {
                 def.qualified_name = cbm_arena_sprintf(a, "%s.%s", def.parent_class, name);
             }
         }

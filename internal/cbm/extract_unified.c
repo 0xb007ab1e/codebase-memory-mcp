@@ -1109,7 +1109,11 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
             if (recv_type && recv_type[0]) {
                 const char *type_qn = cbm_fqn_compute_source_lang(
                     ctx->arena, ctx->project, ctx->rel_path, recv_type, ctx->language);
-                return cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, name);
+                /* NULL only on allocation failure: fall through to the flat
+                 * QN, as the def side does (extract_defs.c). */
+                if (type_qn) {
+                    return cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, name);
+                }
             }
         }
     }
