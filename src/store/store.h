@@ -29,8 +29,11 @@ typedef struct cbm_store_read_scope cbm_store_read_scope_t;
  *   1  #1108: File-node QNs keep the file extension.
  *   2  Kubernetes objects: one Resource per YAML document, QN
  *      <file>::<group>/<Kind>/<declared namespace or ->/<name>; a
- *      Dockerfile.<variant> keeps its suffix in its QNs. */
-#define CBM_INDEX_FORMAT_VERSION 2
+ *      Dockerfile.<variant> keeps its suffix in its QNs.
+ *   3  Image identity invents no registry: a reference without a host is
+ *      __image__<repository as written>, registry "unknown" -- no longer
+ *      __image__docker.io/[library/]<repository>. */
+#define CBM_INDEX_FORMAT_VERSION 3
 #define CBM_STORE_CANCELLED (-3)
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)

@@ -128,7 +128,7 @@ SMOKE = {"scripts/smoke-test.sh", "scripts/smoke-local.sh",
          "scripts/smoke-fixture-server.py", "scripts/smoke-invariants.sh",
          "test-infrastructure/vm/vm-smoke.sh",
          "test-infrastructure/vm/windows-user-path-guard.ps1",
-         "scripts/test-windows.ps1"}
+         "scripts/test-windows.ps1", "scripts/smoke-wrappers.sh"}
 LINT_CONFIG = {"scripts/memory-core-baseline.txt", "scripts/lint-memory-core.py",
                "scripts/hooks/pre-commit"}
 NON_GATING = {"scripts/package-release.sh", "scripts/benchmark-index.sh",

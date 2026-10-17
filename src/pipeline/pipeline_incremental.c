@@ -2457,6 +2457,32 @@ static bool closure_dir_has_compose(const char *repo_path, const char *rel, cons
     return found;
 }
 
+/* The nearest directory at or above `rel`'s that holds a Chart.yaml, into out
+ * ("" for the repository root); false when none does. */
+static bool closure_chart_dir_of(const char *repo_path, const char *rel, char *out, size_t sz) {
+    snprintf(out, sz, "%s", rel);
+    char *cut = strrchr(out, '/');
+    for (;;) {
+        if (cut) {
+            *cut = '\0';
+        } else {
+            out[0] = '\0';
+        }
+        static const char *const names[] = {"Chart.yaml", "Chart.yml"};
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            char path[CBM_SZ_4K];
+            snprintf(path, sizeof(path), "%s/%s%s%s", repo_path, out, out[0] ? "/" : "", names[i]);
+            if (cbm_file_exists(path)) {
+                return true;
+            }
+        }
+        if (!out[0]) {
+            return false;
+        }
+        cut = strrchr(out, '/');
+    }
+}
+
 /* Kubernetes inputs reach past their own file (pass_k8s.c): a kustomization
  * decides which manifests deploy together and in which namespace, a
  * Chart.yaml links other charts, and a manifest's Services select workloads
@@ -2475,6 +2501,20 @@ static const char *closure_k8s_decline(cbm_store_t *store, const char *project,
         }
         if (strcmp(base, "Chart.yaml") == 0 || strcmp(base, "Chart.yml") == 0) {
             return "helm_chart_changed";
+        }
+        /* A chart's values file CONFIGURES it and its templates/ are what it
+         * DEPLOYS: edges the K8s pass draws from the chart directory, which a
+         * repair of this file alone does not hold. */
+        char chart[CBM_SZ_4K];
+        if (closure_chart_dir_of(repo_path, rel, chart, sizeof(chart))) {
+            size_t cl = strlen(chart);
+            const char *in_chart = rel + (cl ? cl + SKIP_ONE : 0);
+            if (cbm_helm_values_name(in_chart)) {
+                return "helm_values_changed";
+            }
+            if (strncmp(in_chart, "templates/", strlen("templates/")) == 0) {
+                return "helm_template_changed";
+            }
         }
         if (strcmp(base, ".env") == 0 && closure_dir_has_compose(repo_path, rel, base)) {
             return "compose_env_changed";
