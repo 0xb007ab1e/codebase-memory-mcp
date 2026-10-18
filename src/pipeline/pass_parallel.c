@@ -1773,7 +1773,8 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
  * once per file by the caller: computing the file QN and finding its node for
  * every definition was 700 k allocations and lookups on the Go corpus. */
 static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
-                                 int64_t file_node_id, CBMLanguage lang, int *reg_entries) {
+                                 int64_t file_node_id, CBMLanguage lang, size_t module_prefix_len,
+                                 int *reg_entries) {
     int edges = 0;
     if (!def->name || !def->qualified_name || !def->label) {
         return 0;
@@ -1781,7 +1782,8 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
      * (helpers.c) — see pass_definitions.c for the per-label rationale. */
     if (cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add_lang(ctx->registry, def->name, def->qualified_name, def->label, lang);
+        cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name, def->label,
+                                        lang, module_prefix_len);
         (*reg_entries)++;
     }
     char marked[CBM_SZ_4K];
@@ -1988,9 +1990,14 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             int64_t file_node_id = file_node ? file_node->id : 0;
             free(file_qn);
             pp_add_file_doc(file_node, result->module_doc);
+            /* Bounds the function-local detection to this file (pass_definitions.c). */
+            size_t py_prefix_len = files[i].language == CBM_LANG_PYTHON
+                                       ? cbm_pipeline_fqn_symbol_prefix_len(ctx->project_name, rel)
+                                       : 0;
             for (int d = 0; d < result->defs.count; d++) {
-                defines_edges += register_and_link_def(ctx, &result->defs.items[d], file_node_id,
-                                                       files[i].language, &reg_entries);
+                defines_edges +=
+                    register_and_link_def(ctx, &result->defs.items[d], file_node_id,
+                                          files[i].language, py_prefix_len, &reg_entries);
             }
         }
 
@@ -2410,8 +2417,18 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
              esc_rp);
     cbm_gbuf_insert_edge(gbuf, source->id, rid, "CALLS", props);
     if (handler_ref && handler_ref[0] != '\0') {
-        cbm_resolution_t hres = cbm_registry_resolve_handler(registry, handler_ref, module_qn, ik,
-                                                             iv, ic, main_gbuf, lang);
+        /* Python: a handler an app factory registers is usually its local def
+         * (`app.add_url_rule("/", "index", index)` inside create_app); only the
+         * lexical lookup sees a function's locals. MUST match pass_calls.c. */
+        cbm_resolution_t hres = {0};
+        if (lang == CBM_LANG_PYTHON) {
+            hres = cbm_registry_resolve_lexical(registry, handler_ref, call->enclosing_func_qn,
+                                                module_qn);
+        }
+        if (!hres.qualified_name) {
+            hres = cbm_registry_resolve_handler(registry, handler_ref, module_qn, ik, iv, ic,
+                                                main_gbuf, lang);
+        }
         if (hres.qualified_name && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn(main_gbuf, hres.qualified_name);
             if (h) {
@@ -3267,8 +3284,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                         lang, lsp->strategy, lsp->callee_qn, rc->project_name);
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
             !rust_external && !php_vendor_call) {
-            res = cbm_registry_resolve_call_lang(rc->registry, call->callee_name, module_qn,
-                                                 imp_keys, imp_vals, imp_count, lang);
+            /* Python LEGB fallback first (MUST match pass_calls.c). */
+            res = cbm_registry_resolve_call_scoped(rc->registry, call->callee_name, module_qn,
+                                                   imp_keys, imp_vals, imp_count, lang,
+                                                   call->enclosing_func_qn);
         }
         /* `p->open(fd)`: the registry does not split a callee on the arrow.
          * The object's type decides, as for the dot call handled further
@@ -3616,6 +3635,7 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         const cbm_gbuf_node_t *tgt = NULL;
         bool precise_call_reference = false;
         const CBMResolvedCall *semantic_reference = NULL;
+        bool property_read = false;
         if (cbm_pipeline_usage_semantic_reference_candidate(usage)) {
             bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
             semantic_reference = cbm_pipeline_find_lsp_reference_indexed_in_graph(
@@ -3628,6 +3648,13 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (semantic_reference) {
                 tgt = cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
                                                    semantic_reference->callee_qn, allow_tail);
+                if (!cbm_pipeline_reference_target_admissible(semantic_reference, tgt)) {
+                    /* a property read: the name fallback below may still bind the
+                     * property's own node, never a callable */
+                    tgt = NULL;
+                    semantic_reference = NULL;
+                    property_read = true;
+                }
                 precise_call_reference = cbm_pipeline_node_is_callable_target(tgt);
             }
         }
@@ -3681,6 +3708,9 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
+                continue;
+            }
+            if (property_read && cbm_pipeline_node_is_callable_target(tgt)) {
                 continue;
             }
         }
