@@ -753,12 +753,56 @@ static bool py_ns_is_type_checking_if(PyNamespaceBuilder *b, TSNode node) {
            memcmp(text, "TYPE_CHECKING", len) == 0;
 }
 
+/* An import in an elif/else branch of a TYPE_CHECKING block rebinds its names
+ * at runtime from wherever that branch says (the compat shape: `else: try:
+ * from runtime.place import name`). A static reader cannot tell which source
+ * the module ends up exporting, so every name such an import binds becomes a
+ * SHADOW (the re-export is withdrawn, as for a later assignment); a star
+ * import, or an import form the builder does not read, may bind any name, so
+ * the whole namespace becomes unknown. An iterative walk of the branch: deep
+ * nesting must not exhaust the stack. */
+static bool py_ns_alternative_imports(PyNamespaceBuilder *b, TSNode root) {
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool done = false;
+    while (!done && !b->failure) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        bool from = strcmp(kind, "import_from_statement") == 0;
+        bool is_import = from || strcmp(kind, "import_statement") == 0;
+        if (is_import) {
+            int start = b->facts.count;
+            bool star = !py_ns_import(b, node, from);
+            for (int i = start; !star && i < b->facts.count; i++) {
+                star = b->facts.items[i].kind == CBM_PY_NS_IMPORT_STAR;
+                b->facts.items[i] = (CBMPyNamespaceFact){.kind = CBM_PY_NS_SHADOW,
+                                                         .local_name = b->facts.items[i].local_name,
+                                                         .reason = CBM_PY_NS_REASON_COMPOUND};
+            }
+            if (star && !b->failure) {
+                b->facts.count = start;
+                py_ns_unknown(b, CBM_PY_NS_REASON_COMPOUND);
+            }
+        }
+        if (!is_import && ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                done = true;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return !b->failure;
+}
+
 /* The type checker view of a module-level `if TYPE_CHECKING:`: its
  * consequence runs, its elif/else branches never do. Packages that load
  * their public names lazily at runtime (`else: sys.modules[...] =
  * _LazyModule(...)`) publish them exactly there, so a static reader of the
  * namespace must take this branch to see them; every other compound
- * statement stays a whole-namespace unknown. */
+ * statement stays a whole-namespace unknown. A name an elif/else branch
+ * imports again is withdrawn (py_ns_alternative_imports). */
 static bool py_ns_type_checking_block(PyNamespaceBuilder *b, TSNode node) {
     TSNode body = ts_node_child_by_field_name(node, TS_FIELD("consequence"));
     if (ts_node_is_null(body))
@@ -772,6 +816,13 @@ static bool py_ns_type_checking_block(PyNamespaceBuilder *b, TSNode node) {
             if (!py_ns_unknown(b, CBM_PY_NS_REASON_UNSUPPORTED))
                 return false;
         }
+    }
+    uint32_t children = ts_node_child_count(node);
+    for (uint32_t i = 0; i < children && !b->failure; i++) {
+        TSNode alt = ts_node_child(node, i);
+        const char *kind = ts_node_type(alt);
+        if (strcmp(kind, "elif_clause") == 0 || strcmp(kind, "else_clause") == 0)
+            py_ns_alternative_imports(b, alt);
     }
     return !b->failure;
 }
