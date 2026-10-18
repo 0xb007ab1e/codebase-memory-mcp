@@ -15220,6 +15220,161 @@ TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548) {
     return pyn_run_init_collision(52);
 }
 
+/* ── F15: a nested class's bare base resolves in its class body first ── */
+
+/* The sqlalchemy asyncpg shape: an adapter class re-declares the DBAPI
+ * exception hierarchy as nested classes, each based on an EARLIER sibling
+ * spelled bare (`class IntegrityError(DatabaseError)`). Python evaluates a
+ * class statement's bases in the enclosing class body, so the sibling wins
+ * over the same-named module classes of exc.py. A sibling defined LATER in
+ * the body is not bound yet: `Early(Later)` names the module-level Later. */
+static const char pyb_exc_py[] = "class DBAPIError(Exception):\n"
+                                 "    pass\n"
+                                 "\n"
+                                 "class DatabaseError(DBAPIError):\n"
+                                 "    pass\n"
+                                 "\n"
+                                 "class IntegrityError(DatabaseError):\n"
+                                 "    pass\n";
+
+static const char pyb_adapter_py[] = "from exc import DBAPIError\n"
+                                     "\n"
+                                     "class Later(Exception):\n"
+                                     "    pass\n"
+                                     "\n"
+                                     "class AsyncAdapt_dbapi:\n"
+                                     "    class Error(DBAPIError):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class DatabaseError(Error):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class IntegrityError(DatabaseError):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class NotNullViolationError(IntegrityError):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class Early(Later):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class Later(Exception):\n"
+                                     "        pass\n";
+
+/* A second adapter with the same nested names, as sqlalchemy has one per
+ * driver: a name-only guess has several same-named candidates to pick. */
+static const char pyb_adapter2_py[] = "class AsyncAdapt_other_dbapi:\n"
+                                      "    class Error(Exception):\n"
+                                      "        pass\n"
+                                      "\n"
+                                      "    class DatabaseError(Error):\n"
+                                      "        pass\n"
+                                      "\n"
+                                      "    class IntegrityError(DatabaseError):\n"
+                                      "        pass\n";
+
+static int pyb_run_class_body_base(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_cbbase_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "exc.py", pyb_exc_py);
+    write_temp_file(tmp, "adapter.py", pyb_adapter_py);
+    write_temp_file(tmp, "adapter2.py", pyb_adapter2_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cbbase.db", tmp);
+    int rc[2] = {-1, -1};
+    bool db_sib[2] = {false, false};
+    bool db_mod[2] = {true, true};
+    bool ie_sib[2] = {false, false};
+    bool ie_mod[2] = {true, true};
+    bool nn_sib[2] = {false, false};
+    bool err_imp[2] = {false, false};
+    bool early_mod[2] = {false, false};
+    bool early_later_sib[2] = {true, true};
+    bool other_sib[2] = {false, false};
+    for (int run = 0; run < 2; run++) {
+        if (run == 1) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/adapter.py", tmp);
+            th_append_file(path, "\n# edited: the second run re-indexes incrementally\n");
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        rc[run] = p ? cbm_pipeline_run(p) : -1;
+        cbm_store_t *s = rc[run] == 0 ? cbm_store_open_path(db_path) : NULL;
+        if (s) {
+            const char *pr = cbm_pipeline_project_name(p);
+            const char *cls = "adapter.AsyncAdapt_dbapi";
+            char a[256];
+            char b[256];
+            snprintf(a, sizeof(a), "%s.DatabaseError", cls);
+            snprintf(b, sizeof(b), "%s.Error", cls);
+            db_sib[run] = pyn_edge(s, pr, a, b, "INHERITS");
+            db_mod[run] = pyn_edge(s, pr, a, "adapter2.AsyncAdapt_other_dbapi.Error", "INHERITS");
+            snprintf(a, sizeof(a), "%s.IntegrityError", cls);
+            snprintf(b, sizeof(b), "%s.DatabaseError", cls);
+            ie_sib[run] = pyn_edge(s, pr, a, b, "INHERITS");
+            ie_mod[run] = pyn_edge(s, pr, a, "exc.DatabaseError", "INHERITS");
+            snprintf(a, sizeof(a), "%s.NotNullViolationError", cls);
+            snprintf(b, sizeof(b), "%s.IntegrityError", cls);
+            nn_sib[run] = pyn_edge(s, pr, a, b, "INHERITS");
+            snprintf(a, sizeof(a), "%s.Error", cls);
+            err_imp[run] = pyn_edge(s, pr, a, "exc.DBAPIError", "INHERITS");
+            snprintf(a, sizeof(a), "%s.Early", cls);
+            snprintf(b, sizeof(b), "%s.Later", cls);
+            early_mod[run] = pyn_edge(s, pr, a, "adapter.Later", "INHERITS");
+            early_later_sib[run] = pyn_edge(s, pr, a, b, "INHERITS");
+            other_sib[run] = pyn_edge(s, pr, "adapter2.AsyncAdapt_other_dbapi.IntegrityError",
+                                      "adapter2.AsyncAdapt_other_dbapi.DatabaseError", "INHERITS");
+            cbm_store_close(s);
+        }
+        if (p) {
+            cbm_pipeline_free(p);
+        }
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    for (int run = 0; run < 2; run++) {
+        ASSERT_EQ(rc[run], 0);
+        ASSERT_TRUE(db_sib[run]);           /* DatabaseError(Error): the earlier sibling */
+        ASSERT_FALSE(db_mod[run]);          /* ... not the other adapter's Error */
+        ASSERT_TRUE(ie_sib[run]);           /* IntegrityError(DatabaseError): the sibling */
+        ASSERT_FALSE(ie_mod[run]);          /* ... not exc.DatabaseError */
+        ASSERT_TRUE(nn_sib[run]);           /* a chain of siblings */
+        ASSERT_TRUE(err_imp[run]);          /* control: a non-sibling base keeps the import */
+        ASSERT_TRUE(early_mod[run]);        /* a LATER sibling is not bound yet: module Later */
+        ASSERT_FALSE(early_later_sib[run]); /* ... never the later sibling */
+        ASSERT_TRUE(other_sib[run]);        /* the second adapter binds its own sibling */
+    }
+    PASS();
+}
+
+TEST(pipeline_python_class_body_sibling_base) {
+    return pyb_run_class_body_base(0);
+}
+
+TEST(pipeline_python_class_body_sibling_base_parallel) {
+    return pyb_run_class_body_base(52);
+}
+
 /* #1548 keeps TESTS for calls made through a test's own nested helper: the
  * call now starts at the extracted helper def (not at the test FILE node, as
  * before #1548), so TESTS is attributed to the enclosing test function. A
@@ -24826,6 +24981,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_issue1548);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548);
+    RUN_TEST(pipeline_python_class_body_sibling_base);
+    RUN_TEST(pipeline_python_class_body_sibling_base_parallel);
     RUN_TEST(pipeline_python_nested_helper_keeps_tests_issue1548);
     RUN_TEST(pipeline_python_nested_helper_keeps_tests_parallel_issue1548);
     RUN_TEST(pipeline_header_include_target_is_independent_of_registration_order);
