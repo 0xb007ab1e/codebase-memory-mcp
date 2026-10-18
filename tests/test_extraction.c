@@ -1506,6 +1506,50 @@ TEST(python_annotated_instance_fields_exported_issue1277) {
     PASS();
 }
 
+/* #1277: the import an annotated field's type comes from usually sits under
+ * `if TYPE_CHECKING:`. It is recorded, flagged annotation-only; a runtime
+ * import is not flagged; an else branch (a runtime alternative) and an
+ * ordinary `if` stay unrecorded as before. */
+static const CBMImport *py_find_import(const CBMFileResult *r, const char *local) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name && strcmp(r->imports.items[i].local_name, local) == 0)
+            return &r->imports.items[i];
+    }
+    return NULL;
+}
+
+TEST(python_type_checking_imports_flagged_issue1277) {
+    const char *src = "from typing import TYPE_CHECKING\n"
+                      "import typing\n"
+                      "if TYPE_CHECKING:\n"
+                      "    from trainer import Trainer\n"
+                      "    import contracts\n"
+                      "else:\n"
+                      "    from fallback import Runtime\n"
+                      "if typing.TYPE_CHECKING:\n"
+                      "    from engine import Engine as Eng\n"
+                      "if FLAG:\n"
+                      "    from other import Conditional\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "loop.py");
+    ASSERT_NOT_NULL(r);
+    const CBMImport *tc = py_find_import(r, "TYPE_CHECKING");
+    const CBMImport *trainer = py_find_import(r, "Trainer");
+    const CBMImport *contracts = py_find_import(r, "contracts");
+    const CBMImport *eng = py_find_import(r, "Eng");
+    ASSERT_NOT_NULL(tc);
+    ASSERT_FALSE(tc->type_checking_only);
+    ASSERT_NOT_NULL(trainer);
+    ASSERT_TRUE(trainer->type_checking_only);
+    ASSERT_NOT_NULL(contracts);
+    ASSERT_TRUE(contracts->type_checking_only);
+    ASSERT_NOT_NULL(eng);
+    ASSERT_TRUE(eng->type_checking_only);
+    ASSERT_NULL(py_find_import(r, "Runtime"));
+    ASSERT_NULL(py_find_import(r, "Conditional"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(python_function) {
     CBMFileResult *r = extract(
         "def greet(name):\n    return f\"Hello {name}\"\n\ndef main():\n    greet(\"World\")\n",
@@ -12625,6 +12669,7 @@ SUITE(extraction) {
     RUN_TEST(python_function);
     RUN_TEST(python_class);
     RUN_TEST(python_annotated_instance_fields_exported_issue1277);
+    RUN_TEST(python_type_checking_imports_flagged_issue1277);
     RUN_TEST(js_function);
     RUN_TEST(js_class);
     RUN_TEST(ts_function);
