@@ -14818,6 +14818,101 @@ TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548) {
     return pyn_run_init_collision(52);
 }
 
+/* #1548 keeps TESTS for calls made through a test's own nested helper: the
+ * call now starts at the extracted helper def (not at the test FILE node, as
+ * before #1548), so TESTS is attributed to the enclosing test function. A
+ * helper nested in a NON-test function stays without TESTS, like a module-level
+ * helper. Both resolvers. */
+static const char pyn_tests_prod_py[] = "def target(value):\n"
+                                        "    return value\n"
+                                        "\n"
+                                        "def other_target(value):\n"
+                                        "    return value\n";
+static const char pyn_tests_test_py[] = "from pkg.prod import target, other_target\n"
+                                        "\n"
+                                        "def test_through_nested_helper():\n"
+                                        "    def check(v):\n"
+                                        "        return target(v)\n"
+                                        "    assert check(1) == 1\n"
+                                        "\n"
+                                        "class TestGroup:\n"
+                                        "    def test_method_helper(self):\n"
+                                        "        def probe():\n"
+                                        "            return target(2)\n"
+                                        "        assert probe() == 2\n"
+                                        "\n"
+                                        "def make_fixture():\n"
+                                        "    def build():\n"
+                                        "        return other_target(3)\n"
+                                        "    return build\n";
+
+static int pyn_run_nested_helper_tests(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_ntests_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "pkg/__init__.py", "");
+    write_temp_file(tmp, "pkg/prod.py", pyn_tests_prod_py);
+    write_temp_file(tmp, "tests/test_rows.py", pyn_tests_test_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ntests.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool fn_tests = false, method_tests = false, helper_calls = false, fixture_tests = true;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        helper_calls = pyn_edge(s, project, "tests.test_rows.test_through_nested_helper.check",
+                                "pkg.prod.target", "CALLS");
+        fn_tests = pyn_edge(s, project, "tests.test_rows.test_through_nested_helper",
+                            "pkg.prod.target", "TESTS");
+        method_tests = pyn_edge(s, project, "tests.test_rows.TestGroup.test_method_helper",
+                                "pkg.prod.target", "TESTS");
+        fixture_tests = pyn_edge(s, project, "tests.test_rows.make_fixture",
+                                 "pkg.prod.other_target", "TESTS") ||
+                        pyn_edge(s, project, "tests.test_rows.make_fixture.build",
+                                 "pkg.prod.other_target", "TESTS");
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(helper_calls);   /* the call starts at the nested helper (#1548) */
+    ASSERT_TRUE(fn_tests);       /* ... and the enclosing test function still TESTS the target */
+    ASSERT_TRUE(method_tests);   /* the same inside a test method */
+    ASSERT_FALSE(fixture_tests); /* a helper nested in a non-test function: no TESTS */
+    PASS();
+}
+
+TEST(pipeline_python_nested_helper_keeps_tests_issue1548) {
+    return pyn_run_nested_helper_tests(0);
+}
+
+TEST(pipeline_python_nested_helper_keeps_tests_parallel_issue1548) {
+    return pyn_run_nested_helper_tests(52);
+}
+
 TEST(pipeline_python_project) {
     /* Port of TestPipelinePythonProject */
     const char *files[] = {"main.py", "utils.py"};
@@ -24321,6 +24416,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_issue1548);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548);
+    RUN_TEST(pipeline_python_nested_helper_keeps_tests_issue1548);
+    RUN_TEST(pipeline_python_nested_helper_keeps_tests_parallel_issue1548);
     RUN_TEST(pipeline_header_include_target_is_independent_of_registration_order);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
