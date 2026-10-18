@@ -15226,8 +15226,10 @@ TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548) {
  * exception hierarchy as nested classes, each based on an EARLIER sibling
  * spelled bare (`class IntegrityError(DatabaseError)`). Python evaluates a
  * class statement's bases in the enclosing class body, so the sibling wins
- * over the same-named module classes of exc.py. A sibling defined LATER in
- * the body is not bound yet: `Early(Later)` names the module-level Later. */
+ * over the same-named module classes of exc.py, which the adapter imports
+ * as a module (so a name guess prefers them, as on sqlalchemy once its
+ * relative `from ... import exc` resolves). A sibling defined LATER in the
+ * body is not bound yet: `Early(Later)` names the module-level Later. */
 static const char pyb_exc_py[] = "class DBAPIError(Exception):\n"
                                  "    pass\n"
                                  "\n"
@@ -15237,7 +15239,8 @@ static const char pyb_exc_py[] = "class DBAPIError(Exception):\n"
                                  "class IntegrityError(DatabaseError):\n"
                                  "    pass\n";
 
-static const char pyb_adapter_py[] = "from exc import DBAPIError\n"
+static const char pyb_adapter_py[] = "import exc\n"
+                                     "from exc import DBAPIError\n"
                                      "\n"
                                      "class Later(Exception):\n"
                                      "    pass\n"
