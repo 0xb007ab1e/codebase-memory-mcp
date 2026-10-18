@@ -4871,6 +4871,78 @@ TEST(probe_helm_release_terraform_dynamic_set) {
     PASS();
 }
 
+/* A set_sensitive whose value is never read: a release image reading its
+ * name (image.tag) is not known; one reading none of them still is. A
+ * postrender may rewrite what a release deploys: no image of its own. */
+TEST(probe_helm_release_terraform_sensitive_and_postrender) {
+    static const GpfFile files[] = {
+        GPF_APP_CHART,
+        {"tf/main.tf",
+         "resource \"helm_release\" \"tagged\" {\n  name  = \"tagged\"\n"
+         "  chart = \"../charts/app\"\n  set {\n    name  = \"image.repository\"\n"
+         "    value = \"quay.io/acme/app\"\n  }\n  set_sensitive {\n    name  = \"image.tag\"\n"
+         "    value = var.tag\n  }\n}\n"
+         "resource \"helm_release\" \"pw\" {\n  name  = \"pw\"\n"
+         "  chart = \"../charts/app\"\n  set {\n    name  = \"image.repository\"\n"
+         "    value = \"quay.io/acme/pw\"\n  }\n  set_sensitive {\n    name  = \"db.password\"\n"
+         "    value = var.pw\n  }\n}\n"
+         "resource \"helm_release\" \"post\" {\n  name  = \"post\"\n"
+         "  chart = \"../charts/app\"\n  set {\n    name  = \"image.tag\"\n"
+         "    value = \"3.3\"\n  }\n  postrender {\n    binary_path = \"./kustomize.sh\"\n  }\n}\n"}};
+    static const char want[] =
+        "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart ref=image "
+        "default_of=[\"image.repository\",\"image.tag\"]\n"
+        "Class:resource.helm_release.pw -> Image:quay.io/acme/pw DEPLOYS "
+        "image=quay.io/acme/pw:1.0 via=terraform ref=image override_of=[\"image.repository\"]\n"
+        "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 "
+        "ref=image default_of=[\"image.repository\",\"image.tag\"]";
+    if (!gpf_expect_image_edges(files, 4, want)) {
+        FAIL("set_sensitive names and postrender make release images unknown");
+    }
+    PASS();
+}
+
+/* A kustomization that also transforms what it inflates (images:, patches)
+ * has no release image of its own: the transformer may change it. */
+TEST(probe_helm_release_kustomize_transformers) {
+    static const GpfFile files[] = {
+        {"kz/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nhelmCharts:\n"
+         "  - name: app\n    releaseName: kapp\n    valuesInline:\n      image:\n"
+         "        tag: \"1.5\"\nimages:\n  - name: ghcr.io/acme/app\n    newTag: \"2.0\"\n"},
+        {"kz/charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n"},
+        {"kz/charts/app/values.yaml", "image:\n  repository: ghcr.io/acme/app\n  tag: \"1.0\"\n"},
+        {"kz/charts/app/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: app\n"
+         "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"}};
+    if (!gpf_expect_image_edges(files, 4, GPF_APP_DEFAULTS)) {
+        FAIL("a kustomization's own transformers make its release images unknown");
+    }
+    PASS();
+}
+
+/* An empty values.yaml is values {} (Helm's), not values not read: the
+ * subchart under it still renders its image. */
+TEST(probe_helm_empty_values_file_renders) {
+    static const GpfFile files[] = {
+        {"charts/app/Chart.yaml",
+         "apiVersion: v2\nname: app\nversion: 1.0.0\nappVersion: \"1.0\"\n"},
+        {"charts/app/values.yaml", ""},
+        {"charts/app/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: app\n"
+         "          image: \"ghcr.io/acme/{{ .Chart.Name }}:{{ .Chart.AppVersion }}\"\n"}};
+    static const char want[] =
+        "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart ref=image\n"
+        "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 "
+        "ref=image";
+    if (!gpf_expect_image_edges(files, 3, want)) {
+        FAIL("an empty values.yaml renders with {}");
+    }
+    PASS();
+}
+
 /* A subchart a dependency aliases renders with .Chart.Name its alias (Helm's
  * getAliasDependency), so an image naming the chart names the alias. */
 TEST(probe_helm_aliased_subchart_chart_name) {
@@ -4919,8 +4991,10 @@ TEST(probe_helm_list_path_mark_on_chart_edge) {
     PASS();
 }
 
+#ifndef _WIN32
 /* gpf_image_edges with symlinks laid in after the files: links[i] names a
- * repository path and the absolute or relative target it points at. */
+ * repository path and the absolute or relative target it points at (POSIX
+ * symlinks: the tests using it skip on Windows). */
 static char *gpf_image_edges_linked(const GpfFile *files, int nfiles, const GpfFile *links,
                                     int nlinks) {
     GpfProj lp;
@@ -4975,6 +5049,7 @@ static char *gpf_image_edges_linked(const GpfFile *files, int nfiles, const GpfF
     gpf_cleanup(&lp, store);
     return out;
 }
+#endif
 
 /* A values file a chart, a kustomization or a Terraform file() names by path
  * is read only when it is a file of the repository: a symlink out of it --
@@ -4982,6 +5057,9 @@ static char *gpf_image_edges_linked(const GpfFile *files, int nfiles, const GpfF
  * file is such a link renders nothing (its values are unknown, not empty);
  * the releases reading one have no image of their own. */
 TEST(probe_helm_values_symlink_not_followed) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink contract");
+#else
     char outside[256];
     snprintf(outside, sizeof(outside), "/tmp/cbm_gpf_out_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(outside));
@@ -5024,11 +5102,15 @@ TEST(probe_helm_values_symlink_not_followed) {
         FAIL("no values read through a symlink out of the repository");
     }
     PASS();
+#endif
 }
 
 /* A Terraform helm_release reading its values with file() of a symlink out
  * of the repository has no image of its own: the link is never followed. */
 TEST(probe_helm_terraform_values_symlink_not_followed) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink contract");
+#else
     char outside[256];
     snprintf(outside, sizeof(outside), "/tmp/cbm_gpf_out_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(outside));
@@ -5057,6 +5139,7 @@ TEST(probe_helm_terraform_values_symlink_not_followed) {
         FAIL("no Terraform values read through a symlink out of the repository");
     }
     PASS();
+#endif
 }
 
 /* A build argument holding a secret -- by its name (*_TOKEN) or its value (a
@@ -6929,6 +7012,9 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_helm_release_flux_unread_sources);
     RUN_TEST(probe_helm_release_kustomize_unread_sources);
     RUN_TEST(probe_helm_release_terraform_dynamic_set);
+    RUN_TEST(probe_helm_release_terraform_sensitive_and_postrender);
+    RUN_TEST(probe_helm_release_kustomize_transformers);
+    RUN_TEST(probe_helm_empty_values_file_renders);
     RUN_TEST(probe_helm_aliased_subchart_chart_name);
     RUN_TEST(probe_helm_list_path_mark_on_chart_edge);
     RUN_TEST(probe_helm_values_symlink_not_followed);

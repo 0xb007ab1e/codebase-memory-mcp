@@ -523,15 +523,27 @@ static yyjson_mut_val *tf_json(const tf_t *t, yyjson_mut_doc *doc, TSNode n) {
 static char *tf_read(const char *path, size_t *len);
 
 /* A repository file's text (cbm_alloc; capped and padded like every file
- * read), NULL when unreadable -- or when it is no file discovery took in: a
- * symlink, or a path through one, is never followed out of the repository. */
+ * read; an empty file is empty text), NULL when unreadable -- or when it is
+ * no file discovery took in: a symlink, or a path through one, is never
+ * followed out of the repository. */
 static char *tf_read_repo(const tf_t *t, const char *path, size_t *len) {
     if (!cbm_pipeline_file_node(t->ctx->gbuf, t->ctx->project_name, path)) {
         return NULL;
     }
     char full[CBM_SZ_4K];
     int n = snprintf(full, sizeof(full), "%s/%s", t->ctx->repo_path, path);
-    return n > 0 && (size_t)n < sizeof(full) ? tf_read(full, len) : NULL;
+    if (n <= 0 || (size_t)n >= sizeof(full)) {
+        return NULL;
+    }
+    char *buf = tf_read(full, len);
+    cbm_path_info_t info;
+    if (!buf && cbm_path_info_utf8(full, &info) == CBM_PATH_INFO_OK && info.is_regular &&
+        !info.is_symlink && info.size == 0) {
+        enum { TF_EMPTY_PAD = 16 };
+        buf = cbm_calloc(CBM_MEM_CLASS_OTHER, TF_EMPTY_PAD);
+        *len = 0;
+    }
+    return buf;
 }
 
 /* A `values = [...]` item as values: a YAML string / heredoc, file(<path>)
@@ -633,8 +645,8 @@ static yyjson_mut_val *tf_set_block(const tf_t *t, yyjson_mut_doc *doc, TSNode b
     return entry;
 }
 
-/* Is block `a` a `dynamic "set"` / `dynamic "set_list"` -- entries made by a
- * for_each, never literal? */
+/* Is block `a` a `dynamic "set"` / `"set_list"` / `"set_sensitive"` --
+ * entries (and names) made by a for_each, never literal? */
 static bool tf_dynamic_set(const tf_t *t, TSNode a) {
     TSNode kw = ts_node_named_child(a, 0);
     TSNode label = ts_node_named_child(a, SKIP_ONE);
@@ -649,17 +661,72 @@ static bool tf_dynamic_set(const tf_t *t, TSNode a) {
     uint32_t lb = ts_node_start_byte(label);
     size_t ll = ts_node_end_byte(label) - lb;
     return (ll == strlen("\"set\"") && strncmp(t->src + lb, "\"set\"", ll) == 0) ||
-           (ll == strlen("\"set_list\"") && strncmp(t->src + lb, "\"set_list\"", ll) == 0);
+           (ll == strlen("\"set_list\"") && strncmp(t->src + lb, "\"set_list\"", ll) == 0) ||
+           (ll == strlen("\"set_sensitive\"") &&
+            strncmp(t->src + lb, "\"set_sensitive\"", ll) == 0);
+}
+
+/* Is node n an identifier spelling `word`? */
+static bool tf_word(const tf_t *t, TSNode n, const char *word) {
+    if (ts_node_is_null(n)) {
+        return false;
+    }
+    uint32_t b = ts_node_start_byte(n);
+    size_t l = ts_node_end_byte(n) - b;
+    return l == strlen(word) && strncmp(t->src + b, word, l) == 0;
+}
+
+/* The expression of attribute `name` of a block's body or of an HCL object
+ * (`{ name = ..., value = ... }`); a null node when there is none. */
+static TSNode tf_entry_attr(const tf_t *t, TSNode entry, const char *name) {
+    TSNode e = tf_unwrap(entry);
+    for (uint32_t j = 0; j < ts_node_named_child_count(e); j++) {
+        TSNode c = ts_node_named_child(e, j);
+        if (tf_type(e, "block") && tf_type(c, "body")) {
+            for (uint32_t k = 0; k < ts_node_named_child_count(c); k++) {
+                TSNode at = ts_node_named_child(c, k);
+                if (tf_type(at, "attribute") && ts_node_named_child_count(at) >= PAIR_LEN &&
+                    tf_word(t, ts_node_named_child(at, 0), name)) {
+                    return ts_node_named_child(at, SKIP_ONE);
+                }
+            }
+        } else if (tf_type(e, "object") && tf_type(c, "object_elem")) {
+            TSNode kn = tf_unwrap(ts_node_child_by_field_name(c, "key", (uint32_t)strlen("key")));
+            TSNode id = tf_type(kn, "variable_expr") ? ts_node_named_child(kn, 0) : (TSNode){0};
+            if (tf_word(t, id, name)) {
+                return ts_node_child_by_field_name(c, "val", (uint32_t)strlen("val"));
+            }
+        }
+    }
+    return (TSNode){0};
+}
+
+/* The literal name of set_sensitive entry `entry` (a block, or an object of
+ * the provider v3 list) appended to names -- the name only, the value is
+ * never read; false when the name is no literal. */
+static bool tf_sensitive_name(const tf_t *t, yyjson_mut_doc *doc, yyjson_mut_val *names,
+                              TSNode entry) {
+    yyjson_mut_val *nm = tf_json(t, doc, tf_entry_attr(t, entry, "name"));
+    if (!yyjson_mut_is_str(nm)) {
+        return false;
+    }
+    yyjson_mut_arr_append(names, nm);
+    return true;
 }
 
 /* The values a helm_release body gives its chart -- `values` items
  * coalesced in order, then each `set` -- as JSON (cbm_alloc); NULL when a
- * part is no literal, or is made by a `dynamic` block. set_sensitive is
- * never read. */
-static char *tf_release_values(const tf_t *t, TSNode body, const char ***files, int *nfiles) {
+ * part is no literal, is made by a `dynamic` block, or a postrender may
+ * rewrite what it deploys. set_sensitive values are never read: their names
+ * go to *sensitive (a JSON array, cbm_alloc; NULL: none), and an image that
+ * reads one is not known (pass_k8s.c). */
+static char *tf_release_values(const tf_t *t, TSNode body, const char ***files, int *nfiles,
+                               char **sensitive) {
+    *sensitive = NULL;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(cbm_json_writer_allocator());
     yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
-    bool ok = root != NULL;
+    yyjson_mut_val *names = doc ? yyjson_mut_arr(doc) : NULL;
+    bool ok = root != NULL && names != NULL;
     for (int pass = 0; ok && pass < PAIR_LEN; pass++) {
         for (uint32_t i = 0; ok && i < ts_node_named_child_count(body); i++) {
             TSNode a = ts_node_named_child(body, i);
@@ -669,11 +736,29 @@ static char *tf_release_values(const tf_t *t, TSNode body, const char ***files, 
             bool is_set = kl == strlen("set") && strncmp(t->src + kb, "set", kl) == 0;
             bool is_values = kl == strlen("values") && strncmp(t->src + kb, "values", kl) == 0;
             /* set_list and dynamic set values are not read: the release's
-             * values would be partial */
+             * values would be partial; a postrender may rewrite its images */
             if ((kl == strlen("set_list") && strncmp(t->src + kb, "set_list", kl) == 0) ||
-                tf_dynamic_set(t, a)) {
+                tf_dynamic_set(t, a) || (tf_type(a, "block") && tf_word(t, key, "postrender"))) {
                 ok = false;
                 break;
+            }
+            bool is_sensitive =
+                kl == strlen("set_sensitive") && strncmp(t->src + kb, "set_sensitive", kl) == 0;
+            if (pass == 0 && is_sensitive && tf_type(a, "block")) {
+                ok = tf_sensitive_name(t, doc, names, a);
+                continue;
+            }
+            if (pass == 0 && is_sensitive && tf_type(a, "attribute")) {
+                /* provider v3: set_sensitive = [{ name, value }, ...] */
+                TSNode list = tf_unwrap(ts_node_named_child(a, SKIP_ONE));
+                ok = tf_type(list, "tuple");
+                for (uint32_t j = 0; ok && j < ts_node_named_child_count(list); j++) {
+                    TSNode it = ts_node_named_child(list, j);
+                    if (!tf_type(it, "tuple_start") && !tf_type(it, "tuple_end")) {
+                        ok = tf_sensitive_name(t, doc, names, it);
+                    }
+                }
+                continue;
             }
             if (pass == 0 && is_values && tf_type(a, "attribute")) {
                 TSNode list = tf_unwrap(ts_node_named_child(a, SKIP_ONE));
@@ -706,6 +791,15 @@ static char *tf_release_values(const tf_t *t, TSNode body, const char ***files, 
     if (ok) {
         size_t len = 0;
         out = yyjson_mut_val_write_opts(root, 0, cbm_json_writer_allocator(), &len, NULL);
+        if (out && yyjson_mut_arr_size(names) > 0) {
+            *sensitive =
+                yyjson_mut_val_write_opts(names, 0, cbm_json_writer_allocator(), &len, NULL);
+            if (!*sensitive) {
+                /* the names not kept: no image of the release could be told apart */
+                cbm_free(CBM_MEM_CLASS_OTHER, out);
+                out = NULL;
+            }
+        }
     }
     if (doc) {
         yyjson_mut_doc_free(doc);
@@ -727,8 +821,9 @@ static void tf_release_push(tf_t *t, int64_t src, int64_t chart, TSNode body) {
     }
     const char **files = NULL;
     int nfiles = 0;
-    ctx->tf_releases[ctx->tf_release_n++] =
-        (cbm_tf_release_t){src, chart, tf_release_values(t, body, &files, &nfiles)};
+    char *sensitive = NULL;
+    char *values = tf_release_values(t, body, &files, &nfiles, &sensitive);
+    ctx->tf_releases[ctx->tf_release_n++] = (cbm_tf_release_t){src, chart, values, sensitive};
     /* the values files it reads, like a kustomization's valuesFile: an edit of
      * one alone renders the release again (pipeline_incremental.c) */
     for (int i = 0; i < nfiles; i++) {

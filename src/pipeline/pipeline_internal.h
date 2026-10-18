@@ -385,9 +385,10 @@ typedef struct {
  * when a part is not a literal (an interpolation, a variable). pass_k8s.c
  * renders the chart's images with them. */
 typedef struct cbm_tf_release {
-    int64_t src;   /* the resource.helm_release node */
-    int64_t chart; /* the Chart node */
-    char *values;  /* owned (cbm_free); NULL: unknown */
+    int64_t src;     /* the resource.helm_release node */
+    int64_t chart;   /* the Chart node */
+    char *values;    /* owned (cbm_free); NULL: unknown */
+    char *sensitive; /* owned: JSON array of its set_sensitive names (never values); NULL: none */
 } cbm_tf_release_t;
 
 /* Shared context passed to each pass function.

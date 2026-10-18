@@ -3904,6 +3904,7 @@ typedef struct {
     k8s_himg_t *v;
     int n;
     int cap;
+    CBMHashTable *seen; /* "src:img" of each v (keys cbm_alloc'd): one look-up a push */
 } k8s_himgs_t;
 
 typedef struct {
@@ -3919,6 +3920,9 @@ typedef struct {
     int tcap;
     k8s_himgs_t dflt; /* the containers' images with the defaults */
     int edges;
+    /* the release rendered: its set_sensitive names (JSON array; NULL: none) --
+     * an image reading one is not known, its value never read */
+    const char *sensitive;
 } k8s_helm_t;
 
 /* The templated images of the facts, kept past them. */
@@ -3948,16 +3952,29 @@ static char *k8s_repo_read(cbm_pipeline_ctx_t *ctx, const char *rel, int *len) {
     }
     char path[CBM_SZ_4K];
     int n = snprintf(path, sizeof(path), "%s/%s", ctx->repo_path, rel);
-    return n > 0 && (size_t)n < sizeof(path) ? k8s_read_file(path, len) : NULL;
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        return NULL;
+    }
+    char *buf = k8s_read_file(path, len);
+    cbm_path_info_t info;
+    if (!buf && cbm_path_info_utf8(path, &info) == CBM_PATH_INFO_OK && info.is_regular &&
+        !info.is_symlink && info.size == 0) {
+        /* an empty file is read: empty text (padded like every read) */
+        enum { CBM_TS_EMPTY_PAD = 16 };
+        buf = cbm_calloc(CBM_MEM_CLASS_OTHER, CBM_TS_EMPTY_PAD);
+        *len = 0;
+    }
+    return buf;
 }
 
-/* Is repository path `rel` there at all -- a file, a symlink, anything (a
- * link is reported, never followed)? */
+/* Is repository path `rel` there, or can that not be told (a link is
+ * reported, never followed; only a path proven absent is not there)? */
 static bool k8s_repo_has(cbm_pipeline_ctx_t *ctx, const char *rel) {
     char path[CBM_SZ_4K];
     int n = snprintf(path, sizeof(path), "%s/%s", ctx->repo_path, rel);
     cbm_path_info_t info;
-    return n > 0 && (size_t)n < sizeof(path) && cbm_path_info_utf8(path, &info) == 0;
+    return n > 0 && (size_t)n < sizeof(path) &&
+           cbm_path_info_utf8(path, &info) != CBM_PATH_INFO_ABSENT;
 }
 
 /* A file of `dir` (one of `names`), parsed as values; *found when one exists.
@@ -4232,14 +4249,38 @@ static const char *k8s_helm_overridden(k8s_helm_t *h, const char *keys, yyjson_m
 }
 
 static void k8s_himg_push(k8s_himgs_t *l, k8s_himg_t x) {
-    for (int i = 0; i < l->n; i++) {
-        if (l->v[i].src == x.src && l->v[i].img == x.img) {
-            return; /* the first (in file order) of the same Image stands for it */
-        }
+    char key[CBM_SZ_64];
+    snprintf(key, sizeof(key), "%lld:%lld", (long long)x.src, (long long)x.img);
+    if (!l->seen) {
+        l->seen = cbm_ht_create(0);
     }
-    if (k8s_grow((void **)&l->v, &l->cap, l->n, sizeof(*l->v))) {
-        l->v[l->n++] = x;
+    if (!l->seen || cbm_ht_get(l->seen, key)) {
+        return; /* the first (in file order) of the same Image stands for it */
     }
+    size_t kl = strlen(key) + SKIP_ONE;
+    char *k = cbm_alloc(CBM_MEM_CLASS_OTHER, kl);
+    if (!k || !k8s_grow((void **)&l->v, &l->cap, l->n, sizeof(*l->v))) {
+        cbm_free(CBM_MEM_CLASS_OTHER, k);
+        return;
+    }
+    memcpy(k, key, kl);
+    cbm_ht_set(l->seen, k, (void *)(uintptr_t)SKIP_ONE);
+    l->v[l->n++] = x;
+}
+
+static void k8s_himg_key_free(const char *key, void *value, void *ud) {
+    (void)value;
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+static void k8s_himgs_free(k8s_himgs_t *l) {
+    if (l->seen) {
+        cbm_ht_foreach(l->seen, k8s_himg_key_free, NULL);
+        cbm_ht_free(l->seen);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, l->v);
+    *l = (k8s_himgs_t){0};
 }
 
 /* Does `src` USE Image `img` already by a literal reference? */
@@ -4313,8 +4354,68 @@ static void k8s_helm_emit_uses(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h, const k8s
     }
 }
 
+/* Do values paths a and b overlap -- one is the other or lies within it
+ * (a key boundary `.` / `[` after the shorter; "" is the whole values)? */
+static bool k8s_path_overlap(const char *a, const char *b) {
+    size_t al = strlen(a);
+    size_t bl = strlen(b);
+    size_t m = al < bl ? al : bl;
+    if (strncmp(a, b, m) != 0) {
+        return false;
+    }
+    char c = (al < bl ? b : a)[m];
+    return m == 0 || c == '\0' || c == '.' || c == '[';
+}
+
+/* Does values path `path` (of the release's chart) overlap a set_sensitive
+ * name of the release rendered? */
+static bool k8s_helm_sensitive_path(const k8s_helm_t *h, const char *path) {
+    if (!h->sensitive || !path) {
+        return false;
+    }
+    yyjson_doc *d = yyjson_read(h->sensitive, strlen(h->sensitive), 0);
+    bool hit = !d; /* names not read: say it touches */
+    size_t idx, max;
+    yyjson_val *k;
+    yyjson_arr_foreach(d ? yyjson_doc_get_root(d) : NULL, idx, max, k) {
+        const char *s = yyjson_get_str(k);
+        hit = hit || (s && k8s_path_overlap(path, s));
+    }
+    if (d) {
+        yyjson_doc_free(d);
+    }
+    return hit;
+}
+
+/* Does an image reading values keys `keys` (a JSON array, of its chart at
+ * key path `prefix` within the release's; global.* are the release's own)
+ * read a set_sensitive name of the release rendered? */
+static bool k8s_helm_sensitive_keys(k8s_helm_t *h, const char *keys, const char *prefix) {
+    if (!h->sensitive || !keys) {
+        return false;
+    }
+    yyjson_doc *d = yyjson_read(keys, strlen(keys), 0);
+    bool hit = !d;
+    size_t idx, max;
+    yyjson_val *k;
+    yyjson_arr_foreach(d ? yyjson_doc_get_root(d) : NULL, idx, max, k) {
+        const char *key = yyjson_get_str(k);
+        bool global = key && strncmp(key, "global.", strlen("global.")) == 0;
+        const char *full = !key ? NULL
+                           : global || !prefix || !prefix[0]
+                               ? key
+                               : cbm_arena_sprintf(&h->a, "%s.%s", prefix, key);
+        hit = hit || !full || k8s_helm_sensitive_path(h, full);
+    }
+    if (d) {
+        yyjson_doc_free(d);
+    }
+    return hit;
+}
+
 /* Chart `from` -DEPLOYS {via, ref: image, image, override_of}-> the images an
- * overlay changed: rendered there, absent from the defaults' images. */
+ * overlay changed: rendered there, absent from the defaults' images. An image
+ * reading a set_sensitive name (whose value is not read) is not known. */
 static void k8s_helm_emit_overrides(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h, int64_t from,
                                     const char *via, const k8s_himgs_t *dflt,
                                     const k8s_himgs_t *got, yyjson_mut_val *overlay,
@@ -4328,7 +4429,7 @@ static void k8s_helm_emit_overrides(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h, int6
                    strcmp(dflt->v[j].ref, x->ref) == 0;
         }
         const char *ovr = k8s_helm_overridden(h, x->keys, overlay, globals, prefix);
-        if (same || !ovr || from <= 0) {
+        if (same || !ovr || from <= 0 || k8s_helm_sensitive_keys(h, x->keys, prefix)) {
             continue;
         }
         k8s_himg_t e = {from, x->img, x->ref, NULL, ovr};
@@ -4593,7 +4694,7 @@ static void k8s_helm_release_local(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, k8
             yyjson_mut_val *globals = yyjson_mut_obj_get(rv, "global");
             k8s_helm_emit_overrides(ctx, h, src, via, &h->dflt, &got, overlay, globals,
                                     path && path[0] ? path : NULL, emitted);
-            cbm_free(CBM_MEM_CLASS_OTHER, got.v);
+            k8s_himgs_free(&got);
         }
         cbm_free(CBM_MEM_CLASS_OTHER, srcs);
         from = to;
@@ -4647,7 +4748,9 @@ static void k8s_helm_convention(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h, int64_t 
                                                           : "",
                                                  dig[0] ? dig : tag)
                              : NULL;
-        int64_t img = ref && k8s_helm_has_host(ref) && cbm_image_ref_valid(ref)
+        /* a set_sensitive name within the mapping: its value is not read */
+        bool sensitive = k8s_helm_sensitive_path(h, path ? path : "");
+        int64_t img = ref && !sensitive && k8s_helm_has_host(ref) && cbm_image_ref_valid(ref)
                           ? cbm_pipeline_image_node(ctx, ref)
                           : 0;
         int before = emitted->n;
@@ -4699,7 +4802,7 @@ static void k8s_helm_release(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, k8s_helm
                cbm_ht_get(b->charts, dir)) {
         k8s_helm_release_local(ctx, b, h, l, src, via, dir, rv, &emitted);
     }
-    cbm_free(CBM_MEM_CLASS_OTHER, emitted.v);
+    k8s_himgs_free(&emitted);
 }
 
 /* A node's document (lines start_line..end_line of its file) as values. */
@@ -4792,6 +4895,16 @@ static yyjson_mut_val *k8s_helm_kustomize_values(cbm_pipeline_ctx_t *ctx, k8s_he
     char *src = kust->file_path ? k8s_repo_read(ctx, kust->file_path, &len) : NULL;
     yyjson_mut_val *doc = src ? cbm_helm_values_parse(h->doc, src, (size_t)len) : NULL;
     cbm_free(CBM_MEM_CLASS_OTHER, src);
+    /* kustomize runs the kustomization's own transformers over the inflated
+     * chart: images / patches / replacements may change what it deploys */
+    static const char *const TRANSFORMS[] = {
+        "images",       "patches",      "patchesJson6902", "patchesStrategicMerge",
+        "replacements", "transformers", "components",      NULL};
+    for (int i = 0; TRANSFORMS[i]; i++) {
+        if (k8s_helm_gives(doc, TRANSFORMS[i])) {
+            return NULL;
+        }
+    }
     yyjson_mut_val *charts = yyjson_mut_is_obj(doc) ? yyjson_mut_obj_get(doc, "helmCharts") : NULL;
     yyjson_mut_val *inline_vals = NULL;
     size_t idx, max;
@@ -4874,9 +4987,12 @@ static void k8s_helm_link_releases(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, k8
             if (jd) {
                 yyjson_doc_free(jd);
             }
+            h->sensitive = r->sensitive;
             k8s_helm_release(ctx, b, h, &l, r->src, "terraform", r->chart, rv);
+            h->sensitive = NULL;
             cbm_free(CBM_MEM_CLASS_OTHER, r->values);
         }
+        cbm_free(CBM_MEM_CLASS_OTHER, r->sensitive);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, ctx->tf_releases);
     ctx->tf_releases = NULL;
@@ -4905,7 +5021,7 @@ static void k8s_helm_free(k8s_helm_t *h) {
         yyjson_mut_doc_free(h->doc);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, h->t);
-    cbm_free(CBM_MEM_CLASS_OTHER, h->dflt.v);
+    k8s_himgs_free(&h->dflt);
     cbm_arena_destroy(&h->a);
     if (h->edges > 0) {
         cbm_log_info("pass.k8s.helm_images", "edges", itoa_k8s(h->edges));

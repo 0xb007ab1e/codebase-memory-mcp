@@ -68,6 +68,7 @@ void cbm_helm_defines_free(cbm_helm_defines_t *d);
 typedef struct {
     int line;           /* 1-based line of the key in the template */
     int n;              /* captures */
+    int cap;            /* room in image / keys (the render's own) */
     const char **image; /* the rendered scalar, YAML quoting removed; NULL: UNKNOWN */
     const char **keys;  /* JSON array of the values paths it read; NULL: none */
 } cbm_helm_probe_t;

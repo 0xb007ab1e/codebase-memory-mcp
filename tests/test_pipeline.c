@@ -4559,6 +4559,191 @@ TEST(helm_change_of_a_new_value_spoils_nothing) {
     PASS();
 }
 
+/* An image line inside a range: n captures of one probe cost memory linear
+ * in n (the capture arrays grow by doubling), not a copy of every earlier
+ * capture each time. */
+TEST(helm_render_captures_grow_linearly) {
+    enum { ITER = 5000 };
+    static const char tpl[] = "{{- range 5000 }}\n"
+                              "image: \"ghcr.io/acme/app:1\"\n"
+                              "{{ end }}\n";
+    CBMArena a;
+    cbm_arena_init_lazy(&a, CBM_SZ_4K);
+    cbm_helm_probe_t probe = {.line = 2};
+    size_t before = cbm_arena_total(&a);
+    cbm_helm_render(&a, "t.yaml", tpl, strlen(tpl), NULL, NULL, NULL, &probe, 1);
+    size_t used = cbm_arena_total(&a) - before;
+    int n = probe.n;
+    cbm_arena_destroy(&a);
+    ASSERT_EQ(n, ITER);
+    ASSERT_TRUE(used < (size_t)CBM_SZ_16 * CBM_SZ_1K * CBM_SZ_1K); /* far below 8*n^2 bytes */
+    PASS();
+}
+
+/* Memory a render takes -- here a 20,000-item values list copied by each of
+ * 200 `first` calls -- counts against its budget: past 256 MiB it stops and
+ * the template's captures are UNKNOWN. */
+TEST(helm_render_memory_budget_ends_unknown) {
+    enum { ITEMS = 20000 };
+    size_t cap = (size_t)ITEMS * 4 + CBM_SZ_64;
+    char *vals = malloc(cap);
+    ASSERT_NOT_NULL(vals);
+    size_t o = (size_t)snprintf(vals, cap, "tag: \"1.0\"\nbig: [");
+    for (int i = 0; i < ITEMS; i++) {
+        o += (size_t)snprintf(vals + o, cap - o, "%s1", i ? "," : "");
+    }
+    snprintf(vals + o, cap - o, "]\n");
+    static const char tpl[] = "image: \"ghcr.io/acme/app:{{ .Values.tag }}\"\n"
+                              "{{- range 200 }}{{ $x := first $.Values.big }}{{ end }}\n";
+    char *got = helm_capture(vals, tpl, NULL, 1);
+    free(vals);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* A set skipped by an UNKNOWN condition whose target is a call's result --
+ * `index .Values "image"`, the idiom for a dashed key -- may change the map
+ * it names: what the image reads of it is UNKNOWN. */
+TEST(helm_skipped_set_of_a_call_result) {
+    static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n";
+    static const char tpl[] =
+        "{{- if semverCompare \">=1.29-0\" .Capabilities.KubeVersion.Version }}"
+        "{{- $_ := set (index .Values \"image\") \"tag\" \"2.0\" }}{{- end }}\n"
+        "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    char *got = helm_capture(vals, tpl, NULL, 2);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* A new map given a map another part holds is new no more: a change made
+ * through it (`set $img ...` of `index $d "image"`) reaches .Values. */
+TEST(helm_own_map_given_a_shared_one) {
+    static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n";
+    static const char tpl[] = "{{- $d := dict -}}{{- $_ := set $d \"image\" .Values.image -}}\n"
+                              "{{- $img := index $d \"image\" -}}{{- $_ := set $img \"tag\" \"2.0\" -}}\n"
+                              "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    char *got = helm_capture(vals, tpl, NULL, 3);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* A set whose target is an UNKNOWN call result (index by .Release.Name) may
+ * change any map of the values: every image after it is UNKNOWN. */
+TEST(helm_set_of_an_unknown_call_result) {
+    static const char vals[] =
+        "apps: {web: {repository: ghcr.io/acme/web, tag: \"1.0\"}}\n";
+    static const char tpl[] = "{{- $_ := set (index .Values.apps .Release.Name) \"tag\" \"2.0\" }}\n"
+                              "image: \"{{ .Values.apps.web.repository }}:{{ .Values.apps.web.tag }}\"\n";
+    char *got = helm_capture(vals, tpl, NULL, 2);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* A break under an UNKNOWN condition: whether the rest of the loop ran is
+ * unknown, so what it assigns ($tag = .) is UNKNOWN after the loop. */
+TEST(helm_unknown_break_spoils_the_rest_of_the_loop) {
+    static const char vals[] = "versions: [\"1.0\", \"2.0\"]\n";
+    static const char tpl[] =
+        "{{- $tag := \"0.9\" }}{{- range .Values.versions }}\n"
+        "{{- if semverCompare \">=1.29-0\" $.Capabilities.KubeVersion.Version }}{{ break }}"
+        "{{ end }}\n"
+        "{{- $tag = . }}{{- end }}\n"
+        "image: \"ghcr.io/acme/app:{{ $tag }}\"\n";
+    char *got = helm_capture(vals, tpl, NULL, 4);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* A variable once made from `dict` and then (in a body an UNKNOWN condition
+ * skips) redefined or given .Values.image is no new map: a set of it there
+ * may change .Values. Without the redefinition the set is of the new map. */
+TEST(helm_skipped_set_after_redefinition) {
+    static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n";
+    static const char redefined[] =
+        "{{- $cfg := dict }}{{- if .Capabilities.APIVersions }}"
+        "{{- $cfg := .Values.image }}{{- $_ := set $cfg \"tag\" \"2.0\" }}{{- end }}\n"
+        "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    static const char assigned[] =
+        "{{- $cfg := dict }}{{- if .Capabilities.APIVersions }}"
+        "{{- $cfg = .Values.image }}{{- $_ := set $cfg \"tag\" \"2.0\" }}{{- end }}\n"
+        "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    static const char kept[] = "{{- $cfg := dict }}{{- if .Capabilities.APIVersions }}"
+                               "{{- $_ := set $cfg \"tag\" \"2.0\" }}{{- end }}\n"
+                               "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    char *got = helm_capture(vals, redefined, NULL, 2);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    got = helm_capture(vals, assigned, NULL, 2);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    got = helm_capture(vals, kept, NULL, 2);
+    ASSERT_STR_EQ(got, "ghcr.io/acme/app:1.0");
+    free(got);
+    PASS();
+}
+
+/* Many maps poisoned (a new dict changed each iteration) keep every later
+ * read correct: a values read after them is known. */
+TEST(helm_many_changed_maps_keep_reads_right) {
+    static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n";
+    static const char tpl[] = "{{- range 20000 }}{{ $c := dict }}{{ $_ := set $c \"k\" \"v\" }}"
+                              "{{ end }}\n"
+                              "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    char *got = helm_capture(vals, tpl, NULL, 2);
+    ASSERT_STR_EQ(got, "ghcr.io/acme/app:1.0");
+    free(got);
+    PASS();
+}
+
+/* Defines that include each other: A changes its argument and includes B,
+ * B includes A. Whether B may change its argument is not settled by A's
+ * scan still running -- an UNKNOWN include of B with .Values.image spoils
+ * what reads it. */
+TEST(helm_define_memo_under_mutual_recursion) {
+    static const char defs_src[] =
+        "{{- define \"A\" -}}{{- include \"B\" . -}}{{- $_ := set . \"tag\" \"2.0\" -}}{{- end -}}\n"
+        "{{- define \"B\" -}}{{- if false }}{{ include \"A\" . }}{{ end -}}{{- end -}}\n";
+    cbm_helm_defines_t *d = cbm_helm_defines_new();
+    ASSERT_NOT_NULL(d);
+    cbm_helm_defines_add(d, "templates/_ab.tpl", defs_src, strlen(defs_src));
+    static const char vals[] =
+        "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\nother: {tag: \"x\"}\n";
+    static const char tpl[] =
+        "{{- if .Capabilities.APIVersions }}{{ include \"A\" .Values.other }}{{ end }}\n"
+        "{{- if .Capabilities.APIVersions }}{{ include \"B\" .Values.image }}{{ end }}\n"
+        "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    char *got = helm_capture(vals, tpl, d, 3);
+    cbm_helm_defines_free(d);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* An include not run because its argument is poisoned may still change maps
+ * within it: a handle taken before ($sub) reads UNKNOWN after. */
+TEST(helm_include_with_poisoned_argument) {
+    static const char defs_src[] =
+        "{{- define \"mut\" -}}{{- $_ := set .sub \"tag\" \"2.0\" -}}{{- end -}}\n";
+    cbm_helm_defines_t *d = cbm_helm_defines_new();
+    ASSERT_NOT_NULL(d);
+    cbm_helm_defines_add(d, "templates/_mut.tpl", defs_src, strlen(defs_src));
+    static const char vals[] = "image: {sub: {repository: ghcr.io/acme/app, tag: \"1.0\"}}\n";
+    static const char tpl[] = "{{- $sub := .Values.image.sub -}}\n"
+                              "{{- $_ := set .Values.image \"x\" \"y\" -}}\n"
+                              "{{- include \"mut\" .Values.image -}}\n"
+                              "image: \"{{ $sub.repository }}:{{ $sub.tag }}\"\n";
+    char *got = helm_capture(vals, tpl, d, 4);
+    cbm_helm_defines_free(d);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
 /* A compose project's .env feeds its compose file (variables in image,
  * build): changing it is no closure repair -- the unchanged compose file's
  * services would keep the old image. It rebuilds; no stale image remains. */
@@ -24297,6 +24482,16 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(helm_mutator_spoils_the_map_it_changes);
     RUN_TEST(helm_unknown_break_leaves_the_loop);
     RUN_TEST(helm_change_of_a_new_value_spoils_nothing);
+    RUN_TEST(helm_render_captures_grow_linearly);
+    RUN_TEST(helm_render_memory_budget_ends_unknown);
+    RUN_TEST(helm_skipped_set_of_a_call_result);
+    RUN_TEST(helm_own_map_given_a_shared_one);
+    RUN_TEST(helm_set_of_an_unknown_call_result);
+    RUN_TEST(helm_unknown_break_spoils_the_rest_of_the_loop);
+    RUN_TEST(helm_skipped_set_after_redefinition);
+    RUN_TEST(helm_many_changed_maps_keep_reads_right);
+    RUN_TEST(helm_define_memo_under_mutual_recursion);
+    RUN_TEST(helm_include_with_poisoned_argument);
     RUN_TEST(incremental_compose_dotenv_change_rebuilds);
     RUN_TEST(incremental_dockerfile_edit_keeps_docker_build_edges);
     RUN_TEST(incremental_second_build_declarer_keeps_the_edge);
