@@ -14646,7 +14646,9 @@ static int pyn_assert_shadowing(cbm_store_t *s, const char *project) {
      * exact callable. sb's sits under `if True:`; at that compound statement's
      * join the LSP invalidates what the branch bound (the def may not exist on
      * every path), so it emits nothing and the registry's lexical step binds
-     * the local -- still never the module def. */
+     * the local -- still never the module def. H1 (the LSP walks compound
+     * statements) may legitimately move sb to an lsp_* strategy; that PR
+     * must update this expectation deliberately. */
     const char *files[] = {"sa", "sb"};
     const char *local_strategy[] = {"\"strategy\":\"lsp_", "\"strategy\":\"lexical_scope\""};
     for (int f = 0; f < 2; f++) {
