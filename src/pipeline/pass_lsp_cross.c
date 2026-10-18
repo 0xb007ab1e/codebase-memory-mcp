@@ -1285,6 +1285,68 @@ static void pxc_supersede_occurrence(CBMArena *dst_arena, CBMResolvedCallArray *
     dst_calls->count = kept;
 }
 
+/* The Kotlin universal-member placeholder: `x.hashCode()` / `toString()` /
+ * `equals()` on a receiver the resolver could not type is emitted on kotlin.Any
+ * (strategy lsp_kt_any, reduced confidence) -- the "no narrower receiver known"
+ * answer. */
+static bool pxc_is_kt_any_placeholder(const CBMResolvedCall *rc) {
+    return rc->strategy && strcmp(rc->strategy, "lsp_kt_any") == 0;
+}
+
+static char *pxc_occurrence_key(CBMArena *keys, const CBMResolvedCall *rc) {
+    return cbm_arena_sprintf(keys, "%u\x1f%s\x1f%u:%u\x1f%u", (unsigned)rc->kind, rc->caller_qn,
+                             rc->site_start_byte, rc->site_end_byte, (unsigned)rc->source_origin);
+}
+
+/* #1555: the per-file pass sees only the file's own declarations, so a receiver
+ * typed by another file (`val type: ProtoType`) is unknown there and
+ * `type.hashCode()` gets the kotlin.Any placeholder. The cross pass types the
+ * receiver and answers with the declared override (`ProtoType.hashCode`), or
+ * with kotlin.Any again when no class on the receiver's chain declares one. Two
+ * distinct targets at one occurrence are a tombstone in the call join
+ * (pass_parallel.c LSP_IDX_AMBIGUOUS), so the occurrence fell to the name-based
+ * registry guess (wire: `type.hashCode` -> AllTypes.hashCode). A placeholder is
+ * therefore dropped when a cross row resolves the same occurrence; the cross row
+ * is then the only evidence. One hash pass per side keeps this linear. */
+static void pxc_drop_superseded_kt_any(CBMArena *keys, CBMResolvedCallArray *dst_calls,
+                                       const CBMResolvedCallArray *src_out) {
+    bool has_placeholder = false;
+    for (int i = 0; i < dst_calls->count && !has_placeholder; i++) {
+        has_placeholder = pxc_is_kt_any_placeholder(&dst_calls->items[i]);
+    }
+    if (!has_placeholder) {
+        return;
+    }
+    CBMHashTable *resolved = cbm_ht_create((uint32_t)src_out->count + 1);
+    for (int j = 0; j < src_out->count; j++) {
+        const CBMResolvedCall *src = &src_out->items[j];
+        if (!src->caller_qn || !src->callee_qn || pxc_is_kt_any_placeholder(src) ||
+            src->site_end_byte <= src->site_start_byte) {
+            continue;
+        }
+        char *k = pxc_occurrence_key(keys, src);
+        if (k) {
+            cbm_ht_set(resolved, k, (void *)(uintptr_t)1);
+        }
+    }
+    int kept = 0;
+    for (int i = 0; i < dst_calls->count; i++) {
+        const CBMResolvedCall *cur = &dst_calls->items[i];
+        if (pxc_is_kt_any_placeholder(cur) && cur->caller_qn) {
+            char *k = pxc_occurrence_key(keys, cur);
+            if (k && cbm_ht_get(resolved, k)) {
+                continue;
+            }
+        }
+        if (kept != i) {
+            dst_calls->items[kept] = *cur;
+        }
+        kept++;
+    }
+    dst_calls->count = kept;
+    cbm_ht_free(resolved);
+}
+
 static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
                                const CBMResolvedCallArray *src_out) {
     if (!dst_calls || !src_out)
@@ -1312,6 +1374,7 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         }
         pxc_supersede_occurrence(dst_arena, dst_calls, src);
     }
+    pxc_drop_superseded_kt_any(&keys, dst_calls, src_out);
 
     for (int i = 0; i < dst_calls->count; i++) {
         const CBMResolvedCall *rc = &dst_calls->items[i];
