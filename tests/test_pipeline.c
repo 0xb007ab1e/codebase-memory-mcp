@@ -14642,15 +14642,21 @@ static int pyn_assert_shadowing(cbm_store_t *s, const char *project) {
                               "\"strategy\":\"lsp_super\""));
     ASSERT_TRUE(pyn_edge_with(s, project, "sc.factory.Local.other", "sc.factory.Local.greet",
                               "CALLS", "\"strategy\":\"lsp_"));
+    /* sa's local def is a plain statement of the body: the LSP binds it as an
+     * exact callable. sb's sits under `if True:`; at that compound statement's
+     * join the LSP invalidates what the branch bound (the def may not exist on
+     * every path), so it emits nothing and the registry's lexical step binds
+     * the local -- still never the module def. */
     const char *files[] = {"sa", "sb"};
+    const char *local_strategy[] = {"\"strategy\":\"lsp_", "\"strategy\":\"lexical_scope\""};
     for (int f = 0; f < 2; f++) {
         char local_caller[64], local_def[64], module_caller[64], module_def[64];
         snprintf(local_caller, sizeof(local_caller), "%s.uses_local", files[f]);
         snprintf(local_def, sizeof(local_def), "%s.uses_local.helper", files[f]);
         snprintf(module_caller, sizeof(module_caller), "%s.uses_module", files[f]);
         snprintf(module_def, sizeof(module_def), "%s.helper", files[f]);
-        ASSERT_TRUE(pyn_edge_with(s, project, local_caller, local_def, "CALLS",
-                                  "\"strategy\":\"lsp_"));
+        ASSERT_TRUE(
+            pyn_edge_with(s, project, local_caller, local_def, "CALLS", local_strategy[f]));
         ASSERT_FALSE(pyn_edge(s, project, local_caller, module_def, "CALLS"));
         ASSERT_TRUE(pyn_edge(s, project, module_caller, module_def, "CALLS"));
         ASSERT_FALSE(pyn_edge(s, project, module_caller, local_def, "CALLS"));
