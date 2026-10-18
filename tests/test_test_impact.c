@@ -2563,6 +2563,42 @@ TEST(test_policy_config_change_runs_all) {
     PASS();
 }
 
+TEST(test_policy_repository_rules_map_every_kind_of_path) {
+    /* This repository's own rules: a path no rule maps runs every test (unmapped_files), so
+     * each kind of tracked file has a rule, and only real build inputs run everything. */
+    cbm_test_config_t *config = cbm_test_config_load(".codebase-memory.json", false);
+    ASSERT_NOT_NULL(config);
+    cbm_test_policy_t *policy = cbm_test_policy_new(config);
+    ASSERT_NOT_NULL(policy);
+    static const char *const cases[][2] = {
+        {"graph-ui/package.json", "repo-data"},
+        {"graph-ui/src/main.tsx", "repo-data"},
+        {"tools/tree-sitter-pascal/src/parser.c", "repo-data"},
+        {"tests/fuzz/corpus/cypher/match.seed", "repo-data"},
+        {"flake.nix", "repo-data"},
+        {"DCO", "repo-data"},
+        {"server.json", "repo-data"},
+        {"scripts/security-ui.sh", "repo-data"},
+        {"tests/test_windows_preflight_contract.ps1", "contracts"},
+        {".gitattributes", "build"},
+        {"scripts/build.sh", "build"},
+        {"Makefile.cbm", "builtin:build"},
+        {"tests/test_main.c", "harness"},
+        {"src/mcp/test_impact_engine.c", "engine"},
+        {"src/pipeline/pipeline.c", NULL},
+        {"src/server.json", NULL},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (!policy_matches(policy, cases[i][0], cases[i][1])) {
+            printf("  %s: expected rule %s\n", cases[i][0], cases[i][1] ? cases[i][1] : "(none)");
+            FAIL("repository rule mapping");
+        }
+    }
+    cbm_test_policy_free(policy);
+    cbm_test_config_free(config);
+    PASS();
+}
+
 TEST(test_policy_lanes_and_semantic_perf_membership) {
     cbm_test_policy_t *policy = policy_of(
         "{\"test_impact\":{\"version\":1,"
@@ -3748,6 +3784,7 @@ SUITE(test_impact) {
     RUN_TEST(test_policy_defaults_and_first_match_before_target_resolution);
     RUN_TEST(test_policy_coverage_compatibility_paths_are_strict);
     RUN_TEST(test_policy_config_change_runs_all);
+    RUN_TEST(test_policy_repository_rules_map_every_kind_of_path);
     RUN_TEST(test_policy_lanes_and_semantic_perf_membership);
     RUN_TEST(test_policy_globs_braces_escapes_and_directory_boundaries);
     RUN_TEST(test_policy_rejects_invalid_consumed_fields_without_changing_seed_loader);
