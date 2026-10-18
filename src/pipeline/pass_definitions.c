@@ -432,7 +432,8 @@ static void link_def_parents(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, 
  * `link_parents` links its DEFINES_METHOD / diagram parent right away; with
  * the result cache the pass links them once every file is registered. */
 static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
-                        const char *file_doc, CBMLanguage lang, bool link_parents) {
+                        const char *file_doc, CBMLanguage lang, size_t module_prefix_len,
+                        bool link_parents) {
     if (!def->qualified_name || !def->name) {
         return;
     }
@@ -458,7 +459,8 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
      * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
      * through the same predicate, so the three registries cannot diverge. */
     if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add_lang(ctx->registry, def->name, def->qualified_name, def->label, lang);
+        cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name, def->label,
+                                        lang, module_prefix_len);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
@@ -1061,10 +1063,15 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                 "test_declarations");
         }
 
-        /* Create nodes for each definition */
+        /* Create nodes for each definition. A Python file's module QN bounds
+         * the registry's function-local detection to this file. */
         const char *file_doc = result->module_doc; /* goes with the first def */
+        size_t py_prefix_len = lang == CBM_LANG_PYTHON
+                                   ? cbm_pipeline_fqn_symbol_prefix_len(ctx->project_name, rel)
+                                   : 0;
         for (int d = 0; d < result->defs.count; d++) {
-            process_def(ctx, &result->defs.items[d], rel, file_doc, lang, !local_cache);
+            process_def(ctx, &result->defs.items[d], rel, file_doc, lang, py_prefix_len,
+                        !local_cache);
             file_doc = NULL;
             total_defs++;
         }
