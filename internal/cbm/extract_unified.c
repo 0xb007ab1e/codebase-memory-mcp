@@ -1166,11 +1166,11 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
      * and all its calls fall back to the File node. */
     if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "impl_item") == 0) {
         char *lt = strchr(name, '<');
+        if (lt == name) {
+            return NULL; /* `<T as Tr>`-style self type: no name to scope by */
+        }
         if (lt) {
             *lt = '\0';
-        }
-        if (!name[0]) {
-            return NULL;
         }
     }
 
