@@ -513,10 +513,17 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
             src->decl_namespace ? cbm_arena_strdup(arena, src->decl_namespace) : NULL;
     }
     dst->is_interface = (strcmp(label, "Interface") == 0 || strcmp(label, "Protocol") == 0);
-    /* Single return-type string. The per-language registrars split on '|'
-     * for multi-return languages (Go); single-return languages just see one
-     * piece, which is what's already stored. */
-    dst->return_types = src->return_type ? cbm_arena_strdup(arena, src->return_type) : NULL;
+    /* The return-type string. The Go registrar splits it on '|' (go_lsp.c
+     * split_pipe_types), so Go gets the PARSED result list, joined: `(*T,
+     * error)` arrives as `*T|error` and a named result `(t *T)` as `*T`. The
+     * raw result text it used to get did not parse, so every variable bound
+     * by a cross-file multi-value or named-result call (`t, err := pkg.New()`)
+     * stayed untyped (F-G8 D1). Other languages keep the single raw string. */
+    if (lang == CBM_LANG_GO && src->return_types && src->return_types[0]) {
+        dst->return_types = pxc_join_pipe(arena, src->return_types);
+    } else {
+        dst->return_types = src->return_type ? cbm_arena_strdup(arena, src->return_type) : NULL;
+    }
     /* Languages whose cross registrars read embedded_types as QNs get their
      * bases resolved against the project registry; everyone else keeps the
      * raw source spelling their own registrar already knows how to handle. */
