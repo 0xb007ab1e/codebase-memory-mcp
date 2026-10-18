@@ -238,6 +238,67 @@ typedef struct {
     CBMLanguage lang;
 } pxc_base_scope_t;
 
+/* A type-like graph node, or NULL. */
+static const cbm_gbuf_node_t *pxc_type_node(const cbm_gbuf_node_t *node) {
+    return node && node->qualified_name && cbm_label_is_type_like(node->label) ? node : NULL;
+}
+
+/* Python `import a.b.c` binds the ROOT name `a`, so a base spelled through it
+ * (`class X(a.b.c.Base)`) is module a.b.c's Base. The import map holds the
+ * imported MODULE under that root local (the IMPORTS edge target), and the
+ * registry's import_map step appends the whole remaining spelling to it
+ * (a.b.c + .b.c.Base), so a dotted base never resolved and every member
+ * inherited through it was invisible to the LSP. Resolve the spelling against
+ * the module the import names: the import map's module when that local is
+ * unique there, else the dotted module path under the project's QN rule.
+ * Import-backed and exact -- no short-name step -- and only a type-like
+ * project node is accepted. `import a.b as m` and `from a import b` bind the
+ * module itself and keep resolving through the import map. */
+static const char *pxc_python_dotted_base_qn(const pxc_base_scope_t *bs, const char *raw) {
+    if (bs->lang != CBM_LANG_PYTHON || !bs->imports || !bs->gbuf || !strchr(raw, '.')) {
+        return NULL;
+    }
+    size_t root_len = strcspn(raw, ".");
+    for (int i = 0; i < bs->imports->count; i++) {
+        const CBMImport *imp = &bs->imports->items[i];
+        const char *local = imp->local_name;
+        const char *path = imp->module_path;
+        if (!local || !path || strlen(local) != root_len || strncmp(raw, local, root_len) != 0 ||
+            strncmp(path, local, root_len) != 0 ||
+            (path[root_len] != '\0' && path[root_len] != '.')) {
+            continue; /* not a root binding of this base's first segment */
+        }
+        size_t path_len = strlen(path);
+        if (strncmp(raw, path, path_len) != 0 || raw[path_len] != '.') {
+            continue; /* the base does not extend this import's module path */
+        }
+        const char *module_qn = NULL;
+        int hits = 0;
+        for (int k = 0; k < bs->imp_count; k++) {
+            if (bs->imp_keys[k] && bs->imp_vals[k] && strcmp(bs->imp_keys[k], local) == 0) {
+                module_qn = bs->imp_vals[k];
+                hits++;
+            }
+        }
+        const cbm_gbuf_node_t *node = NULL;
+        if (hits == 1) {
+            char candidate[CBM_SZ_512];
+            int n = snprintf(candidate, sizeof(candidate), "%s%s", module_qn, raw + path_len);
+            if (n > 0 && (size_t)n < sizeof(candidate)) {
+                node = pxc_type_node(cbm_gbuf_find_by_qn(bs->gbuf, candidate));
+            }
+        }
+        if (!node) {
+            node =
+                pxc_type_node(cbm_pipeline_lsp_target_node(bs->gbuf, bs->project_name, raw, false));
+        }
+        if (node) {
+            return node->qualified_name;
+        }
+    }
+    return NULL;
+}
+
 /* Resolve one base-class spelling to a project QN. Mirrors
  * pass_semantic.c::resolve_as_class — same registry, same type-like veto —
  * then additionally rejects weak short-name strategies (see above).
@@ -247,6 +308,10 @@ static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *r
                                        const char *module_qn) {
     if (!bs || !bs->reg || !raw || !raw[0]) {
         return NULL;
+    }
+    const char *dotted = pxc_python_dotted_base_qn(bs, raw);
+    if (dotted) {
+        return dotted;
     }
     cbm_resolution_t res = cbm_registry_resolve_lang(bs->reg, raw, module_qn, bs->imp_keys,
                                                      bs->imp_vals, bs->imp_count, bs->lang);
@@ -1285,6 +1350,68 @@ static void pxc_supersede_occurrence(CBMArena *dst_arena, CBMResolvedCallArray *
     dst_calls->count = kept;
 }
 
+/* The Kotlin universal-member placeholder: `x.hashCode()` / `toString()` /
+ * `equals()` on a receiver the resolver could not type is emitted on kotlin.Any
+ * (strategy lsp_kt_any, reduced confidence) -- the "no narrower receiver known"
+ * answer. */
+static bool pxc_is_kt_any_placeholder(const CBMResolvedCall *rc) {
+    return rc->strategy && strcmp(rc->strategy, "lsp_kt_any") == 0;
+}
+
+static char *pxc_occurrence_key(CBMArena *keys, const CBMResolvedCall *rc) {
+    return cbm_arena_sprintf(keys, "%u\x1f%s\x1f%u:%u\x1f%u", (unsigned)rc->kind, rc->caller_qn,
+                             rc->site_start_byte, rc->site_end_byte, (unsigned)rc->source_origin);
+}
+
+/* #1555: the per-file pass sees only the file's own declarations, so a receiver
+ * typed by another file (`val type: ProtoType`) is unknown there and
+ * `type.hashCode()` gets the kotlin.Any placeholder. The cross pass types the
+ * receiver and answers with the declared override (`ProtoType.hashCode`), or
+ * with kotlin.Any again when no class on the receiver's chain declares one. Two
+ * distinct targets at one occurrence are a tombstone in the call join
+ * (pass_parallel.c LSP_IDX_AMBIGUOUS), so the occurrence fell to the name-based
+ * registry guess (wire: `type.hashCode` -> AllTypes.hashCode). A placeholder is
+ * therefore dropped when a cross row resolves the same occurrence; the cross row
+ * is then the only evidence. One hash pass per side keeps this linear. */
+static void pxc_drop_superseded_kt_any(CBMArena *keys, CBMResolvedCallArray *dst_calls,
+                                       const CBMResolvedCallArray *src_out) {
+    bool has_placeholder = false;
+    for (int i = 0; i < dst_calls->count && !has_placeholder; i++) {
+        has_placeholder = pxc_is_kt_any_placeholder(&dst_calls->items[i]);
+    }
+    if (!has_placeholder) {
+        return;
+    }
+    CBMHashTable *resolved = cbm_ht_create((uint32_t)src_out->count + 1);
+    for (int j = 0; j < src_out->count; j++) {
+        const CBMResolvedCall *src = &src_out->items[j];
+        if (!src->caller_qn || !src->callee_qn || pxc_is_kt_any_placeholder(src) ||
+            src->site_end_byte <= src->site_start_byte) {
+            continue;
+        }
+        char *k = pxc_occurrence_key(keys, src);
+        if (k) {
+            cbm_ht_set(resolved, k, (void *)(uintptr_t)1);
+        }
+    }
+    int kept = 0;
+    for (int i = 0; i < dst_calls->count; i++) {
+        const CBMResolvedCall *cur = &dst_calls->items[i];
+        if (pxc_is_kt_any_placeholder(cur) && cur->caller_qn) {
+            char *k = pxc_occurrence_key(keys, cur);
+            if (k && cbm_ht_get(resolved, k)) {
+                continue;
+            }
+        }
+        if (kept != i) {
+            dst_calls->items[kept] = *cur;
+        }
+        kept++;
+    }
+    dst_calls->count = kept;
+    cbm_ht_free(resolved);
+}
+
 static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
                                const CBMResolvedCallArray *src_out) {
     if (!dst_calls || !src_out)
@@ -1312,6 +1439,7 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         }
         pxc_supersede_occurrence(dst_arena, dst_calls, src);
     }
+    pxc_drop_superseded_kt_any(&keys, dst_calls, src_out);
 
     for (int i = 0; i < dst_calls->count; i++) {
         const CBMResolvedCall *rc = &dst_calls->items[i];
@@ -1470,31 +1598,42 @@ const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void) {
 /* Convert a CBMLSPDef array (the pipeline's lingua franca, go_lsp.h:73)
  * into a CBMRustLSPDef array (rust_lsp.h) inside `arena`. The two structs
  * have similar fields but different layouts; CBMLSPDef adds
- * language/namespace metadata, so a memcpy is unsafe — copy field-by-field. */
-static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs, int def_count) {
+ * language/namespace metadata, so a memcpy is unsafe — copy field-by-field.
+ * Only Rust defs are kept: the def set is mixed-language, and a Perl or C
+ * function must never become a Rust call target (the Go registrar filters
+ * the same way). *out_count gets the number kept. */
+static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs, int def_count,
+                                          int *out_count) {
+    *out_count = 0;
     if (!defs || def_count <= 0)
         return NULL;
     CBMRustLSPDef *out =
         (CBMRustLSPDef *)cbm_arena_alloc(arena, (size_t)def_count * sizeof(CBMRustLSPDef));
     if (!out)
         return NULL;
+    int n = 0;
     for (int i = 0; i < def_count; i++) {
-        out[i].qualified_name = defs[i].qualified_name;
-        out[i].short_name = defs[i].short_name;
-        out[i].label = defs[i].label;
-        out[i].receiver_type = defs[i].receiver_type;
-        out[i].def_module_qn = defs[i].def_module_qn;
-        out[i].return_types = defs[i].return_types;
-        out[i].embedded_types = defs[i].embedded_types;
-        out[i].field_defs = defs[i].field_defs;
-        out[i].method_names_str = defs[i].method_names_str;
-        out[i].signature_param_types = defs[i].signature_param_types;
-        out[i].signature_param_count = defs[i].signature_param_count;
-        out[i].trait_qn = defs[i].trait_qn;
-        out[i].is_interface = defs[i].is_interface;
-        out[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
-        out[i].is_abstract = defs[i].is_abstract;
+        if (defs[i].lang != CBM_LANG_RUST) {
+            continue;
+        }
+        out[n].qualified_name = defs[i].qualified_name;
+        out[n].short_name = defs[i].short_name;
+        out[n].label = defs[i].label;
+        out[n].receiver_type = defs[i].receiver_type;
+        out[n].def_module_qn = defs[i].def_module_qn;
+        out[n].return_types = defs[i].return_types;
+        out[n].embedded_types = defs[i].embedded_types;
+        out[n].field_defs = defs[i].field_defs;
+        out[n].method_names_str = defs[i].method_names_str;
+        out[n].signature_param_types = defs[i].signature_param_types;
+        out[n].signature_param_count = defs[i].signature_param_count;
+        out[n].trait_qn = defs[i].trait_qn;
+        out[n].is_interface = defs[i].is_interface;
+        out[n].is_rust_impl_relation = defs[i].is_rust_impl_relation;
+        out[n].is_abstract = defs[i].is_abstract;
+        n++;
     }
+    *out_count = n;
     return out;
 }
 
@@ -1581,9 +1720,10 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
          * but diverge after, so convert into the scratch arena. The
          * workspace manifest (set once by the sequential driver) lets
          * `crate_a::foo` route across the crate boundary (#56). */
-        CBMRustLSPDef *rdefs = pxc_lspdefs_to_rust(&scratch, defs, def_count);
+        int rust_def_count = 0;
+        CBMRustLSPDef *rdefs = pxc_lspdefs_to_rust(&scratch, defs, def_count, &rust_def_count);
         cbm_run_rust_lsp_cross_with_manifest(&scratch, source, source_len, module_qn, rdefs,
-                                             def_count, imp_names, imp_qns, imp_count, tree,
+                                             rust_def_count, imp_names, imp_qns, imp_count, tree,
                                              g_pxc_rust_manifest, &out, &synthetic_calls);
         break;
     }

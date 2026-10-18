@@ -260,6 +260,16 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
                                                 CBMLanguage lang);
+/* The registry step of BOTH call resolvers once the LSP has not answered:
+ * for Python, the def or class `callee_name` binds in the nearest def enclosing
+ * `scope_qn` (cbm_registry_resolve_lexical, "lexical_scope"); otherwise, or
+ * when there is no such local, cbm_registry_resolve_call_lang. */
+cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const char *callee_name,
+                                                  const char *module_qn,
+                                                  const char **import_map_keys,
+                                                  const char **import_map_vals,
+                                                  int import_map_count, CBMLanguage lang,
+                                                  const char *scope_qn);
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_pxc_test_import_probe_fail_after(int successful_allocations);
 #endif
@@ -1590,8 +1600,11 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      layers above with unresolved-call evidence capture and its candidate
  *      index. Both upstream version 9 and this branch's earlier version 9
  *      lack part of these semantics, so unchanged files rebuild once.
+ *  11: Python local defs and classes bind through their enclosing lexical
+ *      scope, including app-factory route handlers. Published version 10
+ *      predates this resolution, so unchanged files rebuild once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 10 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 11 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

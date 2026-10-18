@@ -86,6 +86,16 @@ jobs:
           path: ${{ runner.temp }}/test-selection
           if-no-files-found: error
           overwrite: true
+      # The selection a veto discarded (written only when one did): evidence
+      # for the vetoes, never read by a test leg.
+      - name: Upload the vetoed selection
+        if: ${{ !cancelled() && steps.select.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-selection-vetoed
+          path: ${{ runner.temp }}/test-impact/selection-vetoed.json
+          if-no-files-found: ignore
+          overwrite: true
 
   test:
     needs: [changes, lint, select-tests]
