@@ -1039,6 +1039,7 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         return NULL;
     }
     int capacity = total;
+    int records_reserved = 0; /* namespace records placed on top of the def bound */
     int idx = 0;
     for (int fi = 0; fi < file_count; fi++) {
         if (out_def_starts) {
@@ -1105,10 +1106,13 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
             pxc_fold_py_field_types(arena, fr, defs, file_start, idx, &bs, def_modules[fi]);
             /* Package namespace records (re-exports). Their count is not part
              * of the def-count bound above (a spilled result's facts are not
-             * peekable), so grow the array for them here. */
+             * peekable), so grow the array for them here: on top of the bound,
+             * which still reserves every later file's defs, or those overflow.
+             * Geometric growth keeps the copying linear. */
             int need = pxc_py_namespace_record_bound(fr);
-            if (need > 0 && idx + need > capacity) {
-                int grown_cap = capacity * 2 > idx + need ? capacity * 2 : idx + need;
+            int required = total + records_reserved + need;
+            if (need > 0 && required > capacity) {
+                int grown_cap = capacity * 2 > required ? capacity * 2 : required;
                 CBMLSPDef *grown =
                     (CBMLSPDef *)realloc(defs, (size_t)grown_cap * sizeof(CBMLSPDef));
                 if (grown) {
@@ -1119,6 +1123,7 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                 }
             }
             if (need > 0) {
+                records_reserved += need;
                 idx += pxc_build_py_namespace_records(arena, fr, def_modules[fi], &defs[idx]);
             }
         }
