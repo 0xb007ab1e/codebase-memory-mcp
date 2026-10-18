@@ -4871,9 +4871,10 @@ TEST(probe_helm_release_terraform_dynamic_set) {
     PASS();
 }
 
-/* A set_sensitive whose value is never read: a release image reading its
- * name (image.tag) is not known; one reading none of them still is. A
- * postrender may rewrite what a release deploys: no image of its own. */
+/* A set_sensitive's value is never read: any set_sensitive leaves the
+ * release without an image of its own, whatever its name -- image.tag or
+ * db.password (which kept its edge in round 3). A postrender may rewrite
+ * what a release deploys: no image of its own either. */
 TEST(probe_helm_release_terraform_sensitive_and_postrender) {
     static const GpfFile files[] = {
         GPF_APP_CHART,
@@ -4889,15 +4890,105 @@ TEST(probe_helm_release_terraform_sensitive_and_postrender) {
          "resource \"helm_release\" \"post\" {\n  name  = \"post\"\n"
          "  chart = \"../charts/app\"\n  set {\n    name  = \"image.tag\"\n"
          "    value = \"3.3\"\n  }\n  postrender {\n    binary_path = \"./kustomize.sh\"\n  }\n}\n"}};
+    if (!gpf_expect_image_edges(files, 4, GPF_APP_DEFAULTS)) {
+        FAIL("any set_sensitive and a postrender make release images unknown");
+    }
+    PASS();
+}
+
+/* A set_sensitive whose name an image reads on another line ($tag, before
+ * the image line): the release still has no image of its own -- never one
+ * with the chart's default tag. */
+TEST(probe_helm_release_terraform_sensitive_read_earlier) {
+    static const GpfFile files[] = {
+        {"charts/web/Chart.yaml", "apiVersion: v2\nname: web\nversion: 1.0.0\nappVersion: \"1.0\"\n"},
+        {"charts/web/values.yaml", "image:\n  repository: ghcr.io/acme/web\n"},
+        {"charts/web/templates/deploy.yaml",
+         "{{- $tag := .Values.image.tag | default .Chart.AppVersion }}\n"
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: web\n"
+         "          image: \"{{ .Values.image.repository }}:{{ $tag }}\"\n"},
+        {"tf/main.tf",
+         "resource \"helm_release\" \"web\" {\n  name  = \"web\"\n"
+         "  chart = \"../charts/web\"\n  set {\n    name  = \"image.repository\"\n"
+         "    value = \"quay.io/acme/web\"\n  }\n  set_sensitive {\n    name  = \"image.tag\"\n"
+         "    value = var.tag\n  }\n}\n"}};
+    static const char want[] =
+        "Chart:web -> Image:ghcr.io/acme/web DEPLOYS image=- via=chart ref=image "
+        "default_of=[\"image.repository\"]\n"
+        "Resource:Deployment/web -> Image:ghcr.io/acme/web USAGE image=ghcr.io/acme/web:1.0 "
+        "ref=image default_of=[\"image.repository\"]";
+    if (!gpf_expect_image_edges(files, 4, want)) {
+        FAIL("a set_sensitive read on another line makes the release images unknown");
+    }
+    PASS();
+}
+
+/* A postrender as a dynamic block or as an attribute (provider v3) may
+ * rewrite what a release deploys, as a block does: no image of its own. */
+TEST(probe_helm_release_terraform_postrender_forms) {
+    static const GpfFile files[] = {
+        GPF_APP_CHART,
+        {"tf/main.tf",
+         "resource \"helm_release\" \"dyn\" {\n  name  = \"dyn\"\n"
+         "  chart = \"../charts/app\"\n  set {\n    name  = \"image.tag\"\n"
+         "    value = \"3.3\"\n  }\n  dynamic \"postrender\" {\n    for_each = var.post\n"
+         "    content {\n      binary_path = postrender.value\n    }\n  }\n}\n"
+         "resource \"helm_release\" \"attr\" {\n  name  = \"attr\"\n"
+         "  chart = \"../charts/app\"\n  set = [{ name = \"image.tag\", value = \"4.4\" }]\n"
+         "  postrender = { binary_path = \"./kustomize.sh\" }\n}\n"}};
+    if (!gpf_expect_image_edges(files, 4, GPF_APP_DEFAULTS)) {
+        FAIL("a dynamic or attribute postrender makes release images unknown");
+    }
+    PASS();
+}
+
+/* A subchart included under an alias (redis as `cache`) has .Template.BasePath
+ * app/charts/cache/templates, as Helm sets it (an image here shows it). Its
+ * checksum of cm.yaml names its own file, which changes no map -- not app's
+ * cm.yaml, which sets a value: its image stays known, as does app's (which
+ * checksums its Secret). */
+TEST(probe_helm_checksum_include_by_base_path) {
+    static const GpfFile files[] = {
+        {"charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\ndependencies:\n"
+                                  "  - name: redis\n    version: 1.0.0\n    alias: cache\n"},
+        {"charts/app/values.yaml", "image:\n  repository: ghcr.io/acme/app\n  tag: \"1.0\"\n"},
+        {"charts/app/templates/cm.yaml", "{{- $_ := set .Values.image \"tag\" \"2.0\" }}\n"
+                                         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\n"},
+        {"charts/app/templates/secret.yaml", "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app\n"},
+        {"charts/app/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n"
+         "    metadata:\n      annotations:\n        checksum/secret: "
+         "{{ include (print $.Template.BasePath \"/secret.yaml\") . | sha256sum }}\n"
+         "    spec:\n      containers:\n        - name: app\n"
+         "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"},
+        {"charts/app/charts/redis/Chart.yaml", "apiVersion: v2\nname: redis\nversion: 1.0.0\n"},
+        {"charts/app/charts/redis/values.yaml",
+         "image:\n  repository: ghcr.io/acme/redis\n  tag: \"7.0\"\n"},
+        {"charts/app/charts/redis/templates/cm.yaml",
+         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: redis\n"},
+        {"charts/app/charts/redis/templates/sts.yaml",
+         "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: redis\nspec:\n  template:\n"
+         "    metadata:\n      annotations:\n        checksum/config: "
+         "{{ include (print $.Template.BasePath \"/cm.yaml\") . | sha256sum }}\n"
+         "    spec:\n      containers:\n        - name: redis\n"
+         "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"
+         "        - name: path\n          image: \"ghcr.io/{{ .Template.BasePath }}:1\"\n"}};
     static const char want[] =
         "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart ref=image "
         "default_of=[\"image.repository\",\"image.tag\"]\n"
-        "Class:resource.helm_release.pw -> Image:quay.io/acme/pw DEPLOYS "
-        "image=quay.io/acme/pw:1.0 via=terraform ref=image override_of=[\"image.repository\"]\n"
+        "Chart:redis -> Image:ghcr.io/acme/redis DEPLOYS image=- via=chart ref=image "
+        "default_of=[\"image.repository\",\"image.tag\"]\n"
+        "Chart:redis -> Image:ghcr.io/app/charts/cache/templates DEPLOYS image=- via=chart "
+        "ref=image\n"
         "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 "
-        "ref=image default_of=[\"image.repository\",\"image.tag\"]";
-    if (!gpf_expect_image_edges(files, 4, want)) {
-        FAIL("set_sensitive names and postrender make release images unknown");
+        "ref=image default_of=[\"image.repository\",\"image.tag\"]\n"
+        "Resource:StatefulSet/redis -> Image:ghcr.io/acme/redis USAGE "
+        "image=ghcr.io/acme/redis:7.0 ref=image default_of=[\"image.repository\",\"image.tag\"]\n"
+        "Resource:StatefulSet/redis -> Image:ghcr.io/app/charts/cache/templates USAGE "
+        "image=ghcr.io/app/charts/cache/templates:1 ref=image";
+    if (!gpf_expect_image_edges(files, 9, want)) {
+        FAIL("a checksum include by .Template.BasePath names the chart's own file");
     }
     PASS();
 }
@@ -7013,6 +7104,9 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_helm_release_kustomize_unread_sources);
     RUN_TEST(probe_helm_release_terraform_dynamic_set);
     RUN_TEST(probe_helm_release_terraform_sensitive_and_postrender);
+    RUN_TEST(probe_helm_release_terraform_sensitive_read_earlier);
+    RUN_TEST(probe_helm_release_terraform_postrender_forms);
+    RUN_TEST(probe_helm_checksum_include_by_base_path);
     RUN_TEST(probe_helm_release_kustomize_transformers);
     RUN_TEST(probe_helm_empty_values_file_renders);
     RUN_TEST(probe_helm_aliased_subchart_chart_name);

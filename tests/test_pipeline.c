@@ -4338,20 +4338,27 @@ TEST(helm_values_follow_helm_semantics) {
 /* Render template tpl with values src (one probe per `image:` line given)
  * and return the capture of probe 0 ("<UNKNOWN>" for UNKNOWN, "<none>" when
  * nothing was captured) -- a copy, freed by the caller. */
-static char *helm_capture(const char *vals_src, const char *tpl, const cbm_helm_defines_t *defs,
-                          int line) {
+static char *helm_capture_chart(const char *vals_src, const char *tpl,
+                                const cbm_helm_defines_t *defs, const cbm_helm_chart_meta_t *meta,
+                                int line) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *v = doc ? cbm_helm_values_parse(doc, vals_src, strlen(vals_src)) : NULL;
     CBMArena a;
     cbm_arena_init_lazy(&a, CBM_SZ_4K);
     cbm_helm_probe_t probe = {.line = line};
-    cbm_helm_render(&a, "t.yaml", tpl, strlen(tpl), v, NULL, defs, &probe, 1);
+    cbm_helm_render(&a, "t.yaml", tpl, strlen(tpl), v, meta, defs, &probe, 1);
     char *out = strdup(probe.n == 0 ? "<none>" : probe.image[0] ? probe.image[0] : "<UNKNOWN>");
     cbm_arena_destroy(&a);
     if (doc) {
         yyjson_mut_doc_free(doc);
     }
     return out;
+}
+
+/* helm_capture_chart of a template of no chart. */
+static char *helm_capture(const char *vals_src, const char *tpl, const cbm_helm_defines_t *defs,
+                          int line) {
+    return helm_capture_chart(vals_src, tpl, defs, NULL, line);
 }
 
 /* A render doing far more work than any chart -- here a range over an int
@@ -4540,10 +4547,12 @@ TEST(helm_unknown_break_leaves_the_loop) {
     PASS();
 }
 
-/* A change made to a new value -- fromYaml / deepCopy results, a part of one,
- * an empty dict -- reaches nothing another part holds: the images after it
- * stay known (the opentelemetry-ebpf-instrumentation configData pattern). */
-TEST(helm_change_of_a_new_value_spoils_nothing) {
+/* A change of maps the render does not run exactly leaves every image after
+ * it UNKNOWN -- also one of a new value (fromYaml / deepCopy results, an empty
+ * dict): no exemption (the coarse rule, decided in review round 3). Rounds 1-3
+ * kept this image (the opentelemetry-ebpf-instrumentation configData
+ * pattern); it is part of the rule's measured cost. */
+TEST(helm_change_of_a_new_value_spoils_after) {
     static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\ncfg: {a: 1}\n";
     static const char tpl[] =
         "{{- $config := dict -}}\n"
@@ -4554,7 +4563,7 @@ TEST(helm_change_of_a_new_value_spoils_nothing) {
         "{{- $_ := unset (deepCopy .Values.cfg) \"a\" }}\n"
         "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
     char *got = helm_capture(vals, tpl, NULL, 6);
-    ASSERT_STR_EQ(got, "ghcr.io/acme/app:1.0");
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
     PASS();
 }
@@ -4661,7 +4670,9 @@ TEST(helm_unknown_break_spoils_the_rest_of_the_loop) {
 
 /* A variable once made from `dict` and then (in a body an UNKNOWN condition
  * skips) redefined or given .Values.image is no new map: a set of it there
- * may change .Values. Without the redefinition the set is of the new map. */
+ * may change .Values. Without the redefinition the set is of the new map --
+ * still a change in a skipped body, which (the coarse rule) leaves every
+ * image after it UNKNOWN; rounds 2-3 kept that one's image. */
 TEST(helm_skipped_set_after_redefinition) {
     static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n";
     static const char redefined[] =
@@ -4682,7 +4693,7 @@ TEST(helm_skipped_set_after_redefinition) {
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
     got = helm_capture(vals, kept, NULL, 2);
-    ASSERT_STR_EQ(got, "ghcr.io/acme/app:1.0");
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
     PASS();
 }
@@ -4738,6 +4749,301 @@ TEST(helm_include_with_poisoned_argument) {
                               "{{- include \"mut\" .Values.image -}}\n"
                               "image: \"{{ $sub.repository }}:{{ $sub.tag }}\"\n";
     char *got = helm_capture(vals, tpl, d, 4);
+    cbm_helm_defines_free(d);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* The keys a capture read -- 5,000 values paths -- become its mark in one
+ * pass: memory linear in them, never a copy of the mark so far per key. */
+TEST(helm_capture_keys_cost_linear_memory) {
+    enum { ITEMS = 5000 };
+    size_t cap = (size_t)ITEMS * 8 + CBM_SZ_64;
+    char *vals = malloc(cap);
+    ASSERT_NOT_NULL(vals);
+    size_t o = (size_t)snprintf(vals, cap, "big: [");
+    for (int i = 0; i < ITEMS; i++) {
+        o += (size_t)snprintf(vals + o, cap - o, "%s{x: a}", i ? "," : "");
+    }
+    snprintf(vals + o, cap - o, "]\n");
+    static const char tpl[] = "image: \"r/{{ range .Values.big }}{{ .x }}{{ end }}\"\n";
+    cbm_mem_class_flush_thread();
+    size_t base = cbm_mem_class_live_bytes(CBM_MEM_CLASS_ARENA);
+    cbm_mem_class_reset_peaks();
+    char *got = helm_capture(vals, tpl, NULL, 1);
+    cbm_mem_class_flush_thread();
+    size_t peak = cbm_mem_class_peak_bytes(CBM_MEM_CLASS_ARENA);
+    free(vals);
+    ASSERT_NOT_NULL(got);
+    bool image = strncmp(got, "r/aaaa", strlen("r/aaaa")) == 0;
+    free(got);
+    ASSERT_TRUE(image);
+    /* about 14 bytes a key: ~70 KB of keys; a copy per key is ~175 MB */
+    ASSERT_TRUE(peak - base < (size_t)CBM_SZ_32 * CBM_SZ_1K * CBM_SZ_1K);
+    PASS();
+}
+
+/* A render's work -- here 20 copies of a 20,000-item list -- stays in an
+ * arena of its own: the caller's arena grows by the render's results only,
+ * so renders one after another never keep each other's work. */
+TEST(helm_render_keeps_only_its_results) {
+    enum { ITEMS = 20000 };
+    size_t cap = (size_t)ITEMS * 2 + CBM_SZ_64;
+    char *vals = malloc(cap);
+    ASSERT_NOT_NULL(vals);
+    size_t o = (size_t)snprintf(vals, cap, "big: [");
+    for (int i = 0; i < ITEMS; i++) {
+        o += (size_t)snprintf(vals + o, cap - o, "%s1", i ? "," : "");
+    }
+    snprintf(vals + o, cap - o, "]\n");
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *v = doc ? cbm_helm_values_parse(doc, vals, strlen(vals)) : NULL;
+    free(vals);
+    static const char tpl[] = "image: \"ghcr.io/acme/app:1\"\n"
+                              "{{- range 20 }}{{ $x := first $.Values.big }}{{ end }}\n";
+    CBMArena a;
+    cbm_arena_init_lazy(&a, CBM_SZ_4K);
+    cbm_helm_probe_t probe = {.line = 1};
+    size_t before = cbm_arena_total(&a);
+    bool ok = cbm_helm_render(&a, "t.yaml", tpl, strlen(tpl), v, NULL, NULL, &probe, 1);
+    size_t kept = cbm_arena_total(&a) - before;
+    bool image = ok && probe.n == 1 && probe.image[0] &&
+                 strcmp(probe.image[0], "ghcr.io/acme/app:1") == 0;
+    cbm_arena_destroy(&a);
+    if (doc) {
+        yyjson_mut_doc_free(doc);
+    }
+    ASSERT_NOT_NULL(v);
+    ASSERT_TRUE(image);
+    ASSERT_TRUE(kept < (size_t)CBM_SZ_1K * CBM_SZ_1K); /* the work: ~30 MB */
+    PASS();
+}
+
+static char g_helm_budget_log[CBM_SZ_4K];
+
+static void helm_budget_log_sink(const char *line) {
+    if (!line || !strstr(line, "helm.render.budget")) {
+        return;
+    }
+    size_t used = strlen(g_helm_budget_log);
+    snprintf(g_helm_budget_log + used, sizeof(g_helm_budget_log) - used, "%s\n", line);
+}
+
+/* A render its output budget stopped -- an indent that writes past 64 MiB,
+ * or one too wide to try -- says so: reason=output. */
+TEST(helm_render_budget_logs_its_reason) {
+    g_helm_budget_log[0] = '\0';
+    CBMLogLevel prev = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_sink(helm_budget_log_sink);
+    static const char big[] = "image: \"ghcr.io/acme/app{{ indent 70000000 \"\" | trim }}:1\"\n";
+    char *got = helm_capture("{}\n", big, NULL, 1);
+    free(got);
+    static const char huge[] =
+        "image: \"ghcr.io/acme/app{{ indent 9000000000000000000 \"\" | trim }}:1\"\n";
+    got = helm_capture("{}\n", huge, NULL, 1);
+    free(got);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(prev);
+    const char *first = strstr(g_helm_budget_log, "reason=output");
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(strstr(first + SKIP_ONE, "reason=output"));
+    ASSERT_NULL(strstr(g_helm_budget_log, "reason=memory"));
+    PASS();
+}
+
+/* A merge into .Values may change any map of the values, also one a handle
+ * ($img) was taken of before: every image after it is UNKNOWN. */
+TEST(helm_merge_into_values_root) {
+    static const char vals[] = "image: {repository: ghcr.io/acme/app}\n";
+    static const char tpl[] =
+        "{{- $img := .Values.image }}\n"
+        "{{- $_ := merge .Values (dict \"image\" (dict \"tag\" \"2.0\")) }}\n"
+        "image: \"{{ $img.repository }}:{{ $img.tag | default \"1.0\" }}\"\n";
+    char *got = helm_capture(vals, tpl, NULL, 3);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* A set in a body an UNKNOWN condition skips, whatever its target -- here
+ * the outer $vals (.Values.image), a nested range's own $vals aside --
+ * leaves every image after it UNKNOWN. */
+TEST(helm_skipped_set_beside_a_nested_scope) {
+    static const char vals[] =
+        "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\njobs: [a]\n";
+    static const char tpl[] = "{{- $vals := .Values.image }}\n"
+                              "{{- if .Capabilities.APIVersions.Has \"batch/v1\" }}\n"
+                              "{{- range .Values.jobs }}{{- $vals := dict }}{{- end }}\n"
+                              "{{- $_ := set $vals \"tag\" \"2.0\" }}\n"
+                              "{{- end }}\n"
+                              "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    char *got = helm_capture(vals, tpl, NULL, 6);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* An UNKNOWN break in a range over maps: whether the later elements ($c of
+ * web) were changed is not known -- not only the current one's. */
+TEST(helm_unknown_break_spoils_later_elements) {
+    static const char vals[] = "components:\n"
+                               "  api: {repository: ghcr.io/acme/api, tag: \"1.0\"}\n"
+                               "  web: {repository: ghcr.io/acme/web, tag: \"1.0\"}\n";
+    static const char tpl[] =
+        "{{- range $n, $c := .Values.components }}\n"
+        "{{- if semverCompare \">=1.29-0\" $.Capabilities.KubeVersion.Version }}{{ break }}"
+        "{{ end }}\n"
+        "{{- $_ := set $c \"tag\" \"2.0\" }}\n"
+        "{{- end }}\n"
+        "image: \"{{ .Values.components.web.repository }}:{{ .Values.components.web.tag }}\"\n";
+    char *got = helm_capture(vals, tpl, NULL, 5);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* A skipped range whose element variable ($c, each component) is set is no
+ * change of an outer $c (a new dict): every image after it is UNKNOWN. */
+TEST(helm_skipped_range_sets_its_element) {
+    static const char vals[] = "components:\n"
+                               "  web: {repository: ghcr.io/acme/web, tag: \"1.0\"}\n";
+    static const char tpl[] =
+        "{{- $c := dict }}\n"
+        "{{- if .Capabilities.APIVersions.Has \"x/v1\" }}{{- range $_, $c := .Values.components }}"
+        "{{- $_ := set $c \"tag\" \"2.0\" }}{{- end }}{{- end }}\n"
+        "image: \"{{ .Values.components.web.repository }}:{{ .Values.components.web.tag }}\"\n";
+    char *got = helm_capture(vals, tpl, NULL, 3);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* A deep merge into a map that holds a values map by reference ($d.img is
+ * .Values.image, put by a set) changes that values map: the image after it
+ * is UNKNOWN. */
+TEST(helm_deep_merge_reaches_a_held_values_map) {
+    static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n";
+    static const char tpl[] =
+        "{{- $d := dict }}{{- $_ := set $d \"img\" .Values.image }}\n"
+        "{{- $_ := mergeOverwrite $d (dict \"img\" (dict \"tag\" \"2.0\")) }}\n"
+        "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    char *got = helm_capture(vals, tpl, NULL, 3);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* Template files of chart app (charts/app) and of its subchart redis, which
+ * app's dependencies alias `cache` (charts/app/charts/redis): a Secret and a
+ * ConfigMap with no change of maps, an app ConfigMap that sets a value, and
+ * a file that includes itself. */
+static cbm_helm_defines_t *helm_chart_files(void) {
+    static const char secret[] = "apiVersion: v1\nkind: Secret\nmetadata:\n"
+                                 "  name: {{ include \"app.name\" . }}\n";
+    static const char helpers[] = "{{- define \"app.name\" -}}{{ .Chart.Name }}{{- end -}}\n";
+    static const char app_cm[] = "{{- $_ := set .Values.image \"tag\" \"2.0\" }}\n"
+                                 "apiVersion: v1\nkind: ConfigMap\n";
+    static const char sub_cm[] = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n"
+                                 "  name: {{ .Chart.Name }}\n";
+    static const char loop[] = "{{ include \"app/templates/loop.yaml\" . }}\n";
+    cbm_helm_defines_t *d = cbm_helm_defines_new();
+    if (d) {
+        cbm_helm_defines_add(d, "charts/app/templates/_helpers.tpl", helpers, strlen(helpers));
+        cbm_helm_defines_add(d, "charts/app/templates/secret.yaml", secret, strlen(secret));
+        cbm_helm_defines_add(d, "charts/app/templates/cm.yaml", app_cm, strlen(app_cm));
+        cbm_helm_defines_add(d, "charts/app/templates/loop.yaml", loop, strlen(loop));
+        cbm_helm_defines_add(d, "charts/app/charts/redis/templates/cm.yaml", sub_cm,
+                             strlen(sub_cm));
+    }
+    return d;
+}
+
+/* A template of chart `meta` checksumming its file `file`, then an image. */
+static char *helm_capture_checksum(const cbm_helm_defines_t *d, const cbm_helm_chart_meta_t *meta,
+                                   const char *file) {
+    static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n";
+    char tpl[CBM_SZ_512];
+    snprintf(tpl, sizeof(tpl),
+             "metadata:\n  annotations:\n"
+             "    checksum: {{ include (print $.Template.BasePath \"/%s\") . | sha256sum }}\n"
+             "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n",
+             file);
+    return helm_capture_chart(vals, tpl, d, meta, 4);
+}
+
+static const cbm_helm_chart_meta_t HELM_APP = {
+    .name = "app", .base_path = "app/templates", .dir = "charts/app"};
+
+/* The checksum idiom names one of the chart's own template files by its
+ * .Template.BasePath: one with no change of maps in it (a Secret) spoils
+ * nothing -- its output is not rendered, the image after it is known. */
+TEST(helm_checksum_include_keeps_the_image) {
+    cbm_helm_defines_t *d = helm_chart_files();
+    ASSERT_NOT_NULL(d);
+    char *got = helm_capture_checksum(d, &HELM_APP, "secret.yaml");
+    cbm_helm_defines_free(d);
+    ASSERT_STR_EQ(got, "ghcr.io/acme/app:1.0");
+    free(got);
+    PASS();
+}
+
+/* An included template file that sets a value (cm.yaml) may change any map:
+ * every image after it is UNKNOWN -- beside one that does not (secret.yaml). */
+TEST(helm_include_of_a_changing_template_file) {
+    cbm_helm_defines_t *d = helm_chart_files();
+    ASSERT_NOT_NULL(d);
+    char *clean = helm_capture_checksum(d, &HELM_APP, "secret.yaml");
+    char *changing = helm_capture_checksum(d, &HELM_APP, "cm.yaml");
+    cbm_helm_defines_free(d);
+    ASSERT_STR_EQ(clean, "ghcr.io/acme/app:1.0");
+    ASSERT_STR_EQ(changing, "<UNKNOWN>");
+    free(clean);
+    free(changing);
+    PASS();
+}
+
+/* A subchart's .Template.BasePath -- app/charts/cache/templates, by the alias
+ * it is included under -- names its own cm.yaml (no change), not app's (a
+ * set): its image is known; app's own checksum of cm.yaml is not. */
+TEST(helm_subchart_base_path_names_its_own_file) {
+    cbm_helm_defines_t *d = helm_chart_files();
+    ASSERT_NOT_NULL(d);
+    const cbm_helm_chart_meta_t sub = {.name = "cache",
+                                       .base_path = "app/charts/cache/templates",
+                                       .dir = "charts/app/charts/redis"};
+    char *own = helm_capture_checksum(d, &sub, "cm.yaml");
+    char *parent = helm_capture_checksum(d, &HELM_APP, "cm.yaml");
+    cbm_helm_defines_free(d);
+    ASSERT_STR_EQ(own, "ghcr.io/acme/app:1.0");
+    ASSERT_STR_EQ(parent, "<UNKNOWN>");
+    free(own);
+    free(parent);
+    PASS();
+}
+
+/* An include naming no template file of the chart is not looked into: every
+ * image after it is UNKNOWN -- beside one naming a file that is there. */
+TEST(helm_include_of_a_missing_template_file) {
+    cbm_helm_defines_t *d = helm_chart_files();
+    ASSERT_NOT_NULL(d);
+    char *there = helm_capture_checksum(d, &HELM_APP, "secret.yaml");
+    char *missing = helm_capture_checksum(d, &HELM_APP, "missing.yaml");
+    cbm_helm_defines_free(d);
+    ASSERT_STR_EQ(there, "ghcr.io/acme/app:1.0");
+    ASSERT_STR_EQ(missing, "<UNKNOWN>");
+    free(there);
+    free(missing);
+    PASS();
+}
+
+/* A template file that includes itself is never "no change": every image
+ * after an include of it is UNKNOWN. */
+TEST(helm_template_file_including_itself) {
+    cbm_helm_defines_t *d = helm_chart_files();
+    ASSERT_NOT_NULL(d);
+    char *got = helm_capture_checksum(d, &HELM_APP, "loop.yaml");
     cbm_helm_defines_free(d);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
@@ -24481,7 +24787,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(helm_unknown_branch_spoils_what_it_assigns);
     RUN_TEST(helm_mutator_spoils_the_map_it_changes);
     RUN_TEST(helm_unknown_break_leaves_the_loop);
-    RUN_TEST(helm_change_of_a_new_value_spoils_nothing);
+    RUN_TEST(helm_change_of_a_new_value_spoils_after);
     RUN_TEST(helm_render_captures_grow_linearly);
     RUN_TEST(helm_render_memory_budget_ends_unknown);
     RUN_TEST(helm_skipped_set_of_a_call_result);
@@ -24492,6 +24798,19 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(helm_many_changed_maps_keep_reads_right);
     RUN_TEST(helm_define_memo_under_mutual_recursion);
     RUN_TEST(helm_include_with_poisoned_argument);
+    RUN_TEST(helm_capture_keys_cost_linear_memory);
+    RUN_TEST(helm_render_keeps_only_its_results);
+    RUN_TEST(helm_render_budget_logs_its_reason);
+    RUN_TEST(helm_merge_into_values_root);
+    RUN_TEST(helm_skipped_set_beside_a_nested_scope);
+    RUN_TEST(helm_unknown_break_spoils_later_elements);
+    RUN_TEST(helm_skipped_range_sets_its_element);
+    RUN_TEST(helm_deep_merge_reaches_a_held_values_map);
+    RUN_TEST(helm_checksum_include_keeps_the_image);
+    RUN_TEST(helm_include_of_a_changing_template_file);
+    RUN_TEST(helm_subchart_base_path_names_its_own_file);
+    RUN_TEST(helm_include_of_a_missing_template_file);
+    RUN_TEST(helm_template_file_including_itself);
     RUN_TEST(incremental_compose_dotenv_change_rebuilds);
     RUN_TEST(incremental_dockerfile_edit_keeps_docker_build_edges);
     RUN_TEST(incremental_second_build_declarer_keeps_the_edge);

@@ -44,11 +44,17 @@ bool cbm_helm_values_set(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *
  * 1.1) into out; false for a map, a list or null. */
 bool cbm_helm_scalar_text(yyjson_mut_val *v, char *out, size_t sz);
 
-/* A chart's metadata, as its templates see it under .Chart. */
+/* A chart's metadata, as its templates see it under .Chart -- and where its
+ * templates are: .Template.BasePath as Helm sets it (`<chart path>/templates`,
+ * the chart path its root's name and `/charts/<name or alias>` per subchart
+ * below it; NULL: not known) and the chart's directory as its template files
+ * are added to the defines ("" at the repository root). */
 typedef struct {
     const char *name;
     const char *version;
     const char *app_version;
+    const char *base_path;
+    const char *dir;
 } cbm_helm_chart_meta_t;
 
 /* The named templates (`define` / `block`) of one chart family -- a chart and
@@ -75,10 +81,11 @@ typedef struct {
 
 /* Render template `rel` (text src, len) with `values` (its .Values; NULL:
  * an empty map), `chart` and the family's defines, filling `probes` (strings
- * in arena a). Values paths are dot-joined keys, a key's own `.` escaped
- * (`\.`), as --set writes them. False when the render ran past its step or
- * output budget -- a template Helm would not finish either (logged): then
- * every capture is UNKNOWN. */
+ * in arena a, which gets only these: the render works in an arena of its own).
+ * Values paths are dot-joined keys, a key's own `.` escaped (`\.`), as --set
+ * writes them. False when the render ran past its step, output or memory
+ * budget -- a template Helm would not finish either (logged): then every
+ * capture is UNKNOWN. */
 bool cbm_helm_render(CBMArena *a, const char *rel, const char *src, size_t len,
                      yyjson_mut_val *values, const cbm_helm_chart_meta_t *chart,
                      const cbm_helm_defines_t *defs, cbm_helm_probe_t *probes, int nprobes);
