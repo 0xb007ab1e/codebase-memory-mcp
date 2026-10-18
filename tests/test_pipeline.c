@@ -9042,6 +9042,94 @@ TEST(pipeline_rust_assoc_call_never_binds_free_namesake_parallel) {
     return rust_assoc_call_free_namesake_case(52);
 }
 
+/* F-R4 (#763, Rust): calls inside a method of a generic impl (`impl<T> Gen<T>`,
+ * `impl<'a> Life<'a>`) were sourced from the File node: the call scope kept the
+ * generic arguments the def side strips. Each method must be the source of its
+ * own call. pad_files > 0 forces the parallel resolver. */
+static int rust_generic_impl_attribution_case(int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_gimpl_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "pub struct Gen<T> { v: T }\n"
+        "impl<T> Gen<T> {\n"
+        "    pub fn in_generic(&self) -> u32 { helper_a() + self.other_g() + Self::assoc_g() }\n"
+        "    pub fn other_g(&self) -> u32 { 3 }\n"
+        "    pub fn assoc_g() -> u32 { 4 }\n"
+        "}\n"
+        "pub struct Life<'a> { s: &'a str }\n"
+        "impl<'a> Life<'a> {\n"
+        "    pub fn in_lifetime(&self) -> u32 { helper_b() + self.other_l() }\n"
+        "    pub fn other_l(&self) -> u32 { 5 }\n"
+        "}\n"
+        "pub fn helper_a() -> u32 { 1 }\n"
+        "pub fn helper_b() -> u32 { 2 }\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.rs", i);
+        snprintf(body, sizeof(body), "pub fn filler%d() -> u32 {\n    %d\n}\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *saved = NULL;
+    if (pad_files > 0) {
+        char *old_workers = getenv("CBM_WORKERS");
+        saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/rust_gimpl.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_TRUE(cross_file_call_exists(s, project, "in_generic", "helper_a"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "in_lifetime", "helper_b"));
+    /* ... and not from the file. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "lib.rs", "helper_a"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "lib.rs", "helper_b"));
+    /* The LSP side names the impl's self type without its arguments too: its
+     * rows join these callers (lsp_*, not a registry fallback), and `self.` /
+     * `Self::` dispatch inside a generic impl resolves (Self::assoc_g had no
+     * edge at all). */
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_generic", "helper_a", "\"strategy\":\"lsp_"));
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_generic", "other_g", "\"strategy\":\"lsp_"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "in_generic", "assoc_g"));
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_lifetime", "other_l", "\"strategy\":\"lsp_"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (pad_files > 0) {
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_generic_impl_method_sources_its_calls) {
+    return rust_generic_impl_attribution_case(0);
+}
+
+TEST(pipeline_rust_generic_impl_method_sources_its_calls_parallel) {
+    return rust_generic_impl_attribution_case(52);
+}
+
 TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
     /* Parallel twin of the test above: USAGE and WRITES/READS each have a
      * second, independent resolver in pass_parallel.c (resolve_file_usages /
@@ -24748,6 +24836,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_call_never_binds_another_language_parallel);
     RUN_TEST(pipeline_rust_assoc_call_never_binds_free_namesake);
     RUN_TEST(pipeline_rust_assoc_call_never_binds_free_namesake_parallel);
+    RUN_TEST(pipeline_rust_generic_impl_method_sources_its_calls);
+    RUN_TEST(pipeline_rust_generic_impl_method_sources_its_calls_parallel);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
