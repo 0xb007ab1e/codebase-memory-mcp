@@ -8868,6 +8868,180 @@ TEST(pipeline_go_rw_usage_never_cross_into_c) {
     PASS();
 }
 
+/* The Rust registries were built from the mixed-language def set: a Perl
+ * `sub new` became a Rust free function, and the project-wide
+ * lsp_short_name_unique fallback bound `Store::new()` to it at 0.90 (found by
+ * the generic-engine lane on its 12-language fixture). A Rust call never
+ * targets another language's definition. pad_files > 0 forces the parallel
+ * resolver, whose Rust registry is the shared all-defs build. */
+/* Pads a Rust fixture with pad_files filler modules (pad_files > 0 forces the
+ * parallel resolver: CBM_WORKERS=4 for the run), runs the full pipeline into
+ * <tmp>/<db_name> and opens the store. NULL store = the run failed. */
+static cbm_store_t *rust_fixture_run(const char *tmp, int pad_files, const char *db_name,
+                                     cbm_pipeline_t **out_p) {
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.rs", i);
+        snprintf(body, sizeof(body), "pub fn filler%d() -> u32 {\n    %d\n}\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *saved = NULL;
+    if (pad_files > 0) {
+        char *old_workers = getenv("CBM_WORKERS");
+        saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", tmp, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    if (pad_files > 0) {
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+    }
+    *out_p = p;
+    return rc == 0 ? cbm_store_open_path(db_path) : NULL;
+}
+
+static int rust_registry_rust_only_case(int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_only_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/store.rs",
+                    "pub struct Store {\n"
+                    "    n: u32,\n"
+                    "}\n"
+                    "\n"
+                    "impl Store {\n"
+                    "    pub fn new() -> Store {\n"
+                    "        Store { n: 0 }\n"
+                    "    }\n"
+                    "\n"
+                    "    pub fn get(&self, k: u32) -> u32 {\n"
+                    "        self.n + k\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/main.rs",
+                    "mod store;\n"
+                    "\n"
+                    "use crate::store::Store;\n"
+                    "\n"
+                    "fn run() -> u32 {\n"
+                    "    let s = Store::new();\n"
+                    "    s.get(1)\n"
+                    "}\n"
+                    "\n"
+                    "fn main() {\n"
+                    "    run();\n"
+                    "}\n");
+    write_temp_file(tmp, "perlsrc/Lib.pm",
+                    "package Lib;\n"
+                    "\n"
+                    "sub new {\n"
+                    "    my ($class) = @_;\n"
+                    "    return bless {}, $class;\n"
+                    "}\n"
+                    "\n"
+                    "1;\n");
+    cbm_pipeline_t *p = NULL;
+    cbm_store_t *s = rust_fixture_run(tmp, pad_files, "rust_only.db", &p);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Never onto the Perl constructor ... */
+    ASSERT_EQ(named_edge_to_file_count(s, project, "CALLS", "run", "new", "perlsrc/Lib.pm"), 0);
+    /* ... and the Rust call still binds the Rust associated function. */
+    ASSERT_GTE(named_edge_to_file_count(s, project, "CALLS", "run", "new", "src/store.rs"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_call_never_binds_another_language) {
+    return rust_registry_rust_only_case(0);
+}
+
+TEST(pipeline_rust_call_never_binds_another_language_parallel) {
+    return rust_registry_rust_only_case(52);
+}
+
+/* `Opts::write(true)` is an associated function. The LSP leaves it to the
+ * registry (import_map -> fsx.Opts.write), but its free-function short-name
+ * fallback bound it to the project's only free `write` (cache.write) first, and
+ * that LSP row pre-empted the right answer. With the cross-language namesakes
+ * gone (above), this hijack replaced 600+ correct qualified_suffix/import_map
+ * edges on the Rust corpus. A type-qualified call never takes that fallback. */
+static int rust_assoc_call_free_namesake_case(int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_assoc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/fsx.rs",
+                    "pub struct Opts {\n"
+                    "    pub w: bool,\n"
+                    "}\n"
+                    "\n"
+                    "impl Opts {\n"
+                    "    pub fn write(w: bool) -> Opts {\n"
+                    "        Opts { w }\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/cache.rs",
+                    "pub fn write(p: &str) -> usize {\n"
+                    "    p.len()\n"
+                    "}\n");
+    write_temp_file(tmp, "src/main.rs",
+                    "mod cache;\n"
+                    "mod fsx;\n"
+                    "\n"
+                    "use crate::fsx::Opts;\n"
+                    "\n"
+                    "fn run() -> bool {\n"
+                    "    let o = Opts::write(true);\n"
+                    "    o.w\n"
+                    "}\n"
+                    "\n"
+                    "fn main() {\n"
+                    "    run();\n"
+                    "    cache::write(\"x\");\n"
+                    "}\n");
+    cbm_pipeline_t *p = NULL;
+    cbm_store_t *s = rust_fixture_run(tmp, pad_files, "rust_assoc.db", &p);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* The associated function, never the free namesake ... */
+    ASSERT_GTE(named_edge_to_file_count(s, project, "CALLS", "run", "write", "src/fsx.rs"), 1);
+    ASSERT_EQ(named_edge_to_file_count(s, project, "CALLS", "run", "write", "src/cache.rs"), 0);
+    /* ... while the module-qualified free call keeps its target. */
+    ASSERT_GTE(named_edge_to_file_count(s, project, "CALLS", "main", "write", "src/cache.rs"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_assoc_call_never_binds_free_namesake) {
+    return rust_assoc_call_free_namesake_case(0);
+}
+
+TEST(pipeline_rust_assoc_call_never_binds_free_namesake_parallel) {
+    return rust_assoc_call_free_namesake_case(52);
+}
+
 TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
     /* Parallel twin of the test above: USAGE and WRITES/READS each have a
      * second, independent resolver in pass_parallel.c (resolve_file_usages /
@@ -23845,6 +24019,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_html_embedded_member_call_stays_unbound);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
+    RUN_TEST(pipeline_rust_call_never_binds_another_language);
+    RUN_TEST(pipeline_rust_call_never_binds_another_language_parallel);
+    RUN_TEST(pipeline_rust_assoc_call_never_binds_free_namesake);
+    RUN_TEST(pipeline_rust_assoc_call_never_binds_free_namesake_parallel);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
