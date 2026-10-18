@@ -71,6 +71,9 @@ typedef struct {
     bool perf;
     const char *file; /* the runner file that registers it */
     int line;
+    /* Every site registers it under a preprocessor condition: some builds do
+     * not register this suite at all. */
+    bool conditional;
 } cbm_test_runner_suite_t;
 
 typedef struct cbm_test_model cbm_test_model_t;
