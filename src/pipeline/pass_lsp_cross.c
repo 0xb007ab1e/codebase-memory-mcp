@@ -238,6 +238,67 @@ typedef struct {
     CBMLanguage lang;
 } pxc_base_scope_t;
 
+/* A type-like graph node, or NULL. */
+static const cbm_gbuf_node_t *pxc_type_node(const cbm_gbuf_node_t *node) {
+    return node && node->qualified_name && cbm_label_is_type_like(node->label) ? node : NULL;
+}
+
+/* Python `import a.b.c` binds the ROOT name `a`, so a base spelled through it
+ * (`class X(a.b.c.Base)`) is module a.b.c's Base. The import map holds the
+ * imported MODULE under that root local (the IMPORTS edge target), and the
+ * registry's import_map step appends the whole remaining spelling to it
+ * (a.b.c + .b.c.Base), so a dotted base never resolved and every member
+ * inherited through it was invisible to the LSP. Resolve the spelling against
+ * the module the import names: the import map's module when that local is
+ * unique there, else the dotted module path under the project's QN rule.
+ * Import-backed and exact -- no short-name step -- and only a type-like
+ * project node is accepted. `import a.b as m` and `from a import b` bind the
+ * module itself and keep resolving through the import map. */
+static const char *pxc_python_dotted_base_qn(const pxc_base_scope_t *bs, const char *raw) {
+    if (bs->lang != CBM_LANG_PYTHON || !bs->imports || !bs->gbuf || !strchr(raw, '.')) {
+        return NULL;
+    }
+    size_t root_len = strcspn(raw, ".");
+    for (int i = 0; i < bs->imports->count; i++) {
+        const CBMImport *imp = &bs->imports->items[i];
+        const char *local = imp->local_name;
+        const char *path = imp->module_path;
+        if (!local || !path || strlen(local) != root_len || strncmp(raw, local, root_len) != 0 ||
+            strncmp(path, local, root_len) != 0 ||
+            (path[root_len] != '\0' && path[root_len] != '.')) {
+            continue; /* not a root binding of this base's first segment */
+        }
+        size_t path_len = strlen(path);
+        if (strncmp(raw, path, path_len) != 0 || raw[path_len] != '.') {
+            continue; /* the base does not extend this import's module path */
+        }
+        const char *module_qn = NULL;
+        int hits = 0;
+        for (int k = 0; k < bs->imp_count; k++) {
+            if (bs->imp_keys[k] && bs->imp_vals[k] && strcmp(bs->imp_keys[k], local) == 0) {
+                module_qn = bs->imp_vals[k];
+                hits++;
+            }
+        }
+        const cbm_gbuf_node_t *node = NULL;
+        if (hits == 1) {
+            char candidate[CBM_SZ_512];
+            int n = snprintf(candidate, sizeof(candidate), "%s%s", module_qn, raw + path_len);
+            if (n > 0 && (size_t)n < sizeof(candidate)) {
+                node = pxc_type_node(cbm_gbuf_find_by_qn(bs->gbuf, candidate));
+            }
+        }
+        if (!node) {
+            node =
+                pxc_type_node(cbm_pipeline_lsp_target_node(bs->gbuf, bs->project_name, raw, false));
+        }
+        if (node) {
+            return node->qualified_name;
+        }
+    }
+    return NULL;
+}
+
 /* Resolve one base-class spelling to a project QN. Mirrors
  * pass_semantic.c::resolve_as_class — same registry, same type-like veto —
  * then additionally rejects weak short-name strategies (see above).
@@ -247,6 +308,10 @@ static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *r
                                        const char *module_qn) {
     if (!bs || !bs->reg || !raw || !raw[0]) {
         return NULL;
+    }
+    const char *dotted = pxc_python_dotted_base_qn(bs, raw);
+    if (dotted) {
+        return dotted;
     }
     cbm_resolution_t res = cbm_registry_resolve_lang(bs->reg, raw, module_qn, bs->imp_keys,
                                                      bs->imp_vals, bs->imp_count, bs->lang);
