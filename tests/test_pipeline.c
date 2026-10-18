@@ -8879,17 +8879,21 @@ static int rust_generic_impl_attribution_case(int pad_files) {
         FAIL("tmpdir");
     }
     write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n");
-    write_temp_file(tmp, "src/lib.rs",
-                    "pub struct Gen<T> { v: T }\n"
-                    "impl<T> Gen<T> {\n"
-                    "    pub fn in_generic(&self) -> u32 { helper_a() }\n"
-                    "}\n"
-                    "pub struct Life<'a> { s: &'a str }\n"
-                    "impl<'a> Life<'a> {\n"
-                    "    pub fn in_lifetime(&self) -> u32 { helper_b() }\n"
-                    "}\n"
-                    "pub fn helper_a() -> u32 { 1 }\n"
-                    "pub fn helper_b() -> u32 { 2 }\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "pub struct Gen<T> { v: T }\n"
+        "impl<T> Gen<T> {\n"
+        "    pub fn in_generic(&self) -> u32 { helper_a() + self.other_g() + Self::assoc_g() }\n"
+        "    pub fn other_g(&self) -> u32 { 3 }\n"
+        "    pub fn assoc_g() -> u32 { 4 }\n"
+        "}\n"
+        "pub struct Life<'a> { s: &'a str }\n"
+        "impl<'a> Life<'a> {\n"
+        "    pub fn in_lifetime(&self) -> u32 { helper_b() + self.other_l() }\n"
+        "    pub fn other_l(&self) -> u32 { 5 }\n"
+        "}\n"
+        "pub fn helper_a() -> u32 { 1 }\n"
+        "pub fn helper_b() -> u32 { 2 }\n");
     for (int i = 0; i < pad_files; i++) {
         char name[64];
         char body[128];
@@ -8918,6 +8922,17 @@ static int rust_generic_impl_attribution_case(int pad_files) {
     /* ... and not from the file. */
     ASSERT_FALSE(cross_file_call_exists(s, project, "lib.rs", "helper_a"));
     ASSERT_FALSE(cross_file_call_exists(s, project, "lib.rs", "helper_b"));
+    /* The LSP side names the impl's self type without its arguments too: its
+     * rows join these callers (lsp_*, not a registry fallback), and `self.` /
+     * `Self::` dispatch inside a generic impl resolves (Self::assoc_g had no
+     * edge at all). */
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_generic", "helper_a", "\"strategy\":\"lsp_"));
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_generic", "other_g", "\"strategy\":\"lsp_"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "in_generic", "assoc_g"));
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_lifetime", "other_l", "\"strategy\":\"lsp_"));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
