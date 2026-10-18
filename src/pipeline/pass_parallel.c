@@ -3298,7 +3298,15 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
 
         _rc_t0 = extract_now_ns();
-        try_field_type_hint(rc, &res, call->callee_name, source_node->id);
+        /* Not for Go (F-G9): the hint matches the capitalized receiver
+         * VARIABLE name as a substring of a candidate QN (`t.Run` -> any
+         * `...T...Run`), with no type evidence. The sequential resolver has no
+         * such step, so for Go it produced parallel-only edges (par/seq CALLS
+         * diverged), and the Go selector guard could not see them as the weak
+         * pick they are. SCIP precision of Go field_type_hint: 0.016. */
+        if (lang != CBM_LANG_GO) {
+            try_field_type_hint(rc, &res, call->callee_name, source_node->id);
+        }
         /* Cross-language veto — the same predicate as pass_calls.c, applied
          * AFTER the field-type hint so the hint may still re-pick a compatible
          * candidate first, and BEFORE the empty-resolution fallbacks below so a
