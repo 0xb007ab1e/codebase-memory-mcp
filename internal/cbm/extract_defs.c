@@ -12261,9 +12261,9 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         }
         if (cbm_kind_in_set(node, spec->function_node_types)) {
             if (!is_template_class_node(node, ctx->language)) {
-                int defs_before = ctx->result->defs.count;
-                extract_func_def(ctx, node, spec);
                 if (ctx->language == CBM_LANG_PYTHON) {
+                    int defs_before = ctx->result->defs.count;
+                    extract_func_def(ctx, node, spec);
                     if (ctx->result->defs.count > defs_before) {
                         py_push_def_body(&s, node,
                                          ctx->result->defs.items[ctx->result->defs.count - SKIP_ONE]
@@ -12271,6 +12271,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
                     }
                     continue;
                 }
+                extract_func_def(ctx, node, spec);
                 // Most languages stop here. JS/TS (and Wolfram) descend into the
                 // function body so NESTED named definitions are also captured —
                 // e.g. arrow methods of an object literal returned from a factory
