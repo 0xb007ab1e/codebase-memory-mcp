@@ -13967,6 +13967,7 @@ static const char *const py_reexport_calls[][2] = {
     {"chain_var", "pkg.chain.inner.Deep.dive"},
     {"ctl_from_cls", "direct.impl.Direct"},
     {"ctl_from_fn", "direct.impl.direct_fn"},
+    {"lazy_tc", "lz.lazy_mod.Lazy"},
 };
 enum { PY_REEXPORT_N_CALLS = sizeof(py_reexport_calls) / sizeof(py_reexport_calls[0]) };
 
@@ -13974,14 +13975,11 @@ enum { PY_REEXPORT_N_CALLS = sizeof(py_reexport_calls) / sizeof(py_reexport_call
  * name, a private name under a star, a re-export the module shadows later,
  * and one made before a whole-namespace barrier (a top-level `try:`). */
 static const char *const py_reexport_excluded[][2] = {
-    {"excl_unlisted", "pkg.all_mod.Unlisted"},
-    {"excl_private", "pkg.star_mod._private_fn"},
-    {"excl_shadowed", "shad.impl.Gone"},
-    {"excl_barrier", "barr.impl.Before"},
+    {"excl_unlisted", "pkg.all_mod.Unlisted"}, {"excl_private", "pkg.star_mod._private_fn"},
+    {"excl_shadowed", "shad.impl.Gone"},       {"excl_barrier", "barr.impl.Before"},
+    {"excl_compat", "cmp.types_only.Shim"},
 };
-enum {
-    PY_REEXPORT_N_EXCLUDED = sizeof(py_reexport_excluded) / sizeof(py_reexport_excluded[0])
-};
+enum { PY_REEXPORT_N_EXCLUDED = sizeof(py_reexport_excluded) / sizeof(py_reexport_excluded[0]) };
 
 /* Index the fixture; lsp[c] = call c's edge has an lsp_* strategy; excluded[e]
  * = excluded call e reached its target by the LSP anyway. */
@@ -14022,15 +14020,30 @@ static int py_reexport_run(bool parallel, bool *lsp, bool *excluded) {
                     "class Direct:\n    pass\n\n\ndef direct_fn():\n    return 1\n");
     write_temp_file(tmp, "app/shad/__init__.py", "from .impl import Gone\nGone = None\n");
     write_temp_file(tmp, "app/shad/impl.py", "class Gone:\n    pass\n");
-    write_temp_file(tmp, "app/barr/__init__.py",
-                    "from .impl import Before\n"
-                    "try:\n    import optional_dep\nexcept ImportError:\n    optional_dep = None\n");
+    write_temp_file(
+        tmp, "app/barr/__init__.py",
+        "from .impl import Before\n"
+        "try:\n    import optional_dep\nexcept ImportError:\n    optional_dep = None\n");
     write_temp_file(tmp, "app/barr/impl.py", "class Before:\n    pass\n");
+    write_temp_file(tmp, "app/lz/__init__.py",
+                    "from typing import TYPE_CHECKING\n"
+                    "if TYPE_CHECKING:\n    from .lazy_mod import Lazy\n"
+                    "else:\n    import sys\n");
+    write_temp_file(tmp, "app/lz/lazy_mod.py", "class Lazy:\n    pass\n");
+    write_temp_file(tmp, "app/cmp/__init__.py",
+                    "from typing import TYPE_CHECKING\n"
+                    "if TYPE_CHECKING:\n    from .types_only import Shim\n"
+                    "else:\n    try:\n        from .runtime_impl import Shim\n"
+                    "    except ImportError:\n        Shim = None\n");
+    write_temp_file(tmp, "app/cmp/types_only.py", "class Shim:\n    pass\n");
+    write_temp_file(tmp, "app/cmp/runtime_impl.py", "class Shim:\n    pass\n");
     write_temp_file(tmp, "app/main.py",
                     "from app import pkg\n"
                     "from app import cyc\n"
                     "from app import shad\n"
                     "from app import barr\n"
+                    "from app import lz\n"
+                    "from app import cmp\n"
                     "from app.db import models\n"
                     "from app.pkg import Explicit, Listed, Deep, star_fn, Renamed\n"
                     "from app.direct.impl import Direct, direct_fn\n\n\n"
@@ -14054,6 +14067,8 @@ static int py_reexport_run(bool parallel, bool *lsp, bool *excluded) {
                     "def excl_private():\n    pkg._private_fn()\n\n\n"
                     "def excl_shadowed():\n    shad.Gone()\n\n\n"
                     "def excl_barrier():\n    barr.Before()\n\n\n"
+                    "def excl_compat():\n    cmp.Shim()\n\n\n"
+                    "def lazy_tc():\n    lz.Lazy()\n\n\n"
                     "def ctl_from_cls():\n    Direct()\n\n\n"
                     "def ctl_from_fn():\n    direct_fn()\n");
     for (int i = 0; parallel && i < 52; i++) {
@@ -14097,8 +14112,8 @@ static int py_reexport_run(bool parallel, bool *lsp, bool *excluded) {
             char *props = py_reexp_edge_props(s, project, src, tgt, "CALLS");
             excluded[e] = props && strstr(props, "\"strategy\":\"lsp_") != NULL;
             if (excluded[e]) {
-                printf("  [%s] excluded %s -> %s: %s\n", parallel ? "parallel" : "sequential",
-                       src, tgt, props);
+                printf("  [%s] excluded %s -> %s: %s\n", parallel ? "parallel" : "sequential", src,
+                       tgt, props);
             }
             free(props);
         }
