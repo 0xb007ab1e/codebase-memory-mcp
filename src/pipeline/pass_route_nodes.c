@@ -743,8 +743,9 @@ static int try_create_data_flow(cbm_gbuf_t *gb, int64_t caller_id, int64_t handl
 
 /* One route's DATA_FLOWS context: its direct handlers (handler -[HANDLES]-> route) and its
  * INFRA_MAPS hops (route -[INFRA_MAPS]-> endpoint, whose handlers are reached via the endpoint).
- * The edge arrays are the graph buffer's own index arrays. Inserting DATA_FLOWS never appends to a
- * HANDLES, INFRA_MAPS, HTTP_CALLS or ASYNC_CALLS array, so they stay valid while flows are added. */
+ * The edge arrays are the graph buffer's own index arrays. Inserting DATA_FLOWS never appends to
+ * a HANDLES, INFRA_MAPS, HTTP_CALLS or ASYNC_CALLS array, so they stay valid while flows are added
+ * (only edge deletion rebuilds the indexes). */
 typedef struct {
     cbm_gbuf_t *gb;
     const cbm_gbuf_node_t *route;
@@ -776,8 +777,8 @@ static void caller_data_flows(route_flows_t *rf, const cbm_gbuf_edge_t *caller,
     for (int ie = 0; ie < rf->infra_count; ie++) {
         const cbm_gbuf_edge_t **ep_handles = NULL;
         int ep_hcount = 0;
-        cbm_gbuf_find_edges_by_target_type(rf->gb, rf->infra[ie]->target_id, "HANDLES",
-                                           &ep_handles, &ep_hcount);
+        cbm_gbuf_find_edges_by_target_type(rf->gb, rf->infra[ie]->target_id, "HANDLES", &ep_handles,
+                                           &ep_hcount);
         for (int eh = 0; eh < ep_hcount; eh++) {
             route_flow_add(rf, caller, ep_handles[eh]->source_id, edge_type, true);
         }
