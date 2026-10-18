@@ -264,7 +264,8 @@ static const char *pxc_python_dotted_base_qn(const pxc_base_scope_t *bs, const c
         const char *local = imp->local_name;
         const char *path = imp->module_path;
         if (!local || !path || strlen(local) != root_len || strncmp(raw, local, root_len) != 0 ||
-            strncmp(path, local, root_len) != 0 || (path[root_len] != '\0' && path[root_len] != '.')) {
+            strncmp(path, local, root_len) != 0 ||
+            (path[root_len] != '\0' && path[root_len] != '.')) {
             continue; /* not a root binding of this base's first segment */
         }
         size_t path_len = strlen(path);
@@ -288,7 +289,8 @@ static const char *pxc_python_dotted_base_qn(const pxc_base_scope_t *bs, const c
             }
         }
         if (!node) {
-            node = pxc_type_node(cbm_pipeline_lsp_target_node(bs->gbuf, bs->project_name, raw, false));
+            node =
+                pxc_type_node(cbm_pipeline_lsp_target_node(bs->gbuf, bs->project_name, raw, false));
         }
         if (node) {
             return node->qualified_name;
