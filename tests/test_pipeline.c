@@ -13919,6 +13919,223 @@ TEST(python_dotted_base_inheritance_parallel) {
     return check_python_dotted_base_inheritance(true);
 }
 
+/* Properties of the `type` edge src_qn -> tgt_qn (strdup'd; caller frees), or NULL. */
+static char *py_reexp_edge_props(cbm_store_t *s, const char *project, const char *src_qn,
+                                 const char *tgt_qn, const char *type) {
+    cbm_node_t src = {0};
+    cbm_node_t tgt = {0};
+    char *props = NULL;
+    if (cbm_store_find_node_by_qn(s, project, src_qn, &src) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(s, project, tgt_qn, &tgt) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, src.id, type, &edges, &ec);
+        for (int i = 0; i < ec && !props; i++) {
+            if (edges[i].target_id == tgt.id)
+                props = strdup(edges[i].properties_json ? edges[i].properties_json : "{}");
+        }
+        if (edges)
+            cbm_store_free_edges(edges, ec);
+    }
+    cbm_node_free_fields(&src);
+    cbm_node_free_fields(&tgt);
+    return props;
+}
+
+/* Package re-exports, end to end: extraction records each module's ordered
+ * namespace facts, the collector turns them into re-export records, the
+ * shared Python registry folds them into its export table, and the LSP
+ * consults it. `models.CharField` with `from .fields import *` in
+ * models/__init__.py is the django shape. Each app function makes one call so
+ * every edge's strategy is attributable. */
+static const char *const py_reexport_calls[][2] = {
+    {"attr_explicit_cls", "pkg.explicit_mod.Explicit"},
+    {"attr_explicit_fn", "pkg.explicit_mod.explicit_fn"},
+    {"attr_star_cls", "pkg.star_mod.Star"},
+    {"attr_star_fn", "pkg.star_mod.star_fn"},
+    {"attr_all_listed", "pkg.all_mod.Listed"},
+    {"attr_chain", "pkg.chain.inner.Deep"},
+    {"attr_renamed", "pkg.alias_mod.Orig"},
+    {"from_explicit", "pkg.explicit_mod.Explicit"},
+    {"from_star_fn", "pkg.star_mod.star_fn"},
+    {"from_all_listed", "pkg.all_mod.Listed"},
+    {"from_chain", "pkg.chain.inner.Deep"},
+    {"from_renamed", "pkg.alias_mod.Orig"},
+    {"cycle_a", "cyc.a.a_fn"},
+    {"cycle_b", "cyc.b.b_fn"},
+    {"sub_models", "db.models.fields.CharField"},
+    {"chain_var", "pkg.chain.inner.Deep.dive"},
+    {"ctl_from_cls", "direct.impl.Direct"},
+    {"ctl_from_fn", "direct.impl.direct_fn"},
+};
+enum { PY_REEXPORT_N_CALLS = sizeof(py_reexport_calls) / sizeof(py_reexport_calls[0]) };
+
+/* Calls that must NOT reach their target by the LSP: an `__all__`-unlisted
+ * name, a private name under a star, a re-export the module shadows later,
+ * and one made before a whole-namespace barrier (a top-level `try:`). */
+static const char *const py_reexport_excluded[][2] = {
+    {"excl_unlisted", "pkg.all_mod.Unlisted"},
+    {"excl_private", "pkg.star_mod._private_fn"},
+    {"excl_shadowed", "shad.impl.Gone"},
+    {"excl_barrier", "barr.impl.Before"},
+};
+enum {
+    PY_REEXPORT_N_EXCLUDED = sizeof(py_reexport_excluded) / sizeof(py_reexport_excluded[0])
+};
+
+/* Index the fixture; lsp[c] = call c's edge has an lsp_* strategy; excluded[e]
+ * = excluded call e reached its target by the LSP anyway. */
+static int py_reexport_run(bool parallel, bool *lsp, bool *excluded) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_reexport_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return -1;
+    }
+    write_temp_file(tmp, "app/__init__.py", "");
+    write_temp_file(tmp, "app/pkg/__init__.py",
+                    "from .explicit_mod import Explicit, explicit_fn\n"
+                    "from .star_mod import *\n"
+                    "from .all_mod import *\n"
+                    "from .chain import *\n"
+                    "from .alias_mod import Orig as Renamed\n");
+    write_temp_file(tmp, "app/pkg/explicit_mod.py",
+                    "class Explicit:\n    pass\n\n\ndef explicit_fn():\n    return 1\n");
+    write_temp_file(tmp, "app/pkg/star_mod.py",
+                    "class Star:\n    pass\n\n\n"
+                    "def star_fn():\n    return 1\n\n\ndef _private_fn():\n    return 0\n");
+    write_temp_file(tmp, "app/pkg/all_mod.py",
+                    "__all__ = [\"Listed\"]\n\n\nclass Listed:\n    pass\n\n\n"
+                    "class Unlisted:\n    pass\n");
+    write_temp_file(tmp, "app/pkg/chain/__init__.py", "from .inner import Deep\n");
+    write_temp_file(tmp, "app/pkg/chain/inner.py",
+                    "class Deep:\n    def dive(self):\n        return 1\n");
+    write_temp_file(tmp, "app/pkg/alias_mod.py", "class Orig:\n    pass\n");
+    write_temp_file(tmp, "app/cyc/__init__.py", "from .a import *\nfrom .b import *\n");
+    write_temp_file(tmp, "app/cyc/a.py", "from .b import *\n\n\ndef a_fn():\n    return 1\n");
+    write_temp_file(tmp, "app/cyc/b.py", "from .a import *\n\n\ndef b_fn():\n    return 2\n");
+    write_temp_file(tmp, "app/db/__init__.py", "");
+    write_temp_file(tmp, "app/db/models/__init__.py", "from app.db.models.fields import *\n");
+    write_temp_file(tmp, "app/db/models/fields/__init__.py",
+                    "__all__ = [\"CharField\"]\n\n\nclass CharField:\n    pass\n");
+    write_temp_file(tmp, "app/direct/__init__.py", "");
+    write_temp_file(tmp, "app/direct/impl.py",
+                    "class Direct:\n    pass\n\n\ndef direct_fn():\n    return 1\n");
+    write_temp_file(tmp, "app/shad/__init__.py", "from .impl import Gone\nGone = None\n");
+    write_temp_file(tmp, "app/shad/impl.py", "class Gone:\n    pass\n");
+    write_temp_file(tmp, "app/barr/__init__.py",
+                    "from .impl import Before\n"
+                    "try:\n    import optional_dep\nexcept ImportError:\n    optional_dep = None\n");
+    write_temp_file(tmp, "app/barr/impl.py", "class Before:\n    pass\n");
+    write_temp_file(tmp, "app/main.py",
+                    "from app import pkg\n"
+                    "from app import cyc\n"
+                    "from app import shad\n"
+                    "from app import barr\n"
+                    "from app.db import models\n"
+                    "from app.pkg import Explicit, Listed, Deep, star_fn, Renamed\n"
+                    "from app.direct.impl import Direct, direct_fn\n\n\n"
+                    "def attr_explicit_cls():\n    pkg.Explicit()\n\n\n"
+                    "def attr_explicit_fn():\n    pkg.explicit_fn()\n\n\n"
+                    "def attr_star_cls():\n    pkg.Star()\n\n\n"
+                    "def attr_star_fn():\n    pkg.star_fn()\n\n\n"
+                    "def attr_all_listed():\n    pkg.Listed()\n\n\n"
+                    "def attr_chain():\n    pkg.Deep()\n\n\n"
+                    "def attr_renamed():\n    pkg.Renamed()\n\n\n"
+                    "def from_explicit():\n    Explicit()\n\n\n"
+                    "def from_star_fn():\n    star_fn()\n\n\n"
+                    "def from_all_listed():\n    Listed()\n\n\n"
+                    "def from_chain():\n    Deep()\n\n\n"
+                    "def from_renamed():\n    Renamed()\n\n\n"
+                    "def cycle_a():\n    cyc.a_fn()\n\n\n"
+                    "def cycle_b():\n    cyc.b_fn()\n\n\n"
+                    "def sub_models():\n    models.CharField()\n\n\n"
+                    "def chain_var():\n    x = pkg.Deep()\n    x.dive()\n\n\n"
+                    "def excl_unlisted():\n    pkg.Unlisted()\n\n\n"
+                    "def excl_private():\n    pkg._private_fn()\n\n\n"
+                    "def excl_shadowed():\n    shad.Gone()\n\n\n"
+                    "def excl_barrier():\n    barr.Before()\n\n\n"
+                    "def ctl_from_cls():\n    Direct()\n\n\n"
+                    "def ctl_from_fn():\n    direct_fn()\n");
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64];
+        char pad[128];
+        snprintf(name, sizeof(name), "pad/py_pad_%02d.py", i);
+        snprintf(pad, sizeof(pad), "def py_pad_%02d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, pad);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/py_reexport.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+    cbm_store_t *s = project ? cbm_store_open_path(db_path) : NULL;
+    if (!s && run_rc == 0) {
+        run_rc = -1;
+    }
+    if (s) {
+        char src[512];
+        char tgt[512];
+        for (int c = 0; c < PY_REEXPORT_N_CALLS; c++) {
+            snprintf(src, sizeof(src), "%s.app.main.%s", project, py_reexport_calls[c][0]);
+            snprintf(tgt, sizeof(tgt), "%s.app.%s", project, py_reexport_calls[c][1]);
+            char *props = py_reexp_edge_props(s, project, src, tgt, "CALLS");
+            lsp[c] = props && strstr(props, "\"strategy\":\"lsp_") != NULL;
+            if (!lsp[c]) {
+                printf("  [%s] %s -> %s: %s\n", parallel ? "parallel" : "sequential", src, tgt,
+                       props ? props : "(no CALLS edge)");
+            }
+            free(props);
+        }
+        for (int e = 0; e < PY_REEXPORT_N_EXCLUDED; e++) {
+            snprintf(src, sizeof(src), "%s.app.main.%s", project, py_reexport_excluded[e][0]);
+            snprintf(tgt, sizeof(tgt), "%s.app.%s", project, py_reexport_excluded[e][1]);
+            char *props = py_reexp_edge_props(s, project, src, tgt, "CALLS");
+            excluded[e] = props && strstr(props, "\"strategy\":\"lsp_") != NULL;
+            if (excluded[e]) {
+                printf("  [%s] excluded %s -> %s: %s\n", parallel ? "parallel" : "sequential",
+                       src, tgt, props);
+            }
+            free(props);
+        }
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    return run_rc;
+}
+
+/* Sequential driver (few files, one worker) and parallel driver (fillers +
+ * four workers). */
+TEST(pipeline_python_package_reexports_resolve_by_lsp) {
+    for (int mode = 0; mode < 2; mode++) {
+        bool lsp[PY_REEXPORT_N_CALLS];
+        bool excluded[PY_REEXPORT_N_EXCLUDED];
+        memset(lsp, 0, sizeof(lsp));
+        memset(excluded, 1, sizeof(excluded));
+        ASSERT_EQ(py_reexport_run(mode == 1, lsp, excluded), 0);
+        for (int c = 0; c < PY_REEXPORT_N_CALLS; c++) {
+            ASSERT_TRUE(lsp[c]); /* RED for every re-export shape; controls stay green */
+        }
+        for (int e = 0; e < PY_REEXPORT_N_EXCLUDED; e++) {
+            ASSERT_FALSE(excluded[e]); /* __all__, `_`, shadow, barrier */
+        }
+    }
+    PASS();
+}
+
 /* Bind the external-import veto specifically to #1277's typed-field fold.
  * No base classes or CALLS edges participate: a name-only call fallback
  * cannot turn this metadata assertion into a false positive. The unguarded
@@ -24800,6 +25017,7 @@ SUITE(pipeline) {
     RUN_TEST(python_crossfile_typed_field_calls_issue1277_parallel);
     RUN_TEST(python_dotted_base_inheritance);
     RUN_TEST(python_dotted_base_inheritance_parallel);
+    RUN_TEST(pipeline_python_package_reexports_resolve_by_lsp);
     RUN_TEST(python_typed_field_external_import_stays_unresolved);
     RUN_TEST(python_typed_field_project_class_resolves);
     RUN_TEST(usages_creates_edges);
