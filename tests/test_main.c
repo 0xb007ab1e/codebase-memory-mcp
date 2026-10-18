@@ -1812,6 +1812,7 @@ extern void suite_ts_lsp(void);
 extern void suite_java_lsp(void);
 extern void suite_java_lsp_coverage(void);
 extern void suite_kotlin_lsp(void);
+extern void suite_kotlin_typed_calls(void);
 extern void suite_rust_lsp(void);
 extern void suite_store_arch(void);
 extern void suite_architecture_projection(void);
@@ -2394,6 +2395,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(perl_lsp);
     RUN_SELECTED_SUITE(py_lsp);
     RUN_SELECTED_SUITE(kotlin_lsp);
+    RUN_SELECTED_SUITE(kotlin_typed_calls);
     RUN_SELECTED_SUITE(rust_lsp);
     RUN_SELECTED_SUITE_PERF(py_lsp_bench);
     RUN_SELECTED_SUITE(py_lsp_stress);

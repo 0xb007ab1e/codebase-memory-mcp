@@ -13905,6 +13905,123 @@ TEST(python_crossfile_typed_field_calls_issue1277_parallel) {
     return check_python_crossfile_typed_field_calls_issue1277(true);
 }
 
+/* A base class spelled through a root-binding import (`import pkg.mod.nodes`
+ * binds `pkg`; `class X(pkg.mod.nodes.Context)`) is the same class as the
+ * from-imported spelling. The Python LSP's inheritance view never resolved the
+ * dotted spelling, so a member inherited through it (self.m(), super().m(),
+ * super().__init__()) fell to a weak name guess or to nothing. The plain
+ * from-import control must keep resolving; the untyped receiver must not. */
+static int check_python_dotted_base_inheritance(bool parallel) {
+    const char *nodes = "class Context:\n"
+                        "    def __init__(self, line=-1):\n"
+                        "        self.line = line\n\n"
+                        "    def ctx_only_helper(self):\n"
+                        "        return 1\n\n"
+                        "    def describe(self):\n"
+                        "        return 0\n";
+    const char *types = "import pkg.mod.nodes\n"
+                        "from pkg.mod.nodes import Context\n\n"
+                        "class DottedType(pkg.mod.nodes.Context):\n"
+                        "    def __init__(self, line=-1):\n"
+                        "        super().__init__(line)\n\n"
+                        "    def run(self):\n"
+                        "        return self.ctx_only_helper()\n\n"
+                        "    def describe(self):\n"
+                        "        return super().describe()\n\n"
+                        "class PlainType(Context):\n"
+                        "    def run(self):\n"
+                        "        return self.ctx_only_helper()\n\n"
+                        "def untyped(thing):\n"
+                        "    return thing.ctx_only_helper()\n";
+    if (setup_usages_repo("pkg/mod/nodes.py", nodes, "pkg/types.py", types) != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char path[512];
+    const char *inits[] = {"pkg/__init__.py", "pkg/mod/__init__.py"};
+    for (size_t i = 0; i < sizeof(inits) / sizeof(inits[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", g_usages_tmpdir, inits[i]);
+        if (th_write_file(path, "") != 0) {
+            teardown_usages_repo();
+            FAIL("failed to write package marker");
+        }
+    }
+    if (parallel) {
+        for (int i = 0; i < 50; i++) {
+            snprintf(path, sizeof(path), "%s/dotted_pad_%02d.py", g_usages_tmpdir, i);
+            if (th_write_file(path, "dotted_padding = 0\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to write parallel-selection fixture");
+            }
+        }
+    }
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        teardown_usages_repo();
+        FAIL("failed to save pipeline environment");
+    }
+    int pin_workers_rc = parallel ? cbm_setenv("CBM_WORKERS", "4", 1) : 0;
+    int pin_single_rc = parallel ? cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") : 0;
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_dotted_base.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = pin_workers_rc == 0 && pin_single_rc == 0
+                            ? cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL)
+                            : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool store_opened = s != NULL;
+    int dotted_self = -1, dotted_super = -1, dotted_init = -1, plain_self = -1, untyped = -1;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        dotted_self = count_lsp_calls(s, project, "pkg.types.DottedType.run",
+                                      "pkg.mod.nodes.Context.ctx_only_helper");
+        dotted_super = count_lsp_calls(s, project, "pkg.types.DottedType.describe",
+                                       "pkg.mod.nodes.Context.describe");
+        dotted_init = count_lsp_calls(s, project, "pkg.types.DottedType.__init__",
+                                      "pkg.mod.nodes.Context.__init__");
+        plain_self = count_lsp_calls(s, project, "pkg.types.PlainType.run",
+                                     "pkg.mod.nodes.Context.ctx_only_helper");
+        untyped = count_lsp_calls(s, project, "pkg.types.untyped", "ctx_only_helper");
+        cbm_store_close(s);
+    }
+
+    cbm_pipeline_free(p);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    int restore_single_rc = saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                                         : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+    teardown_usages_repo();
+
+    ASSERT_EQ(pin_workers_rc, 0);
+    ASSERT_EQ(pin_single_rc, 0);
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(restore_single_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(store_opened);
+    ASSERT_EQ(dotted_self, 1);  /* self.m() inherited through a dotted base */
+    ASSERT_EQ(dotted_super, 1); /* super().m() through a dotted base */
+    ASSERT_EQ(dotted_init, 1);  /* super().__init__() through a dotted base */
+    ASSERT_EQ(plain_self, 1);   /* control: from-imported base */
+    ASSERT_EQ(untyped, 0);      /* control: no receiver type, no LSP edge */
+    PASS();
+}
+
+TEST(python_dotted_base_inheritance) {
+    return check_python_dotted_base_inheritance(false);
+}
+
+TEST(python_dotted_base_inheritance_parallel) {
+    return check_python_dotted_base_inheritance(true);
+}
+
 /* Bind the external-import veto specifically to #1277's typed-field fold.
  * No base classes or CALLS edges participate: a name-only call fallback
  * cannot turn this metadata assertion into a false positive. The unguarded
@@ -24058,6 +24175,8 @@ SUITE(pipeline) {
     RUN_TEST(override_python_through_intermediate_class);
     RUN_TEST(python_crossfile_typed_field_calls_issue1277);
     RUN_TEST(python_crossfile_typed_field_calls_issue1277_parallel);
+    RUN_TEST(python_dotted_base_inheritance);
+    RUN_TEST(python_dotted_base_inheritance_parallel);
     RUN_TEST(python_typed_field_external_import_stays_unresolved);
     RUN_TEST(python_typed_field_project_class_resolves);
     RUN_TEST(usages_creates_edges);
