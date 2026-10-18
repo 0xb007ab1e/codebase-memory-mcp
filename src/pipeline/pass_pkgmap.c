@@ -1819,6 +1819,38 @@ bool cbm_import_symbol_fallback_allowed(CBMLanguage lang) {
     return lang != CBM_LANG_GO;
 }
 
+/* A Python def or class declared inside a function body -- a closure, a
+ * decorator's `wrapper`, a test's local class -- is a local of that function:
+ * no import can name it. Its QN extends a Function/Method node's
+ * (proj.tests.mock_inputs.inner.wrapper.mock_getpass.getpass), which is how it
+ * is recognised; the symbol-name fallback bound `import getpass` to exactly
+ * that def. Only an enclosing def of the SAME file counts: a package
+ * __init__.py function can share a submodule's QN (poetry: layouts/__init__.py
+ * `def layout` vs layouts/layout.py `class Layout`). Mirrors
+ * cbm_registry_add_lang_in_module, which keeps the same symbols out of the call
+ * resolver's short-name index. */
+static bool import_candidate_is_python_local(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *cand) {
+    const char *qn = cand->qualified_name;
+    const char *slash = cand->file_path ? strrchr(cand->file_path, '/') : NULL;
+    char scope[CBM_SZ_512];
+    size_t len = qn ? strlen(qn) : 0;
+    if (!cand->file_path || len == 0 || len >= sizeof(scope) ||
+        cbm_language_for_filename(slash ? slash + SKIP_ONE : cand->file_path) != CBM_LANG_PYTHON) {
+        return false;
+    }
+    memcpy(scope, qn, len + SKIP_ONE);
+    for (char *dot = strrchr(scope, '.'); dot; dot = strrchr(scope, '.')) {
+        *dot = '\0';
+        const cbm_gbuf_node_t *outer = cbm_gbuf_find_by_qn(gbuf, scope);
+        if (outer && outer->label && outer->file_path &&
+            strcmp(outer->file_path, cand->file_path) == 0 &&
+            (strcmp(outer->label, "Function") == 0 || strcmp(outer->label, "Method") == 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static const char *path_leaf(const char *path) {
     const char *leaf = path;
     for (const char *p = path; p && *p; p++) {
@@ -2514,6 +2546,10 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
                     const cbm_gbuf_node_t *cand = hits[i];
                     if (!cand || (php_only && !node_in_php_file(cand)) ||
                         !import_targetable_label(cand->label)) {
+                        continue;
+                    }
+                    /* A Python def-local (#1548) is no importable name. */
+                    if (import_candidate_is_python_local(ctx->gbuf, cand)) {
                         continue;
                     }
                     if (source_file_qn && cand->qualified_name &&

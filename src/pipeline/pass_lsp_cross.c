@@ -1598,31 +1598,42 @@ const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void) {
 /* Convert a CBMLSPDef array (the pipeline's lingua franca, go_lsp.h:73)
  * into a CBMRustLSPDef array (rust_lsp.h) inside `arena`. The two structs
  * have similar fields but different layouts; CBMLSPDef adds
- * language/namespace metadata, so a memcpy is unsafe — copy field-by-field. */
-static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs, int def_count) {
+ * language/namespace metadata, so a memcpy is unsafe — copy field-by-field.
+ * Only Rust defs are kept: the def set is mixed-language, and a Perl or C
+ * function must never become a Rust call target (the Go registrar filters
+ * the same way). *out_count gets the number kept. */
+static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs, int def_count,
+                                          int *out_count) {
+    *out_count = 0;
     if (!defs || def_count <= 0)
         return NULL;
     CBMRustLSPDef *out =
         (CBMRustLSPDef *)cbm_arena_alloc(arena, (size_t)def_count * sizeof(CBMRustLSPDef));
     if (!out)
         return NULL;
+    int n = 0;
     for (int i = 0; i < def_count; i++) {
-        out[i].qualified_name = defs[i].qualified_name;
-        out[i].short_name = defs[i].short_name;
-        out[i].label = defs[i].label;
-        out[i].receiver_type = defs[i].receiver_type;
-        out[i].def_module_qn = defs[i].def_module_qn;
-        out[i].return_types = defs[i].return_types;
-        out[i].embedded_types = defs[i].embedded_types;
-        out[i].field_defs = defs[i].field_defs;
-        out[i].method_names_str = defs[i].method_names_str;
-        out[i].signature_param_types = defs[i].signature_param_types;
-        out[i].signature_param_count = defs[i].signature_param_count;
-        out[i].trait_qn = defs[i].trait_qn;
-        out[i].is_interface = defs[i].is_interface;
-        out[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
-        out[i].is_abstract = defs[i].is_abstract;
+        if (defs[i].lang != CBM_LANG_RUST) {
+            continue;
+        }
+        out[n].qualified_name = defs[i].qualified_name;
+        out[n].short_name = defs[i].short_name;
+        out[n].label = defs[i].label;
+        out[n].receiver_type = defs[i].receiver_type;
+        out[n].def_module_qn = defs[i].def_module_qn;
+        out[n].return_types = defs[i].return_types;
+        out[n].embedded_types = defs[i].embedded_types;
+        out[n].field_defs = defs[i].field_defs;
+        out[n].method_names_str = defs[i].method_names_str;
+        out[n].signature_param_types = defs[i].signature_param_types;
+        out[n].signature_param_count = defs[i].signature_param_count;
+        out[n].trait_qn = defs[i].trait_qn;
+        out[n].is_interface = defs[i].is_interface;
+        out[n].is_rust_impl_relation = defs[i].is_rust_impl_relation;
+        out[n].is_abstract = defs[i].is_abstract;
+        n++;
     }
+    *out_count = n;
     return out;
 }
 
@@ -1709,9 +1720,10 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
          * but diverge after, so convert into the scratch arena. The
          * workspace manifest (set once by the sequential driver) lets
          * `crate_a::foo` route across the crate boundary (#56). */
-        CBMRustLSPDef *rdefs = pxc_lspdefs_to_rust(&scratch, defs, def_count);
+        int rust_def_count = 0;
+        CBMRustLSPDef *rdefs = pxc_lspdefs_to_rust(&scratch, defs, def_count, &rust_def_count);
         cbm_run_rust_lsp_cross_with_manifest(&scratch, source, source_len, module_qn, rdefs,
-                                             def_count, imp_names, imp_qns, imp_count, tree,
+                                             rust_def_count, imp_names, imp_qns, imp_count, tree,
                                              g_pxc_rust_manifest, &out, &synthetic_calls);
         break;
     }
