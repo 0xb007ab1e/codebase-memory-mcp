@@ -5148,6 +5148,173 @@ TEST(parallel_php_vendor_types_never_bind_by_name_issue1186) {
     PASS();
 }
 
+/* ── PHP LSP types receivers of imported project classes (#1186) ─── */
+
+/* Foo.php calls methods on receivers typed with classes imported from OTHER
+ * project files: a promoted property (`$this->svc->go()`) and an aliased
+ * import (`R $r` -> `$r->find()`). The import map handed to the PHP LSP held
+ * the IMPORTS edge target -- the imported file's File node QN
+ * (`...Svc.php.__file__`) -- as the class, so no receiver ever typed and the
+ * calls fell to name-only strategies (the #1186 "useful calls at 0.38"). The
+ * decoy App\Other\Svc shares the short name and the method, so a name-only
+ * match cannot tell the two apart. Controls: the vendor-typed receiver
+ * (`Client $c`) must stay unresolved, and the same-file calls keep their LSP
+ * strategies. */
+static const struct {
+    const char *rel;
+    const char *src;
+} k_php_xfile_files[] = {
+    {"lib/Services/Svc.php", "<?php\nnamespace App\\Services;\n\nclass Svc {\n"
+                             "    public function go() { return 1; }\n}\n"},
+    {"lib/Other/Svc.php", "<?php\nnamespace App\\Other;\n\nclass Svc {\n"
+                          "    public function go() { return 2; }\n}\n"},
+    {"lib/Repo/Repo.php", "<?php\nnamespace App\\Repo;\n\nclass Repo {\n"
+                          "    public function find() { return 3; }\n}\n"},
+    {"lib/Http/Foo.php",
+     "<?php\nnamespace App\\Http;\n\n"
+     "use App\\Services\\Svc;\nuse App\\Repo\\Repo as R;\nuse Vendor\\Pkg\\Client;\n\n"
+     "class Foo {\n"
+     "    public function __construct(private Svc $svc) {}\n"
+     "    public function run(R $r, Client $c) {\n"
+     "        $this->svc->go();\n"
+     "        $r->find();\n"
+     "        $c->go();\n"
+     "        $this->local();\n"
+     "        (new Local())->ping();\n"
+     "    }\n"
+     "    private function local() { return 4; }\n}\n\n"
+     "class Local {\n"
+     "    public function ping() { return 5; }\n}\n"},
+};
+enum { PHP_XFILE_FILE_COUNT = (int)(sizeof(k_php_xfile_files) / sizeof(k_php_xfile_files[0])) };
+
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    const char *src_rel;
+    const char *tgt_rel;
+    const char *tgt_suffix;
+    const char *strategy_prefix;
+    int total;
+    int with_strategy;
+} php_xfile_edge_count_t;
+
+static void php_xfile_count_edge(const cbm_gbuf_edge_t *edge, void *ud) {
+    php_xfile_edge_count_t *c = ud;
+    if (!edge->type || strcmp(edge->type, "CALLS") != 0) {
+        return;
+    }
+    const cbm_gbuf_node_t *s = cbm_gbuf_find_by_id(c->gbuf, edge->source_id);
+    const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(c->gbuf, edge->target_id);
+    if (!s || !t || !s->file_path || !t->file_path || !t->qualified_name ||
+        strcmp(s->file_path, c->src_rel) != 0 || strcmp(t->file_path, c->tgt_rel) != 0) {
+        return;
+    }
+    size_t qlen = strlen(t->qualified_name);
+    size_t slen = strlen(c->tgt_suffix);
+    if (qlen < slen || strcmp(t->qualified_name + qlen - slen, c->tgt_suffix) != 0) {
+        return;
+    }
+    c->total++;
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"strategy\":\"%s", c->strategy_prefix);
+    if (edge->properties_json && strstr(edge->properties_json, needle)) {
+        c->with_strategy++;
+    }
+}
+
+/* 1 when every cross-file receiver resolved through the PHP LSP, the decoy and
+ * the vendor receiver drew nothing, and the same-file controls held. */
+static int php_xfile_graph_ok(const cbm_gbuf_t *gbuf, const char *driver) {
+    static const char *const foo = "lib/Http/Foo.php";
+    struct {
+        const char *tgt;
+        const char *suffix;
+        int want_total;
+        int want_lsp;
+    } checks[] = {
+        {"lib/Services/Svc.php", ".Svc.go", 1, 1}, /* $this->svc->go(), not $c->go() */
+        {"lib/Other/Svc.php", ".Svc.go", 0, 0},    /* decoy: same short name + method */
+        {"lib/Repo/Repo.php", ".Repo.find", 1, 1}, /* aliased import */
+        {foo, ".Foo.local", 1, 1},                 /* same-file control */
+        {foo, ".Local.ping", 1, 1},                /* same-file control */
+    };
+    int ok = 1;
+    for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
+        php_xfile_edge_count_t c = {gbuf, foo, checks[i].tgt, checks[i].suffix, "php_", 0, 0};
+        cbm_gbuf_foreach_edge(gbuf, php_xfile_count_edge, &c);
+        if (c.total != checks[i].want_total || c.with_strategy != checks[i].want_lsp) {
+            printf("  [%s] CALLS Foo.php -> %s%s: %d edge(s), %d via php_*; want %d, %d\n", driver,
+                   checks[i].tgt, checks[i].suffix, c.total, c.with_strategy, checks[i].want_total,
+                   checks[i].want_lsp);
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
+/* Run the fixture on both venues. extra_use (nullable) is one more `use` line
+ * added to Foo.php. Returns 1 when both graphs pass, 0 when not, -1 on setup
+ * failure. */
+static int php_xfile_run(const char *extra_use) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_phpxfile_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        return -1;
+    }
+    char paths[PHP_XFILE_FILE_COUNT][512];
+    cbm_file_info_t files[PHP_XFILE_FILE_COUNT];
+    memset(files, 0, sizeof(files));
+    static const char foo_use[] = "use Vendor\\Pkg\\Client;\n";
+    for (int i = 0; i < PHP_XFILE_FILE_COUNT; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, k_php_xfile_files[i].rel);
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s", paths[i]);
+        *strrchr(dir, '/') = '\0';
+        cbm_mkdir_p(dir, 0755);
+        char src[2048];
+        const char *s = k_php_xfile_files[i].src;
+        const char *at = extra_use ? strstr(s, foo_use) : NULL;
+        if (at) {
+            size_t head = (size_t)(at - s) + sizeof(foo_use) - 1;
+            snprintf(src, sizeof(src), "%.*s%s%s", (int)head, s, extra_use, s + head);
+            s = src;
+        }
+        if (th_write_file(paths[i], s) != 0) {
+            th_rmtree(tmpdir);
+            return -1;
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)k_php_xfile_files[i].rel;
+        files[i].language = CBM_LANG_PHP;
+    }
+
+    cbm_gbuf_t *seq = run_sequential_with_lsp_cross_and_mutator(
+        "cbm_par_phpxfile", tmpdir, files, PHP_XFILE_FILE_COUNT, NULL, NULL, true);
+    cbm_gbuf_t *par = run_parallel_with_extract_opts_and_mutator(
+        "cbm_par_phpxfile", tmpdir, files, PHP_XFILE_FILE_COUNT, 2, NULL, NULL, NULL, true);
+    int seq_ok = seq ? php_xfile_graph_ok(seq, "sequential") : 0;
+    int par_ok = par ? php_xfile_graph_ok(par, "parallel") : 0;
+    cbm_gbuf_free(seq);
+    cbm_gbuf_free(par);
+    th_rmtree(tmpdir);
+    return seq_ok && par_ok;
+}
+
+TEST(parallel_php_lsp_types_imported_project_receivers_issue1186) {
+    ASSERT_EQ(php_xfile_run(NULL), 1);
+    PASS();
+}
+
+/* The same file with one more import that no file in the project declares,
+ * the global class `use Exception;` written in most namespaced PHP files.
+ * The typed import evidence leaves such a file "unknown" as a whole (#2520),
+ * so the class-valued import mapping must not depend on that evidence. */
+TEST(parallel_php_lsp_types_imported_project_receivers_unknown_bindings_issue1186) {
+    ASSERT_EQ(php_xfile_run("use Exception;\n"), 1);
+    PASS();
+}
+
+
 /* A fresh PHP external row replaces stale evidence for its exact occurrence,
  * including an older external row, without clearing a real project invocation
  * of the same method at the next occurrence. Test both old-row orders. */
@@ -5261,6 +5428,8 @@ TEST(parallel_php_external_row_replaces_only_its_exact_occurrence) {
 SUITE(parallel) {
     RUN_TEST(parallel_php_external_row_replaces_only_its_exact_occurrence);
     RUN_TEST(parallel_php_vendor_types_never_bind_by_name_issue1186);
+    RUN_TEST(parallel_php_lsp_types_imported_project_receivers_issue1186);
+    RUN_TEST(parallel_php_lsp_types_imported_project_receivers_unknown_bindings_issue1186);
     RUN_TEST(usage_semantic_reference_candidate_trusts_marked_producer);
     RUN_TEST(lsp_bare_segment_skips_preprocessor_spacing);
     RUN_TEST(lsp_resolve_qualified_static_call_normalizes_colons);

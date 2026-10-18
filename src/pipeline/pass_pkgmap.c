@@ -2797,15 +2797,53 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 static const char php_import_complete[] = "{\"php_imports_complete\":1,";
 
 /* A resolver NULL can also mean unsupported input or a failed lookup. Only
- * the bounded namespace-only path admits an allocation-free absence proof.
- * A covered-but-missing PSR-4 file, global use, or unavailable namespace map
- * leaves the whole file unknown; already resolved IMPORTS are still written. */
-static bool php_import_known_absent(const char *rel, const CBMImport *imp,
+ * the bounded namespace-only path and an unaliased global class `use` with no
+ * same-named PHP type anywhere admit an absence proof. A covered-but-missing
+ * PSR-4 file, any other global use, or an unavailable namespace map leaves the
+ * whole file unknown; already resolved IMPORTS are still written. */
+/* A global-namespace class `use Exception;` names a project type only when a
+ * PHP file declares a class-like symbol of that name. With no such node at all
+ * (namespaced ones included, so the proof stays conservative), the import is
+ * absent from the project: the PHP builtin or a vendor class. Without this a
+ * single `use Exception;` left the whole file's evidence unknown, and its
+ * project imports reached the PHP LSP as File QNs again. */
+static bool php_global_use_known_absent(const cbm_gbuf_t *gbuf, const CBMImport *imp) {
+    if (!gbuf || imp->kind != CBM_IMPORT_KIND_DEFAULT) {
+        return false;
+    }
+    const char *name = imp->module_path[0] == '\\' ? imp->module_path + 1 : imp->module_path;
+    if (!name[0] || strcmp(name, imp->local_name) != 0) {
+        return false; /* `use X as Y;` keeps the old, unknown verdict */
+    }
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, name, &nodes, &count) != 0) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *n = nodes[i];
+        if (!n || !n->label || !node_in_php_file(n)) {
+            continue;
+        }
+        if (strcmp(n->label, "Class") == 0 || strcmp(n->label, "Interface") == 0 ||
+            strcmp(n->label, "Trait") == 0 || strcmp(n->label, "Enum") == 0 ||
+            strcmp(n->label, "File") == 0 || strcmp(n->label, "Module") == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool php_import_known_absent(const cbm_gbuf_t *gbuf, const char *rel, const CBMImport *imp,
                                     CBMHashTable *namespace_map) {
     if (!namespace_map || !imp->module_path || !imp->local_name || !imp->local_name[0] ||
         (imp->kind != CBM_IMPORT_KIND_DEFAULT && imp->kind != CBM_IMPORT_KIND_FUNCTION &&
-         imp->kind != CBM_IMPORT_KIND_CONST) ||
-        php_use_shape(rel, imp) != PHP_USE_NAMESPACED)
+         imp->kind != CBM_IMPORT_KIND_CONST))
+        return false;
+    php_use_shape_t shape = php_use_shape(rel, imp);
+    if (shape == PHP_USE_GLOBAL)
+        return php_global_use_known_absent(gbuf, imp);
+    if (shape != PHP_USE_NAMESPACED)
         return false;
     const char *name = imp->module_path[0] == '\\' ? imp->module_path + 1 : imp->module_path;
     char key[CBM_SZ_1K];
@@ -3036,7 +3074,7 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
                          : NULL;
         if (targets[i] && targets[i]->id == file->id)
             targets[i] = NULL;
-        if (!targets[i] && !php_import_known_absent(rel, imp, namespace_map))
+        if (!targets[i] && !php_import_known_absent(ctx->gbuf, rel, imp, namespace_map))
             complete = false;
         yyjson_mut_val *entry =
             php_binding_json(doc, imp, targets[i] ? targets[i]->qualified_name : NULL);
