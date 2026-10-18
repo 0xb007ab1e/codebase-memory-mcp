@@ -15123,6 +15123,114 @@ TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548) {
     return pyn_run_shadowing(52);
 }
 
+/* ── super() follows the C3 method resolution order ──────────────── */
+
+/* The home-assistant radarr shape: RadarrCalendarEntity(RadarrEntity,
+ * CalendarEntity), where RadarrEntity reaches the common base Entity through
+ * CoordinatorEntity and CalendarEntity overrides Entity's method. Python's C3
+ * order is [RadarrCalendarEntity, RadarrEntity, CoordinatorEntity,
+ * CalendarEntity, Entity]: a common base comes after every class that
+ * derives from it, so super() reaches CalendarEntity, not Entity through the
+ * first base's ancestry. */
+static const char pym_base_py[] = "class Entity:\n"
+                                  "    def __init__(self):\n"
+                                  "        self.ready = False\n"
+                                  "\n"
+                                  "    def write_state(self):\n"
+                                  "        return 0\n"
+                                  "\n"
+                                  "class CoordinatorEntity(Entity):\n"
+                                  "    pass\n"
+                                  "\n"
+                                  "class CalendarEntity(Entity):\n"
+                                  "    def __init__(self):\n"
+                                  "        self.events = []\n"
+                                  "\n"
+                                  "    def write_state(self):\n"
+                                  "        return 1\n";
+
+static const char pym_radarr_py[] = "from base import CoordinatorEntity, CalendarEntity\n"
+                                    "\n"
+                                    "class RadarrEntity(CoordinatorEntity):\n"
+                                    "    pass\n"
+                                    "\n"
+                                    "class RadarrCalendarEntity(RadarrEntity, CalendarEntity):\n"
+                                    "    def __init__(self):\n"
+                                    "        super().__init__()\n"
+                                    "\n"
+                                    "    def write_state(self):\n"
+                                    "        return super().write_state()\n"
+                                    "\n"
+                                    "class PlainCalendar(CalendarEntity):\n"
+                                    "    def write_state(self):\n"
+                                    "        return super().write_state()\n";
+
+static int pym_run_super_c3(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_superc3_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "base.py", pym_base_py);
+    write_temp_file(tmp, "radarr.py", pym_radarr_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/superc3.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    const char *pr = p ? cbm_pipeline_project_name(p) : NULL;
+    const char *rce = "radarr.RadarrCalendarEntity";
+    char src[256];
+    snprintf(src, sizeof(src), "%s.write_state", rce);
+    bool m_c3 = s && pyn_edge(s, pr, src, "base.CalendarEntity.write_state", "CALLS");
+    bool m_dfs = s && pyn_edge(s, pr, src, "base.Entity.write_state", "CALLS");
+    snprintf(src, sizeof(src), "%s.__init__", rce);
+    bool i_c3 = s && pyn_edge(s, pr, src, "base.CalendarEntity.__init__", "CALLS");
+    bool i_dfs = s && pyn_edge(s, pr, src, "base.Entity.__init__", "CALLS");
+    bool plain = s && pyn_edge(s, pr, "radarr.PlainCalendar.write_state",
+                               "base.CalendarEntity.write_state", "CALLS");
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(m_c3);   /* super().write_state(): CalendarEntity comes before Entity */
+    ASSERT_FALSE(m_dfs); /* ... never Entity through RadarrEntity's ancestry */
+    ASSERT_TRUE(i_c3);   /* super().__init__(): the same order */
+    ASSERT_FALSE(i_dfs);
+    ASSERT_TRUE(plain); /* control: single inheritance */
+    PASS();
+}
+
+TEST(pipeline_python_super_follows_c3_mro) {
+    return pym_run_super_c3(0);
+}
+
+TEST(pipeline_python_super_follows_c3_mro_parallel) {
+    return pym_run_super_c3(52);
+}
+
 /* L7 review of #1548: a package __init__.py function can share a submodule's QN
  * (poetry: layouts/__init__.py `def layout` is the QN prefix of every symbol in
  * layouts/layout.py). The function-local detection is bounded at the symbol's
@@ -24824,6 +24932,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_nested_def_local_after_incremental_issue1548);
     RUN_TEST(pipeline_python_local_def_shadows_module_def_issue1548);
     RUN_TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548);
+    RUN_TEST(pipeline_python_super_follows_c3_mro);
+    RUN_TEST(pipeline_python_super_follows_c3_mro_parallel);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_issue1548);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548);
     RUN_TEST(pipeline_python_nested_helper_keeps_tests_issue1548);
