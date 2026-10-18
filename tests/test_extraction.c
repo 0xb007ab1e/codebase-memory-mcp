@@ -12108,6 +12108,41 @@ TEST(python_namespace_facts_preserve_order_and_import_provenance) {
     PASS();
 }
 
+/* The type checker view of `if TYPE_CHECKING:` publishes its consequence (a
+ * lazy-module package: the else branch only installs the module). A name an
+ * elif/else import binds again is withdrawn by a SHADOW: its runtime source is
+ * the alternative. Both streams stay COMPLETE and valid. */
+TEST(python_namespace_facts_type_checking_alternatives) {
+    CBMFileResult *lazy = extract("from typing import TYPE_CHECKING\n"
+                                  "if TYPE_CHECKING:\n    from .lazy_mod import Lazy\n"
+                                  "else:\n    import sys\n",
+                                  CBM_LANG_PYTHON, "t", "lz/__init__.py");
+    CBMFileResult *compat = extract("from typing import TYPE_CHECKING\n"
+                                    "if TYPE_CHECKING:\n    from .types_only import Shim\n"
+                                    "else:\n    try:\n        from .runtime_impl import Shim\n"
+                                    "    except ImportError:\n        Shim = None\n",
+                                    CBM_LANG_PYTHON, "t", "cmp/__init__.py");
+    bool ok = lazy && compat && lazy->py_namespace.status == CBM_PY_NS_COMPLETE &&
+              compat->py_namespace.status == CBM_PY_NS_COMPLETE &&
+              cbm_py_namespace_facts_valid(&lazy->py_namespace) &&
+              cbm_py_namespace_facts_valid(&compat->py_namespace) &&
+              lazy->py_namespace.count == 3 && compat->py_namespace.count == 3;
+    if (ok) {
+        const CBMPyNamespaceFact *l = lazy->py_namespace.items;
+        const CBMPyNamespaceFact *c = compat->py_namespace.items;
+        ok = l[1].kind == CBM_PY_NS_IMPORT_NAME && strcmp(l[1].local_name, "Lazy") == 0 &&
+             l[2].kind == CBM_PY_NS_SHADOW && strcmp(l[2].local_name, "sys") == 0 &&
+             c[1].kind == CBM_PY_NS_IMPORT_NAME && strcmp(c[1].local_name, "Shim") == 0 &&
+             c[2].kind == CBM_PY_NS_SHADOW && strcmp(c[2].local_name, "Shim") == 0;
+    }
+    if (lazy)
+        cbm_free_result(lazy);
+    if (compat)
+        cbm_free_result(compat);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(python_namespace_facts_distinguish_all_operations_and_unknowns) {
     static const char source[] = "__all__ = ['old']; __all__ = []\n"
                                  "__all__ = dynamic\n"
@@ -12494,6 +12529,7 @@ SUITE(extraction) {
     RUN_TEST(python_namespace_facts_distinguish_all_operations_and_unknowns);
     RUN_TEST(python_namespace_facts_unknown_effects_and_body_stability);
     RUN_TEST(python_namespace_facts_parse_errors_are_complete_unknown);
+    RUN_TEST(python_namespace_facts_type_checking_alternatives);
     RUN_TEST(python_namespace_facts_capture_and_copy_fail_atomically);
     RUN_TEST(python_namespace_facts_validation_rejects_partial_and_unknown_schema);
     RUN_TEST(python_namespace_facts_compact_spill_and_copy_keep_owned_payload);

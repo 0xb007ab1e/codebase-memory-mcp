@@ -757,10 +757,10 @@ static bool py_ns_is_type_checking_if(PyNamespaceBuilder *b, TSNode node) {
  * at runtime from wherever that branch says (the compat shape: `else: try:
  * from runtime.place import name`). A static reader cannot tell which source
  * the module ends up exporting, so every name such an import binds becomes a
- * SHADOW (the re-export is withdrawn, as for a later assignment); a star
- * import, or an import form the builder does not read, may bind any name, so
- * the whole namespace becomes unknown. An iterative walk of the branch: deep
- * nesting must not exhaust the stack. */
+ * SHADOW (reason UNSUPPORTED: the re-export is withdrawn, as for a later
+ * assignment); a star import, or an import form the builder does not read,
+ * may bind any name, so the whole namespace becomes unknown. An iterative
+ * walk of the branch: deep nesting must not exhaust the stack. */
 static bool py_ns_alternative_imports(PyNamespaceBuilder *b, TSNode root) {
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     bool done = false;
@@ -776,7 +776,7 @@ static bool py_ns_alternative_imports(PyNamespaceBuilder *b, TSNode root) {
                 star = b->facts.items[i].kind == CBM_PY_NS_IMPORT_STAR;
                 b->facts.items[i] = (CBMPyNamespaceFact){.kind = CBM_PY_NS_SHADOW,
                                                          .local_name = b->facts.items[i].local_name,
-                                                         .reason = CBM_PY_NS_REASON_COMPOUND};
+                                                         .reason = CBM_PY_NS_REASON_UNSUPPORTED};
             }
             if (star && !b->failure) {
                 b->facts.count = start;
