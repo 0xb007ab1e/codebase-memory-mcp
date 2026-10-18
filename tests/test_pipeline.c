@@ -14713,6 +14713,103 @@ TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548) {
     return pyn_run_shadowing(52);
 }
 
+/* L7 review of #1548: a package __init__.py function can share a submodule's QN
+ * (poetry: layouts/__init__.py `def layout` is the QN prefix of every symbol in
+ * layouts/layout.py). The function-local detection is bounded at the symbol's
+ * own file, so class Layout stays a module-level, importable class. src/ layout
+ * without a manifest: the module resolver misses `rowpkg.layout`, so the import
+ * relies on the symbol-name fallback, which skips function locals -- unbounded,
+ * Layout read as a local of layout() and its import and calls vanished. Both
+ * resolvers; the second run re-indexes incrementally after an edit of
+ * layout.py, so the incremental registry seed is held to the same bound. */
+static const char pyn_layout_init_py[] = "def layout(name):\n"
+                                         "    return name\n";
+static const char pyn_layout_mod_py[] = "class Layout:\n"
+                                        "    def __init__(self, name):\n"
+                                        "        self.name = name\n"
+                                        "\n"
+                                        "    def create(self):\n"
+                                        "        return self.name\n";
+static const char pyn_layout_app_py[] = "from rowpkg.layout import Layout\n"
+                                        "\n"
+                                        "def test_build():\n"
+                                        "    return Layout(\"demo\").create()\n";
+
+static int pyn_run_init_collision(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_initqn_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "src/rowpkg/__init__.py", pyn_layout_init_py);
+    write_temp_file(tmp, "src/rowpkg/layout.py", pyn_layout_mod_py);
+    write_temp_file(tmp, "tests/test_app.py", pyn_layout_app_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/initqn.db", tmp);
+    int rc[2] = {-1, -1};
+    bool imports[2] = {false, false};
+    bool calls[2] = {false, false};
+    bool method[2] = {false, false};
+    for (int run = 0; run < 2; run++) {
+        if (run == 1) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/src/rowpkg/layout.py", tmp);
+            th_append_file(path, "\n# edited: the second run re-indexes incrementally\n");
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        rc[run] = p ? cbm_pipeline_run(p) : -1;
+        cbm_store_t *s = rc[run] == 0 ? cbm_store_open_path(db_path) : NULL;
+        if (s) {
+            const char *project = cbm_pipeline_project_name(p);
+            imports[run] = pyn_edge(s, project, "tests.test_app.py.__file__",
+                                    "src.rowpkg.layout.Layout", "IMPORTS");
+            calls[run] =
+                pyn_edge(s, project, "tests.test_app.test_build", "src.rowpkg.layout.Layout",
+                         "CALLS");
+            method[run] = pyn_edge(s, project, "tests.test_app.test_build",
+                                   "src.rowpkg.layout.Layout.create", "CALLS");
+            cbm_store_close(s);
+        }
+        if (p) {
+            cbm_pipeline_free(p);
+        }
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    for (int run = 0; run < 2; run++) {
+        ASSERT_EQ(rc[run], 0);
+        ASSERT_TRUE(imports[run]); /* the class stays importable */
+        ASSERT_TRUE(calls[run]);   /* Layout("demo") */
+        ASSERT_TRUE(method[run]);  /* .create() through the constructed type */
+    }
+    PASS();
+}
+
+TEST(pipeline_python_init_function_shares_submodule_qn_issue1548) {
+    return pyn_run_init_collision(0);
+}
+
+TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548) {
+    return pyn_run_init_collision(52);
+}
+
 TEST(pipeline_python_project) {
     /* Port of TestPipelinePythonProject */
     const char *files[] = {"main.py", "utils.py"};
@@ -24214,6 +24311,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_nested_def_local_after_incremental_issue1548);
     RUN_TEST(pipeline_python_local_def_shadows_module_def_issue1548);
     RUN_TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548);
+    RUN_TEST(pipeline_python_init_function_shares_submodule_qn_issue1548);
+    RUN_TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548);
     RUN_TEST(pipeline_header_include_target_is_independent_of_registration_order);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);

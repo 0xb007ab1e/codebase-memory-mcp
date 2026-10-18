@@ -593,7 +593,7 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
         cbm_resolution_t hres = {0};
         if (lang == CBM_LANG_PYTHON) {
             hres = cbm_registry_resolve_lexical(ctx->registry, call->second_arg_name,
-                                                call->enclosing_func_qn);
+                                                call->enclosing_func_qn, module_qn);
         }
         if (!hres.qualified_name) {
             hres = cbm_registry_resolve_handler(ctx->registry, call->second_arg_name, module_qn,

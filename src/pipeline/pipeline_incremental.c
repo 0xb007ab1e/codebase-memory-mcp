@@ -1340,6 +1340,7 @@ static bool incr_label_is_registry_symbol(const char *label) {
 typedef struct {
     cbm_registry_t *registry;
     CBMHashTable *lang_by_path; /* rel_path -> (CBMLanguage + 1); keys borrowed */
+    const char *project;        /* bounds Python function-local detection per file */
 } registry_seed_t;
 
 static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
@@ -1354,14 +1355,20 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
             lang = (CBMLanguage)((uintptr_t)v - SKIP_ONE);
         }
     }
-    cbm_registry_add_lang(seed->registry, node->name, node->qualified_name, node->label, lang);
+    /* Same per-file bound as the full index (pass_definitions.c). */
+    size_t prefix_len = lang == CBM_LANG_PYTHON
+                            ? cbm_pipeline_fqn_symbol_prefix_len(seed->project, node->file_path)
+                            : 0;
+    cbm_registry_add_lang_in_module(seed->registry, node->name, node->qualified_name, node->label,
+                                    lang, prefix_len);
 }
 
 /* Seed the registry from every registry symbol in the graph buffer, with
  * languages taken from the discovered files (see registry_visitor). */
 static void registry_seed_from_gbuf(cbm_registry_t *registry, const cbm_gbuf_t *gbuf,
-                                    const cbm_file_info_t *files, int file_count) {
-    registry_seed_t seed = {.registry = registry, .lang_by_path = NULL};
+                                    const char *project, const cbm_file_info_t *files,
+                                    int file_count) {
+    registry_seed_t seed = {.registry = registry, .lang_by_path = NULL, .project = project};
     if (files && file_count > 0) {
         seed.lang_by_path = cbm_ht_create((size_t)file_count * PAIR_LEN);
     }
@@ -3305,7 +3312,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     if (!registry) {
         goto out;
     }
-    registry_seed_from_gbuf(registry, gbuf, files, file_count);
+    registry_seed_from_gbuf(registry, gbuf, project, files, file_count);
     cbm_log_info("delta.preseed_done", "registry", itoa_buf(cbm_registry_size(registry)),
                  "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
@@ -4155,7 +4162,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* Step 3-5: Registry + extract + resolve */
     cbm_registry_t *registry = cbm_registry_new();
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    registry_seed_from_gbuf(registry, existing, files, file_count);
+    registry_seed_from_gbuf(registry, existing, project, files, file_count);
     cbm_log_info("incremental.registry_seed", "symbols", itoa_buf(cbm_registry_size(registry)),
                  "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 

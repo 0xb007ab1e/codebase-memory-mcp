@@ -1773,7 +1773,8 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
  * once per file by the caller: computing the file QN and finding its node for
  * every definition was 700 k allocations and lookups on the Go corpus. */
 static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
-                                 int64_t file_node_id, CBMLanguage lang, int *reg_entries) {
+                                 int64_t file_node_id, CBMLanguage lang, size_t module_prefix_len,
+                                 int *reg_entries) {
     int edges = 0;
     if (!def->name || !def->qualified_name || !def->label) {
         return 0;
@@ -1781,7 +1782,8 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
      * (helpers.c) — see pass_definitions.c for the per-label rationale. */
     if (cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add_lang(ctx->registry, def->name, def->qualified_name, def->label, lang);
+        cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name, def->label,
+                                        lang, module_prefix_len);
         (*reg_entries)++;
     }
     char marked[CBM_SZ_4K];
@@ -1988,9 +1990,14 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             int64_t file_node_id = file_node ? file_node->id : 0;
             free(file_qn);
             pp_add_file_doc(file_node, result->module_doc);
+            /* Bounds the function-local detection to this file (pass_definitions.c). */
+            size_t py_prefix_len = files[i].language == CBM_LANG_PYTHON
+                                       ? cbm_pipeline_fqn_symbol_prefix_len(ctx->project_name, rel)
+                                       : 0;
             for (int d = 0; d < result->defs.count; d++) {
-                defines_edges += register_and_link_def(ctx, &result->defs.items[d], file_node_id,
-                                                       files[i].language, &reg_entries);
+                defines_edges +=
+                    register_and_link_def(ctx, &result->defs.items[d], file_node_id,
+                                          files[i].language, py_prefix_len, &reg_entries);
             }
         }
 
@@ -2415,7 +2422,8 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
          * lexical lookup sees a function's locals. MUST match pass_calls.c. */
         cbm_resolution_t hres = {0};
         if (lang == CBM_LANG_PYTHON) {
-            hres = cbm_registry_resolve_lexical(registry, handler_ref, call->enclosing_func_qn);
+            hres = cbm_registry_resolve_lexical(registry, handler_ref, call->enclosing_func_qn,
+                                                module_qn);
         }
         if (!hres.qualified_name) {
             hres = cbm_registry_resolve_handler(registry, handler_ref, module_qn, ik, iv, ic,

@@ -1824,8 +1824,11 @@ bool cbm_import_symbol_fallback_allowed(CBMLanguage lang) {
  * no import can name it. Its QN extends a Function/Method node's
  * (proj.tests.mock_inputs.inner.wrapper.mock_getpass.getpass), which is how it
  * is recognised; the symbol-name fallback bound `import getpass` to exactly
- * that def. Mirrors cbm_registry_add_lang, which keeps the same
- * symbols out of the call resolver's short-name index. */
+ * that def. Only an enclosing def of the SAME file counts: a package
+ * __init__.py function can share a submodule's QN (poetry: layouts/__init__.py
+ * `def layout` vs layouts/layout.py `class Layout`). Mirrors
+ * cbm_registry_add_lang_in_module, which keeps the same symbols out of the call
+ * resolver's short-name index. */
 static bool import_candidate_is_python_local(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *cand) {
     const char *qn = cand->qualified_name;
     const char *slash = cand->file_path ? strrchr(cand->file_path, '/') : NULL;
@@ -1839,7 +1842,8 @@ static bool import_candidate_is_python_local(const cbm_gbuf_t *gbuf, const cbm_g
     for (char *dot = strrchr(scope, '.'); dot; dot = strrchr(scope, '.')) {
         *dot = '\0';
         const cbm_gbuf_node_t *outer = cbm_gbuf_find_by_qn(gbuf, scope);
-        if (outer && outer->label &&
+        if (outer && outer->label && outer->file_path &&
+            strcmp(outer->file_path, cand->file_path) == 0 &&
             (strcmp(outer->label, "Function") == 0 || strcmp(outer->label, "Method") == 0)) {
             return true;
         }

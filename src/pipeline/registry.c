@@ -1187,14 +1187,45 @@ static bool registry_label_is_callable(const char *label) {
     return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0);
 }
 
-bool cbm_registry_qn_is_function_local(const cbm_registry_t *r, const char *qualified_name) {
+/* Length of the QN prefix the defs of the caller's file carry: its module QN
+ * (cbm_pipeline_fqn_module), minus the trailing `__init__` / `index` segment
+ * that symbol QNs drop (pkg/__init__.py defines proj.pkg.f). 0 when there is
+ * no module QN or `qualified_name` does not extend that prefix. */
+static size_t python_def_prefix_len(const char *module_qn, const char *qualified_name) {
+    static const char *const dropped[] = {".__init__", ".index"};
+    size_t n = module_qn ? strlen(module_qn) : 0;
+    for (size_t i = 0; i < sizeof(dropped) / sizeof(dropped[0]); i++) {
+        size_t k = strlen(dropped[i]);
+        if (n > k && strcmp(module_qn + n - k, dropped[i]) == 0) {
+            n -= k;
+            break;
+        }
+    }
+    if (n == 0 || !qualified_name || strncmp(qualified_name, module_qn, n) != 0 ||
+        qualified_name[n] != '.') {
+        return 0;
+    }
+    return n;
+}
+
+/* Whether `qualified_name` sits inside a def of its OWN file: only prefixes
+ * strictly longer than `module_prefix_len` (cbm_pipeline_fqn_symbol_prefix_len
+ * of the defining file) count. A package's __init__.py can define a function
+ * whose QN equals a submodule's (poetry: layouts/__init__.py `def layout` vs
+ * layouts/layout.py), so an unbounded walk read the submodule's classes as
+ * that function's locals -- and the answer depended on which file registered
+ * first. */
+bool cbm_registry_qn_is_function_local(const cbm_registry_t *r, const char *qualified_name,
+                                       size_t module_prefix_len) {
     char scope[CBM_SZ_512];
     size_t len = qualified_name ? strlen(qualified_name) : 0;
-    if (!r || len == 0 || len >= sizeof(scope)) {
+    size_t floor = module_prefix_len;
+    if (!r || floor == 0 || len <= floor || len >= sizeof(scope) || qualified_name[floor] != '.') {
         return false;
     }
     memcpy(scope, qualified_name, len + SKIP_ONE);
-    for (char *dot = strrchr(scope, '.'); dot; dot = strrchr(scope, '.')) {
+    for (char *dot = strrchr(scope, '.'); dot && (size_t)(dot - scope) > floor;
+         dot = strrchr(scope, '.')) {
         *dot = '\0';
         if (registry_label_is_callable(cbm_ht_get(r->exact, scope))) {
             return true;
@@ -1238,7 +1269,12 @@ static const char *registry_add_exact(cbm_registry_t *r, const char *qualified_n
 
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label) {
-    cbm_registry_add_lang(r, name, qualified_name, label, CBM_LANG_COUNT);
+    cbm_registry_add_lang_in_module(r, name, qualified_name, label, CBM_LANG_COUNT, 0);
+}
+
+void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
+                           const char *label, CBMLanguage lang) {
+    cbm_registry_add_lang_in_module(r, name, qualified_name, label, lang, 0);
 }
 
 /* Python nests defs: a def or class declared in a function body -- a closure,
@@ -1250,14 +1286,19 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
  * decorator's `def wrapper` to a caller in another function or file. The exact
  * map still holds it, for LSP targets and cbm_registry_resolve_lexical. One
  * file's defs register parent first, so the enclosing function is already in
- * the exact map when its locals arrive. Gated to Python: probing every
- * prefix of every symbol would cost a kernel index seconds for nothing. */
-void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
-                           const char *label, CBMLanguage lang) {
+ * the exact map when its locals arrive; the walk never leaves the symbol's own
+ * file (`module_prefix_len`, cbm_pipeline_fqn_symbol_prefix_len of the defining
+ * file; 0 = no local detection).
+ * Gated to Python: probing every prefix of every symbol would cost a kernel
+ * index seconds for nothing. */
+void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
+                                     const char *qualified_name, const char *label,
+                                     CBMLanguage lang, size_t module_prefix_len) {
     if (!r || !qualified_name || !label) {
         return;
     }
-    if (lang == CBM_LANG_PYTHON && cbm_registry_qn_is_function_local(r, qualified_name)) {
+    if (lang == CBM_LANG_PYTHON &&
+        cbm_registry_qn_is_function_local(r, qualified_name, module_prefix_len)) {
         (void)registry_add_exact(r, qualified_name, label);
         return;
     }
@@ -2176,19 +2217,22 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
  * enclosing def -- create_app.index, Tree.visit.visit -- before anything a
  * module-wide strategy would find. Walks scope_qn outward while its prefixes
  * are registered defs or classes (skipping the classes) and stops at the
- * module, which the other strategies own. Empty unless such a local exists.
- * Uncached: the answer depends on the caller, not only on the name. */
+ * caller's module (`module_qn`), which the other strategies own -- a
+ * same-QN function of a package __init__.py is never an enclosing scope.
+ * Empty unless such a local exists. Uncached: the answer depends on the
+ * caller, not only on the name. */
 cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const char *callee_name,
-                                              const char *scope_qn) {
+                                              const char *scope_qn, const char *module_qn) {
     char scope[CBM_SZ_512];
     char candidate[CBM_SZ_512];
     size_t len = scope_qn ? strlen(scope_qn) : 0;
+    size_t floor = python_def_prefix_len(module_qn, scope_qn);
     if (!r || !callee_name || !callee_name[0] || strchr(callee_name, '.') ||
-        strstr(callee_name, "::") || len == 0 || len >= sizeof(scope)) {
+        strstr(callee_name, "::") || len == 0 || len >= sizeof(scope) || floor == 0) {
         return empty_result();
     }
     memcpy(scope, scope_qn, len + SKIP_ONE);
-    for (;;) {
+    while (strlen(scope) > floor) {
         const char *label = cbm_ht_get(r->exact, scope);
         if (!label) {
             break;
@@ -2223,7 +2267,8 @@ cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const
                                                   int import_map_count, CBMLanguage lang,
                                                   const char *scope_qn) {
     if (lang == CBM_LANG_PYTHON) {
-        cbm_resolution_t lexical = cbm_registry_resolve_lexical(r, callee_name, scope_qn);
+        cbm_resolution_t lexical =
+            cbm_registry_resolve_lexical(r, callee_name, scope_qn, module_qn);
         if (lexical.qualified_name && lexical.qualified_name[0]) {
             return lexical;
         }
