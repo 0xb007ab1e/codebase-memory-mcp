@@ -1720,9 +1720,12 @@ TEST(test_selection_inventory_ambiguity_and_conditionals_use_whole_suite) {
  * runner that lacks it then tolerates its absence. Its cases and registrations
  * are unconditional here, so only the runner registration can say so. */
 TEST(test_selection_conditionally_registered_suite_is_conditional_on_every_path) {
+    /* A map covers every function it lists, so the changed one (0) is covered
+     * by the setup of a suite no runner registers: alpha's own rows stay
+     * quiet and each variant reaches alpha by its one path. */
     static const char *quiet_rows = "alpha:*\tcomplete\t\t1\nalpha:stat\tcomplete\t\t1\n"
                                     "alpha:cov\tcomplete\t\t1\nalpha:changed\tcomplete\t\t1\n"
-                                    "alpha:quiet\tcomplete\t\t1\n";
+                                    "alpha:quiet\tcomplete\t\t1\nomega:*\tcomplete\t\t0\n";
     struct {
         const char *rows;
         bool admitted;
@@ -1730,7 +1733,8 @@ TEST(test_selection_conditionally_registered_suite_is_conditional_on_every_path)
         unsigned path;
     } variants[] = {
         {"alpha:*\tincomplete\tlost setup\t1\nalpha:stat\tcomplete\t\t1\n"
-         "alpha:cov\tcomplete\t\t1\nalpha:changed\tcomplete\t\t1\nalpha:quiet\tcomplete\t\t1\n",
+         "alpha:cov\tcomplete\t\t1\nalpha:changed\tcomplete\t\t1\nalpha:quiet\tcomplete\t\t1\n"
+         "omega:*\tcomplete\t\t0\n",
          true, false, false, false, CBM_TEST_SELECT_SETUP_UNKNOWN},
         {"alpha:*\tcomplete\t\t0\nalpha:stat\tcomplete\t\t1\n"
          "alpha:cov\tcomplete\t\t1\nalpha:changed\tcomplete\t\t1\nalpha:quiet\tcomplete\t\t1\n",
