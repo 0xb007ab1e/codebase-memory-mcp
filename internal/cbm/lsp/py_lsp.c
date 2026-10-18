@@ -4408,11 +4408,20 @@ static void py_bind_local_def(PyLSPContext *ctx, TSNode def, bool is_class) {
  * them is still a local of the function; a nested def, class or lambda body
  * is a scope of its own and is never entered. */
 static bool py_is_statement_block(const char *kind) {
-    static const char *const kinds[] = {
-        "block",         "if_statement",   "elif_clause",          "else_clause",
-        "for_statement", "while_statement", "try_statement",       "except_clause",
-        "except_group_clause", "finally_clause", "with_statement", "match_statement",
-        "case_clause",   NULL};
+    static const char *const kinds[] = {"block",
+                                        "if_statement",
+                                        "elif_clause",
+                                        "else_clause",
+                                        "for_statement",
+                                        "while_statement",
+                                        "try_statement",
+                                        "except_clause",
+                                        "except_group_clause",
+                                        "finally_clause",
+                                        "with_statement",
+                                        "match_statement",
+                                        "case_clause",
+                                        NULL};
     for (int i = 0; kinds[i]; i++) {
         if (strcmp(kind, kinds[i]) == 0)
             return true;
@@ -4632,8 +4641,8 @@ static void py_process_class_in(PyLSPContext *ctx, TSNode class_node, const char
         return;
 
     const char *prev_class = ctx->enclosing_class_qn;
-    ctx->enclosing_class_qn = cbm_arena_sprintf(
-        ctx->arena, "%s.%s", container_qn ? container_qn : ctx->module_qn, cname);
+    ctx->enclosing_class_qn =
+        cbm_arena_sprintf(ctx->arena, "%s.%s", container_qn ? container_qn : ctx->module_qn, cname);
 
     TSNode body = ts_node_child_by_field_name(class_node, "body", 4);
     if (!ts_node_is_null(body)) {
