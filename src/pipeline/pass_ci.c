@@ -1086,7 +1086,8 @@ static int ci_compose_env(const ci_t *c, TSNode svc, const ci_env_t *dotenv, con
 
 /* A compose build's `args` (a mapping, or a list of "K=V" items), their
  * values interpolated, as a JSON object; NULL: none. An argument without a
- * value (the environment's) or with an unknown one is left out. */
+ * value (the environment's), with an unknown one or with a secret (by name or
+ * value -- never kept in the graph, never an image) is left out. */
 static const char *ci_compose_build_args(const ci_t *c, TSNode build, const ci_env_t *env) {
     TSNode args = ts_node_is_null(build) ? build : ci_get(c, build, "args");
     if (ts_node_is_null(args)) {
@@ -1109,13 +1110,19 @@ static const char *ci_compose_build_args(const ci_t *c, TSNode build, const ci_e
             raw = ts_node_is_null(pairs[i].value) ? NULL : ci_scalar(c, pairs[i].value, NULL);
         }
         const char *value = raw ? ci_interp(c->a, raw, env) : NULL;
-        if (!key || !key[0] || !value) {
+        if (!key || !key[0] || !value || cbm_is_secret_binding(key, value)) {
             continue;
         }
-        char ek[CBM_SZ_256];
-        char ev[CBM_SZ_1K];
-        cbm_json_escape(ek, (int)sizeof(ek), key);
-        cbm_json_escape(ev, (int)sizeof(ev), value);
+        /* JSON escaping writes at most 6 bytes a byte: nothing is cut */
+        int kn = (int)(strlen(key) * 6 + SKIP_ONE);
+        int vn = (int)(strlen(value) * 6 + SKIP_ONE);
+        char *ek = cbm_arena_alloc(c->a, (size_t)kn);
+        char *ev = cbm_arena_alloc(c->a, (size_t)vn);
+        if (!ek || !ev) {
+            return NULL;
+        }
+        cbm_json_escape(ek, kn, key);
+        cbm_json_escape(ev, vn, value);
         json = cbm_arena_sprintf(c->a, "%s%s\"%s\":\"%s\"", json ? json : "{", json ? "," : "", ek,
                                  ev);
     }

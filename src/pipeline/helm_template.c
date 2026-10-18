@@ -23,6 +23,7 @@
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/json_writer.h" /* cbm_json_writer_allocator */
+#include "foundation/log.h"
 #include "foundation/mem_core.h"
 #include "cbm.h"
 #include "lang_specs.h"
@@ -34,7 +35,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { HELM_MAX_NESTING = 1000 }; /* Helm engine's recursionMaxNums */
+enum { HELM_MAX_NESTING = 1000 };    /* Helm engine's recursionMaxNums */
+enum { HELM_MAX_SET_INDEX = 65536 }; /* Helm strvals' MaxIndex for `--set a[n]` */
+
+/* A render doing more than this -- steps (an action, an evaluation, a range
+ * iteration) or bytes written to any sink -- is one Helm never finishes
+ * either (a range over a huge int, defines that call each other in a fan):
+ * it stops, and every probe of the template is UNKNOWN. Counted, never timed;
+ * far above any real chart (the 20 infra corpora and the helm oracle charts
+ * never reach it). */
+enum { HELM_MAX_STEPS = 10000000 };
+static const size_t HELM_MAX_OUTPUT = (size_t)CBM_SZ_64 * CBM_SZ_1K * CBM_SZ_1K; /* 64 MiB */
 
 /* ── Values: YAML -> JSON ─────────────────────────────────────────── */
 
@@ -42,6 +53,7 @@ typedef struct {
     const char *name;
     size_t len;
     yyjson_mut_val *val;
+    long decodes; /* the nodes its value took to decode, its aliases expanded */
 } hy_anchor_t;
 
 typedef struct {
@@ -51,7 +63,36 @@ typedef struct {
     int nanchors;
     int cap;
     bool unknown;
+    long decodes;       /* nodes decoded, alias expansions included (go-yaml decodeCount) */
+    long alias_decodes; /* of those, the ones an alias expanded (aliasCount) */
 } hy_t;
+
+/* go-yaml v2 (decode.go): a document whose decodes come mostly from alias
+ * expansion -- a billion laughs -- is an error, so Helm reads no values. The
+ * share allowed falls from 99% below 400,000 decodes to 10% above 4,000,000. */
+enum {
+    HY_ALIAS_MIN_ALIASES = 100,
+    HY_ALIAS_MIN_DECODES = 1000,
+    HY_ALIAS_RANGE_LOW = 400000,
+    HY_ALIAS_RANGE_HIGH = 4000000
+};
+static const double HY_ALIAS_RATIO_SMALL = 0.99;
+static const double HY_ALIAS_RATIO_LARGE = 0.10;
+
+static bool hy_excessive_aliasing(const hy_t *y) {
+    if (y->alias_decodes <= HY_ALIAS_MIN_ALIASES || y->decodes <= HY_ALIAS_MIN_DECODES) {
+        return false;
+    }
+    double allowed = HY_ALIAS_RATIO_SMALL;
+    if (y->decodes >= HY_ALIAS_RANGE_HIGH) {
+        allowed = HY_ALIAS_RATIO_LARGE;
+    } else if (y->decodes > HY_ALIAS_RANGE_LOW) {
+        allowed = HY_ALIAS_RATIO_SMALL - (HY_ALIAS_RATIO_SMALL - HY_ALIAS_RATIO_LARGE) *
+                                             ((double)(y->decodes - HY_ALIAS_RANGE_LOW) /
+                                              (double)(HY_ALIAS_RANGE_HIGH - HY_ALIAS_RANGE_LOW));
+    }
+    return (double)y->alias_decodes / (double)y->decodes > allowed;
+}
 
 static bool hy_type(TSNode n, const char *t) {
     return !ts_node_is_null(n) && strcmp(ts_node_type(n), t) == 0;
@@ -63,7 +104,7 @@ static const char *hy_text(const hy_t *y, TSNode n, size_t *len) {
     return y->src + b;
 }
 
-static void hy_anchor(hy_t *y, const char *name, size_t len, yyjson_mut_val *v) {
+static void hy_anchor(hy_t *y, const char *name, size_t len, yyjson_mut_val *v, long decodes) {
     if (y->nanchors == y->cap) {
         int cap = y->cap ? y->cap * PAIR_LEN : CBM_SZ_16;
         hy_anchor_t *g = cbm_realloc(CBM_MEM_CLASS_OTHER, y->anchors, (size_t)cap * sizeof(*g));
@@ -74,12 +115,19 @@ static void hy_anchor(hy_t *y, const char *name, size_t len, yyjson_mut_val *v) 
         y->anchors = g;
         y->cap = cap;
     }
-    y->anchors[y->nanchors++] = (hy_anchor_t){name, len, v};
+    y->anchors[y->nanchors++] = (hy_anchor_t){name, len, v, decodes};
 }
 
+/* An alias: its anchor's value decoded again (a copy), as go-yaml counts it. */
 static yyjson_mut_val *hy_alias(hy_t *y, const char *name, size_t len) {
     for (int i = y->nanchors - SKIP_ONE; i >= 0; i--) {
         if (y->anchors[i].len == len && memcmp(y->anchors[i].name, name, len) == 0) {
+            y->decodes += y->anchors[i].decodes;
+            y->alias_decodes += y->anchors[i].decodes;
+            if (hy_excessive_aliasing(y)) {
+                y->unknown = true;
+                return NULL;
+            }
             return yyjson_mut_val_mut_copy(y->doc, y->anchors[i].val);
         }
     }
@@ -609,20 +657,24 @@ static yyjson_mut_val *hy_node(hy_t *y, TSNode n) {
             }
         }
         yyjson_mut_val *v = NULL;
+        long before = y->decodes;
         if (ts_node_is_null(content)) {
+            y->decodes++;
             v = yyjson_mut_null(y->doc);
         } else if (str_tag && hy_type(content, "plain_scalar")) {
             size_t l = 0;
             const char *s = hy_text(y, content, &l);
+            y->decodes++;
             v = yyjson_mut_strncpy(y->doc, s, l);
         } else {
             v = hy_node(y, content);
         }
         if (v && anchor) {
-            hy_anchor(y, anchor, al, v);
+            hy_anchor(y, anchor, al, v, y->decodes - before);
         }
         return v;
     }
+    y->decodes++; /* a mapping, sequence, scalar or alias node */
     size_t l = 0;
     const char *s = hy_text(y, n, &l);
     if (strcmp(t, "block_mapping") == 0) {
@@ -786,11 +838,15 @@ bool cbm_helm_values_set(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *
             key[k++] = *p++;
         }
         key[k] = '\0';
+        if (*p && *p != '.' && *p != '[') {
+            return false; /* a key longer than the buffer: never split into two */
+        }
         long index = -SKIP_ONE;
         if (*p == '[') {
             char *end = NULL;
             index = strtol(p + SKIP_ONE, &end, 10);
-            if (!end || *end != ']' || index < 0) {
+            /* strvals: a negative index or one past MaxIndex is an error */
+            if (!end || *end != ']' || index < 0 || index > HELM_MAX_SET_INDEX) {
                 return false;
             }
             p = end + SKIP_ONE;
@@ -1192,9 +1248,12 @@ struct hv {
     hv_map_t *m;
     hv_list_t *l;
     const char *path; /* the values path it holds; NULL: none */
+    bool own;         /* a new value holding nothing another part holds (fromYaml, deepCopy,
+                       * a part of one; known or not): changing it changes nothing else */
 };
 
 static const hv_t HV_UNKNOWN = {.k = HV_UNK};
+static const hv_t HV_UNKNOWN_OWN = {.k = HV_UNK, .own = true};
 
 static hv_t hv_nil(void) {
     return (hv_t){.k = HV_NIL};
@@ -1306,6 +1365,12 @@ typedef struct {
 } hframe_t;
 
 typedef struct {
+    const void *map;  /* the hv_map_t / yyjson object changed */
+    const char *path; /* its values path (NULL: none) */
+    bool deep;        /* merge: every map within it may have changed too */
+} hpoison_t;
+
+typedef struct {
     CBMArena *a;
     yyjson_mut_doc *scratch;
     const cbm_helm_defines_t *defs;
@@ -1315,6 +1380,16 @@ typedef struct {
     int nesting;
     bool brk;
     bool cont;
+    long steps;
+    size_t written; /* bytes appended to any sink */
+    bool stop;      /* over HELM_MAX_STEPS / HELM_MAX_OUTPUT: the render is UNKNOWN */
+    /* maps a set / unset / merge changed in place (not modelled): what they
+     * hold is UNKNOWN from then on */
+    hpoison_t *poison;
+    int npoison;
+    int pcap;
+    bool tainted;          /* a change of unknown target: every capture ending later is UNKNOWN */
+    CBMHashTable *mutates; /* define name -> it may change a map ((void *)1 / (void *)2) */
     /* probes of the top-level template */
     const char *top_src;
     size_t top_len;
@@ -1333,8 +1408,30 @@ typedef struct {
     int tcap;
 } hst_t;
 
+/* One step of work; false once the render is over its budget. */
+static bool hst_step(hst_t *st) {
+    if (!st->stop && ++st->steps > HELM_MAX_STEPS) {
+        st->stop = true;
+    }
+    return !st->stop;
+}
+
+/* n more bytes of output; false (and the render stopped) past the budget. */
+static bool hst_write(hst_t *st, size_t n) {
+    if (st->stop || n > HELM_MAX_OUTPUT - st->written) {
+        st->stop = true;
+        return false;
+    }
+    st->written += n;
+    return true;
+}
+
 static void hs_append(hst_t *st, hsink_t *s, const char *p, size_t n) {
     if (s->unk || n == 0) {
+        return;
+    }
+    if (!hst_write(st, n)) {
+        s->unk = true;
         return;
     }
     if (s->n + n + SKIP_ONE > s->cap) {
@@ -1440,6 +1537,85 @@ static hvar_t *hst_var(hst_t *st, const hframe_t *fr, const char *name, size_t n
         }
     }
     return NULL;
+}
+
+/* Has a set / unset / merge changed map v (or, for a merge, a map holding
+ * it)? Then what v holds is UNKNOWN. */
+static bool hv_poisoned(const hst_t *st, const hv_t *v) {
+    const void *map = v->k == HV_MAP    ? (const void *)v->m
+                      : v->k == HV_JSON ? (const void *)v->j
+                                        : NULL;
+    if (!map) {
+        return false;
+    }
+    for (int i = 0; i < st->npoison; i++) {
+        const hpoison_t *p = &st->poison[i];
+        if (p->map == map) {
+            return true;
+        }
+        if (p->deep && p->path && v->path) {
+            size_t pl = strlen(p->path);
+            if (pl == 0 || (strncmp(v->path, p->path, pl) == 0 &&
+                            (v->path[pl] == '\0' || v->path[pl] == '.' || v->path[pl] == '['))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool hst_poison_at(hst_t *st, const hv_t *v, bool deep, int depth);
+
+/* Map v changed in place; false when v is no map (or no room to say so). A
+ * merge (`deep`) may change every map within it too -- a map the template
+ * made (dict) holds others by reference, so those are poisoned as well. */
+static bool hst_poison(hst_t *st, const hv_t *v, bool deep) {
+    return hst_poison_at(st, v, deep, 0);
+}
+
+static bool hst_poison_at(hst_t *st, const hv_t *v, bool deep, int depth) {
+    if (depth > HELM_MAX_NESTING) {
+        return false;
+    }
+    if (deep && v->k == HV_LIST) {
+        /* a list itself is never changed in place; the maps in it may be */
+        for (int i = 0; i < v->l->n; i++) {
+            if ((hv_is_map(&v->l->items[i]) || hv_is_list(&v->l->items[i])) &&
+                !hst_poison_at(st, &v->l->items[i], deep, depth + SKIP_ONE)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    /* a values list (deep): by its path, which every item's path extends */
+    const void *map = v->k == HV_MAP ? (const void *)v->m
+                      : v->k == HV_JSON && (yyjson_mut_is_obj(v->j) || (deep && v->path))
+                          ? (const void *)v->j
+                          : NULL;
+    if (!map) {
+        return false;
+    }
+    if (deep && v->k == HV_MAP) {
+        for (int i = 0; i < v->m->n; i++) {
+            if (hv_is_map(&v->m->vals[i]) && !hst_poison_at(st, &v->m->vals[i], deep, depth + 1)) {
+                return false;
+            }
+        }
+    }
+    if (st->npoison == st->pcap) {
+        int cap = st->pcap ? st->pcap * PAIR_LEN : CBM_SZ_16;
+        hpoison_t *g = cbm_arena_alloc(st->a, (size_t)cap * sizeof(*g));
+        if (!g) {
+            return false;
+        }
+        if (st->npoison) {
+            memcpy(g, st->poison, (size_t)st->npoison * sizeof(*g));
+        }
+        st->poison = g;
+        st->pcap = cap;
+    }
+    st->poison[st->npoison++] = (hpoison_t){map, v->path, deep};
+    return true;
 }
 
 static bool hn_is(TSNode n, const char *t) {
@@ -1574,10 +1750,13 @@ static void hst_capture_end(hst_t *st) {
             memcpy(img, p->image, (size_t)p->n * sizeof(*img));
             memcpy(keys, p->keys, (size_t)p->n * sizeof(*keys));
         }
-        img[p->n] = st->cap.unk ? NULL : hst_scalar(st, st->cap.buf ? st->cap.buf : "", st->cap.n);
+        img[p->n] = st->cap.unk || st->tainted
+                        ? NULL
+                        : hst_scalar(st, st->cap.buf ? st->cap.buf : "", st->cap.n);
         /* the leaves read: a path that is the prefix of another is dropped */
         const char *json = NULL;
-        for (int i = 0; i < st->nck; i++) {
+        bool whole = true;
+        for (int i = 0; i < st->nck && whole; i++) {
             size_t li = strlen(st->ckeys[i]);
             bool prefix = false;
             for (int j = 0; j < st->nck && !prefix; j++) {
@@ -1587,9 +1766,13 @@ static void hst_capture_end(hst_t *st) {
             if (prefix || !st->ckeys[i][0]) {
                 continue;
             }
-            char esc[CBM_SZ_1K];
+            char *esc = cbm_arena_alloc(st->a, li * PAIR_LEN + SKIP_ONE);
+            if (!esc) {
+                whole = false;
+                break;
+            }
             size_t o = 0;
-            for (const char *c = st->ckeys[i]; *c && o + 3 < sizeof(esc); c++) {
+            for (const char *c = st->ckeys[i]; *c; c++) {
                 if (*c == '"' || *c == '\\') {
                     esc[o++] = '\\';
                 }
@@ -1597,8 +1780,12 @@ static void hst_capture_end(hst_t *st) {
             }
             esc[o] = '\0';
             json = cbm_arena_sprintf(st->a, "%s%s\"%s\"", json ? json : "[", json ? "," : "", esc);
+            whole = json != NULL;
         }
-        keys[p->n] = json ? cbm_arena_sprintf(st->a, "%s]", json) : NULL;
+        keys[p->n] = json && whole ? cbm_arena_sprintf(st->a, "%s]", json) : NULL;
+        if (!whole || (json && !keys[p->n])) {
+            img[p->n] = NULL; /* a mark not written in full: no image, never one unmarked */
+        }
         p->image = img;
         p->keys = keys;
         p->n++;
@@ -1720,6 +1907,9 @@ static hv_t he_render_define(hst_t *st, const char *name, hv_t arg, hsink_t *int
 
 /* Field `name` of value v. */
 static hv_t he_field(hst_t *st, const hv_t *v, const char *name, size_t nl) {
+    if (hv_poisoned(st, v)) {
+        return HV_UNKNOWN;
+    }
     if (v->k == HV_MAP) {
         for (int i = 0; i < v->m->n; i++) {
             if (strlen(v->m->keys[i]) == nl && memcmp(v->m->keys[i], name, nl) == 0) {
@@ -1739,6 +1929,9 @@ static hv_t he_field(hst_t *st, const hv_t *v, const char *name, size_t nl) {
 }
 
 static hv_t he_index1(hst_t *st, const hv_t *v, const hv_t *k) {
+    if (hv_poisoned(st, v)) {
+        return HV_UNKNOWN;
+    }
     if (hv_is_map(v)) {
         if (k->k != HV_STR) {
             return HV_UNKNOWN;
@@ -2074,10 +2267,413 @@ static hv_t he_strfn(hst_t *st, const char *fn, const hv_t *a, int n) {
     return HV_UNKNOWN;
 }
 
-/* A function call `fn` with its evaluated arguments (the piped value last). */
+/* Sprig functions that change a map in place. */
+static bool he_mutator(const char *s, size_t n) {
+    static const char *const MUTATORS[] = {
+        "set", "unset", "merge", "mergeOverwrite", "mustMerge", "mustMergeOverwrite", NULL};
+    return hy_in(s, n, MUTATORS);
+}
+
+static bool he_define_may_mutate(hst_t *st, const char *name, int depth);
+
+/* The define a call / action names with a string literal into the arena;
+ * NULL (and *computed) when the name is no literal. */
+static const char *he_called_define(hst_t *st, const char *src, TSNode c, bool *computed) {
+    TSNode nm = {0};
+    *computed = false;
+    if (hn_is(c, "function_call")) {
+        TSNode fn = hn_field(c, "function");
+        TSNode args = hn_field(c, "arguments");
+        uint32_t fb = ts_node_is_null(fn) ? 0 : ts_node_start_byte(fn);
+        size_t fl = ts_node_is_null(fn) ? 0 : ts_node_end_byte(fn) - fb;
+        if (fl != strlen("include") || strncmp(src + fb, "include", fl) != 0) {
+            return NULL;
+        }
+        nm = ts_node_is_null(args) ? (TSNode){0} : ts_node_named_child(args, 0);
+    } else {
+        nm = hn_field(c, "name");
+    }
+    if (!hn_is(nm, "interpreted_string_literal") && !hn_is(nm, "raw_string_literal")) {
+        *computed = true;
+        return NULL;
+    }
+    uint32_t b = ts_node_start_byte(nm);
+    size_t l = ts_node_end_byte(nm) - b;
+    char *name = cbm_arena_alloc(st->a, l * 4 + SKIP_ONE);
+    size_t k = name ? hg_unquote(src + b, l, name) : (size_t)-1;
+    if (k == (size_t)-1) {
+        *computed = true;
+        return NULL;
+    }
+    name[k] = '\0';
+    return name;
+}
+
+/* How new a value is: HF_DEEP holds nothing another part holds (fromYaml,
+ * deepCopy, a dict / list of literals); HF_SHALLOW is a new map or list that
+ * may hold others' maps by reference (dict / list / omit / pick of values) --
+ * a set / unset of it changes nothing else, a merge into it may. */
+typedef enum { HF_NONE = 0, HF_SHALLOW, HF_DEEP } hfresh_lvl_t;
+
+/* Sprig functions whose result holds nothing another part holds. */
+static bool he_own_fn(const char *s, size_t n) {
+    static const char *const OWN[] = {
+        "fromYaml", "fromJson", "fromYamlArray", "fromJsonArray", "deepCopy", "mustDeepCopy", NULL};
+    return hy_in(s, n, OWN);
+}
+
+/* Sprig functions whose result is a new map or list of what they are given. */
+static bool he_wrap_fn(const char *s, size_t n) {
+    static const char *const WRAP[] = {"dict", "list", "omit", "pick", NULL};
+    return hy_in(s, n, WRAP);
+}
+
+/* The text of call node c's function (a function_call's, or a bare
+ * identifier's); NULL when it has none. */
+static const char *he_fn_text(const char *src, TSNode c, size_t *n) {
+    TSNode fn = hn_is(c, "identifier") ? c : hn_field(c, "function");
+    if (ts_node_is_null(fn)) {
+        return NULL;
+    }
+    uint32_t b = ts_node_start_byte(fn);
+    *n = ts_node_end_byte(fn) - b;
+    return src + b;
+}
+
+/* The name text of variable node var ("" for `$`). */
+static const char *he_var_text(const char *src, TSNode var, size_t *n) {
+    TSNode nm = hn_field(var, "name");
+    if (ts_node_is_null(nm)) {
+        *n = 0;
+        return "";
+    }
+    uint32_t b = ts_node_start_byte(nm);
+    *n = ts_node_end_byte(nm) - b;
+    return src + b;
+}
+
+/* The variables a scan saw made new, and how. */
+typedef struct {
+    const char **name;
+    size_t *len;
+    hfresh_lvl_t *lvl;
+    int n;
+    int cap;
+} hfresh_t;
+
+static hfresh_lvl_t he_fresh_var(const hfresh_t *f, const char *src, TSNode var) {
+    size_t vl = 0;
+    const char *vs = he_var_text(src, var, &vl);
+    for (int i = f->n - SKIP_ONE; i >= 0; i--) {
+        if (f->len[i] == vl && memcmp(f->name[i], vs, vl) == 0) {
+            return f->lvl[i];
+        }
+    }
+    return HF_NONE;
+}
+
+static bool he_literal(TSNode x) {
+    return hn_is(x, "interpreted_string_literal") || hn_is(x, "raw_string_literal") ||
+           hn_is(x, "int_literal") || hn_is(x, "float_literal") || hn_is(x, "true") ||
+           hn_is(x, "false") || hn_is(x, "nil");
+}
+
+/* How new expression `val` is: a constructor's result (`... | fromYaml`,
+ * `dict`), or a part dug / got / indexed out of a variable that is new. */
+static hfresh_lvl_t he_fresh_value(const hfresh_t *f, const char *src, TSNode val) {
+    while (hn_is(val, "parenthesized_pipeline") && ts_node_named_child_count(val) == SKIP_ONE) {
+        val = ts_node_named_child(val, 0);
+    }
+    if (hn_is(val, "chained_pipeline")) {
+        uint32_t c = ts_node_named_child_count(val);
+        val = c ? ts_node_named_child(val, c - SKIP_ONE) : (TSNode){0};
+    }
+    size_t fl = 0;
+    const char *fs =
+        hn_is(val, "function_call") || hn_is(val, "identifier") ? he_fn_text(src, val, &fl) : NULL;
+    if (!fs) {
+        return HF_NONE;
+    }
+    if (he_own_fn(fs, fl)) {
+        return HF_DEEP;
+    }
+    TSNode args = hn_field(val, "arguments");
+    uint32_t na = ts_node_is_null(args) ? 0 : ts_node_named_child_count(args);
+    if (he_wrap_fn(fs, fl)) {
+        bool literal = true; /* a dict / list of literals holds no one's map */
+        for (uint32_t i = 0; i < na && literal; i++) {
+            literal = he_literal(ts_node_named_child(args, i));
+        }
+        return literal ? HF_DEEP : HF_SHALLOW;
+    }
+    if (na == 0) {
+        return HF_NONE;
+    }
+    /* a part of a deep-new value: dig takes its map last; get and index first */
+    TSNode from = fl == strlen("dig") && memcmp(fs, "dig", fl) == 0
+                      ? ts_node_named_child(args, na - SKIP_ONE)
+                  : (fl == strlen("get") && memcmp(fs, "get", fl) == 0) ||
+                          (fl == strlen("index") && memcmp(fs, "index", fl) == 0)
+                      ? ts_node_named_child(args, 0)
+                      : (TSNode){0};
+    return hn_is(from, "variable") && he_fresh_var(f, src, from) == HF_DEEP ? HF_DEEP : HF_NONE;
+}
+
+/* Is expression x deep-new: a literal, a deep-new variable or value, or a
+ * dict / list of such? */
+static bool he_deep_value(const hfresh_t *f, const char *src, TSNode x, int depth) {
+    while (hn_is(x, "parenthesized_pipeline") && ts_node_named_child_count(x) == SKIP_ONE) {
+        x = ts_node_named_child(x, 0);
+    }
+    if (depth > HELM_MAX_NESTING || ts_node_is_null(x)) {
+        return false;
+    }
+    if (he_literal(x)) {
+        return true;
+    }
+    if (hn_is(x, "variable")) {
+        return he_fresh_var(f, src, x) == HF_DEEP;
+    }
+    hfresh_lvl_t lvl = he_fresh_value(f, src, x);
+    if (lvl != HF_SHALLOW || !hn_is(x, "function_call")) {
+        return lvl == HF_DEEP;
+    }
+    size_t fl = 0;
+    const char *fs = he_fn_text(src, x, &fl);
+    if (!fs || !(fl == strlen("dict") || fl == strlen("list")) ||
+        (memcmp(fs, "dict", fl) != 0 && memcmp(fs, "list", fl) != 0)) {
+        return false; /* omit / pick keep the maps they are given */
+    }
+    TSNode args = hn_field(x, "arguments");
+    for (uint32_t i = 0; !ts_node_is_null(args) && i < ts_node_named_child_count(args); i++) {
+        if (!he_deep_value(f, src, ts_node_named_child(args, i), depth + SKIP_ONE)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Variable definition `def` (`$x := ...`) into f when what it makes is new. */
+static void he_fresh_note(hst_t *st, hfresh_t *f, const char *src, TSNode def) {
+    TSNode var = hn_field(def, "variable");
+    TSNode val = hn_field(def, "value");
+    hfresh_lvl_t lvl = ts_node_is_null(var)            ? HF_NONE
+                       : he_deep_value(f, src, val, 0) ? HF_DEEP
+                                                       : he_fresh_value(f, src, val);
+    if (lvl == HF_NONE) {
+        return;
+    }
+    if (f->n == f->cap) {
+        int cap = f->cap ? f->cap * PAIR_LEN : CBM_SZ_16;
+        const char **g = cbm_arena_alloc(st->a, (size_t)cap * sizeof(*g));
+        size_t *gl = cbm_arena_alloc(st->a, (size_t)cap * sizeof(*gl));
+        hfresh_lvl_t *gv = cbm_arena_alloc(st->a, (size_t)cap * sizeof(*gv));
+        if (!g || !gl || !gv) {
+            return;
+        }
+        if (f->n) {
+            memcpy(g, f->name, (size_t)f->n * sizeof(*g));
+            memcpy(gl, f->len, (size_t)f->n * sizeof(*gl));
+            memcpy(gv, f->lvl, (size_t)f->n * sizeof(*gv));
+        }
+        *f = (hfresh_t){g, gl, gv, f->n, cap};
+    }
+    f->name[f->n] = he_var_text(src, var, &f->len[f->n]);
+    f->lvl[f->n] = lvl;
+    f->n++;
+}
+
+/* Does expression x read `.` (a field of it)? In a with / range body `.` is
+ * not the frame's. */
+static bool he_reads_dot(TSNode x) {
+    TSTreeCursor cur = ts_tree_cursor_new(x);
+    bool found = false;
+    for (bool more = true; more && !found;) {
+        TSNode c = ts_tree_cursor_current_node(&cur);
+        found = hn_is(c, "dot") || hn_is(c, "field");
+        if (found || ts_tree_cursor_goto_first_child(&cur)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cur)) {
+            if (!ts_tree_cursor_goto_parent(&cur)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cur);
+    return found;
+}
+
+/* What a change of the value of expression x (in frame fr; NULL: not
+ * running) would reach: false when it reaches nothing another part holds --
+ * x is own, or a known map, now poisoned (`deep`: a merge). A value not known
+ * here: true. */
+static bool he_change_reaches(hst_t *st, hframe_t *fr, TSNode x, bool dot_known, bool deep) {
+    if (!fr || ts_node_is_null(x) || (!dot_known && he_reads_dot(x))) {
+        return true;
+    }
+    /* read without recording: the part is not run, its reads are no capture's */
+    int capture = st->capture;
+    st->capture = -SKIP_ONE;
+    hv_t v = he_eval(st, fr, x);
+    st->capture = capture;
+    /* a known map is poisoned even when own: what it holds is not known now */
+    bool poisoned = hst_poison(st, &v, deep);
+    return !poisoned && !v.own;
+}
+
+/* May running node n (of text src) change a map another part holds -- a set /
+ * unset / merge whose target is `.`, `$`, a field path, or a variable n did
+ * not make itself from a new map (`$d := dict ...`), in n or in a define it
+ * includes (whose changes reach only its argument)? A call's result as the
+ * target is a new value: no. With fr (n is a part of the running template
+ * not run), a target or include argument that is a value of fr is looked at:
+ * own, or a known map (then poisoned): no. An include of a computed name is a
+ * template file by path, another template's work, which no render models.
+ * The text a tpl renders is not looked into. */
+static bool he_may_mutate(hst_t *st, const char *src, TSNode n, int depth, hframe_t *fr,
+                          bool dot_known) {
+    if (depth > HELM_MAX_NESTING) {
+        return true;
+    }
+    hfresh_t fresh = {0}; /* variables n makes from a new map */
+    TSTreeCursor cur = ts_tree_cursor_new(n);
+    bool found = false;
+    bool more = true;
+    while (more && !found && hst_step(st)) {
+        TSNode c = ts_tree_cursor_current_node(&cur);
+        const char *t = ts_node_type(c);
+        size_t fl = 0;
+        const char *fs = NULL;
+        if (strcmp(t, "variable_definition") == 0) {
+            he_fresh_note(st, &fresh, src, c);
+        } else if (strcmp(t, "function_call") == 0 && (fs = he_fn_text(src, c, &fl)) != NULL &&
+                   he_mutator(fs, fl)) {
+            TSNode args = hn_field(c, "arguments");
+            TSNode target = ts_node_is_null(args) ? (TSNode){0} : ts_node_named_child(args, 0);
+            bool deep = fs[0] == 'm'; /* a merge reaches the maps within its target too */
+            if (hn_is(target, "variable")) {
+                hfresh_lvl_t lvl = he_fresh_var(&fresh, src, target);
+                bool spared = lvl == HF_DEEP || (lvl == HF_SHALLOW && !deep);
+                found = !spared && he_change_reaches(st, fr, target, dot_known, deep);
+            } else if (ts_node_is_null(target) || hn_is(target, "dot") || hn_is(target, "field") ||
+                       hn_is(target, "selector_expression")) {
+                found = he_change_reaches(st, fr, target, dot_known, deep);
+            }
+        } else if (strcmp(t, "function_call") == 0 || strcmp(t, "template_action") == 0 ||
+                   strcmp(t, "block_action") == 0) {
+            bool computed = false;
+            const char *name = he_called_define(st, src, c, &computed);
+            if (!computed && name && he_define_may_mutate(st, name, depth + SKIP_ONE)) {
+                /* what the define changes is its argument (or a map within it) */
+                TSNode args = hn_field(c, "arguments");
+                TSNode arg = hn_is(c, "function_call")
+                                 ? (ts_node_is_null(args) ? (TSNode){0}
+                                                          : ts_node_named_child(args, SKIP_ONE))
+                                 : hn_field(c, "argument");
+                found = !he_deep_value(&fresh, src, arg, 0) &&
+                        he_change_reaches(st, fr, arg, dot_known, true);
+            }
+        } else if (strcmp(t, "identifier") == 0 && (fs = he_fn_text(src, c, &fl)) != NULL &&
+                   he_mutator(fs, fl) && hn_is(ts_node_parent(c), "chained_pipeline")) {
+            found = true; /* `x | set`: the target is the piped value, not known here */
+        }
+        /* a variable's name ($set) is no call */
+        if (found || (strcmp(t, "variable") != 0 && ts_tree_cursor_goto_first_child(&cur))) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cur)) {
+            if (!ts_tree_cursor_goto_parent(&cur)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cur);
+    return found || st->stop;
+}
+
+/* Memoized per define (a define reached again while it is scanned: no). */
+static bool he_define_may_mutate(hst_t *st, const char *name, int depth) {
+    enum { HM_NO = 1, HM_YES = 2 };
+    const hd_def_t *d = hd_find(st->defs, name);
+    if (!d) {
+        return false; /* a define not found is an error: nothing of it runs */
+    }
+    if (!st->mutates) {
+        st->mutates = cbm_ht_create(0);
+    }
+    void *memo = st->mutates ? cbm_ht_get(st->mutates, name) : NULL;
+    if (memo) {
+        return memo == (void *)(uintptr_t)HM_YES;
+    }
+    const char *key = cbm_arena_strdup(st->a, name);
+    if (st->mutates && key) {
+        cbm_ht_set(st->mutates, key, (void *)(uintptr_t)HM_NO);
+    }
+    bool m = he_may_mutate(st, d->file->src, d->node, depth, NULL, false);
+    if (st->mutates && key) {
+        cbm_ht_set(st->mutates, key, (void *)(uintptr_t)(m ? HM_YES : HM_NO));
+    }
+    return m;
+}
+
+static hv_t he_apply_fn(hst_t *st, hframe_t *fr, const char *fn, hv_t *a, int n);
+
+/* Is the result of `fn` over a own (see hv_t): a part dug / got / indexed /
+ * taken out of an own value; a dict / list / default / coalesce / ternary
+ * whose every map or list (and every value not known) is own? */
+static bool he_own_result(const char *fn, const hv_t *a, int n) {
+    if (n < SKIP_ONE) {
+        return strcmp(fn, "dict") == 0 || strcmp(fn, "list") == 0; /* empty and new */
+    }
+    if (strcmp(fn, "dig") == 0) {
+        return a[n - SKIP_ONE].own;
+    }
+    if (strcmp(fn, "get") == 0 || strcmp(fn, "index") == 0 || strcmp(fn, "first") == 0 ||
+        strcmp(fn, "last") == 0) {
+        return a[0].own;
+    }
+    if (strcmp(fn, "dict") == 0 || strcmp(fn, "list") == 0 || strcmp(fn, "default") == 0 ||
+        strcmp(fn, "coalesce") == 0 || strcmp(fn, "ternary") == 0) {
+        for (int i = 0; i < n; i++) {
+            if (!a[i].own && (a[i].k == HV_UNK || hv_is_map(&a[i]) || hv_is_list(&a[i]))) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+/* A function call `fn` with its evaluated arguments (the piped value last),
+ * its result marked own when it is. */
 static hv_t he_apply(hst_t *st, hframe_t *fr, const char *fn, hv_t *a, int n) {
+    if (he_own_fn(fn, strlen(fn))) {
+        return HV_UNKNOWN_OWN; /* fromYaml / deepCopy: a new value, known or not */
+    }
+    hv_t r = he_apply_fn(st, fr, fn, a, n);
+    r.own = r.own || he_own_result(fn, a, n);
+    return r;
+}
+
+static hv_t he_apply_fn(hst_t *st, hframe_t *fr, const char *fn, hv_t *a, int n) {
     for (int i = 0; i < n; i++) {
         if (a[i].k == HV_UNK) {
+            /* an include of a known define not run: a change it would have
+             * made to its argument is missed, unless that one is own (one of a
+             * name not known -- a template file by path -- is another
+             * template's work, which no render models) */
+            if (strcmp(fn, "include") == 0 && a[0].k == HV_STR && n == PAIR_LEN && !a[1].own) {
+                const char *dn = cbm_arena_strndup(st->a, a[0].s, a[0].sn);
+                if (!dn || he_define_may_mutate(st, dn, st->nesting)) {
+                    st->tainted = true;
+                }
+            }
+            return HV_UNKNOWN;
+        }
+        if (hv_poisoned(st, &a[i])) {
             return HV_UNKNOWN;
         }
     }
@@ -2348,16 +2944,25 @@ static hv_t he_apply(hst_t *st, hframe_t *fr, const char *fn, hv_t *a, int n) {
         if (!hv_to_int(&a[0], &w) || w < 0 || !hv_strval(st, &a[1], &s)) {
             return HV_UNKNOWN;
         }
+        /* every line gets w spaces: a width whose output cannot fit stops here */
+        size_t lines = SKIP_ONE;
+        for (size_t i = 0; i < s.sn; i++) {
+            lines += s.s[i] == '\n';
+        }
+        if ((uint64_t)w > HELM_MAX_OUTPUT / lines) {
+            st->stop = true;
+            return HV_UNKNOWN;
+        }
         hsink_t out = {0};
         if (fn[0] == 'n') {
             hs_append(st, &out, "\n", SKIP_ONE);
         }
-        for (int64_t i = 0; i < w; i++) {
+        for (int64_t i = 0; i < w && !out.unk; i++) {
             hs_append(st, &out, " ", SKIP_ONE);
         }
-        for (size_t i = 0; i < s.sn; i++) {
+        for (size_t i = 0; i < s.sn && !out.unk; i++) {
             hs_append(st, &out, s.s + i, SKIP_ONE);
-            for (int64_t k = 0; s.s[i] == '\n' && k < w; k++) {
+            for (int64_t k = 0; s.s[i] == '\n' && k < w && !out.unk; k++) {
                 hs_append(st, &out, " ", SKIP_ONE);
             }
         }
@@ -2423,6 +3028,30 @@ static hv_t he_call(hst_t *st, hframe_t *fr, TSNode call, const hv_t *piped) {
     fn[fl] = '\0';
     TSNode args = hn_is(call, "identifier") ? (TSNode){0} : hn_field(call, "arguments");
     uint32_t na = ts_node_is_null(args) ? 0 : ts_node_named_child_count(args);
+    if (he_mutator(fn, fl)) {
+        /* set / unset / merge change a map in place -- not modelled: what it
+         * holds is UNKNOWN from here on (after a merge, every map within it).
+         * A target not known that may be one another part holds -- a variable,
+         * `.`, a field path; a call's result is a new value -- spoils every
+         * image after it. */
+        TSNode first = na ? ts_node_named_child(args, 0) : (TSNode){0};
+        hv_t target = na ? he_eval(st, fr, first) : piped ? *piped : HV_UNKNOWN;
+        /* what goes into it: own too, or the map now holds another's */
+        bool put_own = true;
+        for (uint32_t i = SKIP_ONE; i < na + (piped && na ? SKIP_ONE : 0); i++) {
+            hv_t v = i < na ? he_eval(st, fr, ts_node_named_child(args, i)) : *piped;
+            put_own = put_own && (v.own || (v.k != HV_UNK && !hv_is_map(&v) && !hv_is_list(&v)));
+        }
+        bool held = ts_node_is_null(first) || hn_is(first, "variable") || hn_is(first, "dot") ||
+                    hn_is(first, "field") || hn_is(first, "selector_expression");
+        /* a known map is poisoned even when own: what it holds is not known now */
+        bool poisoned = hst_poison(st, &target, fn[0] == 'm');
+        if (!poisoned && !target.own && (held || hv_is_map(&target))) {
+            st->tainted = true;
+        }
+        /* the changed map is what set / merge return */
+        return target.own && put_own ? HV_UNKNOWN_OWN : HV_UNKNOWN;
+    }
     bool lazy = strcmp(fn, "and") == 0 || strcmp(fn, "or") == 0;
     if (lazy) {
         hv_t v = HV_UNKNOWN;
@@ -2485,7 +3114,7 @@ static hv_t he_literal_int(hframe_t *fr, TSNode n) {
 }
 
 static hv_t he_eval(hst_t *st, hframe_t *fr, TSNode n) {
-    if (ts_node_is_null(n) || ts_node_has_error(n) || ts_node_is_missing(n)) {
+    if (ts_node_is_null(n) || ts_node_has_error(n) || ts_node_is_missing(n) || !hst_step(st)) {
         return HV_UNKNOWN;
     }
     const char *t = ts_node_type(n);
@@ -2593,7 +3222,7 @@ static void he_item(hst_t *st, hframe_t *fr, TSNode c);
 /* The named children of `parent` in field `field` (NULL: every one). */
 static void he_items(hst_t *st, hframe_t *fr, TSNode parent, const char *field) {
     uint32_t cc = ts_node_child_count(parent);
-    for (uint32_t i = 0; i < cc && !st->brk && !st->cont; i++) {
+    for (uint32_t i = 0; i < cc && !st->brk && !st->cont && hst_step(st); i++) {
         TSNode c = ts_node_child(parent, i);
         if (!ts_node_is_named(c)) {
             continue;
@@ -2603,6 +3232,140 @@ static void he_items(hst_t *st, hframe_t *fr, TSNode parent, const char *field) 
             continue;
         }
         he_item(st, fr, c);
+    }
+}
+
+/* Is expression x deep-new (f: what the scan saw made new), or a variable of
+ * frame fr whose value is own? */
+static bool he_part_own(hst_t *st, hframe_t *fr, const hfresh_t *f, TSNode x) {
+    if (he_deep_value(f, fr->src, x, 0)) {
+        return true;
+    }
+    if (!hn_is(x, "variable")) {
+        return false;
+    }
+    size_t l = 0;
+    const char *name = hn_var_name(fr, x, &l);
+    hvar_t *v = hst_var(st, fr, name, l);
+    return v && v->v.own;
+}
+
+/* Does assigning expression `value` to variable var keep it own (when it is):
+ * a deep-new value, or a set / merge of var itself with own values
+ * (`$dst = ... | fromYaml | merge $dst`)? */
+static bool he_assign_owns(hst_t *st, hframe_t *fr, const hfresh_t *f, TSNode var, TSNode value) {
+    const char *src = fr->src;
+    if (he_deep_value(f, src, value, 0)) {
+        return true;
+    }
+    while (hn_is(value, "parenthesized_pipeline") && ts_node_named_child_count(value) == SKIP_ONE) {
+        value = ts_node_named_child(value, 0);
+    }
+    TSNode call = value;
+    TSNode piped = {0};
+    if (hn_is(value, "chained_pipeline")) {
+        uint32_t c = ts_node_named_child_count(value);
+        if (c < PAIR_LEN) {
+            return false;
+        }
+        call = ts_node_named_child(value, c - SKIP_ONE);
+        piped = ts_node_named_child(value, c - PAIR_LEN);
+    }
+    size_t fl = 0;
+    const char *fs = hn_is(call, "function_call") ? he_fn_text(src, call, &fl) : NULL;
+    TSNode args = fs && he_mutator(fs, fl) ? hn_field(call, "arguments") : (TSNode){0};
+    uint32_t na = ts_node_is_null(args) ? 0 : ts_node_named_child_count(args);
+    TSNode first = na ? ts_node_named_child(args, 0) : (TSNode){0};
+    if (!hn_is(first, "variable")) {
+        return false;
+    }
+    size_t al = 0;
+    size_t bl = 0;
+    const char *as = he_var_text(src, first, &al);
+    const char *bs = he_var_text(src, var, &bl);
+    if (al != bl || memcmp(as, bs, al) != 0) {
+        return false;
+    }
+    for (uint32_t i = SKIP_ONE; i < na; i++) {
+        if (!he_part_own(st, fr, f, ts_node_named_child(args, i))) {
+            return false;
+        }
+    }
+    return ts_node_is_null(piped) || he_part_own(st, fr, f, piped);
+}
+
+/* The variables of the frames around n that n assigns (`$x = ...`) become
+ * UNKNOWN (an own one stays own when what n gives it keeps it so); true when
+ * n would leave the loop around it -- a break / continue not inside a range
+ * of n's own (`in_range`: n is a range's body). */
+static bool he_scan_skipped(hst_t *st, hframe_t *fr, TSNode n, bool in_range) {
+    TSTreeCursor cur = ts_tree_cursor_new(n);
+    hfresh_t fresh = {0}; /* variables n makes new */
+    bool leave = false;
+    bool more = true;
+    while (more && hst_step(st)) {
+        TSNode c = ts_tree_cursor_current_node(&cur);
+        const char *t = ts_node_type(c);
+        if (strcmp(t, "variable_definition") == 0) {
+            he_fresh_note(st, &fresh, fr->src, c);
+        } else if (strcmp(t, "assignment") == 0) {
+            TSNode var = hn_field(c, "variable");
+            size_t l = 0;
+            const char *name = ts_node_is_null(var) ? NULL : hn_var_name(fr, var, &l);
+            hvar_t *v = name ? hst_var(st, fr, name, l) : NULL;
+            if (v) {
+                bool keeps = v->v.own && he_assign_owns(st, fr, &fresh, var, hn_field(c, "value"));
+                v->v = keeps ? HV_UNKNOWN_OWN : HV_UNKNOWN;
+            }
+        } else if (strcmp(t, "break_action") == 0 || strcmp(t, "continue_action") == 0) {
+            /* a range around it inside n (n itself included) is the one it leaves */
+            bool own = in_range || hn_is(n, "range_action");
+            for (TSNode p = c; !own && !ts_node_eq(p, n) && !ts_node_is_null(p);) {
+                p = ts_node_parent(p);
+                own = hn_is(p, "range_action");
+            }
+            leave = leave || !own;
+        }
+        if (ts_tree_cursor_goto_first_child(&cur)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cur)) {
+            if (!ts_tree_cursor_goto_parent(&cur)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cur);
+    return leave;
+}
+
+/* The bodies of if / with / range n, not run because its condition or
+ * collection is UNKNOWN (that one was run): their output, the variables they
+ * would assign and a change they would make are UNKNOWN; a loop they would
+ * leave is left now (its later iterations are not known). */
+static void he_skipped(hst_t *st, hframe_t *fr, TSNode n) {
+    hst_out_unknown(st, fr);
+    bool range = hn_is(n, "range_action");
+    bool with = hn_is(n, "with_action");
+    bool leave = false;
+    bool mutates = false;
+    uint32_t cc = ts_node_child_count(n);
+    for (uint32_t i = 0; i < cc; i++) {
+        TSNode c = ts_node_child(n, i);
+        const char *f = ts_node_field_name_for_child(n, i);
+        if (!ts_node_is_named(c) || hn_is(c, "range_variable_definition") ||
+            (f && (strcmp(f, "condition") == 0 || strcmp(f, "range") == 0))) {
+            continue;
+        }
+        leave = he_scan_skipped(st, fr, c, range) || leave;
+        mutates = mutates || he_may_mutate(st, fr->src, c, st->nesting, fr, !range && !with);
+    }
+    if (mutates) {
+        st->tainted = true;
+    }
+    if (leave) {
+        st->brk = true;
     }
 }
 
@@ -2630,10 +3393,10 @@ static void he_branches(hst_t *st, hframe_t *fr, TSNode n, bool with) {
                 continue;
             }
             hv_t v = he_eval(st, fr, c);
-            if (v.k == HV_UNK) {
+            if (v.k == HV_UNK || hv_poisoned(st, &v)) {
                 stop = true;
                 active = false;
-                hst_out_unknown(st, fr); /* which branch renders is unknown */
+                he_skipped(st, fr, n); /* which branch renders is unknown */
                 continue;
             }
             active = hv_truth(&v);
@@ -2670,18 +3433,18 @@ static void he_range(hst_t *st, hframe_t *fr, TSNode n) {
         ivar = (TSNode){0};
     }
     hv_t coll = he_eval(st, fr, expr);
-    if (coll.k == HV_UNK) {
-        hst_out_unknown(st, fr);
+    if (coll.k == HV_UNK || hv_poisoned(st, &coll)) {
+        he_skipped(st, fr, n);
         return;
     }
     hv_t *items = NULL;
     const char **keys = NULL;
-    int count = 0;
+    int64_t count = 0;
     bool is_map = hv_is_map(&coll);
     if (is_map) {
         count = hv_keys(st, &coll, &keys);
     } else if (coll.k == HV_INT) {
-        count = coll.i > 0 ? (int)coll.i : 0;
+        count = coll.i > 0 ? coll.i : 0;
     } else {
         count = hv_items(st, &coll, &items);
     }
@@ -2693,7 +3456,7 @@ static void he_range(hst_t *st, hframe_t *fr, TSNode n) {
     size_t el = 0;
     const char *iname = ts_node_is_null(ivar) ? NULL : hn_var_name(fr, ivar, &il);
     const char *ename = ts_node_is_null(evar) ? NULL : hn_var_name(fr, evar, &el);
-    for (int k = 0; k < count; k++) {
+    for (int64_t k = 0; k < count && hst_step(st); k++) {
         int mark = st->nvars;
         hv_t elem;
         hv_t index;
@@ -2742,8 +3505,13 @@ static void he_template(hst_t *st, hframe_t *fr, TSNode n) {
     }
     name[k] = '\0';
     hv_t a = ts_node_is_null(arg) ? hv_nil() : he_eval(st, fr, arg);
-    if (a.k == HV_UNK) {
+    if (a.k == HV_UNK || hv_poisoned(st, &a)) {
         hst_out_unknown(st, fr);
+        /* the define not run: a change it would make to its argument is
+         * missed, unless that one is own */
+        if (!a.own && he_define_may_mutate(st, name, st->nesting)) {
+            st->tainted = true;
+        }
         return;
     }
     if (fr->out) {
@@ -2837,17 +3605,16 @@ static hv_t hv_cstr(const char *s) {
     return s ? hv_str(s, strlen(s)) : hv_nil();
 }
 
-void cbm_helm_render(CBMArena *a, const char *rel, const char *src, size_t len,
+bool cbm_helm_render(CBMArena *a, const char *rel, const char *src, size_t len,
                      yyjson_mut_val *values, const cbm_helm_chart_meta_t *chart,
                      const cbm_helm_defines_t *defs, cbm_helm_probe_t *probes, int nprobes) {
-    (void)rel;
     for (int i = 0; i < nprobes; i++) {
         probes[i].n = 0;
         probes[i].image = NULL;
         probes[i].keys = NULL;
     }
     if (!src || nprobes == 0) {
-        return;
+        return true;
     }
     hst_t st = {.a = a,
                 .defs = defs,
@@ -2866,7 +3633,7 @@ void cbm_helm_render(CBMArena *a, const char *rel, const char *src, size_t len,
         if (st.scratch) {
             yyjson_mut_doc_free(st.scratch);
         }
-        return;
+        return true;
     }
     int nl = SKIP_ONE;
     for (size_t i = 0; i < len; i++) {
@@ -2909,4 +3676,20 @@ void cbm_helm_render(CBMArena *a, const char *rel, const char *src, size_t len,
     }
     ts_parser_delete(st.parser);
     yyjson_mut_doc_free(st.scratch);
+    if (st.mutates) {
+        cbm_ht_free(st.mutates);
+    }
+    if (st.stop) {
+        /* Helm would not finish this template: none of its images is known,
+         * also those captured before the budget ran out */
+        for (int i = 0; i < nprobes; i++) {
+            for (int c = 0; c < probes[i].n; c++) {
+                probes[i].image[c] = NULL;
+                probes[i].keys[c] = NULL;
+            }
+        }
+        cbm_log_warn("helm.render.budget", "file", rel ? rel : "", "reason",
+                     st.steps > HELM_MAX_STEPS ? "steps" : "output");
+    }
+    return !st.stop;
 }

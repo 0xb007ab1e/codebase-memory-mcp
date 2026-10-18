@@ -4766,6 +4766,351 @@ TEST(probe_helm_release_images) {
     PASS();
 }
 
+/* The chart every release test below deploys: an image from two values. */
+#define GPF_APP_CHART                                                                              \
+    {"charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n"},                      \
+        {"charts/app/values.yaml", "image:\n  repository: ghcr.io/acme/app\n  tag: \"1.0\"\n"},    \
+    {                                                                                              \
+        "charts/app/templates/deploy.yaml",                                                        \
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n"  \
+            "    spec:\n      containers:\n        - name: app\n"                                  \
+            "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"        \
+    }
+
+/* The edges of the chart's defaults (every test below has them). */
+#define GPF_APP_DEFAULTS                                                                           \
+    "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart ref=image "                     \
+    "default_of=[\"image.repository\",\"image.tag\"]\n"                                            \
+    "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 "          \
+    "ref=image default_of=[\"image.repository\",\"image.tag\"]"
+
+/* A Terraform number set on a helm_release reaches the chart as the string
+ * Terraform makes of it -- its exact decimal (1.1, 1.10 -> "1.1", 2e3 ->
+ * "2000"), never a float's %.17g ("1.1000000000000001"). */
+TEST(probe_helm_release_terraform_number_set) {
+    static const GpfFile files[] = {
+        GPF_APP_CHART,
+        {"tf/main.tf", "resource \"helm_release\" \"app\" {\n  name  = \"app\"\n"
+                       "  chart = \"../charts/app\"\n  set {\n    name  = \"image.tag\"\n"
+                       "    value = 1.10\n  }\n}\n"}};
+    static const char want[] =
+        "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart ref=image "
+        "default_of=[\"image.repository\",\"image.tag\"]\n"
+        "Class:resource.helm_release.app -> Image:ghcr.io/acme/app DEPLOYS "
+        "image=ghcr.io/acme/app:1.1 via=terraform ref=image override_of=[\"image.tag\"]\n"
+        "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 "
+        "ref=image default_of=[\"image.repository\",\"image.tag\"]";
+    if (!gpf_expect_image_edges(files, 4, want)) {
+        FAIL("a Terraform number set is its exact decimal");
+    }
+    PASS();
+}
+
+/* A Flux HelmRelease whose values also come from a source not read --
+ * valuesFrom, the chart's valuesFiles, a postRenderer that may patch the
+ * images -- renders no image of its own: its values are not known whole. */
+TEST(probe_helm_release_flux_unread_sources) {
+    static const GpfFile files[] = {
+        GPF_APP_CHART,
+        {"flux/app.yaml",
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: files\n"
+         "spec:\n  chart:\n    spec:\n      chart: ./charts/app\n      valuesFiles:\n"
+         "        - charts/app/values-prod.yaml\n      sourceRef:\n        kind: GitRepository\n"
+         "        name: repo\n  values:\n    image:\n      tag: \"9.9\"\n---\n"
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: from\n"
+         "spec:\n  chart:\n    spec:\n      chart: ./charts/app\n      sourceRef:\n"
+         "        kind: GitRepository\n        name: repo\n  valuesFrom:\n"
+         "    - kind: ConfigMap\n      name: app-values\n  values:\n    image:\n"
+         "      tag: \"8.8\"\n---\n"
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: post\n"
+         "spec:\n  chart:\n    spec:\n      chart: ./charts/app\n      sourceRef:\n"
+         "        kind: GitRepository\n        name: repo\n  postRenderers:\n"
+         "    - kustomize:\n        images:\n          - name: ghcr.io/acme/app\n"
+         "            newName: quay.io/acme/app\n  values:\n    image:\n      tag: \"7.7\"\n"}};
+    if (!gpf_expect_image_edges(files, 4, GPF_APP_DEFAULTS)) {
+        FAIL("a HelmRelease with a source not read has no image of its own");
+    }
+    PASS();
+}
+
+/* A kustomize helmCharts entry with additionalValuesFiles, or a valuesMerge
+ * other than the default override, renders no image of its own. */
+TEST(probe_helm_release_kustomize_unread_sources) {
+    static const GpfFile files[] = {
+        {"kz/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nhelmCharts:\n"
+         "  - name: app\n    releaseName: more\n    additionalValuesFiles:\n"
+         "      - extra.yaml\n    valuesInline:\n      image:\n        tag: \"5.5\"\n"
+         "  - name: app\n    releaseName: merged\n    valuesMerge: merge\n"
+         "    valuesInline:\n      image:\n        tag: \"6.6\"\n"},
+        {"kz/charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n"},
+        {"kz/charts/app/values.yaml", "image:\n  repository: ghcr.io/acme/app\n  tag: \"1.0\"\n"},
+        {"kz/charts/app/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: app\n"
+         "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"}};
+    if (!gpf_expect_image_edges(files, 4, GPF_APP_DEFAULTS)) {
+        FAIL("a helmCharts entry with a part not read has no image of its own");
+    }
+    PASS();
+}
+
+/* A Terraform helm_release with a `dynamic "set"` block (entries made by a
+ * for_each) renders no image of its own, whatever its literal sets say. */
+TEST(probe_helm_release_terraform_dynamic_set) {
+    static const GpfFile files[] = {
+        GPF_APP_CHART,
+        {"tf/main.tf", "resource \"helm_release\" \"app\" {\n  name  = \"app\"\n"
+                       "  chart = \"../charts/app\"\n  dynamic \"set\" {\n"
+                       "    for_each = var.sets\n    content {\n      name  = set.key\n"
+                       "      value = set.value\n    }\n  }\n  set {\n    name  = \"image.tag\"\n"
+                       "    value = \"3.3\"\n  }\n}\n"}};
+    if (!gpf_expect_image_edges(files, 4, GPF_APP_DEFAULTS)) {
+        FAIL("a helm_release with a dynamic set has no image of its own");
+    }
+    PASS();
+}
+
+/* A subchart a dependency aliases renders with .Chart.Name its alias (Helm's
+ * getAliasDependency), so an image naming the chart names the alias. */
+TEST(probe_helm_aliased_subchart_chart_name) {
+    static const GpfFile files[] = {
+        {"charts/app/Chart.yaml",
+         "apiVersion: v2\nname: app\nversion: 1.0.0\ndependencies:\n  - name: worker\n"
+         "    version: 0.1.0\n    alias: worker-high\n"},
+        {"charts/app/values.yaml", "worker-high: {}\n"},
+        {"charts/app/charts/worker/Chart.yaml",
+         "apiVersion: v2\nname: worker\nversion: 0.1.0\nappVersion: \"1.0\"\n"},
+        {"charts/app/charts/worker/values.yaml", "{}\n"},
+        {"charts/app/charts/worker/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: worker\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: worker\n"
+         "          image: \"ghcr.io/acme/{{ .Chart.Name }}:{{ .Chart.AppVersion }}\"\n"}};
+    static const char want[] =
+        "Chart:worker -> Image:ghcr.io/acme/worker-high DEPLOYS image=- via=chart ref=image\n"
+        "Resource:Deployment/worker -> Image:ghcr.io/acme/worker-high USAGE "
+        "image=ghcr.io/acme/worker-high:1.0 ref=image";
+    if (!gpf_expect_image_edges(files, 5, want)) {
+        FAIL("an aliased subchart's .Chart.Name is the alias");
+    }
+    PASS();
+}
+
+/* An image read from a values list keeps its mark on the chart's edge:
+ * default_of names the list paths (images[0].repository) whole. */
+TEST(probe_helm_list_path_mark_on_chart_edge) {
+    static const GpfFile files[] = {
+        {"charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n"},
+        {"charts/app/values.yaml",
+         "images:\n  - repository: ghcr.io/acme/app\n    tag: \"1.0\"\n"},
+        {"charts/app/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: app\n"
+         "          image: \"{{ (index .Values.images 0).repository }}:"
+         "{{ (index .Values.images 0).tag }}\"\n"}};
+    static const char want[] =
+        "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart ref=image "
+        "default_of=[\"images\",\"images[0].repository\",\"images[0].tag\"]\n"
+        "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 "
+        "ref=image default_of=[\"images\",\"images[0].repository\",\"images[0].tag\"]";
+    if (!gpf_expect_image_edges(files, 3, want)) {
+        FAIL("a list path's mark is kept whole on the chart edge");
+    }
+    PASS();
+}
+
+/* gpf_image_edges with symlinks laid in after the files: links[i] names a
+ * repository path and the absolute or relative target it points at. */
+static char *gpf_image_edges_linked(const GpfFile *files, int nfiles, const GpfFile *links,
+                                    int nlinks) {
+    GpfProj lp;
+    memset(&lp, 0, sizeof(lp));
+    snprintf(lp.tmpdir, sizeof(lp.tmpdir), "/tmp/cbm_gpf_XXXXXX");
+    if (!cbm_mkdtemp(lp.tmpdir)) {
+        return NULL;
+    }
+    gpf_to_fwd_slashes(lp.tmpdir);
+    for (int i = 0; i < nfiles + nlinks; i++) {
+        const GpfFile *f = i < nfiles ? &files[i] : &links[i - nfiles];
+        char path[700];
+        snprintf(path, sizeof(path), "%s/%s", lp.tmpdir, f->name);
+        char *slash = strrchr(path, '/');
+        if (slash && slash > path + strlen(lp.tmpdir)) {
+            *slash = '\0';
+            cbm_mkdir_p(path, 0755);
+            *slash = '/';
+        }
+        if (i >= nfiles) {
+            if (symlink(f->content, path) != 0) {
+                return NULL;
+            }
+            continue;
+        }
+        FILE *fp = fopen(path, "wb");
+        if (!fp) {
+            return NULL;
+        }
+        fputs(f->content, fp);
+        fclose(fp);
+    }
+    cbm_store_t *store = gpf_open_indexed(&lp);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT s.label || ':' || s.name "
+            "|| ' -> Image:' || t.name || ' ' || e.type || ' image=' || "
+            "coalesce(json_extract(e.properties,'$.image'),'-') || "
+            "coalesce(' via=' || json_extract(e.properties,'$.via'), '') AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND t.label='Image' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A values file a chart, a kustomization or a Terraform file() names by path
+ * is read only when it is a file of the repository: a symlink out of it --
+ * to a file holding an image -- is never followed. The chart whose values
+ * file is such a link renders nothing (its values are unknown, not empty);
+ * the releases reading one have no image of their own. */
+TEST(probe_helm_values_symlink_not_followed) {
+    char outside[256];
+    snprintf(outside, sizeof(outside), "/tmp/cbm_gpf_out_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(outside));
+    char leak[300];
+    snprintf(leak, sizeof(leak), "%s/values.yaml", outside);
+    FILE *lf = fopen(leak, "wb");
+    ASSERT_NOT_NULL(lf);
+    fputs("image:\n  repository: ghcr.io/evil/leak\n  tag: \"6.6\"\n", lf);
+    fclose(lf);
+    const GpfFile files[] = {
+        GPF_APP_CHART,
+        {"linked/Chart.yaml", "apiVersion: v2\nname: linked\nversion: 1.0.0\n"},
+        {"linked/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: linked\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: linked\n"
+         "          image: \"ghcr.io/acme/linked:{{ .Values.tag | default \"latest\" }}\"\n"},
+        {"kz/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nhelmCharts:\n"
+         "  - name: app\n    releaseName: kapp\n    valuesFile: prod.yaml\n"},
+        {"kz/charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n"},
+        {"kz/charts/app/values.yaml", "image:\n  repository: ghcr.io/acme/app\n  tag: \"1.0\"\n"},
+        {"kz/charts/app/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: kapp\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: app\n"
+         "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"}};
+    const GpfFile links[] = {{"linked/values.yaml", leak}, {"kz/prod.yaml", leak}};
+    char *got = gpf_image_edges_linked(files, 9, links, 2);
+    th_rmtree(outside);
+    static const char want[] =
+        "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart\n"
+        "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart\n"
+        "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0\n"
+        "Resource:Deployment/kapp -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0";
+    bool ok = got && strcmp(got, want) == 0;
+    if (!ok) {
+        fprintf(stderr, "image edges got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+    }
+    free(got);
+    if (!ok) {
+        FAIL("no values read through a symlink out of the repository");
+    }
+    PASS();
+}
+
+/* A Terraform helm_release reading its values with file() of a symlink out
+ * of the repository has no image of its own: the link is never followed. */
+TEST(probe_helm_terraform_values_symlink_not_followed) {
+    char outside[256];
+    snprintf(outside, sizeof(outside), "/tmp/cbm_gpf_out_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(outside));
+    char leak[300];
+    snprintf(leak, sizeof(leak), "%s/vals.yaml", outside);
+    FILE *lf = fopen(leak, "wb");
+    ASSERT_NOT_NULL(lf);
+    fputs("image:\n  repository: ghcr.io/evil/leak\n  tag: \"6.6\"\n", lf);
+    fclose(lf);
+    const GpfFile files[] = {
+        GPF_APP_CHART,
+        {"tf/main.tf", "resource \"helm_release\" \"app\" {\n  name   = \"app\"\n"
+                       "  chart  = \"../charts/app\"\n  values = [file(\"vals.yaml\")]\n}\n"}};
+    const GpfFile links[] = {{"tf/vals.yaml", leak}};
+    char *got = gpf_image_edges_linked(files, 4, links, 1);
+    th_rmtree(outside);
+    static const char want[] =
+        "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart\n"
+        "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0";
+    bool ok = got && strcmp(got, want) == 0;
+    if (!ok) {
+        fprintf(stderr, "image edges got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+    }
+    free(got);
+    if (!ok) {
+        FAIL("no Terraform values read through a symlink out of the repository");
+    }
+    PASS();
+}
+
+/* A build argument holding a secret -- by its name (*_TOKEN) or its value (a
+ * GitHub token) -- is never kept on a build edge; the others still choose the
+ * base image they set. */
+TEST(probe_docker_build_args_keep_no_secret) {
+    static const GpfFile files[] = {
+        {"web/Dockerfile", "ARG GO=1.22\nFROM golang:${GO}\n"},
+        {"api/Dockerfile", "ARG PY=3.12\nFROM python:${PY}-slim\n"},
+        {".env", "NPM_TOKEN=npm-secret-value\n"},
+        {"compose.yaml", "services:\n  web:\n    image: ghcr.io/acme/web\n    build:\n"
+                         "      context: ./web\n      args:\n        NPM_TOKEN: ${NPM_TOKEN}\n"
+                         "        GO: \"1.23\"\n"},
+        {"scripts/build.sh",
+         "#!/bin/sh\ndocker build --build-arg CI_KEY=ghp_abcdefghijklmnopqrstuvwxyz0123456789AB "
+         "--build-arg PY=3.13 -t ghcr.io/acme/api:1 api\n"}};
+    int secrets = gpf_query_int(files, 5,
+                                "SELECT count(*) FROM edges WHERE project=?1 AND "
+                                "(properties LIKE '%npm-secret-value%' OR properties LIKE "
+                                "'%ghp_abcdefghij%' OR properties LIKE '%NPM_TOKEN%')");
+    int overrides = gpf_query_int(files, 5,
+                                  "SELECT count(*) FROM edges WHERE project=?1 AND "
+                                  "json_extract(properties,'$.override_of') IS NOT NULL");
+    ASSERT_EQ(secrets, 0);
+    ASSERT_EQ(overrides, 2);
+    PASS();
+}
+
+/* Build arguments of any length are kept whole on the build edge (never cut
+ * to malformed JSON): the one choosing the base still makes its edge. */
+TEST(probe_docker_long_build_args_kept_whole) {
+    enum { ARGS = 40, VAL = 150, CAP = ARGS * (VAL + 40) + 512 };
+    char *script = malloc(CAP);
+    ASSERT_NOT_NULL(script);
+    int o = snprintf(script, CAP, "#!/bin/sh\ndocker build");
+    char val[VAL + 1];
+    memset(val, 'v', VAL);
+    val[VAL] = '\0';
+    for (int i = 0; i < ARGS; i++) {
+        o += snprintf(script + o, (size_t)(CAP - o), " --build-arg LABEL%d=%s", i, val);
+    }
+    snprintf(script + o, (size_t)(CAP - o), " --build-arg PY=3.13 -t ghcr.io/acme/api:1 api\n");
+    const GpfFile files[] = {{"api/Dockerfile", "ARG PY=3.12\nFROM python:${PY}-slim\n"},
+                             {"scripts/build.sh", script}};
+    int overrides =
+        gpf_query_int(files, 2,
+                      "SELECT count(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+                      "e.project=?1 AND t.name='python' AND "
+                      "json_extract(e.properties,'$.override_of') IS NOT NULL");
+    free(script);
+    ASSERT_EQ(overrides, 1);
+    PASS();
+}
+
 /* A template's `include "name"` calls the define of that name in its chart
  * family -- the chart and its subcharts share one template namespace -- never
  * a same-named define of an unrelated chart; a define may also be written in
@@ -6580,6 +6925,16 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_docker_default_images_marked_and_overrides);
     RUN_TEST(probe_helm_template_images_render_with_defaults);
     RUN_TEST(probe_helm_release_images);
+    RUN_TEST(probe_helm_release_terraform_number_set);
+    RUN_TEST(probe_helm_release_flux_unread_sources);
+    RUN_TEST(probe_helm_release_kustomize_unread_sources);
+    RUN_TEST(probe_helm_release_terraform_dynamic_set);
+    RUN_TEST(probe_helm_aliased_subchart_chart_name);
+    RUN_TEST(probe_helm_list_path_mark_on_chart_edge);
+    RUN_TEST(probe_helm_values_symlink_not_followed);
+    RUN_TEST(probe_helm_terraform_values_symlink_not_followed);
+    RUN_TEST(probe_docker_build_args_keep_no_secret);
+    RUN_TEST(probe_docker_long_build_args_kept_whole);
     RUN_TEST(probe_helm_include_resolves_in_the_chart_family);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
     RUN_TEST(probe_k8s_selector_within_kustomize_build);

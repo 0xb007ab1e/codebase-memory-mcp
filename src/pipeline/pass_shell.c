@@ -2489,7 +2489,8 @@ static const char *sh_image_repo(sh_t *s, TSNode cmd, const sh_argv_t *a, int i)
 }
 
 /* JSON object `json` (NULL: none) with build argument `kv` ("K=V") added; a
- * `K` alone (the environment's value) or an unknown word adds nothing. */
+ * `K` alone (the environment's value), an unknown word or a secret (by name
+ * or value -- never kept in the graph, never an image) adds nothing. */
 static const char *sh_build_arg(sh_t *s, const char *json, const char *kv) {
     const char *eq = kv ? strchr(kv, '=') : NULL;
     if (!eq || eq == kv) {
@@ -2500,8 +2501,17 @@ static const char *sh_build_arg(sh_t *s, const char *json, const char *kv) {
             return json;
         }
     }
-    char ev[CBM_SZ_1K];
-    cbm_json_escape(ev, (int)sizeof(ev), eq + SKIP_ONE);
+    const char *key = cbm_arena_strndup(s->a, kv, (size_t)(eq - kv));
+    if (!key || cbm_is_secret_binding(key, eq + SKIP_ONE)) {
+        return json;
+    }
+    /* JSON escaping writes at most 6 bytes a byte: nothing is cut */
+    int vn = (int)(strlen(eq + SKIP_ONE) * 6 + SKIP_ONE);
+    char *ev = cbm_arena_alloc(s->a, (size_t)vn);
+    if (!ev) {
+        return json;
+    }
+    cbm_json_escape(ev, vn, eq + SKIP_ONE);
     const char *pair = cbm_arena_sprintf(s->a, "\"%.*s\":\"%s\"", (int)(eq - kv), kv, ev);
     if (!pair) {
         return json;
@@ -3763,17 +3773,25 @@ static int sh_link_build(cbm_pipeline_ctx_t *ctx, const sh_hit_t *x, CBMHashTabl
     char esc_file[CBM_SZ_1K];
     char esc_img[CBM_SZ_1K];
     char ci[CBM_SZ_1K];
-    char props[CBM_SZ_4K];
     cbm_json_escape(esc_file, (int)sizeof(esc_file), x->file);
     cbm_json_escape(esc_img, (int)sizeof(esc_img), x->ext);
     sh_ci_props(x, ci, sizeof(ci));
-    snprintf(props, sizeof(props),
+    /* sized to what it holds: default_of and build_args are never cut */
+    size_t pn = strlen(esc_file) + strlen(esc_img) + strlen(ci) +
+                (x->default_of ? strlen(x->default_of) : 0) +
+                (x->build_args ? strlen(x->build_args) : 0) + CBM_SZ_256;
+    char *props = cbm_alloc(CBM_MEM_CLASS_OTHER, pn);
+    if (!props) {
+        return 0;
+    }
+    snprintf(props, pn,
              "{\"via\":\"build\",\"tool\":\"docker-build\",\"file\":\"%s\",\"image\":\"%s\"%s,"
              "\"line\":%d%s%s%s%s}",
              esc_file, esc_img, ci, x->line, x->default_of ? ",\"default_of\":" : "",
              x->default_of ? x->default_of : "", x->build_args ? ",\"build_args\":" : "",
              x->build_args ? x->build_args : "");
     cbm_gbuf_insert_edge(ctx->gbuf, img, mod, "DEPENDS_ON", props);
+    cbm_free(CBM_MEM_CLASS_OTHER, props);
     return SKIP_ONE;
 }
 

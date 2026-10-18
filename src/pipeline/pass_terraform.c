@@ -31,6 +31,7 @@
 #include "helpers.h"
 #include "lang_specs.h"
 
+#include <ctype.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -330,9 +331,96 @@ static char *tf_heredoc(const tf_t *t, TSNode n) {
     return out;
 }
 
+/* HCL number literal s (digits, a fraction, an exponent) as Terraform turns a
+ * number into a string: exact decimal, no exponent, no trailing zeros (cty's
+ * big.Float Text('f', -1); 1.10 -> "1.1", 2e3 -> "2000"). False when it is
+ * no such literal or does not fit out. */
+static bool tf_number_text(const char *s, size_t n, char *out, size_t sz) {
+    enum { TF_MAX_EXP = 4096 };
+    char dig[CBM_SZ_256];
+    size_t nd = 0;
+    long exp = 0;
+    bool frac = false;
+    size_t i = 0;
+    for (; i < n && (isdigit((unsigned char)s[i]) || s[i] == '.'); i++) {
+        if (s[i] == '.') {
+            if (frac) {
+                return false;
+            }
+            frac = true;
+            continue;
+        }
+        if (nd + SKIP_ONE >= sizeof(dig)) {
+            return false;
+        }
+        dig[nd++] = s[i];
+        exp -= frac ? SKIP_ONE : 0;
+    }
+    if (i < n) {
+        if (s[i] != 'e' && s[i] != 'E') {
+            return false;
+        }
+        i++;
+        bool neg = i < n && s[i] == '-';
+        i += i < n && (s[i] == '-' || s[i] == '+');
+        long e = 0;
+        if (i == n) {
+            return false;
+        }
+        for (; i < n; i++) {
+            if (!isdigit((unsigned char)s[i]) || e > TF_MAX_EXP) {
+                return false;
+            }
+            e = e * 10 + (s[i] - '0');
+        }
+        exp += neg ? -e : e;
+    }
+    size_t b = 0;
+    while (b < nd && dig[b] == '0') {
+        b++;
+    }
+    if (b == nd) {
+        return snprintf(out, sz, "0") == SKIP_ONE; /* every digit 0 (or none) */
+    }
+    size_t e = nd;
+    while (dig[e - SKIP_ONE] == '0') { /* stops at dig[b], which is no 0 */
+        e--;
+        exp++;
+    }
+    size_t m = e - b; /* significant digits: dig[b, e) x 10^exp */
+    size_t o = 0;
+    long point = (long)m + exp; /* digits before the decimal point */
+    size_t need = exp >= 0    ? m + (size_t)exp
+                  : point > 0 ? m + SKIP_ONE
+                              : m + PAIR_LEN + (size_t)-point;
+    if (need + SKIP_ONE > sz) {
+        return false;
+    }
+    if (point <= 0) {
+        out[o++] = '0';
+        out[o++] = '.';
+        for (long z = 0; z < -point; z++) {
+            out[o++] = '0';
+        }
+    }
+    for (size_t k = 0; k < m; k++) {
+        if (point > 0 && (long)k == point) {
+            out[o++] = '.';
+        }
+        out[o++] = dig[b + k];
+    }
+    for (long z = 0; z < exp; z++) {
+        out[o++] = '0';
+    }
+    out[o] = '\0';
+    return true;
+}
+
 /* An HCL literal as JSON: a string without interpolation, a number, a bool,
- * null, a tuple or object of those; NULL: anything else. */
-static yyjson_mut_val *tf_json(const tf_t *t, yyjson_mut_doc *doc, TSNode n) {
+ * null, a tuple or object of those; NULL: anything else. `num_text`: a number
+ * as the string Terraform makes of it (a helm_release set value is a string),
+ * else a float64. */
+static yyjson_mut_val *tf_json_v(const tf_t *t, yyjson_mut_doc *doc, TSNode n, bool num_text) {
     n = tf_unwrap(n);
     if (tf_type(n, "string_lit") || tf_type(n, "quoted_template")) {
         char buf[CBM_SZ_4K];
@@ -371,7 +459,11 @@ static yyjson_mut_val *tf_json(const tf_t *t, yyjson_mut_doc *doc, TSNode n) {
     uint32_t b = ts_node_start_byte(n);
     uint32_t e = ts_node_end_byte(n);
     if (tf_type(n, "numeric_lit")) {
-        char buf[CBM_SZ_64];
+        char buf[CBM_SZ_256];
+        if (num_text) {
+            return tf_number_text(t->src + b, e - b, buf, sizeof(buf)) ? yyjson_mut_strcpy(doc, buf)
+                                                                       : NULL;
+        }
         snprintf(buf, sizeof(buf), "%.*s", (int)(e - b), t->src + b);
         return yyjson_mut_real(doc, strtod(buf, NULL));
     }
@@ -388,7 +480,7 @@ static yyjson_mut_val *tf_json(const tf_t *t, yyjson_mut_doc *doc, TSNode n) {
             if (tf_type(c, "tuple_start") || tf_type(c, "tuple_end")) {
                 continue;
             }
-            yyjson_mut_val *v = tf_json(t, doc, c);
+            yyjson_mut_val *v = tf_json_v(t, doc, c, num_text);
             if (!v) {
                 return NULL;
             }
@@ -411,9 +503,9 @@ static yyjson_mut_val *tf_json(const tf_t *t, yyjson_mut_doc *doc, TSNode n) {
                 uint32_t kb = ts_node_start_byte(id);
                 key = yyjson_mut_strncpy(doc, t->src + kb, ts_node_end_byte(id) - kb);
             } else {
-                key = tf_json(t, doc, kn);
+                key = tf_json_v(t, doc, kn, false);
             }
-            yyjson_mut_val *val = tf_json(t, doc, vn);
+            yyjson_mut_val *val = tf_json_v(t, doc, vn, num_text);
             if (!key || !yyjson_mut_is_str(key) || !val) {
                 return NULL;
             }
@@ -424,38 +516,22 @@ static yyjson_mut_val *tf_json(const tf_t *t, yyjson_mut_doc *doc, TSNode n) {
     return NULL;
 }
 
-/* A repository file's text (cbm_alloc), NULL when unreadable. */
+static yyjson_mut_val *tf_json(const tf_t *t, yyjson_mut_doc *doc, TSNode n) {
+    return tf_json_v(t, doc, n, false);
+}
+
+static char *tf_read(const char *path, size_t *len);
+
+/* A repository file's text (cbm_alloc; capped and padded like every file
+ * read), NULL when unreadable -- or when it is no file discovery took in: a
+ * symlink, or a path through one, is never followed out of the repository. */
 static char *tf_read_repo(const tf_t *t, const char *path, size_t *len) {
-    char full[CBM_SZ_4K];
-    snprintf(full, sizeof(full), "%s/%s", t->ctx->repo_path, path);
-    FILE *f = cbm_fopen(full, "rb");
-    if (!f) {
+    if (!cbm_pipeline_file_node(t->ctx->gbuf, t->ctx->project_name, path)) {
         return NULL;
     }
-    char *buf = NULL;
-    size_t cap = 0;
-    char chunk[CBM_SZ_4K];
-    size_t r;
-    *len = 0;
-    while ((r = fread(chunk, SKIP_ONE, sizeof(chunk), f)) > 0) {
-        if (*len + r + SKIP_ONE > cap) {
-            cap = (*len + r + SKIP_ONE) * PAIR_LEN;
-            char *g = cbm_realloc(CBM_MEM_CLASS_OTHER, buf, cap);
-            if (!g) {
-                cbm_free(CBM_MEM_CLASS_OTHER, buf);
-                (void)fclose(f);
-                return NULL;
-            }
-            buf = g;
-        }
-        memcpy(buf + *len, chunk, r);
-        *len += r;
-    }
-    (void)fclose(f);
-    if (buf) {
-        buf[*len] = '\0';
-    }
-    return buf;
+    char full[CBM_SZ_4K];
+    int n = snprintf(full, sizeof(full), "%s/%s", t->ctx->repo_path, path);
+    return n > 0 && (size_t)n < sizeof(full) ? tf_read(full, len) : NULL;
 }
 
 /* A `values = [...]` item as values: a YAML string / heredoc, file(<path>)
@@ -512,8 +588,8 @@ static yyjson_mut_val *tf_values_item(const tf_t *t, yyjson_mut_doc *doc, TSNode
                : NULL;
 }
 
-/* A `set` entry (name / value / type) applied to root; false when it is no
- * literal. */
+/* A `set` entry (name / value / type; read with numbers as text) applied to
+ * root; false when it is no literal. */
 static bool tf_set_entry(yyjson_mut_doc *doc, yyjson_mut_val *root, yyjson_mut_val *entry) {
     yyjson_mut_val *nm = yyjson_mut_obj_get(entry, "name");
     yyjson_mut_val *val = yyjson_mut_obj_get(entry, "value");
@@ -521,13 +597,9 @@ static bool tf_set_entry(yyjson_mut_doc *doc, yyjson_mut_val *root, yyjson_mut_v
     if (!yyjson_mut_is_str(nm) || !val) {
         return false;
     }
-    char vbuf[CBM_SZ_64];
     const char *v = NULL;
     if (yyjson_mut_is_str(val)) {
         v = yyjson_mut_get_str(val);
-    } else if (yyjson_mut_is_real(val)) {
-        snprintf(vbuf, sizeof(vbuf), "%.17g", yyjson_mut_get_real(val));
-        v = vbuf;
     } else if (yyjson_mut_is_bool(val)) {
         v = yyjson_mut_get_bool(val) ? "true" : "false";
     }
@@ -550,7 +622,7 @@ static yyjson_mut_val *tf_set_block(const tf_t *t, yyjson_mut_doc *doc, TSNode b
             }
             TSNode key = ts_node_named_child(at, 0);
             uint32_t b = ts_node_start_byte(key);
-            yyjson_mut_val *v = tf_json(t, doc, ts_node_named_child(at, SKIP_ONE));
+            yyjson_mut_val *v = tf_json_v(t, doc, ts_node_named_child(at, SKIP_ONE), true);
             if (!v) {
                 return NULL;
             }
@@ -561,9 +633,29 @@ static yyjson_mut_val *tf_set_block(const tf_t *t, yyjson_mut_doc *doc, TSNode b
     return entry;
 }
 
+/* Is block `a` a `dynamic "set"` / `dynamic "set_list"` -- entries made by a
+ * for_each, never literal? */
+static bool tf_dynamic_set(const tf_t *t, TSNode a) {
+    TSNode kw = ts_node_named_child(a, 0);
+    TSNode label = ts_node_named_child(a, SKIP_ONE);
+    if (!tf_type(a, "block") || ts_node_is_null(kw) || ts_node_is_null(label)) {
+        return false;
+    }
+    uint32_t kb = ts_node_start_byte(kw);
+    if (ts_node_end_byte(kw) - kb != strlen("dynamic") ||
+        strncmp(t->src + kb, "dynamic", strlen("dynamic")) != 0) {
+        return false;
+    }
+    uint32_t lb = ts_node_start_byte(label);
+    size_t ll = ts_node_end_byte(label) - lb;
+    return (ll == strlen("\"set\"") && strncmp(t->src + lb, "\"set\"", ll) == 0) ||
+           (ll == strlen("\"set_list\"") && strncmp(t->src + lb, "\"set_list\"", ll) == 0);
+}
+
 /* The values a helm_release body gives its chart -- `values` items
  * coalesced in order, then each `set` -- as JSON (cbm_alloc); NULL when a
- * part is no literal. set_sensitive is never read. */
+ * part is no literal, or is made by a `dynamic` block. set_sensitive is
+ * never read. */
 static char *tf_release_values(const tf_t *t, TSNode body, const char ***files, int *nfiles) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(cbm_json_writer_allocator());
     yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
@@ -576,8 +668,10 @@ static char *tf_release_values(const tf_t *t, TSNode body, const char ***files, 
             size_t kl = ts_node_is_null(key) ? 0 : ts_node_end_byte(key) - kb;
             bool is_set = kl == strlen("set") && strncmp(t->src + kb, "set", kl) == 0;
             bool is_values = kl == strlen("values") && strncmp(t->src + kb, "values", kl) == 0;
-            /* set_list values are not read: the release's values are partial */
-            if (kl == strlen("set_list") && strncmp(t->src + kb, "set_list", kl) == 0) {
+            /* set_list and dynamic set values are not read: the release's
+             * values would be partial */
+            if ((kl == strlen("set_list") && strncmp(t->src + kb, "set_list", kl) == 0) ||
+                tf_dynamic_set(t, a)) {
                 ok = false;
                 break;
             }
@@ -598,7 +692,7 @@ static char *tf_release_values(const tf_t *t, TSNode body, const char ***files, 
                 ok = entry && tf_set_entry(doc, root, entry);
             } else if (pass == SKIP_ONE && is_set && tf_type(a, "attribute")) {
                 /* provider v3: set = [{ name, value, type }, ...] */
-                yyjson_mut_val *list = tf_json(t, doc, ts_node_named_child(a, SKIP_ONE));
+                yyjson_mut_val *list = tf_json_v(t, doc, ts_node_named_child(a, SKIP_ONE), true);
                 ok = yyjson_mut_is_arr(list);
                 size_t idx, max;
                 yyjson_mut_val *entry;

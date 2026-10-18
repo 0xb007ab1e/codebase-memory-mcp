@@ -4335,6 +4335,230 @@ TEST(helm_values_follow_helm_semantics) {
     PASS();
 }
 
+/* Render template tpl with values src (one probe per `image:` line given)
+ * and return the capture of probe 0 ("<UNKNOWN>" for UNKNOWN, "<none>" when
+ * nothing was captured) -- a copy, freed by the caller. */
+static char *helm_capture(const char *vals_src, const char *tpl, const cbm_helm_defines_t *defs,
+                          int line) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *v = doc ? cbm_helm_values_parse(doc, vals_src, strlen(vals_src)) : NULL;
+    CBMArena a;
+    cbm_arena_init_lazy(&a, CBM_SZ_4K);
+    cbm_helm_probe_t probe = {.line = line};
+    cbm_helm_render(&a, "t.yaml", tpl, strlen(tpl), v, NULL, defs, &probe, 1);
+    char *out = strdup(probe.n == 0 ? "<none>" : probe.image[0] ? probe.image[0] : "<UNKNOWN>");
+    cbm_arena_destroy(&a);
+    if (doc) {
+        yyjson_mut_doc_free(doc);
+    }
+    return out;
+}
+
+/* A render doing far more work than any chart -- here a range over an int
+ * of 20,000,000 -- stops at its step budget (helm_template.c): every capture
+ * of the template is UNKNOWN, also the one made before the loop, never a
+ * partial or wrong image; a range over a huge int ends the same way. */
+TEST(helm_render_range_budget_ends_unknown) {
+    static const char vals[] = "tag: \"1.0\"\n";
+    static const char ok[] = "image: \"ghcr.io/acme/app:{{ .Values.tag }}\"\n";
+    char *got = helm_capture(vals, ok, NULL, 1);
+    ASSERT_STR_EQ(got, "ghcr.io/acme/app:1.0");
+    free(got);
+    static const char rng[] = "image: \"ghcr.io/acme/app:{{ .Values.tag }}\"\n"
+                              "{{- range 20000000 }}{{ end }}\n";
+    got = helm_capture(vals, rng, NULL, 1);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    static const char huge[] = "image: \"ghcr.io/acme/app:{{ .Values.tag }}\"\n"
+                               "{{- range 2000000000 }}{{ range 2000000000 }}{{ end }}{{ end }}\n";
+    got = helm_capture(vals, huge, NULL, 1);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* An indent whose output passes the output budget stops the render: no
+ * capture of it is known (an indent of 9e18 stops before any work). */
+TEST(helm_render_indent_budget_ends_unknown) {
+    static const char big[] = "image: \"ghcr.io/acme/app{{ indent 70000000 \"\" | trim }}:1\"\n";
+    char *got = helm_capture("{}\n", big, NULL, 1);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    static const char huge[] =
+        "image: \"ghcr.io/acme/app{{ indent 9000000000000000000 \"\" | trim }}:1\"\n";
+    got = helm_capture("{}\n", huge, NULL, 1);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* Defines that each include the one below twice multiply the work by two a
+ * level: past the step budget the render stops, its captures UNKNOWN. */
+TEST(helm_render_define_fanout_ends_unknown) {
+    enum { LEVELS = 21, FAN_CAP = 8192 };
+    char *fan = malloc(FAN_CAP);
+    ASSERT_NOT_NULL(fan);
+    int o = snprintf(fan, FAN_CAP, "{{- define \"d0\" -}}x{{- end -}}\n");
+    for (int k = 1; k < LEVELS; k++) {
+        o += snprintf(fan + o, (size_t)(FAN_CAP - o),
+                      "{{- define \"d%d\" -}}{{ include \"d%d\" . }}{{ include \"d%d\" . }}"
+                      "{{- end -}}\n",
+                      k, k - 1, k - 1);
+    }
+    cbm_helm_defines_t *d = cbm_helm_defines_new();
+    ASSERT_NOT_NULL(d);
+    cbm_helm_defines_add(d, "templates/_fan.tpl", fan, strlen(fan));
+    free(fan);
+    static const char tpl[] = "image: \"ghcr.io/acme/app:{{ include \"d20\" . | trunc 1 }}\"\n";
+    char *got = helm_capture("{}\n", tpl, d, 1);
+    cbm_helm_defines_free(d);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* go-yaml v2's aliasing limit (Helm reads values with it): a document whose
+ * decodes come mostly from alias expansion -- a billion laughs -- is no
+ * values; a few aliases still read. */
+TEST(helm_values_alias_expansion_limit) {
+    enum { LEVELS = 5, BUF = 4096 };
+    char laughs[BUF];
+    int o = snprintf(laughs, sizeof(laughs), "a0: &a0 [x, x, x, x, x, x, x, x, x, x]\n");
+    for (int k = 1; k < LEVELS; k++) {
+        o += snprintf(laughs + o, sizeof(laughs) - (size_t)o, "a%d: &a%d [", k, k);
+        for (int i = 0; i < 10; i++) {
+            o += snprintf(laughs + o, sizeof(laughs) - (size_t)o, "%s*a%d", i ? ", " : "", k - 1);
+        }
+        o += snprintf(laughs + o, sizeof(laughs) - (size_t)o, "]\n");
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    ASSERT_NOT_NULL(doc);
+    static const char few[] = "base: &b {tag: \"1\"}\none: *b\ntwo: *b\n";
+    yyjson_mut_val *ok = cbm_helm_values_parse(doc, few, strlen(few));
+    yyjson_mut_val *bomb = cbm_helm_values_parse(doc, laughs, strlen(laughs));
+    yyjson_mut_doc_free(doc);
+    ASSERT_NOT_NULL(ok);
+    ASSERT_NULL(bomb);
+    PASS();
+}
+
+/* --set as Helm's strvals reads it: a list index past MaxIndex (65536) is an
+ * error, so the set is no value (a release with it is unknown) -- never a
+ * list padded to it; a key longer than the parser holds is no value either,
+ * never split into two keys. */
+TEST(helm_values_set_index_cap_and_long_key) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    ASSERT_NOT_NULL(doc);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    ASSERT_TRUE(cbm_helm_values_set(doc, root, "list[3]", "x", false));
+    ASSERT_FALSE(cbm_helm_values_set(doc, root, "big[65537]", "x", false));
+    ASSERT_FALSE(cbm_helm_values_set(doc, root, "huge[9000000000000]", "x", false));
+    char key[700];
+    memset(key, 'k', sizeof(key) - 1);
+    key[sizeof(key) - 1] = '\0';
+    ASSERT_FALSE(cbm_helm_values_set(doc, root, key, "x", false));
+    yyjson_mut_doc_free(doc);
+    PASS();
+}
+
+/* A values key longer than 1 KiB read by an image is in its default_of
+ * mark whole -- a mark is never cut. */
+TEST(helm_render_long_key_mark_whole) {
+    enum { KEY = 1500 };
+    char *key = malloc(KEY + 1);
+    ASSERT_NOT_NULL(key);
+    memset(key, 'k', KEY);
+    key[KEY] = '\0';
+    size_t vn = KEY + CBM_SZ_64;
+    char *vals = malloc(vn);
+    char *tpl = malloc(vn);
+    ASSERT_NOT_NULL(vals);
+    ASSERT_NOT_NULL(tpl);
+    snprintf(vals, vn, "%s: \"1.0\"\n", key);
+    snprintf(tpl, vn, "image: \"ghcr.io/acme/app:{{ index .Values \"%s\" }}\"\n", key);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *v = cbm_helm_values_parse(doc, vals, strlen(vals));
+    CBMArena a;
+    cbm_arena_init_lazy(&a, CBM_SZ_4K);
+    cbm_helm_probe_t probe = {.line = 1};
+    cbm_helm_render(&a, "t.yaml", tpl, strlen(tpl), v, NULL, NULL, &probe, 1);
+    char want[KEY + 8];
+    snprintf(want, sizeof(want), "[\"%s\"]", key);
+    bool whole = probe.n == 1 && probe.keys[0] && strcmp(probe.keys[0], want) == 0;
+    cbm_arena_destroy(&a);
+    yyjson_mut_doc_free(doc);
+    free(key);
+    free(vals);
+    free(tpl);
+    ASSERT_TRUE(whole);
+    PASS();
+}
+
+/* A condition that is UNKNOWN runs no branch -- and what a branch would
+ * assign is UNKNOWN after it: `$tag = .Values.image.tagNew` under a
+ * .Capabilities test leaves no image naming the old tag. */
+TEST(helm_unknown_branch_spoils_what_it_assigns) {
+    static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\", tagNew: \"2.0\"}\n";
+    static const char tpl[] =
+        "{{- $tag := .Values.image.tag -}}\n"
+        "{{- if semverCompare \">=1.29-0\" .Capabilities.KubeVersion.Version }}"
+        "{{- $tag = .Values.image.tagNew -}}{{- end }}\n"
+        "image: \"{{ .Values.image.repository }}:{{ $tag }}\"\n";
+    char *got = helm_capture(vals, tpl, NULL, 3);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* set / unset / merge change a map in place -- not modelled: what it holds
+ * after is UNKNOWN (an image read before the change keeps its value). */
+TEST(helm_mutator_spoils_the_map_it_changes) {
+    static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n";
+    static const char tpl[] = "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"
+                              "{{- $_ := set .Values.image \"tag\" \"2.0\" }}\n"
+                              "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    char *before = helm_capture(vals, tpl, NULL, 1);
+    char *after = helm_capture(vals, tpl, NULL, 3);
+    ASSERT_STR_EQ(before, "ghcr.io/acme/app:1.0");
+    ASSERT_STR_EQ(after, "<UNKNOWN>");
+    free(before);
+    free(after);
+    PASS();
+}
+
+/* A break under an UNKNOWN condition in a range: whether the loop goes on
+ * is unknown, so its later iterations are not rendered (Helm with a true
+ * condition renders no image here). */
+TEST(helm_unknown_break_leaves_the_loop) {
+    static const char tpl[] = "{{- range list \"a\" \"b\" }}\n"
+                              "{{- if .Capabilities.APIVersions }}{{ break }}{{ end }}\n"
+                              "image: \"ghcr.io/acme/{{ . }}:1\"\n"
+                              "{{ end }}\n";
+    char *got = helm_capture("{}\n", tpl, NULL, 3);
+    ASSERT_STR_EQ(got, "<none>");
+    free(got);
+    PASS();
+}
+
+/* A change made to a new value -- fromYaml / deepCopy results, a part of one,
+ * an empty dict -- reaches nothing another part holds: the images after it
+ * stay known (the opentelemetry-ebpf-instrumentation configData pattern). */
+TEST(helm_change_of_a_new_value_spoils_nothing) {
+    static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\ncfg: {a: 1}\n";
+    static const char tpl[] =
+        "{{- $config := dict -}}\n"
+        "{{- $user := deepCopy (.Values.cfg | default dict) -}}\n"
+        "{{- if .Capabilities.APIVersions }}{{- $config = toYaml .Values.cfg | fromYaml -}}"
+        "{{- $config = mergeOverwrite $config $user -}}{{- end }}\n"
+        "{{- $config = mergeOverwrite $config $user -}}\n"
+        "{{- $_ := unset (deepCopy .Values.cfg) \"a\" }}\n"
+        "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    char *got = helm_capture(vals, tpl, NULL, 6);
+    ASSERT_STR_EQ(got, "ghcr.io/acme/app:1.0");
+    free(got);
+    PASS();
+}
+
 /* A compose project's .env feeds its compose file (variables in image,
  * build): changing it is no closure repair -- the unchanged compose file's
  * services would keep the old image. It rebuilds; no stale image remains. */
@@ -24063,6 +24287,16 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_werf_values_edit_keeps_chart_edge);
     RUN_TEST(incremental_release_values_edit_rebuilds);
     RUN_TEST(helm_values_follow_helm_semantics);
+    RUN_TEST(helm_render_range_budget_ends_unknown);
+    RUN_TEST(helm_render_indent_budget_ends_unknown);
+    RUN_TEST(helm_render_define_fanout_ends_unknown);
+    RUN_TEST(helm_values_alias_expansion_limit);
+    RUN_TEST(helm_values_set_index_cap_and_long_key);
+    RUN_TEST(helm_render_long_key_mark_whole);
+    RUN_TEST(helm_unknown_branch_spoils_what_it_assigns);
+    RUN_TEST(helm_mutator_spoils_the_map_it_changes);
+    RUN_TEST(helm_unknown_break_leaves_the_loop);
+    RUN_TEST(helm_change_of_a_new_value_spoils_nothing);
     RUN_TEST(incremental_compose_dotenv_change_rebuilds);
     RUN_TEST(incremental_dockerfile_edit_keeps_docker_build_edges);
     RUN_TEST(incremental_second_build_declarer_keeps_the_edge);

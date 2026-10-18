@@ -75,8 +75,10 @@ typedef struct {
 /* Render template `rel` (text src, len) with `values` (its .Values; NULL:
  * an empty map), `chart` and the family's defines, filling `probes` (strings
  * in arena a). Values paths are dot-joined keys, a key's own `.` escaped
- * (`\.`), as --set writes them. */
-void cbm_helm_render(CBMArena *a, const char *rel, const char *src, size_t len,
+ * (`\.`), as --set writes them. False when the render ran past its step or
+ * output budget -- a template Helm would not finish either (logged): then
+ * every capture is UNKNOWN. */
+bool cbm_helm_render(CBMArena *a, const char *rel, const char *src, size_t len,
                      yyjson_mut_val *values, const cbm_helm_chart_meta_t *chart,
                      const cbm_helm_defines_t *defs, cbm_helm_probe_t *probes, int nprobes);
 
