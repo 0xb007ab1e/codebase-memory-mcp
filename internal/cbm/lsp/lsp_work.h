@@ -22,7 +22,7 @@ uint64_t cbm_lsp_work_take(void);
  * reports RED instead of hanging the runner. Seam builds only: a product build
  * has no ceiling, so it can never decide graph content. */
 extern _Thread_local uint64_t cbm_lsp_work_ceiling;
-#define CBM_LSP_WORK_CEILING_HIT()                                                                 \
+#define CBM_LSP_WORK_CEILING_HIT() \
     (cbm_lsp_work_ceiling != 0 && cbm_lsp_work_steps > cbm_lsp_work_ceiling)
 #else
 #define CBM_LSP_WORK(n) ((void)0)
