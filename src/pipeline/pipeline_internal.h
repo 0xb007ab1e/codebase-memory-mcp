@@ -270,6 +270,14 @@ cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const
                                                   const char **import_map_vals,
                                                   int import_map_count, CBMLanguage lang,
                                                   const char *scope_qn);
+/* Python: the bare base `base` of the class `class_qn` nested in a class body
+ * binds the sibling class of that body (`<enclosing class>.<base>`) when the
+ * sibling is defined earlier in the same file (Python evaluates the bases in
+ * the class body). Exact lookups only; the registry-owned sibling QN, or NULL
+ * to resolve the base as before. Every base-class resolver asks this first. */
+const char *cbm_registry_resolve_python_class_body_base(const cbm_registry_t *r,
+                                                        const cbm_gbuf_t *gb, const char *class_qn,
+                                                        const char *base, CBMLanguage lang);
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_pxc_test_import_probe_fail_after(int successful_allocations);
 #endif
