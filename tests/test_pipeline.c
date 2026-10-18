@@ -15231,6 +15231,92 @@ TEST(pipeline_python_super_follows_c3_mro_parallel) {
     return pym_run_super_c3(52);
 }
 
+/* ── attribute lookup follows the C3 method resolution order ─────── */
+
+/* The same diamond as the super() test, seen from an ordinary attribute:
+ * `self.write_state()` in RadarrCalendarEntity and `e.write_state()` on a
+ * RadarrCalendarEntity both look the method up along the class's C3 order,
+ * which reaches CalendarEntity before the shared base Entity. */
+static const char pya_radarr_py[] = "from base import CoordinatorEntity, CalendarEntity\n"
+                                    "\n"
+                                    "class RadarrEntity(CoordinatorEntity):\n"
+                                    "    pass\n"
+                                    "\n"
+                                    "class RadarrCalendarEntity(RadarrEntity, CalendarEntity):\n"
+                                    "    def refresh(self):\n"
+                                    "        return self.write_state()\n"
+                                    "\n"
+                                    "class PlainCalendar(CalendarEntity):\n"
+                                    "    def refresh(self):\n"
+                                    "        return self.write_state()\n"
+                                    "\n"
+                                    "def publish(e: RadarrCalendarEntity):\n"
+                                    "    return e.write_state()\n";
+
+static int pya_run_attr_c3(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_attrc3_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "base.py", pym_base_py);
+    write_temp_file(tmp, "radarr.py", pya_radarr_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/attrc3.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    const char *pr = p ? cbm_pipeline_project_name(p) : NULL;
+    const char *c3 = "base.CalendarEntity.write_state";
+    const char *dfs = "base.Entity.write_state";
+    const char *self_src = "radarr.RadarrCalendarEntity.refresh";
+    bool self_c3 = s && pyn_edge(s, pr, self_src, c3, "CALLS");
+    bool self_dfs = s && pyn_edge(s, pr, self_src, dfs, "CALLS");
+    bool typed_c3 = s && pyn_edge(s, pr, "radarr.publish", c3, "CALLS");
+    bool typed_dfs = s && pyn_edge(s, pr, "radarr.publish", dfs, "CALLS");
+    bool plain = s && pyn_edge(s, pr, "radarr.PlainCalendar.refresh", c3, "CALLS");
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(self_c3);   /* self.write_state(): CalendarEntity before Entity */
+    ASSERT_FALSE(self_dfs); /* ... never Entity through RadarrEntity's ancestry */
+    ASSERT_TRUE(typed_c3);  /* e.write_state() on a RadarrCalendarEntity */
+    ASSERT_FALSE(typed_dfs);
+    ASSERT_TRUE(plain); /* control: single inheritance */
+    PASS();
+}
+
+TEST(pipeline_python_attribute_follows_c3_mro) {
+    return pya_run_attr_c3(0);
+}
+
+TEST(pipeline_python_attribute_follows_c3_mro_parallel) {
+    return pya_run_attr_c3(52);
+}
+
 /* L7 review of #1548: a package __init__.py function can share a submodule's QN
  * (poetry: layouts/__init__.py `def layout` is the QN prefix of every symbol in
  * layouts/layout.py). The function-local detection is bounded at the symbol's
@@ -24934,6 +25020,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548);
     RUN_TEST(pipeline_python_super_follows_c3_mro);
     RUN_TEST(pipeline_python_super_follows_c3_mro_parallel);
+    RUN_TEST(pipeline_python_attribute_follows_c3_mro);
+    RUN_TEST(pipeline_python_attribute_follows_c3_mro_parallel);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_issue1548);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548);
     RUN_TEST(pipeline_python_nested_helper_keeps_tests_issue1548);
