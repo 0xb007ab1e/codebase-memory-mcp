@@ -782,6 +782,220 @@ static int pxc_build_rust_impl_relation(CBMArena *arena, const CBMImplTrait *imp
     return 0;
 }
 
+/* ── Python namespace records (package re-exports) ────────────────────────
+ *
+ * A package's namespace holds what its __init__ imports, not only what it
+ * defines: `models.CharField` exists because django/db/models/__init__.py
+ * star-imports its fields module. This turns a module's ordered namespace
+ * facts (cbm_extract_python_namespace_facts) into records next to its
+ * definitions:
+ *   PyReexport    a name the module's imports bind at the end of its top
+ *                 level: short_name = the bound local, receiver_type = the
+ *                 import's RAW module spec (one '.' per relative level, then
+ *                 the dotted module), method_names_str = the imported member
+ *   PyStarImport  `from X import *`: receiver_type = X's raw module spec
+ *   PyAll         a literal `__all__`: method_names_str = "a|b|c"
+ * Records are content-only -- built from the facts alone, with no import map
+ * and no graph -- so every driver, the incremental surface probe and the
+ * stored surface rows produce the same bytes for the same source, and the
+ * records of an unchanged file travel through its surface row. The Python
+ * cross registry resolves the specs to project modules and folds the records
+ * into its export table (py_build_module_namespaces). The replay is
+ * conservative: a later own definition, module import, shadow or delete drops
+ * a name; a whole-namespace UNKNOWN fact (an effect, a compound statement)
+ * drops everything recorded before it, and later exact facts record again;
+ * `__all__` is published only as a literal. Facts that are not COMPLETE
+ * publish nothing. */
+typedef struct {
+    bool star;
+    bool live;
+    const char *name;   /* bound local (PyReexport) */
+    const char *spec;   /* raw module spec */
+    const char *member; /* imported member (PyReexport) */
+} PxcPyNsOp;
+
+/* `level` dots followed by `module` ("..pkg.mod", ".", "app.db"). */
+static const char *pxc_py_module_spec(CBMArena *arena, uint32_t level, const char *module) {
+    const char *mod = module ? module : "";
+    if (level == 0)
+        return mod[0] ? cbm_arena_strdup(arena, mod) : NULL;
+    if (level > 64)
+        return NULL;
+    char dots[65];
+    memset(dots, '.', level);
+    dots[level] = '\0';
+    return cbm_arena_sprintf(arena, "%s%s", dots, mod);
+}
+
+/* Number of records pxc_build_py_namespace_records can write for `fr` (one
+ * per fact plus the __all__ record). */
+static int pxc_py_namespace_record_bound(const CBMFileResult *fr) {
+    if (!fr || fr->py_namespace.status != CBM_PY_NS_COMPLETE ||
+        fr->py_namespace.language != CBM_LANG_PYTHON)
+        return 0;
+    return fr->py_namespace.count + 1;
+}
+
+/* Replay fr's namespace facts and write the surviving records to out[]
+ * (capacity pxc_py_namespace_record_bound(fr)). Every string is copied into
+ * `arena`: fr may be a reloaded spill freed right after. Returns the count. */
+static int pxc_build_py_namespace_records(CBMArena *arena, const CBMFileResult *fr,
+                                          const char *module_qn, CBMLSPDef *out) {
+    int bound = pxc_py_namespace_record_bound(fr);
+    if (!arena || !module_qn || bound <= 1)
+        return 0;
+    const CBMPyNamespaceFacts *facts = &fr->py_namespace;
+    PxcPyNsOp *ops = (PxcPyNsOp *)cbm_arena_alloc(arena, (size_t)facts->count * sizeof(PxcPyNsOp));
+    CBMHashTable *by_name = cbm_ht_create((uint32_t)facts->count);
+    const char *scope = cbm_arena_strndup(arena, module_qn, cbm_fqn_symbol_scope_len(module_qn));
+    if (!ops || !by_name || !scope) {
+        cbm_ht_free(by_name);
+        return 0;
+    }
+    int n = 0;
+    enum { PXC_ALL_ABSENT, PXC_ALL_LITERAL, PXC_ALL_UNKNOWN } all_state = PXC_ALL_ABSENT;
+    const char **all_names = NULL;
+    int all_count = 0;
+    int all_cap = 0;
+    for (int i = 0; i < facts->count; i++) {
+        const CBMPyNamespaceFact *f = &facts->items[i];
+        bool barrier = false;
+        const char *bind_name = NULL; /* a name this fact (re)binds */
+        const char *bind_spec = NULL; /* set when the binding is a re-export */
+        switch (f->kind) {
+        case CBM_PY_NS_IMPORT_NAME:
+            bind_name = f->local_name;
+            bind_spec = f->member_name
+                            ? pxc_py_module_spec(arena, f->relative_level, f->module_name)
+                            : NULL;
+            break;
+        case CBM_PY_NS_OWN_DEF:
+        case CBM_PY_NS_IMPORT_MODULE:
+        case CBM_PY_NS_SHADOW:
+        case CBM_PY_NS_DELETE:
+            bind_name = f->local_name;
+            break;
+        case CBM_PY_NS_IMPORT_STAR: {
+            const char *spec = pxc_py_module_spec(arena, f->relative_level, f->module_name);
+            if (!spec) {
+                barrier = true;
+            } else {
+                ops[n++] = (PxcPyNsOp){.star = true, .live = true, .spec = spec};
+            }
+            break;
+        }
+        case CBM_PY_NS_ALL_SET:
+        case CBM_PY_NS_ALL_APPEND:
+            if (f->kind == CBM_PY_NS_ALL_SET) {
+                all_state = PXC_ALL_LITERAL;
+                all_count = 0;
+            } else if (all_state != PXC_ALL_LITERAL) {
+                all_state = PXC_ALL_UNKNOWN;
+                break;
+            }
+            for (int k = 0; k < f->name_count && all_state == PXC_ALL_LITERAL; k++) {
+                if (all_count == all_cap) {
+                    int cap = all_cap ? all_cap * 2 : 16;
+                    const char **grown =
+                        (const char **)cbm_arena_alloc(arena, (size_t)cap * sizeof(char *));
+                    if (!grown) {
+                        all_state = PXC_ALL_UNKNOWN;
+                        break;
+                    }
+                    if (all_count)
+                        memcpy(grown, all_names, (size_t)all_count * sizeof(char *));
+                    all_names = grown;
+                    all_cap = cap;
+                }
+                all_names[all_count++] = f->names[k];
+            }
+            break;
+        case CBM_PY_NS_ALL_UNKNOWN:
+            all_state = PXC_ALL_UNKNOWN;
+            break;
+        case CBM_PY_NS_ALL_DELETE:
+            all_state = PXC_ALL_ABSENT;
+            all_count = 0;
+            break;
+        case CBM_PY_NS_UNKNOWN:
+        default:
+            barrier = true;
+            break;
+        }
+        if (barrier) {
+            for (int k = 0; k < n; k++)
+                ops[k].live = false;
+            all_state = PXC_ALL_UNKNOWN;
+            continue;
+        }
+        if (!bind_name)
+            continue;
+        void *prev = cbm_ht_get(by_name, bind_name);
+        if (prev)
+            ops[(uintptr_t)prev - 1].live = false;
+        if (bind_spec) {
+            ops[n] = (PxcPyNsOp){
+                .name = bind_name, .live = true, .spec = bind_spec, .member = f->member_name};
+            cbm_ht_set(by_name, bind_name, (void *)(uintptr_t)(n + 1));
+            n++;
+        } else if (prev) {
+            cbm_ht_delete(by_name, bind_name);
+        }
+    }
+    cbm_ht_free(by_name);
+
+    int written = 0;
+    for (int k = 0; k < n; k++) {
+        if (!ops[k].live)
+            continue;
+        CBMLSPDef *d = &out[written];
+        memset(d, 0, sizeof(*d));
+        d->def_module_qn = module_qn;
+        d->receiver_type = ops[k].spec;
+        d->lang = CBM_LANG_PYTHON;
+        if (ops[k].star) {
+            d->label = "PyStarImport";
+            d->qualified_name = scope;
+            d->short_name = "*";
+        } else {
+            d->label = "PyReexport";
+            d->short_name = cbm_arena_strdup(arena, ops[k].name);
+            d->method_names_str = cbm_arena_strdup(arena, ops[k].member);
+            d->qualified_name = cbm_arena_sprintf(arena, "%s.%s", scope, ops[k].name);
+            if (!d->short_name || !d->method_names_str)
+                continue;
+        }
+        if (d->qualified_name)
+            written++;
+    }
+    if (all_state == PXC_ALL_LITERAL) {
+        size_t len = 1;
+        for (int k = 0; k < all_count; k++)
+            len += strlen(all_names[k]) + 1;
+        char *names = (char *)cbm_arena_alloc(arena, len);
+        if (names) {
+            size_t pos = 0;
+            for (int k = 0; k < all_count; k++) {
+                if (pos > 0)
+                    names[pos++] = '|';
+                size_t l = strlen(all_names[k]);
+                memcpy(names + pos, all_names[k], l);
+                pos += l;
+            }
+            names[pos] = '\0';
+            CBMLSPDef *d = &out[written++];
+            memset(d, 0, sizeof(*d));
+            d->qualified_name = scope;
+            d->short_name = "__all__";
+            d->label = "PyAll";
+            d->def_module_qn = module_qn;
+            d->method_names_str = names;
+            d->lang = CBM_LANG_PYTHON;
+        }
+    }
+    return written;
+}
+
 /* Collect a project-wide CBMLSPDef[] from all cached results. Returns a
  * malloc'd array (caller frees) of length *out_count. String fields are
  * borrowed from cache[i]->arena and from def_modules[i] (also borrowed).
@@ -824,6 +1038,7 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         }
         return NULL;
     }
+    int capacity = total;
     int idx = 0;
     for (int fi = 0; fi < file_count; fi++) {
         if (out_def_starts) {
@@ -888,6 +1103,24 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         }
         if (files[fi].language == CBM_LANG_PYTHON) {
             pxc_fold_py_field_types(arena, fr, defs, file_start, idx, &bs, def_modules[fi]);
+            /* Package namespace records (re-exports). Their count is not part
+             * of the def-count bound above (a spilled result's facts are not
+             * peekable), so grow the array for them here. */
+            int need = pxc_py_namespace_record_bound(fr);
+            if (need > 0 && idx + need > capacity) {
+                int grown_cap = capacity * 2 > idx + need ? capacity * 2 : idx + need;
+                CBMLSPDef *grown =
+                    (CBMLSPDef *)realloc(defs, (size_t)grown_cap * sizeof(CBMLSPDef));
+                if (grown) {
+                    defs = grown;
+                    capacity = grown_cap;
+                } else {
+                    need = 0;
+                }
+            }
+            if (need > 0) {
+                idx += pxc_build_py_namespace_records(arena, fr, def_modules[fi], &defs[idx]);
+            }
         }
         cbm_pxc_free_import_map(bs.imp_keys, bs.imp_vals, bs.imp_count); /* NULL-safe */
         if (files[fi].language == CBM_LANG_GO) {
