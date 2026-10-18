@@ -1208,6 +1208,34 @@ static int et_handles_exact(const EtFile *files, int nfiles, const EtHandles *wa
     return et_handles_exact_routes(files, nfiles, want, parallel, NULL);
 }
 
+/* ASP.NET Core MVC (#1692): a GET form action and its POST submit share one
+ * method name, so both overloads collapse into one Method node whose merged
+ * properties keep only one route. The parallel resolver emitted each
+ * definition's route at node creation and kept both; the sequential one rebuilt
+ * routes from the merged properties afterwards and kept only the last (28
+ * HANDLES on 6 ASP.NET corpora, 2026-10-18). Both venues keep both. */
+TEST(handles_aspnet_overload_verbs_both_venues_issue1692) {
+    static const EtHandles want[] = {{"AccountController.Login", "/Account/login"},
+                                     {"AccountController.Login", "/Account/login"},
+                                     {NULL, NULL}};
+    static const char *const route_qns[] = {"__route__GET__/Account/login",
+                                            "__route__POST__/Account/login", NULL};
+    static const EtFile f[] = {
+        {"Controllers/AccountController.cs",
+         "using Microsoft.AspNetCore.Mvc;\n\n"
+         "namespace Shop.Web.Controllers\n{\n"
+         "    [Route(\"[controller]\")]\n"
+         "    public class AccountController : Controller\n    {\n"
+         "        [HttpGet(\"login\")]\n"
+         "        public IActionResult Login() { return View(); }\n\n"
+         "        [HttpPost(\"login\")]\n"
+         "        public IActionResult Login(LoginModel model) { return Redirect(\"/\"); }\n"
+         "    }\n}\n"}};
+    ASSERT_TRUE(et_handles_exact_routes(f, 1, want, 0, route_qns));
+    ASSERT_TRUE(et_handles_exact_routes(f, 1, want, 1, route_qns));
+    PASS();
+}
+
 /* #1146: Laravel's two class-based handler forms —
  *   Route::get('/x', [UserController::class, 'show'])   (controller method)
  *   Route::get('/x', GetCurrentUserController::class)   (invokable: __invoke)
@@ -2721,6 +2749,7 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_aspnet_route_tokens_issue1692);
     RUN_TEST(handles_aspnet_override_constraints_issue1692);
     RUN_TEST(handles_aspnet_non_controller_control_issue1692);
+    RUN_TEST(handles_aspnet_overload_verbs_both_venues_issue1692);
     RUN_TEST(handles_laravel_php);
     RUN_TEST(handles_laravel_facade_routes_issue952);
     RUN_TEST(handles_laravel_facade_no_junk_routes_issue952);
