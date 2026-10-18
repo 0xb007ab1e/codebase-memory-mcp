@@ -8806,6 +8806,30 @@ static void write_go_receiver_fixture(const char *tmp, int pad_files) {
                     "func CallsLocal() int { return localHelper() }\n"
                     "\n"
                     "func UsesUtil() string { return util.Tag() }\n");
+    /* F-G9: two project methods named Run, one under a directory whose QN
+     * carries an uppercase T. `t.Run` on a *testing.T must bind neither. The
+     * parallel resolver field-type hint matched the capitalized receiver
+     * variable ("T") as a QN substring and produced a par-only edge. */
+    write_temp_file(tmp, "TBench/bench.go",
+                    "package tbench\n"
+                    "\n"
+                    "type Bench struct{}\n"
+                    "\n"
+                    "func (b *Bench) Run(name string) bool { return name != \"\" }\n");
+    write_temp_file(tmp, "worker/worker.go",
+                    "package worker\n"
+                    "\n"
+                    "type Worker struct{}\n"
+                    "\n"
+                    "func (w *Worker) Run(name string) bool { return false }\n");
+    write_temp_file(tmp, "hash/hash_test.go",
+                    "package hash\n"
+                    "\n"
+                    "import \"testing\"\n"
+                    "\n"
+                    "func TestSubRun(t *testing.T) {\n"
+                    "\tt.Run(\"a\", func(t *testing.T) {})\n"
+                    "}\n");
     for (int i = 0; i < pad_files; i++) {
         char name[64];
         char body[128];
@@ -8843,6 +8867,8 @@ TEST(pipeline_go_receiver_suppresses_weak_method_edge) {
     /* (4) The import-qualified cross-package call survives (import-aware
      * strategies are outside the drop-list). */
     ASSERT_TRUE(cross_file_call_exists(s, project, "UsesUtil", "Tag"));
+    /* (5) F-G9: the stdlib *testing.T Run binds no project Run. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "TestSubRun", "Run"));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -8886,6 +8912,8 @@ TEST(pipeline_go_receiver_parallel_suppresses_weak_method_edge) {
     ASSERT_TRUE(cross_file_call_exists(s, project, "Boot", "Close"));
     ASSERT_TRUE(cross_file_call_exists(s, project, "CallsLocal", "localHelper"));
     ASSERT_TRUE(cross_file_call_exists(s, project, "UsesUtil", "Tag"));
+    /* F-G9: the parallel-only field-type hint must not bind `t.Run` either. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "TestSubRun", "Run"));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
