@@ -14142,9 +14142,17 @@ TEST(pipeline_python_package_reexports_resolve_by_lsp) {
         memset(excluded, 1, sizeof(excluded));
         ASSERT_EQ(py_reexport_run(mode == 1, lsp, excluded), 0);
         for (int c = 0; c < PY_REEXPORT_N_CALLS; c++) {
+            if (!lsp[c]) {
+                fprintf(stderr, "  re-export call %s (%s) did not resolve by the LSP\n",
+                        py_reexport_calls[c][0], mode ? "parallel" : "sequential");
+            }
             ASSERT_TRUE(lsp[c]); /* RED for every re-export shape; controls stay green */
         }
         for (int e = 0; e < PY_REEXPORT_N_EXCLUDED; e++) {
+            if (excluded[e]) {
+                fprintf(stderr, "  excluded call %s (%s) resolved by the LSP anyway\n",
+                        py_reexport_excluded[e][0], mode ? "parallel" : "sequential");
+            }
             ASSERT_FALSE(excluded[e]); /* __all__, `_`, shadow, barrier */
         }
     }
