@@ -7178,6 +7178,63 @@ TEST(extract_perl_method_call_flags_is_method) {
     PASS();
 }
 
+/* The def QN of `name` and the enclosing-function QN of the call `callee` inside
+ * it, from one extraction result. */
+static void rust_def_and_scope(const CBMFileResult *r, const char *name, const char *callee,
+                               const char **def_qn, const char **scope_qn) {
+    *def_qn = NULL;
+    *scope_qn = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && d->qualified_name && strcmp(d->name, name) == 0) {
+            *def_qn = d->qualified_name;
+        }
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, callee) == 0 && c->enclosing_func_qn &&
+            strstr(c->enclosing_func_qn, name)) {
+            *scope_qn = c->enclosing_func_qn;
+        }
+    }
+}
+
+/* F-R4: a method of a generic impl (`impl<T> Gen<T>`, `impl<'a> Life<'a>`) got a
+ * call scope that kept the generic arguments ("...Gen<T>.in_generic") while the
+ * def side strips them ("...Gen.in_generic"), so no node carried the scope and
+ * every call in the body fell back to the File node (base census: 84,331 Rust
+ * CALLS sourced from a File although inside a function, 96% of all File-sourced
+ * Rust CALLS). The def QN and the call scope must agree. */
+TEST(extract_rust_generic_impl_call_scope_matches_def) {
+    CBMFileResult *r = extract("pub struct Plain;\n"
+                               "impl Plain {\n"
+                               "    pub fn in_plain(&self) -> u32 { helper() }\n"
+                               "}\n"
+                               "pub struct Gen<T> { v: T }\n"
+                               "impl<T> Gen<T> {\n"
+                               "    pub fn in_generic(&self) -> u32 { helper() }\n"
+                               "}\n"
+                               "pub struct Life<'a> { s: &'a str }\n"
+                               "impl<'a> Life<'a> {\n"
+                               "    pub fn in_lifetime(&self) -> u32 { helper() }\n"
+                               "}\n"
+                               "pub fn helper() -> u32 { 1 }\n",
+                               CBM_LANG_RUST, "t", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    static const char *const methods[] = {"in_plain", "in_generic", "in_lifetime", NULL};
+    for (int m = 0; methods[m]; m++) {
+        const char *def_qn = NULL;
+        const char *scope_qn = NULL;
+        rust_def_and_scope(r, methods[m], "helper", &def_qn, &scope_qn);
+        ASSERT_NOT_NULL(def_qn);
+        ASSERT_NOT_NULL(scope_qn);
+        ASSERT_STR_EQ(scope_qn, def_qn);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Languages OUTSIDE the is_method flag set (Perl, Python, TS/JS/TSX and Go set
  * it) must be unaffected: a Rust method call never sets is_method. */
 TEST(extract_flag_exempt_method_call_not_flagged_is_method) {
@@ -12629,6 +12686,7 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_config_string_not_a_callee);
     RUN_TEST(extract_perl_builtin_call_is_function_not_method);
     RUN_TEST(extract_perl_method_call_flags_is_method);
+    RUN_TEST(extract_rust_generic_impl_call_scope_matches_def);
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
     RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);

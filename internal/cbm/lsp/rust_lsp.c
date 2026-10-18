@@ -306,6 +306,22 @@ static void rust_strip_turbofish(char *path) {
     *write = '\0';
 }
 
+/* In place: `Gen<T>` -> `Gen`, `foo::Bar<'a, T>` -> `foo::Bar` (#763). An
+ * impl's self type keeps its generic arguments in the source text, but every
+ * def-side QN (a method's receiver, the extractor's call scope) strips them.
+ * Unstripped, the LSP's caller QN, `self`/`Self` dispatch and the return-type
+ * harvest never matched a generic impl's methods. Text starting with `<` (a
+ * qualified path) is left alone. Safe on NULL. */
+static void rust_strip_impl_type_args(char *type_text) {
+    if (!type_text) {
+        return;
+    }
+    char *lt = strchr(type_text, '<');
+    if (lt && lt > type_text) {
+        *lt = '\0';
+    }
+}
+
 /* Look up a `use` alias and return its fully-qualified module path,
  * or NULL if absent. The returned pointer aliases into the use map. */
 static const char *rust_resolve_use(RustLSPContext *ctx, const char *local_name) {
@@ -5274,6 +5290,7 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
     char *type_text = rust_node_text(ctx, type_node);
     if (!type_text)
         return;
+    rust_strip_impl_type_args(type_text);
 
     /* Detect blanket impl: `impl<T: Trait> ForeignTrait for T { ... }`
      * where type_text is a name that appears in the impl's type
@@ -6028,6 +6045,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             if (ts_node_is_null(type_node) || ts_node_is_null(body))
                 continue;
             char *type_name = cbm_node_text(arena, type_node, source);
+            rust_strip_impl_type_args(type_name);
             if (!type_name || !type_name[0])
                 continue;
             const char *type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
