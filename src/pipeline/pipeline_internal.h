@@ -260,6 +260,16 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
                                                 CBMLanguage lang);
+/* The registry step of BOTH call resolvers once the LSP has not answered:
+ * for Python, the def or class `callee_name` binds in the nearest def enclosing
+ * `scope_qn` (cbm_registry_resolve_lexical, "lexical_scope"); otherwise, or
+ * when there is no such local, cbm_registry_resolve_call_lang. */
+cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const char *callee_name,
+                                                  const char *module_qn,
+                                                  const char **import_map_keys,
+                                                  const char **import_map_vals,
+                                                  int import_map_count, CBMLanguage lang,
+                                                  const char *scope_qn);
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_pxc_test_import_probe_fail_after(int successful_allocations);
 #endif
