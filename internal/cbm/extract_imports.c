@@ -1222,6 +1222,15 @@ static bool py_ns_check_path(const PyNsCallCheck *c, const char *text, size_t le
     return true;
 }
 
+/* The relative level of a `from` module path: its leading dots. */
+static size_t py_ns_leading_dots(const char *text, size_t len) {
+    const char *end = text + len;
+    const char *p = text;
+    while (p != end && *p == '.')
+        p++;
+    return (size_t)(p - text);
+}
+
 /* An import in the callee's body. When its module is this package, the
  * submodule it installs as a package attribute is shadowed: the first
  * segment after the package, or every imported member when the import names
@@ -1240,23 +1249,19 @@ static bool py_ns_check_import(PyNsCallCheck *c, TSNode node, bool from) {
         size_t len = 0;
         if (!py_ns_slice(c->b, module, &text, &len))
             return false;
-        size_t level = 0;
-        while (level < len && text[level] == '.')
-            level++;
-        const char *rest = text + level;
-        size_t rest_len = len - level;
-        if (rest_len && !py_ns_identifier_bytes(rest, rest_len, true))
+        size_t level = py_ns_leading_dots(text, len);
+        PyNsSlice rest = {text + level, len - level};
+        if (rest.len && !py_ns_identifier_bytes(rest.text, rest.len, true))
             return false;
         int own_at = -1;
         PyNsSlice next;
-        if (!py_ns_check_path(c, rest, rest_len, &own_at, &next))
+        if (!py_ns_check_path(c, rest.text, rest.len, &own_at, &next))
             return false;
         if (c->package && level == 1) {
-            into_package = rest_len == 0;
-            if (rest_len) {
-                size_t first = strcspn(rest, ".");
-                sub = (PyNsSlice){rest, first < rest_len ? first : rest_len};
-            }
+            /* `from . import x` names the package; `from .x.y import z` installs x */
+            const char *dot = rest.len ? memchr(rest.text, '.', rest.len) : NULL;
+            into_package = rest.len == 0;
+            sub = (PyNsSlice){rest.text, dot ? (size_t)(dot - rest.text) : rest.len};
         } else if (c->package && (level == 0 || (level == 2 && own_at == 0)) && own_at >= 0) {
             /* level 2: the parent's child of this name is this package; a
              * later segment of the same name is a package further down */
