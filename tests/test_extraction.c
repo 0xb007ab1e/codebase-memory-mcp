@@ -12755,7 +12755,7 @@ TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects) {
                                  "__all__ = ['escaped\\n']\n";
     CBMFileResult *r = extract(source, CBM_LANG_PYTHON, "t", "main.py");
     bool ok = r && !r->has_error && !r->parse_incomplete &&
-              r->py_namespace.status == CBM_PY_NS_COMPLETE && r->py_namespace.count == 14 &&
+              r->py_namespace.status == CBM_PY_NS_COMPLETE && r->py_namespace.count == 13 &&
               cbm_py_namespace_facts_valid(&r->py_namespace) && has_def(r, "Function", "later") &&
               has_def(r, "Class", "HasDescriptor");
     if (ok) {
@@ -12771,8 +12771,10 @@ TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects) {
              strcmp(f[7].local_name, "__all__") == 0 && f[8].kind == CBM_PY_NS_UNKNOWN &&
              f[9].kind == CBM_PY_NS_SHADOW && strcmp(f[9].local_name, "values") == 0 &&
              f[10].kind == CBM_PY_NS_UNKNOWN && f[11].kind == CBM_PY_NS_SHADOW &&
-             f[11].reason == CBM_PY_NS_REASON_UNPROVEN_CLASS && f[12].kind == CBM_PY_NS_UNKNOWN &&
-             f[13].kind == CBM_PY_NS_ALL_UNKNOWN;
+             f[11].reason == CBM_PY_NS_REASON_UNPROVEN_CLASS &&
+             /* a string with an escape evaluates nothing: no effect, but no
+              * literal export name either */
+             f[12].kind == CBM_PY_NS_ALL_UNKNOWN;
     }
     if (r)
         cbm_free_result(r);
