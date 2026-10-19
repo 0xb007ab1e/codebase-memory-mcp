@@ -12474,8 +12474,8 @@ TEST(python_namespace_facts_init_call_allowlist) {
 
     /* A plain module is no package: the body's imports set attributes of its
      * parent package, never of the module itself. */
-    r = extract("def __go(lcls):\n    from . import base\n\n__go(locals())\n", CBM_LANG_PYTHON,
-                "t", "sql/mod.py");
+    r = extract("def __go(lcls):\n    from . import base\n\n__go(locals())\n", CBM_LANG_PYTHON, "t",
+                "sql/mod.py");
     ok = py_facts_valid_complete(r) && !py_facts_has_effect(r) &&
          py_facts_count_kind(r, CBM_PY_NS_SHADOW) == 0;
     if (r)
