@@ -4332,9 +4332,16 @@ static void php_lsp_collect_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *re
      * Pass 2: classes and enums (which may `use Trait;` and need the
      * trait's signatures already patched).
      */
-    struct php_trait_index trait_index = {0};
+    /* The index lives in the call's arena, not on this stack frame: ctx keeps
+     * a pointer to it for the duration of the pass. On an allocation failure
+     * it stays NULL and flatten_trait_into_class runs the full scan. */
+    struct php_trait_index *trait_index =
+        (struct php_trait_index *)cbm_arena_alloc(ctx->arena, sizeof(*trait_index));
+    if (trait_index) {
+        memset(trait_index, 0, sizeof(*trait_index));
+    }
     struct php_trait_index *outer_index = ctx->trait_index;
-    ctx->trait_index = &trait_index;
+    ctx->trait_index = trait_index;
     for (int pass = 0; pass < 2; pass++) {
         TSNode stack[256];
         int top = 0;
@@ -4359,7 +4366,9 @@ static void php_lsp_collect_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *re
             }
         }
     }
-    php_trait_index_free(&trait_index);
+    if (trait_index) {
+        php_trait_index_free(trait_index);
+    }
     ctx->trait_index = outer_index;
 }
 
