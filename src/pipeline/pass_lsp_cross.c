@@ -305,9 +305,15 @@ static const char *pxc_python_dotted_base_qn(const pxc_base_scope_t *bs, const c
  * Returns NULL when the base is not a confidently-known project type;
  * stdlib and third-party bases land here and keep their raw spelling. */
 static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *raw,
-                                       const char *module_qn) {
+                                       const char *module_qn, const char *class_qn) {
     if (!bs || !bs->reg || !raw || !raw[0]) {
         return NULL;
+    }
+    /* A base of a class nested in a class body: an earlier sibling first. */
+    const char *sibling =
+        cbm_registry_resolve_python_class_body_base(bs->reg, bs->gbuf, class_qn, raw, bs->lang);
+    if (sibling) {
+        return sibling;
     }
     const char *dotted = pxc_python_dotted_base_qn(bs, raw);
     if (dotted) {
@@ -338,7 +344,8 @@ static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *r
  * source spelling. Unresolved entries pass through verbatim so a base the
  * registry does not know keeps working exactly as before. */
 static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
-                                     const pxc_base_scope_t *bs, const char *module_qn) {
+                                     const pxc_base_scope_t *bs, const char *module_qn,
+                                     const char *class_qn) {
     if (!bases || !bases[0]) {
         return NULL;
     }
@@ -352,7 +359,7 @@ static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
         return pxc_join_pipe(arena, bases);
     }
     for (int i = 0; i < count; i++) {
-        const char *qn = pxc_resolve_base_qn(bs, bases[i], module_qn);
+        const char *qn = pxc_resolve_base_qn(bs, bases[i], module_qn, class_qn);
         resolved[i] = qn ? qn : bases[i];
     }
     resolved[count] = NULL;
@@ -520,9 +527,10 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     /* Languages whose cross registrars read embedded_types as QNs get their
      * bases resolved against the project registry; everyone else keeps the
      * raw source spelling their own registrar already knows how to handle. */
-    dst->embedded_types = (bs && bs->reg && pxc_lang_resolves_base_qns(lang))
-                              ? pxc_join_base_qns(arena, src->base_classes, bs, module_qn)
-                              : pxc_join_pipe(arena, src->base_classes);
+    dst->embedded_types =
+        (bs && bs->reg && pxc_lang_resolves_base_qns(lang))
+            ? pxc_join_base_qns(arena, src->base_classes, bs, module_qn, src->qualified_name)
+            : pxc_join_pipe(arena, src->base_classes);
     dst->signature_param_types = NULL;
     dst->signature_param_count = 0;
     if (src->signature_param_types && src->signature_param_count > 0) {
@@ -727,7 +735,7 @@ static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result
         fields[f].type_qn = NULL;
         CBMLSPDef *owner = ft->class_qn ? (CBMLSPDef *)cbm_ht_get(by_qn, ft->class_qn) : NULL;
         const char *name = owner ? pxc_py_annotation_type_name(arena, ft->type_text) : NULL;
-        const char *qn = name ? pxc_resolve_base_qn(bs, name, module_qn) : NULL;
+        const char *qn = name ? pxc_resolve_base_qn(bs, name, module_qn, NULL) : NULL;
         if (!qn || !ft->field_name || !ft->field_name[0]) {
             continue;
         }

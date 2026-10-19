@@ -9042,6 +9042,94 @@ TEST(pipeline_rust_assoc_call_never_binds_free_namesake_parallel) {
     return rust_assoc_call_free_namesake_case(52);
 }
 
+/* F-R4 (#763, Rust): calls inside a method of a generic impl (`impl<T> Gen<T>`,
+ * `impl<'a> Life<'a>`) were sourced from the File node: the call scope kept the
+ * generic arguments the def side strips. Each method must be the source of its
+ * own call. pad_files > 0 forces the parallel resolver. */
+static int rust_generic_impl_attribution_case(int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_gimpl_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "pub struct Gen<T> { v: T }\n"
+        "impl<T> Gen<T> {\n"
+        "    pub fn in_generic(&self) -> u32 { helper_a() + self.other_g() + Self::assoc_g() }\n"
+        "    pub fn other_g(&self) -> u32 { 3 }\n"
+        "    pub fn assoc_g() -> u32 { 4 }\n"
+        "}\n"
+        "pub struct Life<'a> { s: &'a str }\n"
+        "impl<'a> Life<'a> {\n"
+        "    pub fn in_lifetime(&self) -> u32 { helper_b() + self.other_l() }\n"
+        "    pub fn other_l(&self) -> u32 { 5 }\n"
+        "}\n"
+        "pub fn helper_a() -> u32 { 1 }\n"
+        "pub fn helper_b() -> u32 { 2 }\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.rs", i);
+        snprintf(body, sizeof(body), "pub fn filler%d() -> u32 {\n    %d\n}\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *saved = NULL;
+    if (pad_files > 0) {
+        char *old_workers = getenv("CBM_WORKERS");
+        saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/rust_gimpl.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_TRUE(cross_file_call_exists(s, project, "in_generic", "helper_a"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "in_lifetime", "helper_b"));
+    /* ... and not from the file. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "lib.rs", "helper_a"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "lib.rs", "helper_b"));
+    /* The LSP side names the impl's self type without its arguments too: its
+     * rows join these callers (lsp_*, not a registry fallback), and `self.` /
+     * `Self::` dispatch inside a generic impl resolves (Self::assoc_g had no
+     * edge at all). */
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_generic", "helper_a", "\"strategy\":\"lsp_"));
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_generic", "other_g", "\"strategy\":\"lsp_"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "in_generic", "assoc_g"));
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_lifetime", "other_l", "\"strategy\":\"lsp_"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (pad_files > 0) {
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_generic_impl_method_sources_its_calls) {
+    return rust_generic_impl_attribution_case(0);
+}
+
+TEST(pipeline_rust_generic_impl_method_sources_its_calls_parallel) {
+    return rust_generic_impl_attribution_case(52);
+}
+
 TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
     /* Parallel twin of the test above: USAGE and WRITES/READS each have a
      * second, independent resolver in pass_parallel.c (resolve_file_usages /
@@ -10528,6 +10616,258 @@ TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge) {
     }
     th_rmtree(tmp);
     PASS();
+}
+
+/* CALLS edges from a caller to a callee, both matched by QN suffix (start each
+ * suffix with '.' to anchor it at a segment boundary), any strategy. *guessed
+ * is set when a matching edge came from a name guess rather than an import
+ * binding or the LSP. */
+static int py_calls_between(cbm_store_t *s, const char *project, const char *caller_suffix,
+                            const char *callee_suffix, bool *guessed) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count);
+    int hits = 0;
+    size_t cs = strlen(caller_suffix);
+    size_t ts = strlen(callee_suffix);
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            size_t sl = strlen(src.qualified_name);
+            size_t tl = strlen(tgt.qualified_name);
+            if (sl >= cs && tl >= ts && strcmp(src.qualified_name + sl - cs, caller_suffix) == 0 &&
+                strcmp(tgt.qualified_name + tl - ts, callee_suffix) == 0) {
+                hits++;
+                const char *pj = edges[i].properties_json ? edges[i].properties_json : "";
+                if (guessed && !strstr(pj, "\"import_map\"") && !strstr(pj, "\"lsp")) {
+                    *guessed = true;
+                }
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges)
+        cbm_store_free_edges(edges, edge_count);
+    return hits;
+}
+
+/* Pin CBM_WORKERS=4 for a padded (> 50 files) parallel run; restore after. */
+typedef struct {
+    char *saved;
+    bool had;
+    int rc;
+} py_workers_pin_t;
+
+static py_workers_pin_t py_pin_workers(bool parallel) {
+    py_workers_pin_t pin = {0};
+    if (!parallel) {
+        return pin;
+    }
+    const char *old = getenv("CBM_WORKERS");
+    pin.had = old != NULL;
+    pin.saved = old ? strdup(old) : NULL;
+    pin.rc = (old && !pin.saved) ? -1 : cbm_setenv("CBM_WORKERS", "4", 1);
+    return pin;
+}
+
+static int py_unpin_workers(bool parallel, py_workers_pin_t *pin) {
+    if (!parallel) {
+        return 0;
+    }
+    int rc = pin->had ? cbm_setenv("CBM_WORKERS", pin->saved, 1) : cbm_unsetenv("CBM_WORKERS");
+    free(pin->saved);
+    pin->saved = NULL;
+    return rc;
+}
+
+static void py_write_padding(const char *tmp, const char *stem, bool parallel) {
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64];
+        char body[96];
+        snprintf(name, sizeof(name), "%s%d.py", stem, i);
+        snprintf(body, sizeof(body), "def %s%d():\n    return %d\n", stem, i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+/* `from . import x`, `from .. import x` and `from . import x as y` name the
+ * importing file's own (or parent) package. The extractor recorded them one
+ * package too high ("..x"), so the import fell to pass_pkgmap's symbol-name
+ * guess -- the lexicographically first same-named project definition -- and
+ * every call became a confident edge into comp.aaa, through the import map and
+ * the Python LSP's alias binding alike (home-assistant: 7,175 call pairs).
+ * Both resolvers: <= 50 files sequential, padded > 50 parallel. */
+static int check_python_package_relative_imports(bool parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_relpkg_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "comp/__init__.py", "");
+    write_temp_file(tmp, "comp/aaa/__init__.py",
+                    "def async_register(hass):\n"
+                    "    return 1\n\n"
+                    "def local_fn():\n"
+                    "    return 2\n");
+    write_temp_file(tmp, "comp/web/__init__.py",
+                    "def async_register(hass):\n"
+                    "    return 3\n");
+    write_temp_file(tmp, "comp/web/trigger.py",
+                    "from . import async_register\n\n"
+                    "def attach(hass):\n"
+                    "    return async_register(hass)\n");
+    write_temp_file(tmp, "comp/web/sub/__init__.py",
+                    "def local_fn():\n"
+                    "    return 4\n");
+    write_temp_file(tmp, "comp/web/sub/mod.py",
+                    "from .. import async_register\n"
+                    "from . import local_fn as lf\n\n"
+                    "def deep(hass):\n"
+                    "    async_register(hass)\n"
+                    "    return lf()\n");
+    py_write_padding(tmp, "relpad", parallel);
+
+    py_workers_pin_t pin = py_pin_workers(parallel);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/relpkg.db", tmp);
+    cbm_pipeline_t *p = pin.rc == 0 ? cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL) : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool opened = s != NULL;
+    bool guessed = false;
+    int own = -1, own_decoy = -1, parent = -1, parent_decoy = -1, alias = -1, alias_decoy = -1;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        own = py_calls_between(s, project, ".comp.web.trigger.attach", ".comp.web.async_register",
+                               &guessed);
+        own_decoy = py_calls_between(s, project, ".comp.web.trigger.attach",
+                                     ".comp.aaa.async_register", NULL);
+        parent = py_calls_between(s, project, ".comp.web.sub.mod.deep", ".comp.web.async_register",
+                                  &guessed);
+        parent_decoy = py_calls_between(s, project, ".comp.web.sub.mod.deep",
+                                        ".comp.aaa.async_register", NULL);
+        alias = py_calls_between(s, project, ".comp.web.sub.mod.deep", ".comp.web.sub.local_fn",
+                                 &guessed);
+        alias_decoy =
+            py_calls_between(s, project, ".comp.web.sub.mod.deep", ".comp.aaa.local_fn", NULL);
+        cbm_store_close(s);
+    }
+    cbm_pipeline_free(p);
+    int unpin_rc = py_unpin_workers(parallel, &pin);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(pin.rc, 0);
+    ASSERT_EQ(unpin_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(opened);
+    ASSERT_EQ(own, 1);       /* from . import x: the file's own package */
+    ASSERT_EQ(own_decoy, 0); /* never the lexicographically first namesake */
+    ASSERT_EQ(parent, 1);    /* from .. import x: the parent package */
+    ASSERT_EQ(parent_decoy, 0);
+    ASSERT_EQ(alias, 1); /* from . import x as y */
+    ASSERT_EQ(alias_decoy, 0);
+    ASSERT_FALSE(guessed); /* bound by the import, not by a name guess */
+    PASS();
+}
+
+TEST(pipeline_python_package_relative_imports) {
+    return check_python_package_relative_imports(false);
+}
+
+TEST(pipeline_python_package_relative_imports_parallel) {
+    return check_python_package_relative_imports(true);
+}
+
+/* #1237: a plain `from pkg.db import get_row_or_none` and bare calls resolve to
+ * the imported module-level def (function and method callers, plus the
+ * same-file caller), never to a same-named def elsewhere that a name guess
+ * would rank first (legacy.compat), and a re-index that only ADDS an unrelated
+ * file (the reporter's watcher re-index after writing benchmark scripts into the
+ * indexed tree) keeps exactly the same CALLS. Main already resolved this shape
+ * when the guard landed: it pins the shape and has no RED on revert. */
+static int check_python_from_import_bare_call_issue1237(bool parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_1237_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "pkg/__init__.py", "");
+    write_temp_file(tmp, "pkg/db.py",
+                    "def get_row_or_none(model, **filters):\n"
+                    "    return None\n\n"
+                    "def other_helper():\n"
+                    "    return get_row_or_none(1, id=2)\n");
+    write_temp_file(tmp, "pkg/views.py",
+                    "from pkg.db import get_row_or_none\n\n"
+                    "def show(pk):\n"
+                    "    return get_row_or_none(object, id=pk)\n\n"
+                    "class Detail:\n"
+                    "    def get(self, pk):\n"
+                    "        return get_row_or_none(object, pk=pk)\n");
+    write_temp_file(tmp, "legacy/__init__.py", "");
+    write_temp_file(tmp, "legacy/compat.py",
+                    "def get_row_or_none(model):\n"
+                    "    return model\n");
+    py_write_padding(tmp, "rowpad", parallel);
+
+    py_workers_pin_t pin = py_pin_workers(parallel);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/rows.db", tmp);
+    int run_rc[2] = {-1, -1};
+    int show[2] = {-1, -1};
+    int method[2] = {-1, -1};
+    int same[2] = {-1, -1};
+    int decoy[2] = {-1, -1};
+    int calls[2] = {-1, -1};
+    bool guessed = false;
+    for (int run = 0; run < 2 && pin.rc == 0; run++) {
+        if (run == 1) {
+            /* Second run on the same db: routes to the incremental re-index. */
+            write_temp_file(tmp, "bench_rows.py", "def bench():\n    return 0\n");
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        run_rc[run] = p ? cbm_pipeline_run(p) : -1;
+        cbm_store_t *s = run_rc[run] == 0 ? cbm_store_open_path(db_path) : NULL;
+        if (s) {
+            const char *project = cbm_pipeline_project_name(p);
+            const char *target = ".pkg.db.get_row_or_none";
+            const char *namesake = ".legacy.compat.get_row_or_none";
+            show[run] = py_calls_between(s, project, ".pkg.views.show", target, &guessed);
+            method[run] = py_calls_between(s, project, ".pkg.views.Detail.get", target, &guessed);
+            same[run] = py_calls_between(s, project, ".pkg.db.other_helper", target, &guessed);
+            decoy[run] = py_calls_between(s, project, ".pkg.views.show", namesake, NULL) +
+                         py_calls_between(s, project, ".pkg.views.Detail.get", namesake, NULL);
+            calls[run] = cbm_store_count_edges_by_type(s, project, "CALLS");
+            cbm_store_close(s);
+        }
+        cbm_pipeline_free(p);
+    }
+    int unpin_rc = py_unpin_workers(parallel, &pin);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(pin.rc, 0);
+    ASSERT_EQ(unpin_rc, 0);
+    for (int run = 0; run < 2; run++) {
+        ASSERT_EQ(run_rc[run], 0);
+        ASSERT_EQ(show[run], 1);   /* cross-file bare call through a plain from-import */
+        ASSERT_EQ(method[run], 1); /* the same from a method */
+        ASSERT_EQ(same[run], 1);   /* same-file bare call */
+        ASSERT_EQ(decoy[run], 0);  /* never the namesake a name guess would pick */
+    }
+    ASSERT_EQ(calls[1], calls[0]); /* adding a call-free file moves no CALLS edge */
+    ASSERT_FALSE(guessed);
+    PASS();
+}
+
+TEST(pipeline_python_from_import_bare_call_issue1237) {
+    return check_python_from_import_bare_call_issue1237(false);
+}
+
+TEST(pipeline_python_from_import_bare_call_issue1237_parallel) {
+    return check_python_from_import_bare_call_issue1237(true);
 }
 
 /* Reproduce-first: pass_parallel's fused cross-LSP eligibility currently counts
@@ -15376,6 +15716,114 @@ TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548) {
     return pyn_run_shadowing(52);
 }
 
+/* ── super() follows the C3 method resolution order ──────────────── */
+
+/* The home-assistant radarr shape: RadarrCalendarEntity(RadarrEntity,
+ * CalendarEntity), where RadarrEntity reaches the common base Entity through
+ * CoordinatorEntity and CalendarEntity overrides Entity's method. Python's C3
+ * order is [RadarrCalendarEntity, RadarrEntity, CoordinatorEntity,
+ * CalendarEntity, Entity]: a common base comes after every class that
+ * derives from it, so super() reaches CalendarEntity, not Entity through the
+ * first base's ancestry. */
+static const char pym_base_py[] = "class Entity:\n"
+                                  "    def __init__(self):\n"
+                                  "        self.ready = False\n"
+                                  "\n"
+                                  "    def write_state(self):\n"
+                                  "        return 0\n"
+                                  "\n"
+                                  "class CoordinatorEntity(Entity):\n"
+                                  "    pass\n"
+                                  "\n"
+                                  "class CalendarEntity(Entity):\n"
+                                  "    def __init__(self):\n"
+                                  "        self.events = []\n"
+                                  "\n"
+                                  "    def write_state(self):\n"
+                                  "        return 1\n";
+
+static const char pym_radarr_py[] = "from base import CoordinatorEntity, CalendarEntity\n"
+                                    "\n"
+                                    "class RadarrEntity(CoordinatorEntity):\n"
+                                    "    pass\n"
+                                    "\n"
+                                    "class RadarrCalendarEntity(RadarrEntity, CalendarEntity):\n"
+                                    "    def __init__(self):\n"
+                                    "        super().__init__()\n"
+                                    "\n"
+                                    "    def write_state(self):\n"
+                                    "        return super().write_state()\n"
+                                    "\n"
+                                    "class PlainCalendar(CalendarEntity):\n"
+                                    "    def write_state(self):\n"
+                                    "        return super().write_state()\n";
+
+static int pym_run_super_c3(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_superc3_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "base.py", pym_base_py);
+    write_temp_file(tmp, "radarr.py", pym_radarr_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/superc3.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    const char *pr = p ? cbm_pipeline_project_name(p) : NULL;
+    const char *rce = "radarr.RadarrCalendarEntity";
+    char src[256];
+    snprintf(src, sizeof(src), "%s.write_state", rce);
+    bool m_c3 = s && pyn_edge(s, pr, src, "base.CalendarEntity.write_state", "CALLS");
+    bool m_dfs = s && pyn_edge(s, pr, src, "base.Entity.write_state", "CALLS");
+    snprintf(src, sizeof(src), "%s.__init__", rce);
+    bool i_c3 = s && pyn_edge(s, pr, src, "base.CalendarEntity.__init__", "CALLS");
+    bool i_dfs = s && pyn_edge(s, pr, src, "base.Entity.__init__", "CALLS");
+    bool plain = s && pyn_edge(s, pr, "radarr.PlainCalendar.write_state",
+                               "base.CalendarEntity.write_state", "CALLS");
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(m_c3);   /* super().write_state(): CalendarEntity comes before Entity */
+    ASSERT_FALSE(m_dfs); /* ... never Entity through RadarrEntity's ancestry */
+    ASSERT_TRUE(i_c3);   /* super().__init__(): the same order */
+    ASSERT_FALSE(i_dfs);
+    ASSERT_TRUE(plain); /* control: single inheritance */
+    PASS();
+}
+
+TEST(pipeline_python_super_follows_c3_mro) {
+    return pym_run_super_c3(0);
+}
+
+TEST(pipeline_python_super_follows_c3_mro_parallel) {
+    return pym_run_super_c3(52);
+}
+
 /* L7 review of #1548: a package __init__.py function can share a submodule's QN
  * (poetry: layouts/__init__.py `def layout` is the QN prefix of every symbol in
  * layouts/layout.py). The function-local detection is bounded at the symbol's
@@ -15473,6 +15921,164 @@ TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548) {
     return pyn_run_init_collision(52);
 }
 
+/* ── F15: a nested class's bare base resolves in its class body first ── */
+
+/* The sqlalchemy asyncpg shape: an adapter class re-declares the DBAPI
+ * exception hierarchy as nested classes, each based on an EARLIER sibling
+ * spelled bare (`class IntegrityError(DatabaseError)`). Python evaluates a
+ * class statement's bases in the enclosing class body, so the sibling wins
+ * over the same-named module classes of exc.py, which the adapter imports
+ * as a module (so a name guess prefers them, as on sqlalchemy once its
+ * relative `from ... import exc` resolves). A sibling defined LATER in the
+ * body is not bound yet: `Early(Later)` names the module-level Later. */
+static const char pyb_exc_py[] = "class DBAPIError(Exception):\n"
+                                 "    pass\n"
+                                 "\n"
+                                 "class DatabaseError(DBAPIError):\n"
+                                 "    pass\n"
+                                 "\n"
+                                 "class IntegrityError(DatabaseError):\n"
+                                 "    pass\n";
+
+static const char pyb_adapter_py[] = "import exc\n"
+                                     "from exc import DBAPIError\n"
+                                     "\n"
+                                     "class Later(Exception):\n"
+                                     "    pass\n"
+                                     "\n"
+                                     "class AsyncAdapt_dbapi:\n"
+                                     "    class Error(DBAPIError):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class DatabaseError(Error):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class IntegrityError(DatabaseError):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class NotNullViolationError(IntegrityError):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class Early(Later):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class Later(Exception):\n"
+                                     "        pass\n";
+
+/* A second adapter with the same nested names, as sqlalchemy has one per
+ * driver: a name-only guess has several same-named candidates to pick. */
+static const char pyb_adapter2_py[] = "class AsyncAdapt_other_dbapi:\n"
+                                      "    class Error(Exception):\n"
+                                      "        pass\n"
+                                      "\n"
+                                      "    class DatabaseError(Error):\n"
+                                      "        pass\n"
+                                      "\n"
+                                      "    class IntegrityError(DatabaseError):\n"
+                                      "        pass\n";
+
+static int pyb_run_class_body_base(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_cbbase_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "exc.py", pyb_exc_py);
+    write_temp_file(tmp, "adapter.py", pyb_adapter_py);
+    write_temp_file(tmp, "adapter2.py", pyb_adapter2_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cbbase.db", tmp);
+    int rc[2] = {-1, -1};
+    bool db_sib[2] = {false, false};
+    bool db_mod[2] = {true, true};
+    bool ie_sib[2] = {false, false};
+    bool ie_mod[2] = {true, true};
+    bool nn_sib[2] = {false, false};
+    bool err_imp[2] = {false, false};
+    bool early_mod[2] = {false, false};
+    bool early_later_sib[2] = {true, true};
+    bool other_sib[2] = {false, false};
+    for (int run = 0; run < 2; run++) {
+        if (run == 1) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/adapter.py", tmp);
+            th_append_file(path, "\n# edited: the second run re-indexes incrementally\n");
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        rc[run] = p ? cbm_pipeline_run(p) : -1;
+        cbm_store_t *s = rc[run] == 0 ? cbm_store_open_path(db_path) : NULL;
+        if (s) {
+            const char *pr = cbm_pipeline_project_name(p);
+            const char *cls = "adapter.AsyncAdapt_dbapi";
+            char a[256];
+            char b[256];
+            snprintf(a, sizeof(a), "%s.DatabaseError", cls);
+            snprintf(b, sizeof(b), "%s.Error", cls);
+            db_sib[run] = pyn_edge(s, pr, a, b, "INHERITS");
+            db_mod[run] = pyn_edge(s, pr, a, "adapter2.AsyncAdapt_other_dbapi.Error", "INHERITS");
+            snprintf(a, sizeof(a), "%s.IntegrityError", cls);
+            snprintf(b, sizeof(b), "%s.DatabaseError", cls);
+            ie_sib[run] = pyn_edge(s, pr, a, b, "INHERITS");
+            ie_mod[run] = pyn_edge(s, pr, a, "exc.DatabaseError", "INHERITS");
+            snprintf(a, sizeof(a), "%s.NotNullViolationError", cls);
+            snprintf(b, sizeof(b), "%s.IntegrityError", cls);
+            nn_sib[run] = pyn_edge(s, pr, a, b, "INHERITS");
+            snprintf(a, sizeof(a), "%s.Error", cls);
+            err_imp[run] = pyn_edge(s, pr, a, "exc.DBAPIError", "INHERITS");
+            snprintf(a, sizeof(a), "%s.Early", cls);
+            snprintf(b, sizeof(b), "%s.Later", cls);
+            early_mod[run] = pyn_edge(s, pr, a, "adapter.Later", "INHERITS");
+            early_later_sib[run] = pyn_edge(s, pr, a, b, "INHERITS");
+            other_sib[run] = pyn_edge(s, pr, "adapter2.AsyncAdapt_other_dbapi.IntegrityError",
+                                      "adapter2.AsyncAdapt_other_dbapi.DatabaseError", "INHERITS");
+            cbm_store_close(s);
+        }
+        if (p) {
+            cbm_pipeline_free(p);
+        }
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    for (int run = 0; run < 2; run++) {
+        ASSERT_EQ(rc[run], 0);
+        ASSERT_TRUE(db_sib[run]);           /* DatabaseError(Error): the earlier sibling */
+        ASSERT_FALSE(db_mod[run]);          /* ... not the other adapter's Error */
+        ASSERT_TRUE(ie_sib[run]);           /* IntegrityError(DatabaseError): the sibling */
+        ASSERT_FALSE(ie_mod[run]);          /* ... not exc.DatabaseError */
+        ASSERT_TRUE(nn_sib[run]);           /* a chain of siblings */
+        ASSERT_TRUE(err_imp[run]);          /* control: a non-sibling base keeps the import */
+        ASSERT_TRUE(early_mod[run]);        /* a LATER sibling is not bound yet: module Later */
+        ASSERT_FALSE(early_later_sib[run]); /* ... never the later sibling */
+        ASSERT_TRUE(other_sib[run]);        /* the second adapter binds its own sibling */
+    }
+    PASS();
+}
+
+TEST(pipeline_python_class_body_sibling_base) {
+    return pyb_run_class_body_base(0);
+}
+
+TEST(pipeline_python_class_body_sibling_base_parallel) {
+    return pyb_run_class_body_base(52);
+}
+
 /* #1548 keeps TESTS for calls made through a test's own nested helper: the
  * call now starts at the extracted helper def (not at the test FILE node, as
  * before #1548), so TESTS is attributed to the enclosing test function. A
@@ -15566,6 +16172,94 @@ TEST(pipeline_python_nested_helper_keeps_tests_issue1548) {
 
 TEST(pipeline_python_nested_helper_keeps_tests_parallel_issue1548) {
     return pyn_run_nested_helper_tests(52);
+}
+
+/* A decorated class nested in a class body (`@dataclass class Meta:` inside a
+ * class) is a nested class like an undecorated one: it gets its Class node and
+ * its methods their Method nodes. push_nested_class_nodes looked through
+ * field/template/declaration and conditional wrappers but not through Python's
+ * decorated_definition, so the decorated class and everything in it was never
+ * extracted. Both resolvers. */
+static const char pyn_decorated_nested_py[] = "def deco(cls):\n"
+                                              "    return cls\n"
+                                              "\n"
+                                              "class Outer:\n"
+                                              "    @deco\n"
+                                              "    class Decorated:\n"
+                                              "        def run(self):\n"
+                                              "            return 1\n"
+                                              "\n"
+                                              "    class Plain:\n"
+                                              "        def go(self):\n"
+                                              "            return 2\n";
+
+static bool pyn_node_exists(cbm_store_t *s, const char *project, const char *rel_qn,
+                            const char *label) {
+    char qn[512];
+    pyn_qn(qn, sizeof(qn), project, rel_qn);
+    cbm_node_t n = {0};
+    bool found = cbm_store_find_node_by_qn(s, project, qn, &n) == CBM_STORE_OK && n.label &&
+                 strcmp(n.label, label) == 0;
+    cbm_node_free_fields(&n);
+    return found;
+}
+
+static int pyn_run_decorated_nested(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_decnest_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "sd.py", pyn_decorated_nested_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/decnest.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+    bool dec_class = s && pyn_node_exists(s, project, "sd.Outer.Decorated", "Class");
+    bool dec_method = s && pyn_node_exists(s, project, "sd.Outer.Decorated.run", "Method");
+    bool plain_class = s && pyn_node_exists(s, project, "sd.Outer.Plain", "Class");
+    bool plain_method = s && pyn_node_exists(s, project, "sd.Outer.Plain.go", "Method");
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(dec_class);    /* the decorated nested class is extracted */
+    ASSERT_TRUE(dec_method);   /* ... and its method */
+    ASSERT_TRUE(plain_class);  /* control: undecorated nested class */
+    ASSERT_TRUE(plain_method); /* control */
+    PASS();
+}
+
+TEST(pipeline_python_decorated_nested_class_extracted) {
+    return pyn_run_decorated_nested(0);
+}
+
+TEST(pipeline_python_decorated_nested_class_extracted_parallel) {
+    return pyn_run_decorated_nested(52);
 }
 
 TEST(pipeline_python_project) {
@@ -25001,6 +25695,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_call_never_binds_another_language_parallel);
     RUN_TEST(pipeline_rust_assoc_call_never_binds_free_namesake);
     RUN_TEST(pipeline_rust_assoc_call_never_binds_free_namesake_parallel);
+    RUN_TEST(pipeline_rust_generic_impl_method_sources_its_calls);
+    RUN_TEST(pipeline_rust_generic_impl_method_sources_its_calls_parallel);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
@@ -25016,6 +25712,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
+    RUN_TEST(pipeline_python_package_relative_imports);
+    RUN_TEST(pipeline_python_package_relative_imports_parallel);
+    RUN_TEST(pipeline_python_from_import_bare_call_issue1237);
+    RUN_TEST(pipeline_python_from_import_bare_call_issue1237_parallel);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
@@ -25078,10 +25778,16 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_nested_def_local_after_incremental_issue1548);
     RUN_TEST(pipeline_python_local_def_shadows_module_def_issue1548);
     RUN_TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548);
+    RUN_TEST(pipeline_python_super_follows_c3_mro);
+    RUN_TEST(pipeline_python_super_follows_c3_mro_parallel);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_issue1548);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548);
+    RUN_TEST(pipeline_python_class_body_sibling_base);
+    RUN_TEST(pipeline_python_class_body_sibling_base_parallel);
     RUN_TEST(pipeline_python_nested_helper_keeps_tests_issue1548);
     RUN_TEST(pipeline_python_nested_helper_keeps_tests_parallel_issue1548);
+    RUN_TEST(pipeline_python_decorated_nested_class_extracted);
+    RUN_TEST(pipeline_python_decorated_nested_class_extracted_parallel);
     RUN_TEST(pipeline_header_include_target_is_independent_of_registration_order);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
