@@ -8819,6 +8819,208 @@ static void write_go_c_ref_guard_fixture(const char *tmp, int pad_files) {
     }
 }
 
+/* F-G8 D1: a variable bound by a CROSS-file multi-value or named-result call
+ * is typed. The cross-file registrar received the raw result text
+ * `(*Encoder, error)`, which did not parse, so `e, err := enc.NewEncoder()`
+ * left e untyped and e.EncodeTuple() fell to a name guess. A single result
+ * keeps its raw text: `[]Sample` must stay a slice so that `xs[0].TS()` is
+ * typed (the extractor's cleaned return_types read it as `Sample`). Every
+ * target method has two same-named decoys, so a guess cannot pass.
+ * pad_files > 0 forces the parallel resolver. */
+static void write_go_multi_return_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "go.mod", "module example.com/fx\n\ngo 1.22\n");
+    write_temp_file(tmp, "enc/enc.go",
+                    "package enc\n"
+                    "\n"
+                    "type Encoder struct{ n int }\n"
+                    "\n"
+                    "func NewEncoder() (*Encoder, error) { return &Encoder{}, nil }\n"
+                    "\n"
+                    "func NewNamed() (e *Encoder) { e = &Encoder{}; return }\n"
+                    "\n"
+                    "func NewPair() (a, b *Encoder) { return &Encoder{}, &Encoder{} }\n"
+                    "\n"
+                    "func (e *Encoder) EncodeTuple() int { return e.n }\n"
+                    "\n"
+                    "func (e *Encoder) EncodeNamed() int { return e.n }\n"
+                    "\n"
+                    "func (e *Encoder) EncodeGrouped() int { return e.n }\n");
+    write_temp_file(tmp, "samples/samples.go",
+                    "package samples\n"
+                    "\n"
+                    "type Sample interface{ TS() int64 }\n"
+                    "\n"
+                    "type sample struct{}\n"
+                    "\n"
+                    "func (sample) TS() int64 { return 0 }\n"
+                    "\n"
+                    "func Generate() []Sample { return []Sample{sample{}} }\n"
+                    "\n"
+                    "func List() ([]Sample, error) { return []Sample{sample{}}, nil }\n");
+    write_temp_file(tmp, "diag/diag.go",
+                    "package diag\n"
+                    "\n"
+                    "type Diagnostic struct{ msg string }\n"
+                    "\n"
+                    "type Diagnostics []Diagnostic\n"
+                    "\n"
+                    "func (d Diagnostics) HasErrorsSlice() bool { return len(d) > 0 }\n"
+                    "\n"
+                    "func Run() (int, Diagnostics) { return 0, nil }\n");
+    write_temp_file(tmp, "app/types.go",
+                    "package app\n"
+                    "\n"
+                    "type isolation struct{}\n"
+                    "\n"
+                    "func (i *isolation) LowWatermarkField() int { return 0 }\n"
+                    "\n"
+                    "type Head struct{ iso *isolation }\n"
+                    "\n"
+                    "func newHead() (*Head, error) { return &Head{iso: &isolation{}}, nil }\n");
+    write_temp_file(tmp, "app/app.go",
+                    "package app\n"
+                    "\n"
+                    "import (\n"
+                    "\t\"example.com/fx/diag\"\n"
+                    "\t\"example.com/fx/enc\"\n"
+                    "\t\"example.com/fx/samples\"\n"
+                    ")\n"
+                    "\n"
+                    "func UseIndex() int64 {\n"
+                    "\txs := samples.Generate()\n"
+                    "\treturn xs[0].TS()\n"
+                    "}\n"
+                    "\n"
+                    "func UseTupleSlice() int64 {\n"
+                    "\tys, _ := samples.List()\n"
+                    "\treturn ys[0].TS()\n"
+                    "}\n"
+                    "\n"
+                    "func UseGrouped() int {\n"
+                    "\tx, _ := enc.NewPair()\n"
+                    "\treturn x.EncodeGrouped()\n"
+                    "}\n"
+                    "\n"
+                    "func UseTuple() int {\n"
+                    "\te, err := enc.NewEncoder()\n"
+                    "\t_ = err\n"
+                    "\treturn e.EncodeTuple()\n"
+                    "}\n"
+                    "\n"
+                    "func UseNamed() int {\n"
+                    "\te := enc.NewNamed()\n"
+                    "\treturn e.EncodeNamed()\n"
+                    "}\n"
+                    "\n"
+                    "func UseField() int {\n"
+                    "\th, _ := newHead()\n"
+                    "\treturn h.iso.LowWatermarkField()\n"
+                    "}\n"
+                    "\n"
+                    "func UseSlice() bool {\n"
+                    "\t_, d := diag.Run()\n"
+                    "\treturn d.HasErrorsSlice()\n"
+                    "}\n");
+    write_temp_file(tmp, "decoy/decoy.go",
+                    "package decoy\n"
+                    "\n"
+                    "type D1 struct{}\n"
+                    "\n"
+                    "type D2 struct{}\n"
+                    "\n"
+                    "func (D1) EncodeTuple() int { return 0 }\n"
+                    "func (D2) EncodeTuple() int { return 0 }\n"
+                    "func (D1) EncodeNamed() int { return 0 }\n"
+                    "func (D2) EncodeNamed() int { return 0 }\n"
+                    "func (D1) LowWatermarkField() int { return 0 }\n"
+                    "func (D2) LowWatermarkField() int { return 0 }\n"
+                    "func (D1) HasErrorsSlice() bool { return false }\n"
+                    "func (D2) HasErrorsSlice() bool { return false }\n"
+                    "func (D1) EncodeGrouped() int { return 0 }\n"
+                    "func (D2) EncodeGrouped() int { return 0 }\n"
+                    "func (D1) TS() int64 { return 0 }\n"
+                    "func (D2) TS() int64 { return 0 }\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler/filler%d.go", i);
+        snprintf(body, sizeof(body), "package filler\n\nfunc Filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+static int go_multi_return_case(int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_multiret_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_multi_return_fixture(tmp, pad_files);
+    char *saved = NULL;
+    if (pad_files > 0) {
+        char *old_workers = getenv("CBM_WORKERS");
+        saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_multiret.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    if (pad_files > 0) {
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+    }
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(rc, 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    static const struct {
+        const char *caller;
+        const char *method;
+        const char *file;
+    } want[] = {
+        {"UseTuple", "EncodeTuple", "enc/enc.go"},         /* e, err := enc.NewEncoder() */
+        {"UseNamed", "EncodeNamed", "enc/enc.go"},         /* named result (e *Encoder) */
+        {"UseField", "LowWatermarkField", "app/types.go"}, /* h, _ := newHead(); h.iso.X() */
+        {"UseSlice", "HasErrorsSlice", "diag/diag.go"},    /* _, d := diag.Run() */
+        {"UseGrouped", "EncodeGrouped", "enc/enc.go"},     /* (a, b *Encoder) */
+        {"UseIndex", "TS", "samples/samples.go"},          /* single []Sample, xs[0] */
+        {"UseTupleSlice", "TS", "samples/samples.go"},     /* ([]Sample, error) */
+    };
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        int right = named_edge_to_file_count(s, project, "CALLS", want[i].caller, want[i].method,
+                                             want[i].file);
+        int decoy = named_edge_to_file_count(s, project, "CALLS", want[i].caller, want[i].method,
+                                             "decoy/decoy.go");
+        bool typed = cross_file_call_has_strategy(s, project, want[i].caller, want[i].method,
+                                                  "\"strategy\":\"lsp_");
+        if (right < 1 || decoy != 0 || !typed) {
+            printf("  %s -> %s: right=%d decoy=%d lsp=%d\n", want[i].caller, want[i].method, right,
+                   decoy, typed);
+            FAIL("multi-value / named-result receiver not typed");
+        }
+    }
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_multi_return_receiver_is_typed) {
+    return go_multi_return_case(0);
+}
+
+TEST(pipeline_go_multi_return_receiver_is_typed_parallel) {
+    return go_multi_return_case(52);
+}
+
 TEST(pipeline_go_rw_usage_never_cross_into_c) {
     /* #1928: USAGE and WRITES/READS resolve through the same short-name
      * registry as CALLS but never consulted the #725 cross-language guard.
@@ -8866,6 +9068,268 @@ TEST(pipeline_go_rw_usage_never_cross_into_c) {
     cbm_pipeline_free(p);
     th_rmtree(tmp);
     PASS();
+}
+
+/* The Rust registries were built from the mixed-language def set: a Perl
+ * `sub new` became a Rust free function, and the project-wide
+ * lsp_short_name_unique fallback bound `Store::new()` to it at 0.90 (found by
+ * the generic-engine lane on its 12-language fixture). A Rust call never
+ * targets another language's definition. pad_files > 0 forces the parallel
+ * resolver, whose Rust registry is the shared all-defs build. */
+/* Pads a Rust fixture with pad_files filler modules (pad_files > 0 forces the
+ * parallel resolver: CBM_WORKERS=4 for the run), runs the full pipeline into
+ * <tmp>/<db_name> and opens the store. NULL store = the run failed. */
+static cbm_store_t *rust_fixture_run(const char *tmp, int pad_files, const char *db_name,
+                                     cbm_pipeline_t **out_p) {
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.rs", i);
+        snprintf(body, sizeof(body), "pub fn filler%d() -> u32 {\n    %d\n}\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *saved = NULL;
+    if (pad_files > 0) {
+        char *old_workers = getenv("CBM_WORKERS");
+        saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", tmp, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    if (pad_files > 0) {
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+    }
+    *out_p = p;
+    return rc == 0 ? cbm_store_open_path(db_path) : NULL;
+}
+
+static int rust_registry_rust_only_case(int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_only_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/store.rs",
+                    "pub struct Store {\n"
+                    "    n: u32,\n"
+                    "}\n"
+                    "\n"
+                    "impl Store {\n"
+                    "    pub fn new() -> Store {\n"
+                    "        Store { n: 0 }\n"
+                    "    }\n"
+                    "\n"
+                    "    pub fn get(&self, k: u32) -> u32 {\n"
+                    "        self.n + k\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/main.rs",
+                    "mod store;\n"
+                    "\n"
+                    "use crate::store::Store;\n"
+                    "\n"
+                    "fn run() -> u32 {\n"
+                    "    let s = Store::new();\n"
+                    "    s.get(1)\n"
+                    "}\n"
+                    "\n"
+                    "fn main() {\n"
+                    "    run();\n"
+                    "}\n");
+    write_temp_file(tmp, "perlsrc/Lib.pm",
+                    "package Lib;\n"
+                    "\n"
+                    "sub new {\n"
+                    "    my ($class) = @_;\n"
+                    "    return bless {}, $class;\n"
+                    "}\n"
+                    "\n"
+                    "1;\n");
+    cbm_pipeline_t *p = NULL;
+    cbm_store_t *s = rust_fixture_run(tmp, pad_files, "rust_only.db", &p);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Never onto the Perl constructor ... */
+    ASSERT_EQ(named_edge_to_file_count(s, project, "CALLS", "run", "new", "perlsrc/Lib.pm"), 0);
+    /* ... and the Rust call still binds the Rust associated function. */
+    ASSERT_GTE(named_edge_to_file_count(s, project, "CALLS", "run", "new", "src/store.rs"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_call_never_binds_another_language) {
+    return rust_registry_rust_only_case(0);
+}
+
+TEST(pipeline_rust_call_never_binds_another_language_parallel) {
+    return rust_registry_rust_only_case(52);
+}
+
+/* `Opts::write(true)` is an associated function. The LSP leaves it to the
+ * registry (import_map -> fsx.Opts.write), but its free-function short-name
+ * fallback bound it to the project's only free `write` (cache.write) first, and
+ * that LSP row pre-empted the right answer. With the cross-language namesakes
+ * gone (above), this hijack replaced 600+ correct qualified_suffix/import_map
+ * edges on the Rust corpus. A type-qualified call never takes that fallback. */
+static int rust_assoc_call_free_namesake_case(int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_assoc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/fsx.rs",
+                    "pub struct Opts {\n"
+                    "    pub w: bool,\n"
+                    "}\n"
+                    "\n"
+                    "impl Opts {\n"
+                    "    pub fn write(w: bool) -> Opts {\n"
+                    "        Opts { w }\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/cache.rs",
+                    "pub fn write(p: &str) -> usize {\n"
+                    "    p.len()\n"
+                    "}\n");
+    write_temp_file(tmp, "src/main.rs",
+                    "mod cache;\n"
+                    "mod fsx;\n"
+                    "\n"
+                    "use crate::fsx::Opts;\n"
+                    "\n"
+                    "fn run() -> bool {\n"
+                    "    let o = Opts::write(true);\n"
+                    "    o.w\n"
+                    "}\n"
+                    "\n"
+                    "fn main() {\n"
+                    "    run();\n"
+                    "    cache::write(\"x\");\n"
+                    "}\n");
+    cbm_pipeline_t *p = NULL;
+    cbm_store_t *s = rust_fixture_run(tmp, pad_files, "rust_assoc.db", &p);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* The associated function, never the free namesake ... */
+    ASSERT_GTE(named_edge_to_file_count(s, project, "CALLS", "run", "write", "src/fsx.rs"), 1);
+    ASSERT_EQ(named_edge_to_file_count(s, project, "CALLS", "run", "write", "src/cache.rs"), 0);
+    /* ... while the module-qualified free call keeps its target. */
+    ASSERT_GTE(named_edge_to_file_count(s, project, "CALLS", "main", "write", "src/cache.rs"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_assoc_call_never_binds_free_namesake) {
+    return rust_assoc_call_free_namesake_case(0);
+}
+
+TEST(pipeline_rust_assoc_call_never_binds_free_namesake_parallel) {
+    return rust_assoc_call_free_namesake_case(52);
+}
+
+/* F-R4 (#763, Rust): calls inside a method of a generic impl (`impl<T> Gen<T>`,
+ * `impl<'a> Life<'a>`) were sourced from the File node: the call scope kept the
+ * generic arguments the def side strips. Each method must be the source of its
+ * own call. pad_files > 0 forces the parallel resolver. */
+static int rust_generic_impl_attribution_case(int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_gimpl_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "pub struct Gen<T> { v: T }\n"
+        "impl<T> Gen<T> {\n"
+        "    pub fn in_generic(&self) -> u32 { helper_a() + self.other_g() + Self::assoc_g() }\n"
+        "    pub fn other_g(&self) -> u32 { 3 }\n"
+        "    pub fn assoc_g() -> u32 { 4 }\n"
+        "}\n"
+        "pub struct Life<'a> { s: &'a str }\n"
+        "impl<'a> Life<'a> {\n"
+        "    pub fn in_lifetime(&self) -> u32 { helper_b() + self.other_l() }\n"
+        "    pub fn other_l(&self) -> u32 { 5 }\n"
+        "}\n"
+        "pub fn helper_a() -> u32 { 1 }\n"
+        "pub fn helper_b() -> u32 { 2 }\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.rs", i);
+        snprintf(body, sizeof(body), "pub fn filler%d() -> u32 {\n    %d\n}\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *saved = NULL;
+    if (pad_files > 0) {
+        char *old_workers = getenv("CBM_WORKERS");
+        saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/rust_gimpl.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_TRUE(cross_file_call_exists(s, project, "in_generic", "helper_a"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "in_lifetime", "helper_b"));
+    /* ... and not from the file. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "lib.rs", "helper_a"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "lib.rs", "helper_b"));
+    /* The LSP side names the impl's self type without its arguments too: its
+     * rows join these callers (lsp_*, not a registry fallback), and `self.` /
+     * `Self::` dispatch inside a generic impl resolves (Self::assoc_g had no
+     * edge at all). */
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_generic", "helper_a", "\"strategy\":\"lsp_"));
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_generic", "other_g", "\"strategy\":\"lsp_"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "in_generic", "assoc_g"));
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_lifetime", "other_l", "\"strategy\":\"lsp_"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (pad_files > 0) {
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_generic_impl_method_sources_its_calls) {
+    return rust_generic_impl_attribution_case(0);
+}
+
+TEST(pipeline_rust_generic_impl_method_sources_its_calls_parallel) {
+    return rust_generic_impl_attribution_case(52);
 }
 
 TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
@@ -10354,6 +10818,258 @@ TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge) {
     }
     th_rmtree(tmp);
     PASS();
+}
+
+/* CALLS edges from a caller to a callee, both matched by QN suffix (start each
+ * suffix with '.' to anchor it at a segment boundary), any strategy. *guessed
+ * is set when a matching edge came from a name guess rather than an import
+ * binding or the LSP. */
+static int py_calls_between(cbm_store_t *s, const char *project, const char *caller_suffix,
+                            const char *callee_suffix, bool *guessed) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count);
+    int hits = 0;
+    size_t cs = strlen(caller_suffix);
+    size_t ts = strlen(callee_suffix);
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            size_t sl = strlen(src.qualified_name);
+            size_t tl = strlen(tgt.qualified_name);
+            if (sl >= cs && tl >= ts && strcmp(src.qualified_name + sl - cs, caller_suffix) == 0 &&
+                strcmp(tgt.qualified_name + tl - ts, callee_suffix) == 0) {
+                hits++;
+                const char *pj = edges[i].properties_json ? edges[i].properties_json : "";
+                if (guessed && !strstr(pj, "\"import_map\"") && !strstr(pj, "\"lsp")) {
+                    *guessed = true;
+                }
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges)
+        cbm_store_free_edges(edges, edge_count);
+    return hits;
+}
+
+/* Pin CBM_WORKERS=4 for a padded (> 50 files) parallel run; restore after. */
+typedef struct {
+    char *saved;
+    bool had;
+    int rc;
+} py_workers_pin_t;
+
+static py_workers_pin_t py_pin_workers(bool parallel) {
+    py_workers_pin_t pin = {0};
+    if (!parallel) {
+        return pin;
+    }
+    const char *old = getenv("CBM_WORKERS");
+    pin.had = old != NULL;
+    pin.saved = old ? strdup(old) : NULL;
+    pin.rc = (old && !pin.saved) ? -1 : cbm_setenv("CBM_WORKERS", "4", 1);
+    return pin;
+}
+
+static int py_unpin_workers(bool parallel, py_workers_pin_t *pin) {
+    if (!parallel) {
+        return 0;
+    }
+    int rc = pin->had ? cbm_setenv("CBM_WORKERS", pin->saved, 1) : cbm_unsetenv("CBM_WORKERS");
+    free(pin->saved);
+    pin->saved = NULL;
+    return rc;
+}
+
+static void py_write_padding(const char *tmp, const char *stem, bool parallel) {
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64];
+        char body[96];
+        snprintf(name, sizeof(name), "%s%d.py", stem, i);
+        snprintf(body, sizeof(body), "def %s%d():\n    return %d\n", stem, i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+/* `from . import x`, `from .. import x` and `from . import x as y` name the
+ * importing file's own (or parent) package. The extractor recorded them one
+ * package too high ("..x"), so the import fell to pass_pkgmap's symbol-name
+ * guess -- the lexicographically first same-named project definition -- and
+ * every call became a confident edge into comp.aaa, through the import map and
+ * the Python LSP's alias binding alike (home-assistant: 7,175 call pairs).
+ * Both resolvers: <= 50 files sequential, padded > 50 parallel. */
+static int check_python_package_relative_imports(bool parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_relpkg_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "comp/__init__.py", "");
+    write_temp_file(tmp, "comp/aaa/__init__.py",
+                    "def async_register(hass):\n"
+                    "    return 1\n\n"
+                    "def local_fn():\n"
+                    "    return 2\n");
+    write_temp_file(tmp, "comp/web/__init__.py",
+                    "def async_register(hass):\n"
+                    "    return 3\n");
+    write_temp_file(tmp, "comp/web/trigger.py",
+                    "from . import async_register\n\n"
+                    "def attach(hass):\n"
+                    "    return async_register(hass)\n");
+    write_temp_file(tmp, "comp/web/sub/__init__.py",
+                    "def local_fn():\n"
+                    "    return 4\n");
+    write_temp_file(tmp, "comp/web/sub/mod.py",
+                    "from .. import async_register\n"
+                    "from . import local_fn as lf\n\n"
+                    "def deep(hass):\n"
+                    "    async_register(hass)\n"
+                    "    return lf()\n");
+    py_write_padding(tmp, "relpad", parallel);
+
+    py_workers_pin_t pin = py_pin_workers(parallel);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/relpkg.db", tmp);
+    cbm_pipeline_t *p = pin.rc == 0 ? cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL) : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool opened = s != NULL;
+    bool guessed = false;
+    int own = -1, own_decoy = -1, parent = -1, parent_decoy = -1, alias = -1, alias_decoy = -1;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        own = py_calls_between(s, project, ".comp.web.trigger.attach", ".comp.web.async_register",
+                               &guessed);
+        own_decoy = py_calls_between(s, project, ".comp.web.trigger.attach",
+                                     ".comp.aaa.async_register", NULL);
+        parent = py_calls_between(s, project, ".comp.web.sub.mod.deep", ".comp.web.async_register",
+                                  &guessed);
+        parent_decoy = py_calls_between(s, project, ".comp.web.sub.mod.deep",
+                                        ".comp.aaa.async_register", NULL);
+        alias = py_calls_between(s, project, ".comp.web.sub.mod.deep", ".comp.web.sub.local_fn",
+                                 &guessed);
+        alias_decoy =
+            py_calls_between(s, project, ".comp.web.sub.mod.deep", ".comp.aaa.local_fn", NULL);
+        cbm_store_close(s);
+    }
+    cbm_pipeline_free(p);
+    int unpin_rc = py_unpin_workers(parallel, &pin);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(pin.rc, 0);
+    ASSERT_EQ(unpin_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(opened);
+    ASSERT_EQ(own, 1);       /* from . import x: the file's own package */
+    ASSERT_EQ(own_decoy, 0); /* never the lexicographically first namesake */
+    ASSERT_EQ(parent, 1);    /* from .. import x: the parent package */
+    ASSERT_EQ(parent_decoy, 0);
+    ASSERT_EQ(alias, 1); /* from . import x as y */
+    ASSERT_EQ(alias_decoy, 0);
+    ASSERT_FALSE(guessed); /* bound by the import, not by a name guess */
+    PASS();
+}
+
+TEST(pipeline_python_package_relative_imports) {
+    return check_python_package_relative_imports(false);
+}
+
+TEST(pipeline_python_package_relative_imports_parallel) {
+    return check_python_package_relative_imports(true);
+}
+
+/* #1237: a plain `from pkg.db import get_row_or_none` and bare calls resolve to
+ * the imported module-level def (function and method callers, plus the
+ * same-file caller), never to a same-named def elsewhere that a name guess
+ * would rank first (legacy.compat), and a re-index that only ADDS an unrelated
+ * file (the reporter's watcher re-index after writing benchmark scripts into the
+ * indexed tree) keeps exactly the same CALLS. Main already resolved this shape
+ * when the guard landed: it pins the shape and has no RED on revert. */
+static int check_python_from_import_bare_call_issue1237(bool parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_1237_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "pkg/__init__.py", "");
+    write_temp_file(tmp, "pkg/db.py",
+                    "def get_row_or_none(model, **filters):\n"
+                    "    return None\n\n"
+                    "def other_helper():\n"
+                    "    return get_row_or_none(1, id=2)\n");
+    write_temp_file(tmp, "pkg/views.py",
+                    "from pkg.db import get_row_or_none\n\n"
+                    "def show(pk):\n"
+                    "    return get_row_or_none(object, id=pk)\n\n"
+                    "class Detail:\n"
+                    "    def get(self, pk):\n"
+                    "        return get_row_or_none(object, pk=pk)\n");
+    write_temp_file(tmp, "legacy/__init__.py", "");
+    write_temp_file(tmp, "legacy/compat.py",
+                    "def get_row_or_none(model):\n"
+                    "    return model\n");
+    py_write_padding(tmp, "rowpad", parallel);
+
+    py_workers_pin_t pin = py_pin_workers(parallel);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/rows.db", tmp);
+    int run_rc[2] = {-1, -1};
+    int show[2] = {-1, -1};
+    int method[2] = {-1, -1};
+    int same[2] = {-1, -1};
+    int decoy[2] = {-1, -1};
+    int calls[2] = {-1, -1};
+    bool guessed = false;
+    for (int run = 0; run < 2 && pin.rc == 0; run++) {
+        if (run == 1) {
+            /* Second run on the same db: routes to the incremental re-index. */
+            write_temp_file(tmp, "bench_rows.py", "def bench():\n    return 0\n");
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        run_rc[run] = p ? cbm_pipeline_run(p) : -1;
+        cbm_store_t *s = run_rc[run] == 0 ? cbm_store_open_path(db_path) : NULL;
+        if (s) {
+            const char *project = cbm_pipeline_project_name(p);
+            const char *target = ".pkg.db.get_row_or_none";
+            const char *namesake = ".legacy.compat.get_row_or_none";
+            show[run] = py_calls_between(s, project, ".pkg.views.show", target, &guessed);
+            method[run] = py_calls_between(s, project, ".pkg.views.Detail.get", target, &guessed);
+            same[run] = py_calls_between(s, project, ".pkg.db.other_helper", target, &guessed);
+            decoy[run] = py_calls_between(s, project, ".pkg.views.show", namesake, NULL) +
+                         py_calls_between(s, project, ".pkg.views.Detail.get", namesake, NULL);
+            calls[run] = cbm_store_count_edges_by_type(s, project, "CALLS");
+            cbm_store_close(s);
+        }
+        cbm_pipeline_free(p);
+    }
+    int unpin_rc = py_unpin_workers(parallel, &pin);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(pin.rc, 0);
+    ASSERT_EQ(unpin_rc, 0);
+    for (int run = 0; run < 2; run++) {
+        ASSERT_EQ(run_rc[run], 0);
+        ASSERT_EQ(show[run], 1);   /* cross-file bare call through a plain from-import */
+        ASSERT_EQ(method[run], 1); /* the same from a method */
+        ASSERT_EQ(same[run], 1);   /* same-file bare call */
+        ASSERT_EQ(decoy[run], 0);  /* never the namesake a name guess would pick */
+    }
+    ASSERT_EQ(calls[1], calls[0]); /* adding a call-free file moves no CALLS edge */
+    ASSERT_FALSE(guessed);
+    PASS();
+}
+
+TEST(pipeline_python_from_import_bare_call_issue1237) {
+    return check_python_from_import_bare_call_issue1237(false);
+}
+
+TEST(pipeline_python_from_import_bare_call_issue1237_parallel) {
+    return check_python_from_import_bare_call_issue1237(true);
 }
 
 /* Reproduce-first: pass_parallel's fused cross-LSP eligibility currently counts
@@ -13492,8 +14208,17 @@ TEST(pipeline_python_init_import_probe_failure_falls_back) {
 /* #1277: typed instance fields of a Python class imported from another file.
  * Counts CALLS edges caller -> callee (QN suffixes) whose properties name an
  * LSP strategy. */
+static int count_calls_with(cbm_store_t *s, const char *project, const char *caller_suffix,
+                            const char *callee_suffix, const char *fragment);
+
 static int count_lsp_calls(cbm_store_t *s, const char *project, const char *caller_suffix,
                            const char *callee_suffix) {
+    return count_calls_with(s, project, caller_suffix, callee_suffix, "lsp");
+}
+
+/* As count_lsp_calls, with any properties fragment (NULL = every CALLS edge). */
+static int count_calls_with(cbm_store_t *s, const char *project, const char *caller_suffix,
+                            const char *callee_suffix, const char *fragment) {
     cbm_edge_t *edges = NULL;
     int edge_count = 0;
     cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count);
@@ -13509,7 +14234,8 @@ static int count_lsp_calls(cbm_store_t *s, const char *project, const char *call
             size_t ts = strlen(callee_suffix);
             if (sl >= cs && tl >= ts && strcmp(src.qualified_name + sl - cs, caller_suffix) == 0 &&
                 strcmp(tgt.qualified_name + tl - ts, callee_suffix) == 0 &&
-                edges[i].properties_json && strstr(edges[i].properties_json, "lsp")) {
+                (!fragment ||
+                 (edges[i].properties_json && strstr(edges[i].properties_json, fragment)))) {
                 hits++;
             }
         }
@@ -13626,6 +14352,480 @@ TEST(python_crossfile_typed_field_calls_issue1277) {
 
 TEST(python_crossfile_typed_field_calls_issue1277_parallel) {
     return check_python_crossfile_typed_field_calls_issue1277(true);
+}
+
+/* #1277, second half: the reporter's chain with both annotation imports
+ * under `if TYPE_CHECKING:` (the usual shape when the import would cycle).
+ * trainer.strategies is typed through a TYPE_CHECKING import of Contract, and
+ * run()'s parameter through a typing.TYPE_CHECKING import of Trainer; the call
+ * resolves by the LSP exactly as with runtime imports. A runtime call through
+ * a TYPE_CHECKING-only name cannot happen: it gets no CALLS edge at all. */
+static int check_python_type_checking_typed_field_issue1277(bool parallel) {
+    const char *contracts = "class Contract:\n"
+                            "    def process_batch(self) -> None:\n"
+                            "        ...\n";
+    const char *trainer = "from __future__ import annotations\n"
+                          "from typing import TYPE_CHECKING\n\n"
+                          "if TYPE_CHECKING:\n"
+                          "    from contracts import Contract\n\n"
+                          "class Trainer:\n"
+                          "    def __init__(self, strategies: Contract) -> None:\n"
+                          "        self.strategies = strategies\n";
+    const char *loop = "from __future__ import annotations\n"
+                       "import typing\n\n"
+                       "if typing.TYPE_CHECKING:\n"
+                       "    from trainer import Trainer\n\n"
+                       "def run(trainer: Trainer) -> None:\n"
+                       "    trainer.strategies.process_batch()\n\n"
+                       "def bad():\n"
+                       "    return Trainer()\n";
+    if (setup_usages_repo("contracts.py", contracts, "trainer.py", trainer) != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/loop.py", g_usages_tmpdir);
+    if (th_write_file(path, loop) != 0) {
+        teardown_usages_repo();
+        FAIL("failed to write loop.py");
+    }
+    if (parallel) {
+        for (int i = 0; i < 50; i++) {
+            snprintf(path, sizeof(path), "%s/tc_pad_%02d.py", g_usages_tmpdir, i);
+            if (th_write_file(path, "tc_padding = 0\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to write parallel-selection fixture");
+            }
+        }
+    }
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        teardown_usages_repo();
+        FAIL("failed to save pipeline environment");
+    }
+    int pin_workers_rc = parallel ? cbm_setenv("CBM_WORKERS", "4", 1) : 0;
+    int pin_single_rc = parallel ? cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") : 0;
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_1277_tc.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = pin_workers_rc == 0 && pin_single_rc == 0
+                            ? cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL)
+                            : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool store_opened = s != NULL;
+    int via_field = -1, runtime_import = -1, runtime_lsp = -1;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        via_field = count_lsp_calls(s, project, "loop.run", "contracts.Contract.process_batch");
+        runtime_import = count_calls_with(s, project, "loop.bad", "trainer.Trainer",
+                                          "\"strategy\":\"import_map");
+        runtime_lsp = count_lsp_calls(s, project, "loop.bad", "trainer.Trainer");
+        cbm_store_close(s);
+    }
+
+    cbm_pipeline_free(p);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    int restore_single_rc = saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                                         : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+    teardown_usages_repo();
+
+    ASSERT_EQ(pin_workers_rc, 0);
+    ASSERT_EQ(pin_single_rc, 0);
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(restore_single_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(store_opened);
+    ASSERT_EQ(via_field, 1);      /* annotation through TYPE_CHECKING imports */
+    ASSERT_EQ(runtime_import, 0); /* control: no CALLS import map binds the name */
+    ASSERT_EQ(runtime_lsp, 0);    /* control: the LSP binds it for annotations only */
+    PASS();
+}
+
+TEST(python_type_checking_typed_field_issue1277) {
+    return check_python_type_checking_typed_field_issue1277(false);
+}
+
+TEST(python_type_checking_typed_field_issue1277_parallel) {
+    return check_python_type_checking_typed_field_issue1277(true);
+}
+
+/* A base class spelled through a root-binding import (`import pkg.mod.nodes`
+ * binds `pkg`; `class X(pkg.mod.nodes.Context)`) is the same class as the
+ * from-imported spelling. The Python LSP's inheritance view never resolved the
+ * dotted spelling, so a member inherited through it (self.m(), super().m(),
+ * super().__init__()) fell to a weak name guess or to nothing. The plain
+ * from-import control must keep resolving; the untyped receiver must not. */
+static int check_python_dotted_base_inheritance(bool parallel) {
+    const char *nodes = "class Context:\n"
+                        "    def __init__(self, line=-1):\n"
+                        "        self.line = line\n\n"
+                        "    def ctx_only_helper(self):\n"
+                        "        return 1\n\n"
+                        "    def describe(self):\n"
+                        "        return 0\n";
+    const char *types = "import pkg.mod.nodes\n"
+                        "from pkg.mod.nodes import Context\n\n"
+                        "class DottedType(pkg.mod.nodes.Context):\n"
+                        "    def __init__(self, line=-1):\n"
+                        "        super().__init__(line)\n\n"
+                        "    def run(self):\n"
+                        "        return self.ctx_only_helper()\n\n"
+                        "    def describe(self):\n"
+                        "        return super().describe()\n\n"
+                        "class PlainType(Context):\n"
+                        "    def run(self):\n"
+                        "        return self.ctx_only_helper()\n\n"
+                        "def untyped(thing):\n"
+                        "    return thing.ctx_only_helper()\n";
+    if (setup_usages_repo("pkg/mod/nodes.py", nodes, "pkg/types.py", types) != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char path[512];
+    const char *inits[] = {"pkg/__init__.py", "pkg/mod/__init__.py"};
+    for (size_t i = 0; i < sizeof(inits) / sizeof(inits[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", g_usages_tmpdir, inits[i]);
+        if (th_write_file(path, "") != 0) {
+            teardown_usages_repo();
+            FAIL("failed to write package marker");
+        }
+    }
+    if (parallel) {
+        for (int i = 0; i < 50; i++) {
+            snprintf(path, sizeof(path), "%s/dotted_pad_%02d.py", g_usages_tmpdir, i);
+            if (th_write_file(path, "dotted_padding = 0\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to write parallel-selection fixture");
+            }
+        }
+    }
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        teardown_usages_repo();
+        FAIL("failed to save pipeline environment");
+    }
+    int pin_workers_rc = parallel ? cbm_setenv("CBM_WORKERS", "4", 1) : 0;
+    int pin_single_rc = parallel ? cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") : 0;
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_dotted_base.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = pin_workers_rc == 0 && pin_single_rc == 0
+                            ? cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL)
+                            : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool store_opened = s != NULL;
+    int dotted_self = -1, dotted_super = -1, dotted_init = -1, plain_self = -1, untyped = -1;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        dotted_self = count_lsp_calls(s, project, "pkg.types.DottedType.run",
+                                      "pkg.mod.nodes.Context.ctx_only_helper");
+        dotted_super = count_lsp_calls(s, project, "pkg.types.DottedType.describe",
+                                       "pkg.mod.nodes.Context.describe");
+        dotted_init = count_lsp_calls(s, project, "pkg.types.DottedType.__init__",
+                                      "pkg.mod.nodes.Context.__init__");
+        plain_self = count_lsp_calls(s, project, "pkg.types.PlainType.run",
+                                     "pkg.mod.nodes.Context.ctx_only_helper");
+        untyped = count_lsp_calls(s, project, "pkg.types.untyped", "ctx_only_helper");
+        cbm_store_close(s);
+    }
+
+    cbm_pipeline_free(p);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    int restore_single_rc = saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                                         : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+    teardown_usages_repo();
+
+    ASSERT_EQ(pin_workers_rc, 0);
+    ASSERT_EQ(pin_single_rc, 0);
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(restore_single_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(store_opened);
+    ASSERT_EQ(dotted_self, 1);  /* self.m() inherited through a dotted base */
+    ASSERT_EQ(dotted_super, 1); /* super().m() through a dotted base */
+    ASSERT_EQ(dotted_init, 1);  /* super().__init__() through a dotted base */
+    ASSERT_EQ(plain_self, 1);   /* control: from-imported base */
+    ASSERT_EQ(untyped, 0);      /* control: no receiver type, no LSP edge */
+    PASS();
+}
+
+TEST(python_dotted_base_inheritance) {
+    return check_python_dotted_base_inheritance(false);
+}
+
+TEST(python_dotted_base_inheritance_parallel) {
+    return check_python_dotted_base_inheritance(true);
+}
+
+/* Properties of the `type` edge src_qn -> tgt_qn (strdup'd; caller frees), or NULL. */
+static char *py_reexp_edge_props(cbm_store_t *s, const char *project, const char *src_qn,
+                                 const char *tgt_qn, const char *type) {
+    cbm_node_t src = {0};
+    cbm_node_t tgt = {0};
+    char *props = NULL;
+    if (cbm_store_find_node_by_qn(s, project, src_qn, &src) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(s, project, tgt_qn, &tgt) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, src.id, type, &edges, &ec);
+        for (int i = 0; i < ec && !props; i++) {
+            if (edges[i].target_id == tgt.id)
+                props = strdup(edges[i].properties_json ? edges[i].properties_json : "{}");
+        }
+        if (edges)
+            cbm_store_free_edges(edges, ec);
+    }
+    cbm_node_free_fields(&src);
+    cbm_node_free_fields(&tgt);
+    return props;
+}
+
+/* Package re-exports, end to end: extraction records each module's ordered
+ * namespace facts, the collector turns them into re-export records, the
+ * shared Python registry folds them into its export table, and the LSP
+ * consults it. `models.CharField` with `from .fields import *` in
+ * models/__init__.py is the django shape. Each app function makes one call so
+ * every edge's strategy is attributable. */
+static const char *const py_reexport_calls[][2] = {
+    {"attr_explicit_cls", "pkg.explicit_mod.Explicit"},
+    {"attr_explicit_fn", "pkg.explicit_mod.explicit_fn"},
+    {"attr_star_cls", "pkg.star_mod.Star"},
+    {"attr_star_fn", "pkg.star_mod.star_fn"},
+    {"attr_all_listed", "pkg.all_mod.Listed"},
+    {"attr_chain", "pkg.chain.inner.Deep"},
+    {"attr_renamed", "pkg.alias_mod.Orig"},
+    {"from_explicit", "pkg.explicit_mod.Explicit"},
+    {"from_star_fn", "pkg.star_mod.star_fn"},
+    {"from_all_listed", "pkg.all_mod.Listed"},
+    {"from_chain", "pkg.chain.inner.Deep"},
+    {"from_renamed", "pkg.alias_mod.Orig"},
+    {"cycle_a", "cyc.a.a_fn"},
+    {"cycle_b", "cyc.b.b_fn"},
+    {"sub_models", "db.models.fields.CharField"},
+    {"chain_var", "pkg.chain.inner.Deep.dive"},
+    {"ctl_from_cls", "direct.impl.Direct"},
+    {"ctl_from_fn", "direct.impl.direct_fn"},
+    {"lazy_tc", "lz.lazy_mod.Lazy"},
+};
+enum { PY_REEXPORT_N_CALLS = sizeof(py_reexport_calls) / sizeof(py_reexport_calls[0]) };
+
+/* Calls that must NOT reach their target by the LSP: an `__all__`-unlisted
+ * name, a private name under a star, a re-export the module shadows later,
+ * and one made before a whole-namespace barrier (a top-level `try:`). */
+static const char *const py_reexport_excluded[][2] = {
+    {"excl_unlisted", "pkg.all_mod.Unlisted"}, {"excl_private", "pkg.star_mod._private_fn"},
+    {"excl_shadowed", "shad.impl.Gone"},       {"excl_barrier", "barr.impl.Before"},
+    {"excl_compat", "cmp.types_only.Shim"},
+};
+enum { PY_REEXPORT_N_EXCLUDED = sizeof(py_reexport_excluded) / sizeof(py_reexport_excluded[0]) };
+
+/* Index the fixture; lsp[c] = call c's edge has an lsp_* strategy; excluded[e]
+ * = excluded call e reached its target by the LSP anyway. */
+static int py_reexport_run(bool parallel, bool incremental, bool *lsp, bool *excluded) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_reexport_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return -1;
+    }
+    write_temp_file(tmp, "app/__init__.py", "");
+    write_temp_file(tmp, "app/pkg/__init__.py",
+                    "from .explicit_mod import Explicit, explicit_fn\n"
+                    "from .star_mod import *\n"
+                    "from .all_mod import *\n"
+                    "from .chain import *\n"
+                    "from .alias_mod import Orig as Renamed\n");
+    write_temp_file(tmp, "app/pkg/explicit_mod.py",
+                    "class Explicit:\n    pass\n\n\ndef explicit_fn():\n    return 1\n");
+    write_temp_file(tmp, "app/pkg/star_mod.py",
+                    "class Star:\n    pass\n\n\n"
+                    "def star_fn():\n    return 1\n\n\ndef _private_fn():\n    return 0\n");
+    write_temp_file(tmp, "app/pkg/all_mod.py",
+                    "__all__ = [\"Listed\"]\n\n\nclass Listed:\n    pass\n\n\n"
+                    "class Unlisted:\n    pass\n");
+    write_temp_file(tmp, "app/pkg/chain/__init__.py", "from .inner import Deep\n");
+    write_temp_file(tmp, "app/pkg/chain/inner.py",
+                    "class Deep:\n    def dive(self):\n        return 1\n");
+    write_temp_file(tmp, "app/pkg/alias_mod.py", "class Orig:\n    pass\n");
+    write_temp_file(tmp, "app/cyc/__init__.py", "from .a import *\nfrom .b import *\n");
+    write_temp_file(tmp, "app/cyc/a.py", "from .b import *\n\n\ndef a_fn():\n    return 1\n");
+    write_temp_file(tmp, "app/cyc/b.py", "from .a import *\n\n\ndef b_fn():\n    return 2\n");
+    write_temp_file(tmp, "app/db/__init__.py", "");
+    write_temp_file(tmp, "app/db/models/__init__.py", "from app.db.models.fields import *\n");
+    write_temp_file(tmp, "app/db/models/fields/__init__.py",
+                    "__all__ = [\"CharField\"]\n\n\nclass CharField:\n    pass\n");
+    write_temp_file(tmp, "app/direct/__init__.py", "");
+    write_temp_file(tmp, "app/direct/impl.py",
+                    "class Direct:\n    pass\n\n\ndef direct_fn():\n    return 1\n");
+    write_temp_file(tmp, "app/shad/__init__.py", "from .impl import Gone\nGone = None\n");
+    write_temp_file(tmp, "app/shad/impl.py", "class Gone:\n    pass\n");
+    write_temp_file(
+        tmp, "app/barr/__init__.py",
+        "from .impl import Before\n"
+        "try:\n    import optional_dep\nexcept ImportError:\n    optional_dep = None\n");
+    write_temp_file(tmp, "app/barr/impl.py", "class Before:\n    pass\n");
+    write_temp_file(tmp, "app/lz/__init__.py",
+                    "from typing import TYPE_CHECKING\n"
+                    "if TYPE_CHECKING:\n    from .lazy_mod import Lazy\n"
+                    "else:\n    import sys\n");
+    write_temp_file(tmp, "app/lz/lazy_mod.py", "class Lazy:\n    pass\n");
+    write_temp_file(tmp, "app/cmp/__init__.py",
+                    "from typing import TYPE_CHECKING\n"
+                    "if TYPE_CHECKING:\n    from .types_only import Shim\n"
+                    "else:\n    try:\n        from .runtime_impl import Shim\n"
+                    "    except ImportError:\n        Shim = None\n");
+    write_temp_file(tmp, "app/cmp/types_only.py", "class Shim:\n    pass\n");
+    write_temp_file(tmp, "app/cmp/runtime_impl.py", "class Shim:\n    pass\n");
+    write_temp_file(tmp, "app/main.py",
+                    "from app import pkg\n"
+                    "from app import cyc\n"
+                    "from app import shad\n"
+                    "from app import barr\n"
+                    "from app import lz\n"
+                    "from app import cmp\n"
+                    "from app.db import models\n"
+                    "from app.pkg import Explicit, Listed, Deep, star_fn, Renamed\n"
+                    "from app.direct.impl import Direct, direct_fn\n\n\n"
+                    "def attr_explicit_cls():\n    pkg.Explicit()\n\n\n"
+                    "def attr_explicit_fn():\n    pkg.explicit_fn()\n\n\n"
+                    "def attr_star_cls():\n    pkg.Star()\n\n\n"
+                    "def attr_star_fn():\n    pkg.star_fn()\n\n\n"
+                    "def attr_all_listed():\n    pkg.Listed()\n\n\n"
+                    "def attr_chain():\n    pkg.Deep()\n\n\n"
+                    "def attr_renamed():\n    pkg.Renamed()\n\n\n"
+                    "def from_explicit():\n    Explicit()\n\n\n"
+                    "def from_star_fn():\n    star_fn()\n\n\n"
+                    "def from_all_listed():\n    Listed()\n\n\n"
+                    "def from_chain():\n    Deep()\n\n\n"
+                    "def from_renamed():\n    Renamed()\n\n\n"
+                    "def cycle_a():\n    cyc.a_fn()\n\n\n"
+                    "def cycle_b():\n    cyc.b_fn()\n\n\n"
+                    "def sub_models():\n    models.CharField()\n\n\n"
+                    "def chain_var():\n    x = pkg.Deep()\n    x.dive()\n\n\n"
+                    "def excl_unlisted():\n    pkg.Unlisted()\n\n\n"
+                    "def excl_private():\n    pkg._private_fn()\n\n\n"
+                    "def excl_shadowed():\n    shad.Gone()\n\n\n"
+                    "def excl_barrier():\n    barr.Before()\n\n\n"
+                    "def excl_compat():\n    cmp.Shim()\n\n\n"
+                    "def lazy_tc():\n    lz.Lazy()\n\n\n"
+                    "def ctl_from_cls():\n    Direct()\n\n\n"
+                    "def ctl_from_fn():\n    direct_fn()\n");
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64];
+        char pad[128];
+        snprintf(name, sizeof(name), "pad/py_pad_%02d.py", i);
+        snprintf(pad, sizeof(pad), "def py_pad_%02d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, pad);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/py_reexport.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    if (incremental && run_rc == 0) {
+        /* Touch only the caller: re-indexed alone, it must still find the
+         * re-exports of the unchanged packages. */
+        cbm_pipeline_free(p);
+        char main_path[512];
+        snprintf(main_path, sizeof(main_path), "%s/app/main.py", tmp);
+        th_append_file(main_path, "\n# edited: the second run re-indexes the caller\n");
+        p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        run_rc = p ? cbm_pipeline_run(p) : -1;
+    }
+    const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+    cbm_store_t *s = project ? cbm_store_open_path(db_path) : NULL;
+    if (!s && run_rc == 0) {
+        run_rc = -1;
+    }
+    if (s) {
+        char src[512];
+        char tgt[512];
+        for (int c = 0; c < PY_REEXPORT_N_CALLS; c++) {
+            snprintf(src, sizeof(src), "%s.app.main.%s", project, py_reexport_calls[c][0]);
+            snprintf(tgt, sizeof(tgt), "%s.app.%s", project, py_reexport_calls[c][1]);
+            char *props = py_reexp_edge_props(s, project, src, tgt, "CALLS");
+            lsp[c] = props && strstr(props, "\"strategy\":\"lsp_") != NULL;
+            if (!lsp[c]) {
+                printf("  [%s] %s -> %s: %s\n", parallel ? "parallel" : "sequential", src, tgt,
+                       props ? props : "(no CALLS edge)");
+            }
+            free(props);
+        }
+        for (int e = 0; e < PY_REEXPORT_N_EXCLUDED; e++) {
+            snprintf(src, sizeof(src), "%s.app.main.%s", project, py_reexport_excluded[e][0]);
+            snprintf(tgt, sizeof(tgt), "%s.app.%s", project, py_reexport_excluded[e][1]);
+            char *props = py_reexp_edge_props(s, project, src, tgt, "CALLS");
+            excluded[e] = props && strstr(props, "\"strategy\":\"lsp_") != NULL;
+            if (excluded[e]) {
+                printf("  [%s] excluded %s -> %s: %s\n", parallel ? "parallel" : "sequential", src,
+                       tgt, props);
+            }
+            free(props);
+        }
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    return run_rc;
+}
+
+/* Sequential driver (few files, one worker) and parallel driver (fillers +
+ * four workers), each as a full index and as an incremental re-index that
+ * touched only the caller. */
+TEST(pipeline_python_package_reexports_resolve_by_lsp) {
+    static const char *const mode_names[] = {"sequential", "parallel", "sequential incremental",
+                                             "parallel incremental"};
+    for (int mode = 0; mode < 4; mode++) {
+        bool lsp[PY_REEXPORT_N_CALLS];
+        bool excluded[PY_REEXPORT_N_EXCLUDED];
+        memset(lsp, 0, sizeof(lsp));
+        memset(excluded, 1, sizeof(excluded));
+        ASSERT_EQ(py_reexport_run((mode & 1) != 0, mode >= 2, lsp, excluded), 0);
+        for (int c = 0; c < PY_REEXPORT_N_CALLS; c++) {
+            if (!lsp[c]) {
+                fprintf(stderr, "  re-export call %s (%s) did not resolve by the LSP\n",
+                        py_reexport_calls[c][0], mode_names[mode]);
+            }
+            ASSERT_TRUE(lsp[c]); /* RED for every re-export shape; controls stay green */
+        }
+        for (int e = 0; e < PY_REEXPORT_N_EXCLUDED; e++) {
+            if (excluded[e]) {
+                fprintf(stderr, "  excluded call %s (%s) resolved by the LSP anyway\n",
+                        py_reexport_excluded[e][0], mode_names[mode]);
+            }
+            ASSERT_FALSE(excluded[e]); /* __all__, `_`, shadow, barrier */
+        }
+    }
+    PASS();
 }
 
 /* Bind the external-import veto specifically to #1277's typed-field fold.
@@ -14297,6 +15497,1258 @@ static void teardown_lang_repo(void) {
     if (g_lang_tmpdir[0])
         rm_rf(g_lang_tmpdir);
     g_lang_tmpdir[0] = '\0';
+}
+
+/* ── #1548: Python defs nested in a function body ─────────────────── */
+
+/* The QN of `rel` in `project` ("web.create_app.health"). Route QNs
+ * ("__route__GET__/health") carry no project and are taken as they are. */
+static void pyn_qn(char *buf, size_t cap, const char *project, const char *rel) {
+    if (strncmp(rel, "__route__", strlen("__route__")) == 0) {
+        snprintf(buf, cap, "%s", rel);
+    } else {
+        snprintf(buf, cap, "%s.%s", project, rel);
+    }
+}
+
+/* True iff an edge of `type` runs from node `src_rel` to node `tgt_rel`. */
+static bool pyn_edge(cbm_store_t *s, const char *project, const char *src_rel, const char *tgt_rel,
+                     const char *type) {
+    char sq[512];
+    char tq[512];
+    pyn_qn(sq, sizeof(sq), project, src_rel);
+    pyn_qn(tq, sizeof(tq), project, tgt_rel);
+    cbm_node_t src = {0};
+    cbm_node_t tgt = {0};
+    bool found = false;
+    if (cbm_store_find_node_by_qn(s, project, sq, &src) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(s, project, tq, &tgt) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, src.id, type, &edges, &ec);
+        for (int i = 0; i < ec && !found; i++) {
+            found = edges[i].target_id == tgt.id;
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    cbm_node_free_fields(&src);
+    cbm_node_free_fields(&tgt);
+    return found;
+}
+
+/* The fixtures of the #1548 pipeline tests. */
+static const char pyn_web_py[] = "from flask import Flask\n"
+                                 "\n"
+                                 "def load_user(uid):\n"
+                                 "    return uid\n"
+                                 "\n"
+                                 "def render(name):\n"
+                                 "    return name\n"
+                                 "\n"
+                                 "def create_app():\n"
+                                 "    app = Flask(__name__)\n"
+                                 "\n"
+                                 "    @app.route(\"/users/<uid>\")\n"
+                                 "    def show_user(uid):\n"
+                                 "        return render(load_user(uid))\n"
+                                 "\n"
+                                 "    @app.get(\"/health\")\n"
+                                 "    def health():\n"
+                                 "        return render(\"ok\")\n"
+                                 "\n"
+                                 "    def ping():\n"
+                                 "        return render(\"pong\")\n"
+                                 "\n"
+                                 "    app.add_url_rule(\"/ping\", \"ping\", ping)\n"
+                                 "    return app\n";
+/* A nested def named like its method, and a local helper whose name exists
+ * nowhere else -- b.py calls that name without binding it. */
+static const char pyn_a_py[] = "class Tree:\n"
+                               "    def visit(self, node):\n"
+                               "        def visit(n):\n"
+                               "            if n:\n"
+                               "                visit(n.child)\n"
+                               "\n"
+                               "        visit(node)\n"
+                               "\n"
+                               "\n"
+                               "def outer():\n"
+                               "    def helper_only_here():\n"
+                               "        return 1\n"
+                               "\n"
+                               "    return helper_only_here()\n";
+static const char pyn_b_py[] = "def elsewhere():\n"
+                               "    return helper_only_here()\n";
+/* Two defs, each with its own local class of the same name. */
+static const char pyn_c_py[] = "def make_forms():\n"
+                               "    class LocalForm:\n"
+                               "        def clean(self):\n"
+                               "            return 1\n"
+                               "\n"
+                               "    form = LocalForm()\n"
+                               "    return form.clean()\n"
+                               "\n"
+                               "\n"
+                               "def make_other_forms():\n"
+                               "    class LocalForm:\n"
+                               "        def clean(self):\n"
+                               "            return 2\n"
+                               "\n"
+                               "    form = LocalForm()\n"
+                               "    return form.clean()\n";
+/* A local def named like a stdlib function another module imports. */
+static const char pyn_x_py[] = "def outer():\n"
+                               "    def getpass(prompt):\n"
+                               "        return prompt\n"
+                               "\n"
+                               "    return getpass(\"?\")\n";
+static const char pyn_y_py[] = "from getpass import getpass\n"
+                               "\n"
+                               "\n"
+                               "def ask():\n"
+                               "    return getpass(\"password: \")\n";
+
+/* The issue's headline: an app factory's route handlers are defs inside
+ * create_app. They were never extracted, so the HTTP layer vanished -- no
+ * HANDLES, and load_user()'s only caller was pinned on the file node. */
+TEST(pipeline_python_app_factory_routes_issue1548) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_factory_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "web.py", pyn_web_py);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/factory.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_TRUE(
+        pyn_edge(s, project, "web.create_app.show_user", "__route__ANY__/users/{}", "HANDLES"));
+    ASSERT_TRUE(pyn_edge(s, project, "web.create_app.health", "__route__GET__/health", "HANDLES"));
+    ASSERT_TRUE(pyn_edge(s, project, "web.create_app.show_user", "web.load_user", "CALLS"));
+    ASSERT_TRUE(pyn_edge(s, project, "web.create_app.health", "web.render", "CALLS"));
+    ASSERT_FALSE(pyn_edge(s, project, "web.py.__file__", "web.load_user", "CALLS"));
+    /* A call-registered handler: add_url_rule names create_app's local ping. */
+    ASSERT_TRUE(pyn_edge(s, project, "web.create_app.ping", "__route__ANY__/ping", "HANDLES"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* A def nested in a function is a local of it (Python LEGB). A bare call
+ * resolves to the local bound in the nearest enclosing function: visit(node)
+ * in Tree.visit reaches the nested visit, whose own recursion stays a
+ * self-call instead of landing on the method. And no caller outside the
+ * function can reach the local by name -- b.py's unbound helper_only_here()
+ * must not be matched to it by a short-name strategy. */
+TEST(pipeline_python_nested_def_is_function_local_issue1548) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_local_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "a.py", pyn_a_py);
+    write_temp_file(tmp, "b.py", pyn_b_py);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/local.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_TRUE(pyn_edge(s, project, "a.Tree.visit", "a.Tree.visit.visit", "CALLS"));
+    ASSERT_FALSE(pyn_edge(s, project, "a.Tree.visit.visit", "a.Tree.visit", "CALLS"));
+    ASSERT_TRUE(pyn_edge(s, project, "a.outer", "a.outer.helper_only_here", "CALLS"));
+    ASSERT_FALSE(pyn_edge(s, project, "b.elsewhere", "a.outer.helper_only_here", "CALLS"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Two defs each declare `class LocalForm`. Each constructor call reaches its
+ * own def's class, and a method call on the instance never reaches the other
+ * def's class: the Python LSP must not bind a local class module-wide by its
+ * short name (every same-named local class collapsed onto one). */
+TEST(pipeline_python_local_classes_stay_in_their_def_issue1548) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_localcls_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "c.py", pyn_c_py);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/localcls.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_TRUE(pyn_edge(s, project, "c.make_forms", "c.make_forms.LocalForm", "CALLS"));
+    ASSERT_TRUE(
+        pyn_edge(s, project, "c.make_other_forms", "c.make_other_forms.LocalForm", "CALLS"));
+    ASSERT_FALSE(pyn_edge(s, project, "c.make_forms", "c.make_other_forms.LocalForm", "CALLS"));
+    ASSERT_FALSE(pyn_edge(s, project, "c.make_other_forms", "c.make_forms.LocalForm", "CALLS"));
+    ASSERT_FALSE(
+        pyn_edge(s, project, "c.make_forms", "c.make_other_forms.LocalForm.clean", "CALLS"));
+    ASSERT_FALSE(
+        pyn_edge(s, project, "c.make_other_forms", "c.make_forms.LocalForm.clean", "CALLS"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* No import can name a function's local. The symbol-name import fallback
+ * bound `from getpass import getpass` (the stdlib module, not in the project)
+ * to x.outer's local `def getpass`, and ask()'s call followed the import. */
+TEST(pipeline_python_import_never_binds_a_local_def_issue1548) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_localimp_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "x.py", pyn_x_py);
+    write_temp_file(tmp, "y.py", pyn_y_py);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/localimp.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_TRUE(pyn_edge(s, project, "x.outer", "x.outer.getpass", "CALLS"));
+    ASSERT_FALSE(pyn_edge(s, project, "y.py.__file__", "x.outer.getpass", "IMPORTS"));
+    ASSERT_FALSE(pyn_edge(s, project, "y.ask", "x.outer.getpass", "CALLS"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* The same four fixtures through the parallel path: >= 50 files and
+ * CBM_WORKERS=4 force pass_parallel.c and the cross-file Python LSP, which
+ * register, resolve and bind through their own code. */
+TEST(pipeline_python_nested_defs_parallel_issue1548) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_nested_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "web.py", pyn_web_py);
+    write_temp_file(tmp, "a.py", pyn_a_py);
+    write_temp_file(tmp, "b.py", pyn_b_py);
+    write_temp_file(tmp, "c.py", pyn_c_py);
+    write_temp_file(tmp, "x.py", pyn_x_py);
+    write_temp_file(tmp, "y.py", pyn_y_py);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/nested_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_TRUE(
+        pyn_edge(s, project, "web.create_app.show_user", "__route__ANY__/users/{}", "HANDLES"));
+    ASSERT_TRUE(pyn_edge(s, project, "web.create_app.health", "__route__GET__/health", "HANDLES"));
+    ASSERT_TRUE(pyn_edge(s, project, "web.create_app.show_user", "web.load_user", "CALLS"));
+    ASSERT_TRUE(pyn_edge(s, project, "web.create_app.ping", "__route__ANY__/ping", "HANDLES"));
+    ASSERT_TRUE(pyn_edge(s, project, "a.Tree.visit", "a.Tree.visit.visit", "CALLS"));
+    ASSERT_FALSE(pyn_edge(s, project, "a.Tree.visit.visit", "a.Tree.visit", "CALLS"));
+    ASSERT_TRUE(pyn_edge(s, project, "a.outer", "a.outer.helper_only_here", "CALLS"));
+    ASSERT_FALSE(pyn_edge(s, project, "b.elsewhere", "a.outer.helper_only_here", "CALLS"));
+    ASSERT_TRUE(pyn_edge(s, project, "c.make_forms", "c.make_forms.LocalForm", "CALLS"));
+    ASSERT_FALSE(pyn_edge(s, project, "c.make_forms", "c.make_other_forms.LocalForm", "CALLS"));
+    ASSERT_FALSE(
+        pyn_edge(s, project, "c.make_forms", "c.make_other_forms.LocalForm.clean", "CALLS"));
+    ASSERT_FALSE(
+        pyn_edge(s, project, "c.make_other_forms", "c.make_forms.LocalForm.clean", "CALLS"));
+    ASSERT_TRUE(pyn_edge(s, project, "x.outer", "x.outer.getpass", "CALLS"));
+    ASSERT_FALSE(pyn_edge(s, project, "y.py.__file__", "x.outer.getpass", "IMPORTS"));
+    ASSERT_FALSE(pyn_edge(s, project, "y.ask", "x.outer.getpass", "CALLS"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* An incremental re-index seeds its registry from the stored graph, not from
+ * extraction. It must keep a function's locals out of the short-name index
+ * exactly as the full index does: re-resolving the touched b.py must not bind
+ * its unbound helper_only_here() to a.outer's local. */
+TEST(pipeline_python_nested_def_local_after_incremental_issue1548) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_local_incr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "a.py", pyn_a_py);
+    write_temp_file(tmp, "b.py", pyn_b_py);
+    /* An extensionless script is Python by its shebang: its locals are locals
+     * in the incremental seed too, not only in the full index. */
+    write_temp_file(tmp, "tool",
+                    "#!/usr/bin/env python3\n"
+                    "def run():\n"
+                    "    def helper_in_tool():\n"
+                    "        return 1\n"
+                    "\n"
+                    "    return helper_in_tool()\n");
+    write_temp_file(tmp, "d.py",
+                    "def elsewhere_too():\n"
+                    "    return helper_in_tool()\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/local_incr.db", tmp);
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    cbm_pipeline_free(p1);
+
+    char b_path[512];
+    snprintf(b_path, sizeof(b_path), "%s/b.py", tmp);
+    ASSERT_EQ(th_append_file(b_path, "\n# touched: re-resolve b.py incrementally\n"), 0);
+    snprintf(b_path, sizeof(b_path), "%s/d.py", tmp);
+    ASSERT_EQ(th_append_file(b_path, "\n# touched: re-resolve d.py incrementally\n"), 0);
+
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    const char *project = cbm_pipeline_project_name(p2);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_TRUE(pyn_edge(s, project, "a.outer", "a.outer.helper_only_here", "CALLS"));
+    ASSERT_FALSE(pyn_edge(s, project, "b.elsewhere", "a.outer.helper_only_here", "CALLS"));
+    ASSERT_TRUE(pyn_edge(s, project, "tool.run", "tool.run.helper_in_tool", "CALLS"));
+    ASSERT_FALSE(pyn_edge(s, project, "d.elsewhere_too", "tool.run.helper_in_tool", "CALLS"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p2);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* As pyn_edge, and the edge's properties also contain `fragment`. */
+static bool pyn_edge_with(cbm_store_t *s, const char *project, const char *src_rel,
+                          const char *tgt_rel, const char *type, const char *fragment) {
+    char sq[512];
+    char tq[512];
+    pyn_qn(sq, sizeof(sq), project, src_rel);
+    pyn_qn(tq, sizeof(tq), project, tgt_rel);
+    cbm_node_t src = {0};
+    cbm_node_t tgt = {0};
+    bool found = false;
+    if (cbm_store_find_node_by_qn(s, project, sq, &src) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(s, project, tq, &tgt) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, src.id, type, &edges, &ec);
+        for (int i = 0; i < ec && !found; i++) {
+            found = edges[i].target_id == tgt.id && edges[i].properties_json &&
+                    strstr(edges[i].properties_json, fragment);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    cbm_node_free_fields(&src);
+    cbm_node_free_fields(&tgt);
+    return found;
+}
+
+/* A local def shadows a module def of the same name (Python LEGB), in both
+ * orders of the two callers within one file: the registry's per-file resolve
+ * cache is keyed by the callee name only, so a caller-dependent answer must
+ * never come from it. The undecorated local is bound by the Python LSP itself
+ * (an lsp_* edge); a decorated one is no exact callable value, so the LSP
+ * shadows it and the registry's lexical_scope step binds it. */
+static const char pyn_shadow_local_first_py[] = "def helper():\n"
+                                                "    return 0\n"
+                                                "\n"
+                                                "def uses_local():\n"
+                                                "    def helper():\n"
+                                                "        return 1\n"
+                                                "    return helper()\n"
+                                                "\n"
+                                                "def uses_module():\n"
+                                                "    return helper()\n"
+                                                "\n"
+                                                "def uses_decorated():\n"
+                                                "    @staticmethod\n"
+                                                "    def helper():\n"
+                                                "        return 2\n"
+                                                "    return helper()\n";
+static const char pyn_shadow_module_first_py[] = "def helper():\n"
+                                                 "    return 0\n"
+                                                 "\n"
+                                                 "def uses_module():\n"
+                                                 "    return helper()\n"
+                                                 "\n"
+                                                 "def uses_local():\n"
+                                                 "    if True:\n"
+                                                 "        def helper():\n"
+                                                 "            return 1\n"
+                                                 "    return helper()\n";
+
+/* A class declared in a def is walked by the LSP under the def's QN: super()
+ * and self calls in its methods resolve through the class's own bases. */
+static const char pyn_local_class_methods_py[] = "class Base:\n"
+                                                 "    def greet(self):\n"
+                                                 "        return 1\n"
+                                                 "\n"
+                                                 "def factory():\n"
+                                                 "    class Local(Base):\n"
+                                                 "        def greet(self):\n"
+                                                 "            return super().greet()\n"
+                                                 "\n"
+                                                 "        def other(self):\n"
+                                                 "            return self.greet()\n"
+                                                 "    return Local\n";
+
+static int pyn_assert_shadowing(cbm_store_t *s, const char *project) {
+    ASSERT_TRUE(pyn_edge_with(s, project, "sc.factory.Local.greet", "sc.Base.greet", "CALLS",
+                              "\"strategy\":\"lsp_super\""));
+    ASSERT_TRUE(pyn_edge_with(s, project, "sc.factory.Local.other", "sc.factory.Local.greet",
+                              "CALLS", "\"strategy\":\"lsp_"));
+    /* sa's local def is a plain statement of the body: the LSP binds it as an
+     * exact callable. sb's sits under `if True:`; at that compound statement's
+     * join the LSP invalidates what the branch bound (the def may not exist on
+     * every path), so it emits nothing and the registry's lexical step binds
+     * the local -- still never the module def. H1 (the LSP walks compound
+     * statements) may legitimately move sb to an lsp_* strategy; that PR
+     * must update this expectation deliberately. */
+    const char *files[] = {"sa", "sb"};
+    const char *local_strategy[] = {"\"strategy\":\"lsp_", "\"strategy\":\"lexical_scope\""};
+    for (int f = 0; f < 2; f++) {
+        char local_caller[64], local_def[64], module_caller[64], module_def[64];
+        snprintf(local_caller, sizeof(local_caller), "%s.uses_local", files[f]);
+        snprintf(local_def, sizeof(local_def), "%s.uses_local.helper", files[f]);
+        snprintf(module_caller, sizeof(module_caller), "%s.uses_module", files[f]);
+        snprintf(module_def, sizeof(module_def), "%s.helper", files[f]);
+        ASSERT_TRUE(
+            pyn_edge_with(s, project, local_caller, local_def, "CALLS", local_strategy[f]));
+        ASSERT_FALSE(pyn_edge(s, project, local_caller, module_def, "CALLS"));
+        ASSERT_TRUE(pyn_edge(s, project, module_caller, module_def, "CALLS"));
+        ASSERT_FALSE(pyn_edge(s, project, module_caller, local_def, "CALLS"));
+    }
+    ASSERT_TRUE(pyn_edge_with(s, project, "sa.uses_decorated", "sa.uses_decorated.helper",
+                              "CALLS", "\"strategy\":\"lexical_scope\""));
+    ASSERT_FALSE(pyn_edge(s, project, "sa.uses_decorated", "sa.helper", "CALLS"));
+    return 0;
+}
+
+static int pyn_run_shadowing(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "sa.py", pyn_shadow_local_first_py);
+    write_temp_file(tmp, "sb.py", pyn_shadow_module_first_py);
+    write_temp_file(tmp, "sc.py", pyn_local_class_methods_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/shadow.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    int verdict = s ? pyn_assert_shadowing(s, cbm_pipeline_project_name(p)) : 1;
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    return verdict;
+}
+
+TEST(pipeline_python_local_def_shadows_module_def_issue1548) {
+    return pyn_run_shadowing(0);
+}
+
+TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548) {
+    return pyn_run_shadowing(52);
+}
+
+/* ── super() follows the C3 method resolution order ──────────────── */
+
+/* The home-assistant radarr shape: RadarrCalendarEntity(RadarrEntity,
+ * CalendarEntity), where RadarrEntity reaches the common base Entity through
+ * CoordinatorEntity and CalendarEntity overrides Entity's method. Python's C3
+ * order is [RadarrCalendarEntity, RadarrEntity, CoordinatorEntity,
+ * CalendarEntity, Entity]: a common base comes after every class that
+ * derives from it, so super() reaches CalendarEntity, not Entity through the
+ * first base's ancestry. */
+static const char pym_base_py[] = "class Entity:\n"
+                                  "    def __init__(self):\n"
+                                  "        self.ready = False\n"
+                                  "\n"
+                                  "    def write_state(self):\n"
+                                  "        return 0\n"
+                                  "\n"
+                                  "class CoordinatorEntity(Entity):\n"
+                                  "    pass\n"
+                                  "\n"
+                                  "class CalendarEntity(Entity):\n"
+                                  "    def __init__(self):\n"
+                                  "        self.events = []\n"
+                                  "\n"
+                                  "    def write_state(self):\n"
+                                  "        return 1\n";
+
+static const char pym_radarr_py[] = "from base import CoordinatorEntity, CalendarEntity\n"
+                                    "\n"
+                                    "class RadarrEntity(CoordinatorEntity):\n"
+                                    "    pass\n"
+                                    "\n"
+                                    "class RadarrCalendarEntity(RadarrEntity, CalendarEntity):\n"
+                                    "    def __init__(self):\n"
+                                    "        super().__init__()\n"
+                                    "\n"
+                                    "    def write_state(self):\n"
+                                    "        return super().write_state()\n"
+                                    "\n"
+                                    "class PlainCalendar(CalendarEntity):\n"
+                                    "    def write_state(self):\n"
+                                    "        return super().write_state()\n";
+
+static int pym_run_super_c3(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_superc3_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "base.py", pym_base_py);
+    write_temp_file(tmp, "radarr.py", pym_radarr_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/superc3.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    const char *pr = p ? cbm_pipeline_project_name(p) : NULL;
+    const char *rce = "radarr.RadarrCalendarEntity";
+    char src[256];
+    snprintf(src, sizeof(src), "%s.write_state", rce);
+    bool m_c3 = s && pyn_edge(s, pr, src, "base.CalendarEntity.write_state", "CALLS");
+    bool m_dfs = s && pyn_edge(s, pr, src, "base.Entity.write_state", "CALLS");
+    snprintf(src, sizeof(src), "%s.__init__", rce);
+    bool i_c3 = s && pyn_edge(s, pr, src, "base.CalendarEntity.__init__", "CALLS");
+    bool i_dfs = s && pyn_edge(s, pr, src, "base.Entity.__init__", "CALLS");
+    bool plain = s && pyn_edge(s, pr, "radarr.PlainCalendar.write_state",
+                               "base.CalendarEntity.write_state", "CALLS");
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(m_c3);   /* super().write_state(): CalendarEntity comes before Entity */
+    ASSERT_FALSE(m_dfs); /* ... never Entity through RadarrEntity's ancestry */
+    ASSERT_TRUE(i_c3);   /* super().__init__(): the same order */
+    ASSERT_FALSE(i_dfs);
+    ASSERT_TRUE(plain); /* control: single inheritance */
+    PASS();
+}
+
+TEST(pipeline_python_super_follows_c3_mro) {
+    return pym_run_super_c3(0);
+}
+
+TEST(pipeline_python_super_follows_c3_mro_parallel) {
+    return pym_run_super_c3(52);
+}
+
+/* ── attribute lookup follows the C3 method resolution order ─────── */
+
+/* The same diamond as the super() test, seen from an ordinary attribute:
+ * `self.write_state()` in RadarrCalendarEntity and `e.write_state()` on a
+ * RadarrCalendarEntity both look the method up along the class's C3 order,
+ * which reaches CalendarEntity before the shared base Entity. */
+static const char pya_radarr_py[] = "from base import CoordinatorEntity, CalendarEntity\n"
+                                    "\n"
+                                    "class RadarrEntity(CoordinatorEntity):\n"
+                                    "    pass\n"
+                                    "\n"
+                                    "class RadarrCalendarEntity(RadarrEntity, CalendarEntity):\n"
+                                    "    def refresh(self):\n"
+                                    "        return self.write_state()\n"
+                                    "\n"
+                                    "class PlainCalendar(CalendarEntity):\n"
+                                    "    def refresh(self):\n"
+                                    "        return self.write_state()\n"
+                                    "\n"
+                                    "def publish(e: RadarrCalendarEntity):\n"
+                                    "    return e.write_state()\n";
+
+static int pya_run_attr_c3(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_attrc3_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "base.py", pym_base_py);
+    write_temp_file(tmp, "radarr.py", pya_radarr_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/attrc3.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    const char *pr = p ? cbm_pipeline_project_name(p) : NULL;
+    const char *c3 = "base.CalendarEntity.write_state";
+    const char *dfs = "base.Entity.write_state";
+    const char *self_src = "radarr.RadarrCalendarEntity.refresh";
+    bool self_c3 = s && pyn_edge(s, pr, self_src, c3, "CALLS");
+    bool self_dfs = s && pyn_edge(s, pr, self_src, dfs, "CALLS");
+    bool typed_c3 = s && pyn_edge(s, pr, "radarr.publish", c3, "CALLS");
+    bool typed_dfs = s && pyn_edge(s, pr, "radarr.publish", dfs, "CALLS");
+    bool plain = s && pyn_edge(s, pr, "radarr.PlainCalendar.refresh", c3, "CALLS");
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(self_c3);   /* self.write_state(): CalendarEntity before Entity */
+    ASSERT_FALSE(self_dfs); /* ... never Entity through RadarrEntity's ancestry */
+    ASSERT_TRUE(typed_c3);  /* e.write_state() on a RadarrCalendarEntity */
+    ASSERT_FALSE(typed_dfs);
+    ASSERT_TRUE(plain); /* control: single inheritance */
+    PASS();
+}
+
+TEST(pipeline_python_attribute_follows_c3_mro) {
+    return pya_run_attr_c3(0);
+}
+
+TEST(pipeline_python_attribute_follows_c3_mro_parallel) {
+    return pya_run_attr_c3(52);
+}
+
+/* L7 review of #1548: a package __init__.py function can share a submodule's QN
+ * (poetry: layouts/__init__.py `def layout` is the QN prefix of every symbol in
+ * layouts/layout.py). The function-local detection is bounded at the symbol's
+ * own file, so class Layout stays a module-level, importable class. src/ layout
+ * without a manifest: the module resolver misses `rowpkg.layout`, so the import
+ * relies on the symbol-name fallback, which skips function locals -- unbounded,
+ * Layout read as a local of layout() and its import and calls vanished. Both
+ * resolvers; the second run re-indexes incrementally after an edit of
+ * layout.py, so the incremental registry seed is held to the same bound. */
+static const char pyn_layout_init_py[] = "def layout(name):\n"
+                                         "    return name\n";
+static const char pyn_layout_mod_py[] = "class Layout:\n"
+                                        "    def __init__(self, name):\n"
+                                        "        self.name = name\n"
+                                        "\n"
+                                        "    def create(self):\n"
+                                        "        return self.name\n";
+static const char pyn_layout_app_py[] = "from rowpkg.layout import Layout\n"
+                                        "\n"
+                                        "def test_build():\n"
+                                        "    return Layout(\"demo\").create()\n";
+
+static int pyn_run_init_collision(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_initqn_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "src/rowpkg/__init__.py", pyn_layout_init_py);
+    write_temp_file(tmp, "src/rowpkg/layout.py", pyn_layout_mod_py);
+    write_temp_file(tmp, "tests/test_app.py", pyn_layout_app_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/initqn.db", tmp);
+    int rc[2] = {-1, -1};
+    bool imports[2] = {false, false};
+    bool calls[2] = {false, false};
+    bool method[2] = {false, false};
+    for (int run = 0; run < 2; run++) {
+        if (run == 1) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/src/rowpkg/layout.py", tmp);
+            th_append_file(path, "\n# edited: the second run re-indexes incrementally\n");
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        rc[run] = p ? cbm_pipeline_run(p) : -1;
+        cbm_store_t *s = rc[run] == 0 ? cbm_store_open_path(db_path) : NULL;
+        if (s) {
+            const char *project = cbm_pipeline_project_name(p);
+            imports[run] = pyn_edge(s, project, "tests.test_app.py.__file__",
+                                    "src.rowpkg.layout.Layout", "IMPORTS");
+            calls[run] =
+                pyn_edge(s, project, "tests.test_app.test_build", "src.rowpkg.layout.Layout",
+                         "CALLS");
+            method[run] = pyn_edge(s, project, "tests.test_app.test_build",
+                                   "src.rowpkg.layout.Layout.create", "CALLS");
+            cbm_store_close(s);
+        }
+        if (p) {
+            cbm_pipeline_free(p);
+        }
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    for (int run = 0; run < 2; run++) {
+        ASSERT_EQ(rc[run], 0);
+        ASSERT_TRUE(imports[run]); /* the class stays importable */
+        ASSERT_TRUE(calls[run]);   /* Layout("demo") */
+        ASSERT_TRUE(method[run]);  /* .create() through the constructed type */
+    }
+    PASS();
+}
+
+TEST(pipeline_python_init_function_shares_submodule_qn_issue1548) {
+    return pyn_run_init_collision(0);
+}
+
+TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548) {
+    return pyn_run_init_collision(52);
+}
+
+/* ── F15: a nested class's bare base resolves in its class body first ── */
+
+/* The sqlalchemy asyncpg shape: an adapter class re-declares the DBAPI
+ * exception hierarchy as nested classes, each based on an EARLIER sibling
+ * spelled bare (`class IntegrityError(DatabaseError)`). Python evaluates a
+ * class statement's bases in the enclosing class body, so the sibling wins
+ * over the same-named module classes of exc.py, which the adapter imports
+ * as a module (so a name guess prefers them, as on sqlalchemy once its
+ * relative `from ... import exc` resolves). A sibling defined LATER in the
+ * body is not bound yet: `Early(Later)` names the module-level Later. */
+static const char pyb_exc_py[] = "class DBAPIError(Exception):\n"
+                                 "    pass\n"
+                                 "\n"
+                                 "class DatabaseError(DBAPIError):\n"
+                                 "    pass\n"
+                                 "\n"
+                                 "class IntegrityError(DatabaseError):\n"
+                                 "    pass\n";
+
+static const char pyb_adapter_py[] = "import exc\n"
+                                     "from exc import DBAPIError\n"
+                                     "\n"
+                                     "class Later(Exception):\n"
+                                     "    pass\n"
+                                     "\n"
+                                     "class AsyncAdapt_dbapi:\n"
+                                     "    class Error(DBAPIError):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class DatabaseError(Error):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class IntegrityError(DatabaseError):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class NotNullViolationError(IntegrityError):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class Early(Later):\n"
+                                     "        pass\n"
+                                     "\n"
+                                     "    class Later(Exception):\n"
+                                     "        pass\n";
+
+/* A second adapter with the same nested names, as sqlalchemy has one per
+ * driver: a name-only guess has several same-named candidates to pick. */
+static const char pyb_adapter2_py[] = "class AsyncAdapt_other_dbapi:\n"
+                                      "    class Error(Exception):\n"
+                                      "        pass\n"
+                                      "\n"
+                                      "    class DatabaseError(Error):\n"
+                                      "        pass\n"
+                                      "\n"
+                                      "    class IntegrityError(DatabaseError):\n"
+                                      "        pass\n";
+
+static int pyb_run_class_body_base(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_cbbase_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "exc.py", pyb_exc_py);
+    write_temp_file(tmp, "adapter.py", pyb_adapter_py);
+    write_temp_file(tmp, "adapter2.py", pyb_adapter2_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cbbase.db", tmp);
+    int rc[2] = {-1, -1};
+    bool db_sib[2] = {false, false};
+    bool db_mod[2] = {true, true};
+    bool ie_sib[2] = {false, false};
+    bool ie_mod[2] = {true, true};
+    bool nn_sib[2] = {false, false};
+    bool err_imp[2] = {false, false};
+    bool early_mod[2] = {false, false};
+    bool early_later_sib[2] = {true, true};
+    bool other_sib[2] = {false, false};
+    for (int run = 0; run < 2; run++) {
+        if (run == 1) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/adapter.py", tmp);
+            th_append_file(path, "\n# edited: the second run re-indexes incrementally\n");
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        rc[run] = p ? cbm_pipeline_run(p) : -1;
+        cbm_store_t *s = rc[run] == 0 ? cbm_store_open_path(db_path) : NULL;
+        if (s) {
+            const char *pr = cbm_pipeline_project_name(p);
+            const char *cls = "adapter.AsyncAdapt_dbapi";
+            char a[256];
+            char b[256];
+            snprintf(a, sizeof(a), "%s.DatabaseError", cls);
+            snprintf(b, sizeof(b), "%s.Error", cls);
+            db_sib[run] = pyn_edge(s, pr, a, b, "INHERITS");
+            db_mod[run] = pyn_edge(s, pr, a, "adapter2.AsyncAdapt_other_dbapi.Error", "INHERITS");
+            snprintf(a, sizeof(a), "%s.IntegrityError", cls);
+            snprintf(b, sizeof(b), "%s.DatabaseError", cls);
+            ie_sib[run] = pyn_edge(s, pr, a, b, "INHERITS");
+            ie_mod[run] = pyn_edge(s, pr, a, "exc.DatabaseError", "INHERITS");
+            snprintf(a, sizeof(a), "%s.NotNullViolationError", cls);
+            snprintf(b, sizeof(b), "%s.IntegrityError", cls);
+            nn_sib[run] = pyn_edge(s, pr, a, b, "INHERITS");
+            snprintf(a, sizeof(a), "%s.Error", cls);
+            err_imp[run] = pyn_edge(s, pr, a, "exc.DBAPIError", "INHERITS");
+            snprintf(a, sizeof(a), "%s.Early", cls);
+            snprintf(b, sizeof(b), "%s.Later", cls);
+            early_mod[run] = pyn_edge(s, pr, a, "adapter.Later", "INHERITS");
+            early_later_sib[run] = pyn_edge(s, pr, a, b, "INHERITS");
+            other_sib[run] = pyn_edge(s, pr, "adapter2.AsyncAdapt_other_dbapi.IntegrityError",
+                                      "adapter2.AsyncAdapt_other_dbapi.DatabaseError", "INHERITS");
+            cbm_store_close(s);
+        }
+        if (p) {
+            cbm_pipeline_free(p);
+        }
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    for (int run = 0; run < 2; run++) {
+        ASSERT_EQ(rc[run], 0);
+        ASSERT_TRUE(db_sib[run]);           /* DatabaseError(Error): the earlier sibling */
+        ASSERT_FALSE(db_mod[run]);          /* ... not the other adapter's Error */
+        ASSERT_TRUE(ie_sib[run]);           /* IntegrityError(DatabaseError): the sibling */
+        ASSERT_FALSE(ie_mod[run]);          /* ... not exc.DatabaseError */
+        ASSERT_TRUE(nn_sib[run]);           /* a chain of siblings */
+        ASSERT_TRUE(err_imp[run]);          /* control: a non-sibling base keeps the import */
+        ASSERT_TRUE(early_mod[run]);        /* a LATER sibling is not bound yet: module Later */
+        ASSERT_FALSE(early_later_sib[run]); /* ... never the later sibling */
+        ASSERT_TRUE(other_sib[run]);        /* the second adapter binds its own sibling */
+    }
+    PASS();
+}
+
+TEST(pipeline_python_class_body_sibling_base) {
+    return pyb_run_class_body_base(0);
+}
+
+TEST(pipeline_python_class_body_sibling_base_parallel) {
+    return pyb_run_class_body_base(52);
+}
+
+/* #1548 keeps TESTS for calls made through a test's own nested helper: the
+ * call now starts at the extracted helper def (not at the test FILE node, as
+ * before #1548), so TESTS is attributed to the enclosing test function. A
+ * helper nested in a NON-test function stays without TESTS, like a module-level
+ * helper. Both resolvers. */
+static const char pyn_tests_prod_py[] = "def target(value):\n"
+                                        "    return value\n"
+                                        "\n"
+                                        "def other_target(value):\n"
+                                        "    return value\n";
+static const char pyn_tests_test_py[] = "from pkg.prod import target, other_target\n"
+                                        "\n"
+                                        "def test_through_nested_helper():\n"
+                                        "    def check(v):\n"
+                                        "        return target(v)\n"
+                                        "    assert check(1) == 1\n"
+                                        "\n"
+                                        "class TestGroup:\n"
+                                        "    def test_method_helper(self):\n"
+                                        "        def probe():\n"
+                                        "            return target(2)\n"
+                                        "        assert probe() == 2\n"
+                                        "\n"
+                                        "def make_fixture():\n"
+                                        "    def build():\n"
+                                        "        return other_target(3)\n"
+                                        "    return build\n";
+
+static int pyn_run_nested_helper_tests(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_ntests_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "pkg/__init__.py", "");
+    write_temp_file(tmp, "pkg/prod.py", pyn_tests_prod_py);
+    write_temp_file(tmp, "tests/test_rows.py", pyn_tests_test_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ntests.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool fn_tests = false, method_tests = false, helper_calls = false, fixture_tests = true;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        helper_calls = pyn_edge(s, project, "tests.test_rows.test_through_nested_helper.check",
+                                "pkg.prod.target", "CALLS");
+        fn_tests = pyn_edge(s, project, "tests.test_rows.test_through_nested_helper",
+                            "pkg.prod.target", "TESTS");
+        method_tests = pyn_edge(s, project, "tests.test_rows.TestGroup.test_method_helper",
+                                "pkg.prod.target", "TESTS");
+        fixture_tests = pyn_edge(s, project, "tests.test_rows.make_fixture",
+                                 "pkg.prod.other_target", "TESTS") ||
+                        pyn_edge(s, project, "tests.test_rows.make_fixture.build",
+                                 "pkg.prod.other_target", "TESTS");
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(helper_calls);   /* the call starts at the nested helper (#1548) */
+    ASSERT_TRUE(fn_tests);       /* ... and the enclosing test function still TESTS the target */
+    ASSERT_TRUE(method_tests);   /* the same inside a test method */
+    ASSERT_FALSE(fixture_tests); /* a helper nested in a non-test function: no TESTS */
+    PASS();
+}
+
+TEST(pipeline_python_nested_helper_keeps_tests_issue1548) {
+    return pyn_run_nested_helper_tests(0);
+}
+
+TEST(pipeline_python_nested_helper_keeps_tests_parallel_issue1548) {
+    return pyn_run_nested_helper_tests(52);
+}
+
+/* A decorated class nested in a class body (`@dataclass class Meta:` inside a
+ * class) is a nested class like an undecorated one: it gets its Class node and
+ * its methods their Method nodes. push_nested_class_nodes looked through
+ * field/template/declaration and conditional wrappers but not through Python's
+ * decorated_definition, so the decorated class and everything in it was never
+ * extracted. Both resolvers. */
+static const char pyn_decorated_nested_py[] = "def deco(cls):\n"
+                                              "    return cls\n"
+                                              "\n"
+                                              "class Outer:\n"
+                                              "    @deco\n"
+                                              "    class Decorated:\n"
+                                              "        def run(self):\n"
+                                              "            return 1\n"
+                                              "\n"
+                                              "    class Plain:\n"
+                                              "        def go(self):\n"
+                                              "            return 2\n";
+
+static bool pyn_node_exists(cbm_store_t *s, const char *project, const char *rel_qn,
+                            const char *label) {
+    char qn[512];
+    pyn_qn(qn, sizeof(qn), project, rel_qn);
+    cbm_node_t n = {0};
+    bool found = cbm_store_find_node_by_qn(s, project, qn, &n) == CBM_STORE_OK && n.label &&
+                 strcmp(n.label, label) == 0;
+    cbm_node_free_fields(&n);
+    return found;
+}
+
+static int pyn_run_decorated_nested(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_decnest_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "sd.py", pyn_decorated_nested_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/decnest.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+    bool dec_class = s && pyn_node_exists(s, project, "sd.Outer.Decorated", "Class");
+    bool dec_method = s && pyn_node_exists(s, project, "sd.Outer.Decorated.run", "Method");
+    bool plain_class = s && pyn_node_exists(s, project, "sd.Outer.Plain", "Class");
+    bool plain_method = s && pyn_node_exists(s, project, "sd.Outer.Plain.go", "Method");
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(dec_class);    /* the decorated nested class is extracted */
+    ASSERT_TRUE(dec_method);   /* ... and its method */
+    ASSERT_TRUE(plain_class);  /* control: undecorated nested class */
+    ASSERT_TRUE(plain_method); /* control */
+    PASS();
+}
+
+TEST(pipeline_python_decorated_nested_class_extracted) {
+    return pyn_run_decorated_nested(0);
+}
+
+TEST(pipeline_python_decorated_nested_class_extracted_parallel) {
+    return pyn_run_decorated_nested(52);
+}
+
+/* A class nested in a class is walked by the Python LSP under its outer
+ * class (m.Outer.Inner): a typed-parameter call, a self call and a
+ * constructor call in its methods resolve, and so does a decorated nested
+ * class. Walked under the module (m.Inner) none of the LSP rows joined the
+ * method nodes, so the calls fell to name guesses or got no edge. */
+static const char pyn_nested_class_py[] = "class Helper:\n"
+                                          "    def go(self):\n"
+                                          "        return 1\n"
+                                          "\n"
+                                          "def deco(cls):\n"
+                                          "    return cls\n"
+                                          "\n"
+                                          "class Outer:\n"
+                                          "    class Inner:\n"
+                                          "        def run(self, h: Helper):\n"
+                                          "            return h.go()\n"
+                                          "\n"
+                                          "        def again(self):\n"
+                                          "            return self.run(Helper())\n"
+                                          "\n"
+                                          "    @deco\n"
+                                          "    class Decorated:\n"
+                                          "        def run(self, h: Helper):\n"
+                                          "            return h.go()\n";
+
+static int pyn_run_nested_class(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_nestcls_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "sn.py", pyn_nested_class_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/nestcls.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+    bool typed = s && pyn_edge_with(s, project, "sn.Outer.Inner.run", "sn.Helper.go", "CALLS",
+                                    "\"strategy\":\"lsp_");
+    bool self_call = s && pyn_edge_with(s, project, "sn.Outer.Inner.again", "sn.Outer.Inner.run",
+                                        "CALLS", "\"strategy\":\"lsp_");
+    bool ctor = s && pyn_edge_with(s, project, "sn.Outer.Inner.again", "sn.Helper", "CALLS",
+                                   "\"strategy\":\"lsp_");
+    bool decorated = s && pyn_edge_with(s, project, "sn.Outer.Decorated.run", "sn.Helper.go",
+                                        "CALLS", "\"strategy\":\"lsp_");
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(typed);
+    ASSERT_TRUE(self_call);
+    ASSERT_TRUE(ctor);
+    ASSERT_TRUE(decorated);
+    PASS();
+}
+
+TEST(pipeline_python_nested_class_methods_resolve) {
+    return pyn_run_nested_class(0);
+}
+
+TEST(pipeline_python_nested_class_methods_resolve_parallel) {
+    return pyn_run_nested_class(52);
 }
 
 TEST(pipeline_python_project) {
@@ -20884,7 +23336,7 @@ TEST(pipeline_python_namespace_change_admission) {
     }
     int body = -9, signature = -9, alias = -9, order = -9;
     int empty = -9, literal = -9, unknown = -9, deletion = -9, transition = -9;
-    const char *non_python = "{\"v\":2,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
+    const char *non_python = "{\"v\":3,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
     if (complete) {
         body = cbm_lsp_surface_python_change(json[0], json[1]);
         signature = cbm_lsp_surface_python_change(json[0], json[2]);
@@ -21011,22 +23463,22 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
      * Even an empty LSP array must validate its namespace envelope. */
     const char *bad[] = {
         "{\"v\":1,\"lsp\":[]}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[]}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":null}",
-        "{\"v\":2,\"lang\":1.0,\"lsp\":[],\"py\":null}",
-        "{\"v\":2,\"v\":2,\"lang\":0,\"lsp\":[],\"py\":null}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[]}",
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":null}",
+        "{\"v\":3,\"lang\":1.0,\"lsp\":[],\"py\":null}",
+        "{\"v\":3,\"v\":3,\"lang\":0,\"lsp\":[],\"py\":null}",
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":3,\"failure\":2,\"events\":[]}}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\\u0000suffix\",\"status\":2,"
         "\"failure\":0,\"events\":[]}}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":999,\"d\":0,\"s\":0,\"r\":0,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":8,\"d\":0,\"s\":1,\"r\":0,\"f\":0,\"l\":4294967296,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
@@ -21046,7 +23498,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
         cbm_arena_destroy(&arena);
     }
     const char *unknown =
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":1,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}";
@@ -21073,7 +23525,7 @@ TEST(pipeline_lsp_surface_large_object_array_decode) {
     const size_t capacity = (size_t)count * 192 + 64;
     char *json = malloc(capacity);
     ASSERT_NOT_NULL(json);
-    size_t used = (size_t)snprintf(json, capacity, "{\"v\":2,\"lang\":0,\"py\":null,\"lsp\":[");
+    size_t used = (size_t)snprintf(json, capacity, "{\"v\":3,\"lang\":0,\"py\":null,\"lsp\":[");
     for (int i = 0; i < count; i++) {
         int n = snprintf(json + used, capacity - used,
                          "%s{\"qn\":\"pkg.f%d\",\"sn\":\"f%d\",\"lb\":\"Function\","
@@ -21163,9 +23615,10 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
         ASSERT_TRUE(row_a->surface_sha && row_a->surface_sha[0]);
         if (round == 0) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
-            /* The row is the versioned codec envelope with the def present. */
+            /* The row is the versioned codec envelope (codec version 3) with
+             * the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":2") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":3") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -23726,8 +26179,16 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_keeps_specific_unique_name_member_call);
     RUN_TEST(pipeline_html_embedded_member_call_stays_unbound);
+    RUN_TEST(pipeline_go_multi_return_receiver_is_typed);
+    RUN_TEST(pipeline_go_multi_return_receiver_is_typed_parallel);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
+    RUN_TEST(pipeline_rust_call_never_binds_another_language);
+    RUN_TEST(pipeline_rust_call_never_binds_another_language_parallel);
+    RUN_TEST(pipeline_rust_assoc_call_never_binds_free_namesake);
+    RUN_TEST(pipeline_rust_assoc_call_never_binds_free_namesake_parallel);
+    RUN_TEST(pipeline_rust_generic_impl_method_sources_its_calls);
+    RUN_TEST(pipeline_rust_generic_impl_method_sources_its_calls_parallel);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
@@ -23743,6 +26204,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
+    RUN_TEST(pipeline_python_package_relative_imports);
+    RUN_TEST(pipeline_python_package_relative_imports_parallel);
+    RUN_TEST(pipeline_python_from_import_bare_call_issue1237);
+    RUN_TEST(pipeline_python_from_import_bare_call_issue1237_parallel);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
@@ -23778,6 +26243,11 @@ SUITE(pipeline) {
     RUN_TEST(override_python_through_intermediate_class);
     RUN_TEST(python_crossfile_typed_field_calls_issue1277);
     RUN_TEST(python_crossfile_typed_field_calls_issue1277_parallel);
+    RUN_TEST(python_type_checking_typed_field_issue1277);
+    RUN_TEST(python_type_checking_typed_field_issue1277_parallel);
+    RUN_TEST(python_dotted_base_inheritance);
+    RUN_TEST(python_dotted_base_inheritance_parallel);
+    RUN_TEST(pipeline_python_package_reexports_resolve_by_lsp);
     RUN_TEST(python_typed_field_external_import_stays_unresolved);
     RUN_TEST(python_typed_field_project_class_resolves);
     RUN_TEST(usages_creates_edges);
@@ -23794,6 +26264,28 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_c_variants_on_sequential_and_parallel_paths_c1);
     RUN_TEST(pipeline_cpp_overloads_are_listed_as_variants_c1);
     RUN_TEST(pipeline_semantic_version_3_index_is_rebuilt_in_full_c1);
+    RUN_TEST(pipeline_python_app_factory_routes_issue1548);
+    RUN_TEST(pipeline_python_nested_def_is_function_local_issue1548);
+    RUN_TEST(pipeline_python_local_classes_stay_in_their_def_issue1548);
+    RUN_TEST(pipeline_python_import_never_binds_a_local_def_issue1548);
+    RUN_TEST(pipeline_python_nested_defs_parallel_issue1548);
+    RUN_TEST(pipeline_python_nested_def_local_after_incremental_issue1548);
+    RUN_TEST(pipeline_python_local_def_shadows_module_def_issue1548);
+    RUN_TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548);
+    RUN_TEST(pipeline_python_super_follows_c3_mro);
+    RUN_TEST(pipeline_python_super_follows_c3_mro_parallel);
+    RUN_TEST(pipeline_python_attribute_follows_c3_mro);
+    RUN_TEST(pipeline_python_attribute_follows_c3_mro_parallel);
+    RUN_TEST(pipeline_python_init_function_shares_submodule_qn_issue1548);
+    RUN_TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548);
+    RUN_TEST(pipeline_python_class_body_sibling_base);
+    RUN_TEST(pipeline_python_class_body_sibling_base_parallel);
+    RUN_TEST(pipeline_python_nested_helper_keeps_tests_issue1548);
+    RUN_TEST(pipeline_python_nested_helper_keeps_tests_parallel_issue1548);
+    RUN_TEST(pipeline_python_decorated_nested_class_extracted);
+    RUN_TEST(pipeline_python_decorated_nested_class_extracted_parallel);
+    RUN_TEST(pipeline_python_nested_class_methods_resolve);
+    RUN_TEST(pipeline_python_nested_class_methods_resolve_parallel);
     RUN_TEST(pipeline_header_include_target_is_independent_of_registration_order);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);

@@ -309,8 +309,8 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
     size_t pos = (size_t)n;
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
-    /* Right after the docstring: the buffer is sized for exactly these three
-     * uncapped fields (pd_props_buf), so none can be squeezed out. */
+    /* The buffer is sized for every field below (pd_props_buf), so none can be
+     * squeezed out. */
     append_json_raw(buf, bufsize, &pos, "variants", def->variants);
     append_json_string(buf, bufsize, &pos, "variant_key", def->variant_key);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
@@ -353,24 +353,71 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
 }
 
-/* A def's properties buffer: CBM_SZ_2K for every other field plus the whole
- * serialized docstring, variants and variant_key fields, which have no length
- * cap (a field that does not fit is dropped whole). Returns `stack` for a def
- * with none of them, or when the larger buffer cannot be allocated. Twin of
- * pass_parallel.c -- keep both in sync. */
-static char *pd_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
-    size_t need = *size;
-    if (def->docstring && def->docstring[0]) {
-        need += strlen("docstring") + def_json_escaped_len(def->docstring) + PD_JSON_FIELD_OVERHEAD;
+/* Upper bound of build_def_props' fixed prefix: the Function/Method metrics
+ * literal (about 330 B) with nine ints and seven true/false/test_role strings at
+ * their widest stays under 600 B. */
+enum { PD_PROPS_PREFIX_MAX = CBM_SZ_1K };
+
+/* Serialized size of one optional field as append_json_string emits it
+ * (0 when the field is absent). */
+static size_t pd_str_field_len(const char *key, const char *val) {
+    return val && val[0] ? strlen(key) + def_json_escaped_len(val) + PD_JSON_FIELD_OVERHEAD : 0;
+}
+
+/* Serialized size of a string array as append_json_str_array emits it. */
+static size_t pd_arr_field_len(const char *key, const char **arr) {
+    if (!arr || !arr[0]) {
+        return 0;
     }
+    size_t n = strlen(key) + PD_JSON_FIELD_OVERHEAD;
+    for (int i = 0; arr[i]; i++) {
+        n += def_json_escaped_len(arr[i]) + PD_ESC_SPACE + (i > 0 ? SKIP_ONE : 0);
+    }
+    return n;
+}
+
+/* A def's properties buffer, sized so EVERY field build_def_props appends fits:
+ * the fixed metrics prefix (PD_PROPS_PREFIX_MAX) plus each optional field's
+ * whole serialized form. A field that does not fit is dropped whole, so a buffer
+ * sized for only some of them let a long signature, decorator list or parameter
+ * list squeeze out the MinHash fingerprint ("fp"), structural profile ("sp") and
+ * body tokens ("bt") behind them: no SIMILAR_TO edge and fewer
+ * SEMANTICALLY_RELATED edges for exactly the widest definitions (jellyfin's
+ * ImageController actions, 2026-10-18). fp/sp/bt are appended behind their own
+ * room checks, so both the check's reserve and the field are counted. Returns
+ * `stack` when everything fits it, or when the larger buffer cannot be
+ * allocated. Twin of pass_parallel.c -- keep both in sync. */
+static char *pd_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
+    size_t need = PD_PROPS_PREFIX_MAX + pd_str_field_len("docstring", def->docstring);
     if (def->variants && def->variants[0]) {
         need += strlen("variants") + strlen(def->variants) + PD_JSON_FIELD_OVERHEAD;
     }
-    if (def->variant_key && def->variant_key[0]) {
-        need +=
-            strlen("variant_key") + def_json_escaped_len(def->variant_key) + PD_JSON_FIELD_OVERHEAD;
+    need += pd_str_field_len("variant_key", def->variant_key) +
+            pd_str_field_len("signature", def->signature) +
+            pd_str_field_len("return_type", def->return_type) +
+            pd_str_field_len("parent_class", def->parent_class) +
+            pd_arr_field_len("decorators", def->decorators) +
+            pd_arr_field_len("base_classes", def->base_classes) +
+            pd_arr_field_len("param_names", def->param_names) +
+            pd_arr_field_len("param_types", def->param_types) +
+            pd_str_field_len("route_path", def->route_path) +
+            pd_str_field_len("route_method", def->route_method) +
+            pd_str_field_len("http_client", def->http_client) +
+            pd_str_field_len("http_base_url", def->http_base_url);
+    for (const char **kv = def->extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
+        need += pd_str_field_len(kv[0], kv[SKIP_ONE]);
     }
-    if (need == *size) {
+    if (def->fingerprint && def->fingerprint_k > 0) {
+        need += CBM_MINHASH_HEX_LEN + CBM_MINHASH_JSON_OVERHEAD + SKIP_ONE;
+    }
+    if (def->structural_profile) {
+        need += CBM_AST_PROFILE_BUF + pd_str_field_len("sp", def->structural_profile) + SKIP_ONE;
+    }
+    if (def->body_tokens) {
+        need += CBM_SZ_512 + pd_str_field_len("bt", def->body_tokens) + SKIP_ONE;
+    }
+    need += PD_ESC_SPACE; /* the closing '}' + NUL */
+    if (need <= *size) {
         return stack;
     }
     char *buf = cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, need);
@@ -432,7 +479,8 @@ static void link_def_parents(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, 
  * `link_parents` links its DEFINES_METHOD / diagram parent right away; with
  * the result cache the pass links them once every file is registered. */
 static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
-                        const char *file_doc, CBMLanguage lang, bool link_parents) {
+                        const char *file_doc, CBMLanguage lang, size_t module_prefix_len,
+                        bool link_parents) {
     if (!def->qualified_name || !def->name) {
         return;
     }
@@ -452,13 +500,19 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     if (props != stack) {
         cbm_free(CBM_MEM_CLASS_GBUF_STRING, props);
     }
+    /* Per definition, like pass_parallel.c: overloads sharing this QN each keep
+     * their own route (the merged node properties hold only one of them). */
+    if (node_id > 0) {
+        cbm_pipeline_emit_def_route(ctx->gbuf, node_id, def, def_rel);
+    }
     /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
      * (helpers.c): callables + type-like containers (INHERITS/IMPLEMENTS/method/
      * field resolution), Variable/Field (READS/WRITES resolution), and Table/View
      * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
      * through the same predicate, so the three registries cannot diverge. */
     if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add_lang(ctx->registry, def->name, def->qualified_name, def->label, lang);
+        cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name, def->label,
+                                        lang, module_prefix_len);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
@@ -1061,10 +1115,15 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                 "test_declarations");
         }
 
-        /* Create nodes for each definition */
+        /* Create nodes for each definition. A Python file's module QN bounds
+         * the registry's function-local detection to this file. */
         const char *file_doc = result->module_doc; /* goes with the first def */
+        size_t py_prefix_len = lang == CBM_LANG_PYTHON
+                                   ? cbm_pipeline_fqn_symbol_prefix_len(ctx->project_name, rel)
+                                   : 0;
         for (int d = 0; d < result->defs.count; d++) {
-            process_def(ctx, &result->defs.items[d], rel, file_doc, lang, !local_cache);
+            process_def(ctx, &result->defs.items[d], rel, file_doc, lang, py_prefix_len,
+                        !local_cache);
             file_doc = NULL;
             total_defs++;
         }
