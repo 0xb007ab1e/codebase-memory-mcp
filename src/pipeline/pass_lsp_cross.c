@@ -1011,16 +1011,28 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
     for (int i = 0; i < file_count; i++) {
         int defs = 0;
         int impls = 0;
+        int records = 0; /* a Python module's namespace records (re-exports) */
         if (cache[i]) {
             owner_walk_required = owner_walk_required || cache[i]->has_test_definition_owners;
             defs = cache[i]->defs.count;
             impls = cache[i]->impl_traits.count;
+            records = pxc_py_namespace_record_bound(cache[i]);
         } else if (spill && cbm_result_spill_has(spill, i)) {
-            cbm_result_spill_peek_counts(spill, i, &defs, &impls);
+            /* The header carries the counts (and the fact stream's status and
+             * size), so the bound needs no full load. */
+            CBMFileResult hdr;
+            if (cbm_result_spill_peek_header(spill, i, &hdr)) {
+                defs = hdr.defs.count;
+                impls = hdr.impl_traits.count;
+                records = pxc_py_namespace_record_bound(&hdr);
+            }
         }
         total += defs;
         if (files[i].language == CBM_LANG_RUST) {
             total += impls;
+        }
+        if (files[i].language == CBM_LANG_PYTHON) {
+            total += records;
         }
     }
     if (total == 0) {
@@ -1039,7 +1051,6 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         return NULL;
     }
     int capacity = total;
-    int records_reserved = 0; /* namespace records placed on top of the def bound */
     int idx = 0;
     for (int fi = 0; fi < file_count; fi++) {
         if (out_def_starts) {
@@ -1104,26 +1115,11 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         }
         if (files[fi].language == CBM_LANG_PYTHON) {
             pxc_fold_py_field_types(arena, fr, defs, file_start, idx, &bs, def_modules[fi]);
-            /* Package namespace records (re-exports). Their count is not part
-             * of the def-count bound above (a spilled result's facts are not
-             * peekable), so grow the array for them here: on top of the bound,
-             * which still reserves every later file's defs, or those overflow.
-             * Geometric growth keeps the copying linear. */
+            /* Package namespace records (re-exports), reserved in the bound
+             * above; written only while they fit it (a result whose loaded
+             * stream outgrew its header would otherwise overflow). */
             int need = pxc_py_namespace_record_bound(fr);
-            int required = total + records_reserved + need;
-            if (need > 0 && required > capacity) {
-                int grown_cap = capacity * 2 > required ? capacity * 2 : required;
-                CBMLSPDef *grown =
-                    (CBMLSPDef *)realloc(defs, (size_t)grown_cap * sizeof(CBMLSPDef));
-                if (grown) {
-                    defs = grown;
-                    capacity = grown_cap;
-                } else {
-                    need = 0;
-                }
-            }
-            if (need > 0) {
-                records_reserved += need;
+            if (need > 0 && idx + need <= capacity) {
                 idx += pxc_build_py_namespace_records(arena, fr, def_modules[fi], &defs[idx]);
             }
         }
