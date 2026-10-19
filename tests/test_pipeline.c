@@ -13983,7 +13983,7 @@ enum { PY_REEXPORT_N_EXCLUDED = sizeof(py_reexport_excluded) / sizeof(py_reexpor
 
 /* Index the fixture; lsp[c] = call c's edge has an lsp_* strategy; excluded[e]
  * = excluded call e reached its target by the LSP anyway. */
-static int py_reexport_run(bool parallel, bool *lsp, bool *excluded) {
+static int py_reexport_run(bool parallel, bool incremental, bool *lsp, bool *excluded) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_reexport_XXXXXX");
     if (!cbm_mkdtemp(tmp)) {
@@ -14087,6 +14087,16 @@ static int py_reexport_run(bool parallel, bool *lsp, bool *excluded) {
     snprintf(db_path, sizeof(db_path), "%s/py_reexport.db", tmp);
     cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
     int run_rc = p ? cbm_pipeline_run(p) : -1;
+    if (incremental && run_rc == 0) {
+        /* Touch only the caller: re-indexed alone, it must still find the
+         * re-exports of the unchanged packages. */
+        cbm_pipeline_free(p);
+        char main_path[512];
+        snprintf(main_path, sizeof(main_path), "%s/app/main.py", tmp);
+        th_append_file(main_path, "\n# edited: the second run re-indexes the caller\n");
+        p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        run_rc = p ? cbm_pipeline_run(p) : -1;
+    }
     const char *project = p ? cbm_pipeline_project_name(p) : NULL;
     cbm_store_t *s = project ? cbm_store_open_path(db_path) : NULL;
     if (!s && run_rc == 0) {
@@ -14133,25 +14143,28 @@ static int py_reexport_run(bool parallel, bool *lsp, bool *excluded) {
 }
 
 /* Sequential driver (few files, one worker) and parallel driver (fillers +
- * four workers). */
+ * four workers), each as a full index and as an incremental re-index that
+ * touched only the caller. */
 TEST(pipeline_python_package_reexports_resolve_by_lsp) {
-    for (int mode = 0; mode < 2; mode++) {
+    static const char *const mode_names[] = {"sequential", "parallel", "sequential incremental",
+                                             "parallel incremental"};
+    for (int mode = 0; mode < 4; mode++) {
         bool lsp[PY_REEXPORT_N_CALLS];
         bool excluded[PY_REEXPORT_N_EXCLUDED];
         memset(lsp, 0, sizeof(lsp));
         memset(excluded, 1, sizeof(excluded));
-        ASSERT_EQ(py_reexport_run(mode == 1, lsp, excluded), 0);
+        ASSERT_EQ(py_reexport_run((mode & 1) != 0, mode >= 2, lsp, excluded), 0);
         for (int c = 0; c < PY_REEXPORT_N_CALLS; c++) {
             if (!lsp[c]) {
                 fprintf(stderr, "  re-export call %s (%s) did not resolve by the LSP\n",
-                        py_reexport_calls[c][0], mode ? "parallel" : "sequential");
+                        py_reexport_calls[c][0], mode_names[mode]);
             }
             ASSERT_TRUE(lsp[c]); /* RED for every re-export shape; controls stay green */
         }
         for (int e = 0; e < PY_REEXPORT_N_EXCLUDED; e++) {
             if (excluded[e]) {
                 fprintf(stderr, "  excluded call %s (%s) resolved by the LSP anyway\n",
-                        py_reexport_excluded[e][0], mode ? "parallel" : "sequential");
+                        py_reexport_excluded[e][0], mode_names[mode]);
             }
             ASSERT_FALSE(excluded[e]); /* __all__, `_`, shadow, barrier */
         }
