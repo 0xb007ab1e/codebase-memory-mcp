@@ -12408,6 +12408,116 @@ TEST(python_namespace_facts_string_statements_and_future_imports) {
     PASS();
 }
 
+/* A top-level call of a same-module function is a namespace effect, unless the
+ * callee provably cannot rebind the caller's names: sqlalchemy's
+ * `sql/__init__.py` ends with `__go(locals())`. Every submodule its body
+ * imports becomes a package attribute, so those names are shadowed at the
+ * call; everything else of the namespace survives. */
+static bool py_facts_has_effect(const CBMFileResult *r) {
+    for (int i = 0; r && i < r->py_namespace.count; i++) {
+        if (r->py_namespace.items[i].kind == CBM_PY_NS_UNKNOWN &&
+            r->py_namespace.items[i].reason == CBM_PY_NS_REASON_EFFECT)
+            return true;
+    }
+    return false;
+}
+
+static int py_facts_count_kind(const CBMFileResult *r, CBMPyNamespaceFactKind kind) {
+    int n = 0;
+    for (int i = 0; r && i < r->py_namespace.count; i++)
+        n += r->py_namespace.items[i].kind == kind;
+    return n;
+}
+
+static bool py_facts_valid_complete(const CBMFileResult *r) {
+    return r && !r->has_error && r->py_namespace.status == CBM_PY_NS_COMPLETE &&
+           cbm_py_namespace_facts_valid(&r->py_namespace);
+}
+
+TEST(python_namespace_facts_init_call_allowlist) {
+    static const char go[] = "from typing import TYPE_CHECKING, Any\n"
+                             "from .impl import base\n"
+                             "from .elements import cast\n"
+                             "def __go(lcls: Any) -> None:\n"
+                             "    from .. import util as _sa_util\n"
+                             "    from . import base\n"
+                             "    from . import coercions, elements as _el\n"
+                             "    if not TYPE_CHECKING:\n"
+                             "        base.coercions = _el.coercions = coercions\n"
+                             "    from .annotation import _prepare_annotations\n"
+                             "    _prepare_annotations(cast, cast)\n"
+                             "    _sa_util.preloaded.import_prefix(\"sqlalchemy.sql\")\n"
+                             "\n"
+                             "__go(locals())\n";
+    CBMFileResult *r = extract(go, CBM_LANG_PYTHON, "t", "sql/__init__.py");
+    bool ok = py_facts_valid_complete(r) && !py_facts_has_effect(r) && r->py_namespace.count == 9;
+    if (ok) {
+        const CBMPyNamespaceFact *f = r->py_namespace.items;
+        static const char *const shadowed[] = {"base", "coercions", "elements", "annotation"};
+        ok = f[2].kind == CBM_PY_NS_IMPORT_NAME && strcmp(f[2].local_name, "base") == 0 &&
+             f[4].kind == CBM_PY_NS_OWN_DEF && strcmp(f[4].local_name, "__go") == 0;
+        for (int i = 0; ok && i < 4; i++) {
+            ok = f[5 + i].kind == CBM_PY_NS_SHADOW && f[5 + i].local_name &&
+                 strcmp(f[5 + i].local_name, shadowed[i]) == 0;
+        }
+    }
+    if (!ok && r) {
+        for (int i = 0; i < r->py_namespace.count; i++) {
+            const CBMPyNamespaceFact *f = &r->py_namespace.items[i];
+            printf("  __go fact %d: kind %d reason %d name %s\n", i, (int)f->kind, (int)f->reason,
+                   f->local_name ? f->local_name : "-");
+        }
+    }
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(ok); /* RED while every top-level call withdraws the namespace */
+
+    /* A plain module is no package: the body's imports set attributes of its
+     * parent package, never of the module itself. */
+    r = extract("def __go(lcls):\n    from . import base\n\n__go(locals())\n", CBM_LANG_PYTHON,
+                "t", "sql/mod.py");
+    ok = py_facts_valid_complete(r) && !py_facts_has_effect(r) &&
+         py_facts_count_kind(r, CBM_PY_NS_SHADOW) == 0;
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(ok);
+
+    /* Each of these can rebind a name of the caller's namespace (or is not
+     * provably a same-module function): the call stays a whole-namespace
+     * effect. */
+    static const char *const effects[][2] = {
+        {"param", "def __go(lcls):\n    lcls['base'] = 1\n\n__go(locals())\n"},
+        {"global", "def __go(lcls):\n    global base\n    base = 1\n\n__go(locals())\n"},
+        {"nested global", "def __go(lcls):\n    def inner():\n        global base\n"
+                          "        base = 1\n    inner()\n\n__go(locals())\n"},
+        {"globals()", "def __go(lcls):\n    globals()['base'] = 1\n\n__go(locals())\n"},
+        {"sys.modules", "def __go(lcls):\n    import sys\n    sys.modules[__name__].base = 1\n"
+                        "\n__go(locals())\n"},
+        {"imported callee", "from .setup import __go\n__go(locals())\n"},
+        {"own package name", "def __go(lcls):\n    from .. import sql\n    sql.base = 1\n"
+                             "\n__go(locals())\n"},
+        {"same-module helper", "def helper():\n    pass\n\ndef __go(lcls):\n    helper()\n"
+                               "\n__go(locals())\n"},
+        {"rebound callee", "def __go(lcls):\n    pass\n\n__go = other\n__go(locals())\n"},
+        {"call before def", "__go(locals())\n\ndef __go(lcls):\n    pass\n"},
+        {"argument effect", "def __go(lcls):\n    pass\n\n__go(make())\n"},
+        {"rebound locals", "def locals():\n    return {}\n\ndef __go(lcls):\n    pass\n"
+                           "\n__go(locals())\n"},
+    };
+    for (size_t i = 0; i < sizeof(effects) / sizeof(effects[0]); i++) {
+        char src[512];
+        snprintf(src, sizeof(src), "from .impl import base\n%s", effects[i][1]);
+        r = extract(src, CBM_LANG_PYTHON, "t", "sql/__init__.py");
+        ok = py_facts_valid_complete(r) && py_facts_has_effect(r);
+        if (!ok)
+            printf("  control '%s' is no namespace effect\n", effects[i][0]);
+        if (r)
+            cbm_free_result(r);
+        ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
 TEST(python_namespace_facts_distinguish_all_operations_and_unknowns) {
     static const char source[] = "__all__ = ['old']; __all__ = []\n"
                                  "__all__ = dynamic\n"
@@ -12796,6 +12906,7 @@ SUITE(extraction) {
     RUN_TEST(python_namespace_facts_parse_errors_are_complete_unknown);
     RUN_TEST(python_namespace_facts_type_checking_alternatives);
     RUN_TEST(python_namespace_facts_string_statements_and_future_imports);
+    RUN_TEST(python_namespace_facts_init_call_allowlist);
     RUN_TEST(python_namespace_facts_capture_and_copy_fail_atomically);
     RUN_TEST(python_namespace_facts_validation_rejects_partial_and_unknown_schema);
     RUN_TEST(python_namespace_facts_compact_spill_and_copy_keep_owned_payload);
