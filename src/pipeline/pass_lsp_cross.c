@@ -1147,12 +1147,10 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
             continue;
         memcpy(local, start, n);
         local[n] = '\0';
-        if (!include_type_only &&
-            !cbm_imports_local_binds_runtime_name(result ? &result->imports : NULL, local)) {
-            free(local); /* annotation-only import (#1277): no CALLS binding */
-            continue;
-        }
-        char *value = pxc_import_value_qn(lang, result, local, target);
+        /* An annotation-only import (#1277) binds no CALLS name: it gets no value. */
+        bool binds = include_type_only ||
+                     cbm_imports_local_binds_runtime_name(result ? &result->imports : NULL, local);
+        char *value = binds ? pxc_import_value_qn(lang, result, local, target) : NULL;
         if (!value) {
             free(local);
             continue;

@@ -402,14 +402,16 @@ void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp) {
     arr->items[arr->count++] = imp;
 }
 
-bool cbm_imports_local_binds_runtime_name(const CBMImportArray *imports, const char *local_name) {
-    if (!imports || !local_name) {
+bool cbm_imports_local_span_binds_runtime_name(const CBMImportArray *imports, const char *name,
+                                               size_t len) {
+    if (!imports || !name) {
         return true;
     }
     bool seen = false;
     for (int i = 0; i < imports->count; i++) {
         const CBMImport *imp = &imports->items[i];
-        if (!imp->local_name || strcmp(imp->local_name, local_name) != 0) {
+        if (!imp->local_name || strncmp(imp->local_name, name, len) != 0 ||
+            imp->local_name[len] != '\0') {
             continue;
         }
         if (cbm_import_binds_runtime_name(imp)) {
@@ -418,6 +420,11 @@ bool cbm_imports_local_binds_runtime_name(const CBMImportArray *imports, const c
         seen = true;
     }
     return !seen;
+}
+
+bool cbm_imports_local_binds_runtime_name(const CBMImportArray *imports, const char *local_name) {
+    return !local_name ||
+           cbm_imports_local_span_binds_runtime_name(imports, local_name, strlen(local_name));
 }
 
 void cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage) {

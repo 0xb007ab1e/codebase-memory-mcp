@@ -1321,6 +1321,10 @@ void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp);
  * annotation-only (cbm_import_binds_runtime_name), so also true when no import
  * names it: the rule for the builders that key IMPORTS edges by local name. */
 bool cbm_imports_local_binds_runtime_name(const CBMImportArray *imports, const char *local_name);
+/* The same for the `len` bytes at `name` (not NUL-terminated): lets a caller
+ * decide before it copies the name. */
+bool cbm_imports_local_span_binds_runtime_name(const CBMImportArray *imports, const char *name,
+                                               size_t len);
 void cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage);
 void cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr);
 void cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);
