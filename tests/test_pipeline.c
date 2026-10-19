@@ -8822,9 +8822,11 @@ static void write_go_c_ref_guard_fixture(const char *tmp, int pad_files) {
 /* F-G8 D1: a variable bound by a CROSS-file multi-value or named-result call
  * is typed. The cross-file registrar received the raw result text
  * `(*Encoder, error)`, which did not parse, so `e, err := enc.NewEncoder()`
- * left e untyped and e.EncodeTuple() fell to a name guess. Every target
- * method has two same-named decoys, so a guess cannot pass. pad_files > 0
- * forces the parallel resolver. */
+ * left e untyped and e.EncodeTuple() fell to a name guess. A single result
+ * keeps its raw text: `[]Sample` must stay a slice so that `xs[0].TS()` is
+ * typed (the extractor's cleaned return_types read it as `Sample`). Every
+ * target method has two same-named decoys, so a guess cannot pass.
+ * pad_files > 0 forces the parallel resolver. */
 static void write_go_multi_return_fixture(const char *tmp, int pad_files) {
     write_temp_file(tmp, "go.mod", "module example.com/fx\n\ngo 1.22\n");
     write_temp_file(tmp, "enc/enc.go",
@@ -8836,9 +8838,25 @@ static void write_go_multi_return_fixture(const char *tmp, int pad_files) {
                     "\n"
                     "func NewNamed() (e *Encoder) { e = &Encoder{}; return }\n"
                     "\n"
+                    "func NewPair() (a, b *Encoder) { return &Encoder{}, &Encoder{} }\n"
+                    "\n"
                     "func (e *Encoder) EncodeTuple() int { return e.n }\n"
                     "\n"
-                    "func (e *Encoder) EncodeNamed() int { return e.n }\n");
+                    "func (e *Encoder) EncodeNamed() int { return e.n }\n"
+                    "\n"
+                    "func (e *Encoder) EncodeGrouped() int { return e.n }\n");
+    write_temp_file(tmp, "samples/samples.go",
+                    "package samples\n"
+                    "\n"
+                    "type Sample interface{ TS() int64 }\n"
+                    "\n"
+                    "type sample struct{}\n"
+                    "\n"
+                    "func (sample) TS() int64 { return 0 }\n"
+                    "\n"
+                    "func Generate() []Sample { return []Sample{sample{}} }\n"
+                    "\n"
+                    "func List() ([]Sample, error) { return []Sample{sample{}}, nil }\n");
     write_temp_file(tmp, "diag/diag.go",
                     "package diag\n"
                     "\n"
@@ -8865,7 +8883,23 @@ static void write_go_multi_return_fixture(const char *tmp, int pad_files) {
                     "import (\n"
                     "\t\"example.com/fx/diag\"\n"
                     "\t\"example.com/fx/enc\"\n"
+                    "\t\"example.com/fx/samples\"\n"
                     ")\n"
+                    "\n"
+                    "func UseIndex() int64 {\n"
+                    "\txs := samples.Generate()\n"
+                    "\treturn xs[0].TS()\n"
+                    "}\n"
+                    "\n"
+                    "func UseTupleSlice() int64 {\n"
+                    "\tys, _ := samples.List()\n"
+                    "\treturn ys[0].TS()\n"
+                    "}\n"
+                    "\n"
+                    "func UseGrouped() int {\n"
+                    "\tx, _ := enc.NewPair()\n"
+                    "\treturn x.EncodeGrouped()\n"
+                    "}\n"
                     "\n"
                     "func UseTuple() int {\n"
                     "\te, err := enc.NewEncoder()\n"
@@ -8901,7 +8935,11 @@ static void write_go_multi_return_fixture(const char *tmp, int pad_files) {
                     "func (D1) LowWatermarkField() int { return 0 }\n"
                     "func (D2) LowWatermarkField() int { return 0 }\n"
                     "func (D1) HasErrorsSlice() bool { return false }\n"
-                    "func (D2) HasErrorsSlice() bool { return false }\n");
+                    "func (D2) HasErrorsSlice() bool { return false }\n"
+                    "func (D1) EncodeGrouped() int { return 0 }\n"
+                    "func (D2) EncodeGrouped() int { return 0 }\n"
+                    "func (D1) TS() int64 { return 0 }\n"
+                    "func (D2) TS() int64 { return 0 }\n");
     for (int i = 0; i < pad_files; i++) {
         char name[64];
         char body[128];
@@ -8951,6 +8989,9 @@ static int go_multi_return_case(int pad_files) {
         {"UseNamed", "EncodeNamed", "enc/enc.go"},         /* named result (e *Encoder) */
         {"UseField", "LowWatermarkField", "app/types.go"}, /* h, _ := newHead(); h.iso.X() */
         {"UseSlice", "HasErrorsSlice", "diag/diag.go"},    /* _, d := diag.Run() */
+        {"UseGrouped", "EncodeGrouped", "enc/enc.go"},     /* (a, b *Encoder) */
+        {"UseIndex", "TS", "samples/samples.go"},          /* single []Sample, xs[0] */
+        {"UseTupleSlice", "TS", "samples/samples.go"},     /* ([]Sample, error) */
     };
     for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
         int right = named_edge_to_file_count(s, project, "CALLS", want[i].caller, want[i].method,
