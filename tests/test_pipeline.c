@@ -14308,6 +14308,7 @@ static const char *const py_reexport_calls[][2] = {
     {"ctl_from_cls", "direct.impl.Direct"},
     {"ctl_from_fn", "direct.impl.direct_fn"},
     {"lazy_tc", "lz.lazy_mod.Lazy"},
+    {"doc_reexport", "docp.impl.Doc"},
 };
 enum { PY_REEXPORT_N_CALLS = sizeof(py_reexport_calls) / sizeof(py_reexport_calls[0]) };
 
@@ -14317,7 +14318,7 @@ enum { PY_REEXPORT_N_CALLS = sizeof(py_reexport_calls) / sizeof(py_reexport_call
 static const char *const py_reexport_excluded[][2] = {
     {"excl_unlisted", "pkg.all_mod.Unlisted"}, {"excl_private", "pkg.star_mod._private_fn"},
     {"excl_shadowed", "shad.impl.Gone"},       {"excl_barrier", "barr.impl.Before"},
-    {"excl_compat", "cmp.types_only.Shim"},
+    {"excl_compat", "cmp.types_only.Shim"},    {"excl_fstring", "fsp.impl.Kept"},
 };
 enum { PY_REEXPORT_N_EXCLUDED = sizeof(py_reexport_excluded) / sizeof(py_reexport_excluded[0]) };
 
@@ -14377,6 +14378,19 @@ static int py_reexport_run(bool parallel, bool incremental, bool *lsp, bool *exc
                     "    except ImportError:\n        Shim = None\n");
     write_temp_file(tmp, "app/cmp/types_only.py", "class Shim:\n    pass\n");
     write_temp_file(tmp, "app/cmp/runtime_impl.py", "class Shim:\n    pass\n");
+    /* The sql/expression.py shape of sqlalchemy: docstrings and a __future__
+     * import around the re-exports; an f-string with a field stays a barrier. */
+    write_temp_file(tmp, "app/docp/__init__.py",
+                    "\"\"\"Package docstring.\"\"\"\n"
+                    "from __future__ import annotations\n"
+                    "from .impl import Doc\n"
+                    "alias = Doc\n"
+                    "\"\"\"Attribute docstring.\"\"\"\n");
+    write_temp_file(tmp, "app/docp/impl.py", "class Doc:\n    pass\n");
+    write_temp_file(tmp, "app/fsp/__init__.py",
+                    "from .impl import Kept\n"
+                    "f\"{Kept}\"\n");
+    write_temp_file(tmp, "app/fsp/impl.py", "class Kept:\n    pass\n");
     write_temp_file(tmp, "app/main.py",
                     "from app import pkg\n"
                     "from app import cyc\n"
@@ -14384,6 +14398,8 @@ static int py_reexport_run(bool parallel, bool incremental, bool *lsp, bool *exc
                     "from app import barr\n"
                     "from app import lz\n"
                     "from app import cmp\n"
+                    "from app import docp\n"
+                    "from app import fsp\n"
                     "from app.db import models\n"
                     "from app.pkg import Explicit, Listed, Deep, star_fn, Renamed\n"
                     "from app.direct.impl import Direct, direct_fn\n\n\n"
@@ -14409,6 +14425,8 @@ static int py_reexport_run(bool parallel, bool incremental, bool *lsp, bool *exc
                     "def excl_barrier():\n    barr.Before()\n\n\n"
                     "def excl_compat():\n    cmp.Shim()\n\n\n"
                     "def lazy_tc():\n    lz.Lazy()\n\n\n"
+                    "def doc_reexport():\n    docp.Doc()\n\n\n"
+                    "def excl_fstring():\n    fsp.Kept()\n\n\n"
                     "def ctl_from_cls():\n    Direct()\n\n\n"
                     "def ctl_from_fn():\n    direct_fn()\n");
     for (int i = 0; parallel && i < 52; i++) {
