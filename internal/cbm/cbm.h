@@ -398,8 +398,19 @@ typedef struct {
     const char *member;      // ES named import: the exported name the local binds (`get` in
                              // `import { get as navigate } from "axios"`); NULL otherwise
     bool is_default;         // ES default import (`import X from "Y"`), JS/TS only (#1916)
+    bool type_checking_only; // Python: inside a module-level `if TYPE_CHECKING:` block --
+                             // binds the name for annotations, never at runtime (#1277)
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
 } CBMImport;
+
+/* True when an import binds its local name at runtime. A Python import under
+ * `if TYPE_CHECKING:` exists for annotations only: a call through that name
+ * cannot happen, so no CALLS import map may bind it (an import_map edge
+ * through it would be fabricated by construction). THE one rule every CALLS
+ * import-map builder applies. */
+static inline bool cbm_import_binds_runtime_name(const CBMImport *imp) {
+    return imp && !imp->type_checking_only;
+}
 
 /* Content-only ordered Python namespace facts; no resolved target identities. */
 #define CBM_PY_NAMESPACE_FACTS_VERSION 1u
@@ -1306,6 +1317,14 @@ void cbm_py_namespace_test_copy_fail_after(int successful_allocations);
 void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
 void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
 void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp);
+/* True unless every import of `imports` that binds `local_name` is
+ * annotation-only (cbm_import_binds_runtime_name), so also true when no import
+ * names it: the rule for the builders that key IMPORTS edges by local name. */
+bool cbm_imports_local_binds_runtime_name(const CBMImportArray *imports, const char *local_name);
+/* The same for the `len` bytes at `name` (not NUL-terminated): lets a caller
+ * decide before it copies the name. */
+bool cbm_imports_local_span_binds_runtime_name(const CBMImportArray *imports, const char *name,
+                                               size_t len);
 void cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage);
 void cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr);
 void cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);
