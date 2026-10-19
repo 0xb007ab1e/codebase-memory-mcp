@@ -1506,6 +1506,82 @@ TEST(python_annotated_instance_fields_exported_issue1277) {
     PASS();
 }
 
+/* #1277: the import an annotated field's type comes from usually sits under
+ * `if TYPE_CHECKING:`. It is recorded, flagged annotation-only; a runtime
+ * import is not flagged; an else branch (a runtime alternative) and an
+ * ordinary `if` stay unrecorded as before. */
+static const CBMImport *py_find_import(const CBMFileResult *r, const char *local) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name && strcmp(r->imports.items[i].local_name, local) == 0)
+            return &r->imports.items[i];
+    }
+    return NULL;
+}
+
+TEST(python_type_checking_imports_flagged_issue1277) {
+    const char *src = "from typing import TYPE_CHECKING\n"
+                      "import typing\n"
+                      "if TYPE_CHECKING:\n"
+                      "    from trainer import Trainer\n"
+                      "    import contracts\n"
+                      "else:\n"
+                      "    from fallback import Runtime\n"
+                      "if typing.TYPE_CHECKING:\n"
+                      "    from engine import Engine as Eng\n"
+                      "if FLAG:\n"
+                      "    from other import Conditional\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "loop.py");
+    ASSERT_NOT_NULL(r);
+    const CBMImport *tc = py_find_import(r, "TYPE_CHECKING");
+    const CBMImport *trainer = py_find_import(r, "Trainer");
+    const CBMImport *contracts = py_find_import(r, "contracts");
+    const CBMImport *eng = py_find_import(r, "Eng");
+    ASSERT_NOT_NULL(tc);
+    ASSERT_FALSE(tc->type_checking_only);
+    ASSERT_NOT_NULL(trainer);
+    ASSERT_TRUE(trainer->type_checking_only);
+    ASSERT_NOT_NULL(contracts);
+    ASSERT_TRUE(contracts->type_checking_only);
+    ASSERT_NOT_NULL(eng);
+    ASSERT_TRUE(eng->type_checking_only);
+    ASSERT_NULL(py_find_import(r, "Runtime"));
+    ASSERT_NULL(py_find_import(r, "Conditional"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A name the alternative of an `if TYPE_CHECKING:` binds again (the airflow
+ * compat shape, usually inside try/except ImportError) is bound at runtime, so
+ * its TYPE_CHECKING import is not annotation-only: it stays unrecorded, as the
+ * runtime import itself does. A star import in an alternative may bind any
+ * name, so it covers every name of the block. */
+TEST(python_type_checking_rebound_in_else_unrecorded_issue1277) {
+    const char *src = "from typing import TYPE_CHECKING\n"
+                      "if TYPE_CHECKING:\n"
+                      "    from airflow.sdk.execution_time.secrets_masker import mask_secret\n"
+                      "    from airflow.sdk.types import OnlyTyped\n"
+                      "else:\n"
+                      "    try:\n"
+                      "        from airflow.sdk.log import mask_secret\n"
+                      "    except ImportError:\n"
+                      "        mask_secret = None\n"
+                      "if TYPE_CHECKING:\n"
+                      "    from compat.types import Starred\n"
+                      "elif SOMETHING:\n"
+                      "    from compat import *\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "hook.py");
+    ASSERT_NOT_NULL(r);
+    const CBMImport *typed = py_find_import(r, "OnlyTyped");
+    ASSERT_NOT_NULL(typed);
+    ASSERT_TRUE(typed->type_checking_only);        /* only the type checker binds it */
+    ASSERT_NULL(py_find_import(r, "mask_secret")); /* the else branch binds it at runtime */
+    ASSERT_NULL(py_find_import(r, "Starred"));     /* the elif star import may bind it */
+    ASSERT_NULL(py_find_import(r, "compat"));      /* alternatives stay unrecorded */
+    ASSERT_NOT_NULL(py_find_import(r, "TYPE_CHECKING"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(python_function) {
     CBMFileResult *r = extract(
         "def greet(name):\n    return f\"Hello {name}\"\n\ndef main():\n    greet(\"World\")\n",
@@ -3786,6 +3862,48 @@ TEST(python_imports) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GT(r->imports.count, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The module_path recorded for a local name, or NULL. */
+static const char *import_path_of(CBMFileResult *r, const char *local) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name && strcmp(r->imports.items[i].local_name, local) == 0)
+            return r->imports.items[i].module_path;
+    }
+    return NULL;
+}
+
+/* `from . import x` names the importing file's OWN package: the path is ".x",
+ * as `from .m import f` is ".m.f". Joining the all-dots module with another '.'
+ * recorded "..x" (the parent package), so the import resolved one package too
+ * high and fell to an arbitrary same-named definition (home-assistant: 7,175
+ * calls bound to another integration's function). */
+TEST(python_package_relative_import_paths) {
+    CBMFileResult *r = extract("from . import async_register\n"
+                               "from .. import shared\n"
+                               "from . import local_fn as lf\n"
+                               "from .helpers import helper_fn\n"
+                               "from pkg.db import get_row\n",
+                               CBM_LANG_PYTHON, "t", "comp/web/sub/mod.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *own = import_path_of(r, "async_register");
+    const char *parent = import_path_of(r, "shared");
+    const char *aliased = import_path_of(r, "lf");
+    const char *member = import_path_of(r, "helper_fn");
+    const char *absolute = import_path_of(r, "get_row");
+    ASSERT_NOT_NULL(own);
+    ASSERT_NOT_NULL(parent);
+    ASSERT_NOT_NULL(aliased);
+    ASSERT_NOT_NULL(member);
+    ASSERT_NOT_NULL(absolute);
+    ASSERT_STR_EQ(own, ".async_register");
+    ASSERT_STR_EQ(parent, "..shared");
+    ASSERT_STR_EQ(aliased, ".local_fn");
+    ASSERT_STR_EQ(member, ".helpers.helper_fn"); /* control: unchanged */
+    ASSERT_STR_EQ(absolute, "pkg.db.get_row");   /* control: unchanged */
     cbm_free_result(r);
     PASS();
 }
@@ -12197,6 +12315,41 @@ TEST(python_namespace_facts_preserve_order_and_import_provenance) {
     PASS();
 }
 
+/* The type checker view of `if TYPE_CHECKING:` publishes its consequence (a
+ * lazy-module package: the else branch only installs the module). A name an
+ * elif/else import binds again is withdrawn by a SHADOW: its runtime source is
+ * the alternative. Both streams stay COMPLETE and valid. */
+TEST(python_namespace_facts_type_checking_alternatives) {
+    CBMFileResult *lazy = extract("from typing import TYPE_CHECKING\n"
+                                  "if TYPE_CHECKING:\n    from .lazy_mod import Lazy\n"
+                                  "else:\n    import sys\n",
+                                  CBM_LANG_PYTHON, "t", "lz/__init__.py");
+    CBMFileResult *compat = extract("from typing import TYPE_CHECKING\n"
+                                    "if TYPE_CHECKING:\n    from .types_only import Shim\n"
+                                    "else:\n    try:\n        from .runtime_impl import Shim\n"
+                                    "    except ImportError:\n        Shim = None\n",
+                                    CBM_LANG_PYTHON, "t", "cmp/__init__.py");
+    bool ok = lazy && compat && lazy->py_namespace.status == CBM_PY_NS_COMPLETE &&
+              compat->py_namespace.status == CBM_PY_NS_COMPLETE &&
+              cbm_py_namespace_facts_valid(&lazy->py_namespace) &&
+              cbm_py_namespace_facts_valid(&compat->py_namespace) &&
+              lazy->py_namespace.count == 3 && compat->py_namespace.count == 3;
+    if (ok) {
+        const CBMPyNamespaceFact *l = lazy->py_namespace.items;
+        const CBMPyNamespaceFact *c = compat->py_namespace.items;
+        ok = l[1].kind == CBM_PY_NS_IMPORT_NAME && strcmp(l[1].local_name, "Lazy") == 0 &&
+             l[2].kind == CBM_PY_NS_SHADOW && strcmp(l[2].local_name, "sys") == 0 &&
+             c[1].kind == CBM_PY_NS_IMPORT_NAME && strcmp(c[1].local_name, "Shim") == 0 &&
+             c[2].kind == CBM_PY_NS_SHADOW && strcmp(c[2].local_name, "Shim") == 0;
+    }
+    if (lazy)
+        cbm_free_result(lazy);
+    if (compat)
+        cbm_free_result(compat);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(python_namespace_facts_distinguish_all_operations_and_unknowns) {
     static const char source[] = "__all__ = ['old']; __all__ = []\n"
                                  "__all__ = dynamic\n"
@@ -12583,6 +12736,7 @@ SUITE(extraction) {
     RUN_TEST(python_namespace_facts_distinguish_all_operations_and_unknowns);
     RUN_TEST(python_namespace_facts_unknown_effects_and_body_stability);
     RUN_TEST(python_namespace_facts_parse_errors_are_complete_unknown);
+    RUN_TEST(python_namespace_facts_type_checking_alternatives);
     RUN_TEST(python_namespace_facts_capture_and_copy_fail_atomically);
     RUN_TEST(python_namespace_facts_validation_rejects_partial_and_unknown_schema);
     RUN_TEST(python_namespace_facts_compact_spill_and_copy_keep_owned_payload);
@@ -12716,6 +12870,8 @@ SUITE(extraction) {
     RUN_TEST(python_function);
     RUN_TEST(python_class);
     RUN_TEST(python_annotated_instance_fields_exported_issue1277);
+    RUN_TEST(python_type_checking_imports_flagged_issue1277);
+    RUN_TEST(python_type_checking_rebound_in_else_unrecorded_issue1277);
     RUN_TEST(js_function);
     RUN_TEST(js_class);
     RUN_TEST(ts_function);
@@ -12880,6 +13036,7 @@ SUITE(extraction) {
     RUN_TEST(python_iris_invokeClassMethod);
     RUN_TEST(go_calls);
     RUN_TEST(python_imports);
+    RUN_TEST(python_package_relative_import_paths);
     RUN_TEST(js_imports);
     RUN_TEST(go_imports);
     RUN_TEST(go_cgo_pseudo_import_dropped);

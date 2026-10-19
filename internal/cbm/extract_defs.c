@@ -3584,6 +3584,325 @@ static const char *join_route_paths(CBMArena *a, const char *prefix, const char 
     return cbm_arena_sprintf(a, "%s%s", prefix, path);
 }
 
+/* ── ASP.NET Core attribute routing (C#, #1041 / #1692) ──────────────────────
+ * Controllers route through attributes rather than Spring-style mapping names:
+ *   [Route("api/[controller]")] class QuotesController      -> class prefix
+ *   [HttpGet("{symbol}")]  /  [HttpPost] + [Route("x/{id}")] -> action route
+ *   [AcceptVerbs("GET", "HEAD", Route = "x")]
+ * A template is relative to the class prefix unless it starts with "/" or
+ * "~/". The [controller]/[action]/[area] tokens are replaced and constraints,
+ * defaults and optional markers reduce to the bare parameter ("{id:int}" ->
+ * "{id}"), so the result leads with '/' and canonicalizes like any other
+ * decorator route. */
+typedef struct {
+    const char *method;      /* HTTP verb of the first verb attribute */
+    const char *verb_tmpl;   /* its template (AcceptVerbs: Route = "...") */
+    const char *route_tmpl;  /* template of the first [Route] */
+    const char *action_name; /* [ActionName("x")] */
+    const char *area;        /* [Area("x")] */
+    bool has_route;          /* a [Route] attribute was seen */
+} aspnet_attrs_t;
+
+/* Attribute name without namespace qualifier or "Attribute" suffix:
+ * Microsoft.AspNetCore.Mvc.HttpGetAttribute -> HttpGet. */
+static const char *aspnet_attr_name(CBMArena *a, TSNode attr, const char *source) {
+    TSNode name_node = ts_node_child_by_field_name(attr, TS_FIELD("name"));
+    if (ts_node_is_null(name_node)) {
+        return NULL;
+    }
+    const char *name = cbm_node_text(a, name_node, source);
+    if (!name) {
+        return NULL;
+    }
+    const char *sep = strrchr(name, '.');
+    const char *colon = strrchr(name, ':');
+    if (colon > sep) {
+        sep = colon;
+    }
+    if (sep) {
+        name = sep + SKIP_CHAR;
+    }
+    static const char suffix[] = "Attribute";
+    size_t len = strlen(name);
+    size_t slen = sizeof(suffix) - SKIP_CHAR;
+    if (len > slen && strcmp(name + len - slen, suffix) == 0) {
+        return cbm_arena_strndup(a, name, len - slen);
+    }
+    return name;
+}
+
+static const char *aspnet_verb(const char *name) {
+    static const char *const verbs[][PAIR_CHARS] = {
+        {"HttpGet", "GET"},        {"HttpPost", "POST"},   {"HttpPut", "PUT"},
+        {"HttpDelete", "DELETE"},  {"HttpPatch", "PATCH"}, {"HttpHead", "HEAD"},
+        {"HttpOptions", "OPTIONS"}};
+    for (size_t i = 0; i < sizeof(verbs) / sizeof(verbs[0]); i++) {
+        if (strcmp(name, verbs[i][0]) == 0) {
+            return verbs[i][SKIP_CHAR];
+        }
+    }
+    return NULL;
+}
+
+/* Unquoted text of a C# "x" or @"x" string literal node; NULL otherwise. */
+static const char *aspnet_string_value(CBMArena *a, TSNode node, const char *source) {
+    const char *kind = ts_node_type(node);
+    bool verbatim = strcmp(kind, "verbatim_string_literal") == 0;
+    if (!verbatim && strcmp(kind, "string_literal") != 0) {
+        return NULL;
+    }
+    const char *text = cbm_node_text(a, node, source);
+    size_t open = verbatim ? PAIR_CHARS : SKIP_CHAR; /* `@"` or `"` */
+    size_t len = text ? strlen(text) : 0;
+    if (len < open + SKIP_CHAR) {
+        return NULL;
+    }
+    return cbm_arena_strndup(a, text + open, len - open - SKIP_CHAR);
+}
+
+/* The first positional string argument (key == NULL) or the string value of
+ * the named argument `key` (Route = "..."). */
+static const char *aspnet_attr_arg(CBMArena *a, TSNode attr, const char *source, const char *key) {
+    TSNode args = cbm_find_child_by_kind(attr, "attribute_argument_list");
+    if (ts_node_is_null(args)) {
+        return NULL;
+    }
+    uint32_t nc = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        uint32_t vc = ts_node_named_child_count(arg);
+        if (strcmp(ts_node_type(arg), "attribute_argument") != 0 || vc == 0) {
+            continue;
+        }
+        TSNode name = ts_node_child_by_field_name(arg, TS_FIELD("name"));
+        TSNode value = ts_node_named_child(arg, vc - SKIP_CHAR);
+        if (ts_node_is_null(name) != (key == NULL)) {
+            continue; /* positional wanted but named seen, or vice versa */
+        }
+        if (key) {
+            const char *n = cbm_node_text(a, name, source);
+            if (!n || strcmp(n, key) != 0) {
+                continue;
+            }
+        }
+        return aspnet_string_value(a, value, source);
+    }
+    return NULL;
+}
+
+/* [AcceptVerbs("get", ...)]: first verb upper-cased; letters only, since the
+ * verb lands in the Route QN and its JSON properties unescaped. */
+static const char *aspnet_accept_verb(CBMArena *a, const char *verb) {
+    enum { VERB_MAX = 7 }; /* OPTIONS */
+    size_t len = verb ? strlen(verb) : 0;
+    if (len == 0 || len > VERB_MAX) {
+        return "ANY";
+    }
+    char *up = cbm_arena_strndup(a, verb, len);
+    for (size_t i = 0; i < len; i++) {
+        if (!isalpha((unsigned char)up[i])) {
+            return "ANY";
+        }
+        up[i] = (char)toupper((unsigned char)up[i]);
+    }
+    return up;
+}
+
+static void aspnet_note_attr(CBMArena *a, TSNode attr, const char *source, aspnet_attrs_t *out) {
+    const char *name = aspnet_attr_name(a, attr, source);
+    if (!name) {
+        return;
+    }
+    const char *verb = aspnet_verb(name);
+    if (verb || strcmp(name, "AcceptVerbs") == 0) {
+        if (!out->method) {
+            out->method =
+                verb ? verb : aspnet_accept_verb(a, aspnet_attr_arg(a, attr, source, NULL));
+            out->verb_tmpl = aspnet_attr_arg(a, attr, source, verb ? NULL : "Route");
+        }
+    } else if (strcmp(name, "Route") == 0) {
+        if (!out->has_route) {
+            out->has_route = true;
+            out->route_tmpl = aspnet_attr_arg(a, attr, source, NULL);
+        }
+    } else if (strcmp(name, "ActionName") == 0) {
+        out->action_name = aspnet_attr_arg(a, attr, source, NULL);
+    } else if (strcmp(name, "Area") == 0) {
+        out->area = aspnet_attr_arg(a, attr, source, NULL);
+    }
+}
+
+static void aspnet_scan_attrs(CBMArena *a, TSNode owner, const char *source, aspnet_attrs_t *out) {
+    memset(out, 0, sizeof(*out));
+    TSNode wrappers[MAX_ATTR_WRAPPERS];
+    int wn = find_jvm_modifiers(owner, CBM_LANG_CSHARP, wrappers, MAX_ATTR_WRAPPERS);
+    for (int w = 0; w < wn; w++) {
+        uint32_t cc = ts_node_named_child_count(wrappers[w]);
+        for (uint32_t ci = 0; ci < cc; ci++) {
+            TSNode child = ts_node_named_child(wrappers[w], ci);
+            if (strcmp(ts_node_type(child), "attribute") == 0) {
+                aspnet_note_attr(a, child, source, out);
+            }
+        }
+    }
+}
+
+/* `name` minus `suffix` when it is a proper suffix (QuotesController ->
+ * Quotes, GetAsync -> Get); `name` otherwise. */
+static const char *aspnet_trim_suffix(CBMArena *a, const char *name, const char *suffix) {
+    size_t len = name ? strlen(name) : 0;
+    size_t slen = strlen(suffix);
+    if (len > slen && strcmp(name + len - slen, suffix) == 0) {
+        return cbm_arena_strndup(a, name, len - slen);
+    }
+    return name;
+}
+
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} aspnet_buf_t;
+
+static void aspnet_putc(aspnet_buf_t *b, char c) {
+    if (c == '/' && b->len > 0 && b->buf[b->len - SKIP_CHAR] == '/') {
+        return; /* "api/" + "/x" and empty token values never double a slash */
+    }
+    if (b->len + SKIP_CHAR < b->cap) {
+        b->buf[b->len++] = c;
+    }
+}
+
+static void aspnet_putn(aspnet_buf_t *b, const char *s, size_t n) {
+    for (size_t i = 0; i < n && s[i]; i++) {
+        aspnet_putc(b, s[i]);
+    }
+}
+
+/* Index just past the '}' closing the '{' at t[open] (braces nest, as in
+ * "{code:regex(^\d{{3}}$)}"); 0 when unterminated. */
+static size_t aspnet_brace_end(const char *t, size_t open) {
+    int depth = 0;
+    for (size_t j = open; t[j]; j++) {
+        if (t[j] == '{') {
+            depth++;
+        } else if (t[j] == '}' && --depth == 0) {
+            return j + SKIP_CHAR;
+        }
+    }
+    return 0;
+}
+
+/* "{id:int}", "{page=1}", "{slug?}", "{**path}" -> "{id}", "{page}", "{slug}",
+ * "{**path}": keep the catch-all stars and the parameter name. */
+static void aspnet_put_param(aspnet_buf_t *b, const char *t, size_t open, size_t end) {
+    size_t i = open + SKIP_CHAR;
+    aspnet_putc(b, '{');
+    while (i < end && t[i] == '*') {
+        aspnet_putc(b, t[i++]);
+    }
+    while (i < end && (isalnum((unsigned char)t[i]) || t[i] == '_')) {
+        aspnet_putc(b, t[i++]);
+    }
+    aspnet_putc(b, '}');
+}
+
+enum { ASPNET_TOKENS = 3 }; /* [controller], [action], [area] */
+
+/* Replacement for the [controller]/[action]/[area] token starting at t[i]
+ * (values[k] belongs to tokens[k]); NULL when t[i] starts no known token or
+ * its value is unknown, so the token is kept verbatim. */
+static const char *aspnet_token_value(const char *t, size_t i, const char *const *values,
+                                      size_t *tok_len) {
+    static const char *const tokens[ASPNET_TOKENS] = {"[controller]", "[action]", "[area]"};
+    for (size_t k = 0; k < ASPNET_TOKENS; k++) {
+        size_t n = strlen(tokens[k]);
+        if (values[k] && strncmp(t + i, tokens[k], n) == 0) {
+            *tok_len = n;
+            return values[k];
+        }
+    }
+    return NULL;
+}
+
+/* Normalize one ASP.NET route template into a '/'-led path (see the section
+ * comment above). values = {controller, action, area}. */
+static const char *aspnet_route_template(CBMArena *a, const char *t, const char *const *values) {
+    size_t extra = 0;
+    for (int k = 0; k < ASPNET_TOKENS; k++) {
+        extra += values[k] ? strlen(values[k]) : 0;
+    }
+    size_t brackets = 0;
+    for (const char *p = t; *p; p++) {
+        brackets += *p == '[';
+    }
+    aspnet_buf_t b = {0};
+    b.cap = strlen(t) + (brackets * extra) + PAIR_CHARS;
+    b.buf = (char *)cbm_arena_alloc(a, b.cap);
+    if (!b.buf) {
+        return NULL;
+    }
+    aspnet_putc(&b, '/');
+    size_t i = (t[0] == '~') ? SKIP_CHAR : 0;
+    while (t[i]) {
+        size_t tok_len = 0;
+        const char *val = (t[i] == '[') ? aspnet_token_value(t, i, values, &tok_len) : NULL;
+        size_t end = (t[i] == '{' && t[i + SKIP_CHAR] != '{') ? aspnet_brace_end(t, i) : 0;
+        if (val) {
+            aspnet_putn(&b, val, strlen(val));
+            i += tok_len;
+        } else if (end) {
+            aspnet_put_param(&b, t, i, end);
+            i = end;
+        } else if ((t[i] == '{' || t[i] == '}' || t[i] == '[' || t[i] == ']') &&
+                   t[i + SKIP_CHAR] == t[i]) {
+            aspnet_putc(&b, t[i]); /* "{{" / "[[" escapes a literal brace */
+            i += PAIR_CHARS;
+        } else {
+            aspnet_putc(&b, t[i++]);
+        }
+    }
+    if (b.len > SKIP_CHAR && b.buf[b.len - SKIP_CHAR] == '/') {
+        b.len--;
+    }
+    b.buf[b.len] = '\0';
+    return b.buf;
+}
+
+static bool aspnet_template_is_absolute(const char *t) {
+    return t[0] == '/' || (t[0] == '~' && t[SKIP_CHAR] == '/');
+}
+
+/* Route of one controller action: sets out_path and out_method when the method
+ * carries a verb attribute, [AcceptVerbs] or [Route]; clears them otherwise. */
+static void aspnet_action_route(CBMArena *a, TSNode method_node, TSNode class_node,
+                                const char *method_name, const char *source, const char **out_path,
+                                const char **out_method) {
+    *out_path = NULL;
+    *out_method = NULL;
+    aspnet_attrs_t act;
+    aspnet_scan_attrs(a, method_node, source, &act);
+    if (!act.method && !act.has_route) {
+        return;
+    }
+    aspnet_attrs_t cls;
+    aspnet_scan_attrs(a, class_node, source, &cls);
+    TSNode cname = ts_node_child_by_field_name(class_node, TS_FIELD("name"));
+    const char *ctrl = ts_node_is_null(cname) ? NULL : cbm_node_text(a, cname, source);
+    const char *values[ASPNET_TOKENS] = {
+        aspnet_trim_suffix(a, ctrl, "Controller"),
+        act.action_name ? act.action_name : aspnet_trim_suffix(a, method_name, "Async"),
+        act.area ? act.area : cls.area,
+    };
+    const char *tmpl = act.verb_tmpl ? act.verb_tmpl : act.route_tmpl;
+    const char *path = tmpl ? aspnet_route_template(a, tmpl, values) : NULL;
+    if ((!tmpl || !aspnet_template_is_absolute(tmpl)) && cls.route_tmpl) {
+        path = join_route_paths(a, aspnet_route_template(a, cls.route_tmpl, values), path);
+    }
+    *out_path = path ? path : "/";
+    *out_method = act.method ? act.method : "ANY";
+}
+
 static const char *spring_class_route_prefix(CBMArena *a, TSNode class_node, const char *source,
                                              const CBMLangSpec *spec) {
     const char *map_path = NULL;
@@ -8447,6 +8766,10 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         def.route_path = prefix ? join_route_paths(a, prefix, def.route_path) : NULL;
         def.route_method = prefix ? def.route_method : NULL;
     }
+    if (ctx->language == CBM_LANG_CSHARP) {
+        aspnet_action_route(a, child, class_node, name, ctx->source, &def.route_path,
+                            &def.route_method);
+    }
     def.docstring = extract_docstring(ctx, child, name);
 
     if (spec->branching_node_types && spec->branching_node_types[0]) {
@@ -11493,9 +11816,12 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_sta
                 wd_push(s, child, enclosing_qn);
             } else {
                 const char *ck = ts_node_type(child);
-                /* A nested class inside #if/#else is still nested here. */
+                /* A nested class inside #if/#else is still nested here, and so is
+                 * a decorated one (Python `@dataclass class Meta:` in a class
+                 * body): the decorated_definition wraps the class_definition. */
                 if (strcmp(ck, "field_declaration") == 0 ||
                     strcmp(ck, "template_declaration") == 0 || strcmp(ck, "declaration") == 0 ||
+                    (ctx->language == CBM_LANG_PYTHON && strcmp(ck, "decorated_definition") == 0) ||
                     cbm_kind_in_set(child, cbm_conditional_block_types(spec->language))) {
                     ts_nstack_push(&nc_stack, child);
                 }
