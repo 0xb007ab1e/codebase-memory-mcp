@@ -4374,10 +4374,27 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                  * this file, not to a stale extraction marker. */
                 cbm_index_mark_start(rel);
                 bool had_error = result->has_error;
+                /* The LSP map also binds annotation-only imports (#1277);
+                 * only a file that records one needs its own map, every
+                 * other file passes the CALLS map unchanged. MUST match the
+                 * sequential dispatch in pass_lsp_cross.c. */
+                const char **lsp_keys = NULL;
+                const char **lsp_vals = NULL;
+                int lsp_count = 0;
+                bool own_lsp_map = cbm_pxc_result_has_type_only_import(result);
+                if (own_lsp_map) {
+                    cbm_pxc_build_import_map_ex(rc->main_gbuf, rc->project_name, rel, lang, result,
+                                                true, &lsp_keys, &lsp_vals, &lsp_count);
+                }
                 cbm_pxc_dispatch_file_with_php_bindings(
                     lang, result, lsp_source, lsp_source_len, rel, def_module, rc->cross_registries,
-                    rc->module_def_index, rc->all_defs, rc->def_count, imp_keys, imp_vals,
-                    imp_count, pp_rust_shared_registry_get, rc, &php_vendor);
+                    rc->module_def_index, rc->all_defs, rc->def_count,
+                    own_lsp_map ? lsp_keys : imp_keys, own_lsp_map ? lsp_vals : imp_vals,
+                    own_lsp_map ? lsp_count : imp_count, pp_rust_shared_registry_get, rc,
+                    &php_vendor);
+                if (own_lsp_map) {
+                    cbm_pxc_free_import_map(lsp_keys, lsp_vals, lsp_count);
+                }
                 cbm_index_mark_done(rel);
                 if (!had_error && result->has_error && result->error_msg &&
                     (strcmp(result->error_msg, CBM_C_LSP_MEMO_ERROR) == 0 ||

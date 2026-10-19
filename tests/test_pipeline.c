@@ -14006,8 +14006,17 @@ TEST(pipeline_python_init_import_probe_failure_falls_back) {
 /* #1277: typed instance fields of a Python class imported from another file.
  * Counts CALLS edges caller -> callee (QN suffixes) whose properties name an
  * LSP strategy. */
+static int count_calls_with(cbm_store_t *s, const char *project, const char *caller_suffix,
+                            const char *callee_suffix, const char *fragment);
+
 static int count_lsp_calls(cbm_store_t *s, const char *project, const char *caller_suffix,
                            const char *callee_suffix) {
+    return count_calls_with(s, project, caller_suffix, callee_suffix, "lsp");
+}
+
+/* As count_lsp_calls, with any properties fragment (NULL = every CALLS edge). */
+static int count_calls_with(cbm_store_t *s, const char *project, const char *caller_suffix,
+                            const char *callee_suffix, const char *fragment) {
     cbm_edge_t *edges = NULL;
     int edge_count = 0;
     cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count);
@@ -14023,7 +14032,8 @@ static int count_lsp_calls(cbm_store_t *s, const char *project, const char *call
             size_t ts = strlen(callee_suffix);
             if (sl >= cs && tl >= ts && strcmp(src.qualified_name + sl - cs, caller_suffix) == 0 &&
                 strcmp(tgt.qualified_name + tl - ts, callee_suffix) == 0 &&
-                edges[i].properties_json && strstr(edges[i].properties_json, "lsp")) {
+                (!fragment ||
+                 (edges[i].properties_json && strstr(edges[i].properties_json, fragment)))) {
                 hits++;
             }
         }
@@ -14140,6 +14150,110 @@ TEST(python_crossfile_typed_field_calls_issue1277) {
 
 TEST(python_crossfile_typed_field_calls_issue1277_parallel) {
     return check_python_crossfile_typed_field_calls_issue1277(true);
+}
+
+/* #1277, second half: the reporter's chain with both annotation imports
+ * under `if TYPE_CHECKING:` (the usual shape when the import would cycle).
+ * trainer.strategies is typed through a TYPE_CHECKING import of Contract, and
+ * run()'s parameter through a typing.TYPE_CHECKING import of Trainer; the call
+ * resolves by the LSP exactly as with runtime imports. A runtime call through
+ * a TYPE_CHECKING-only name cannot happen: it gets no CALLS edge at all. */
+static int check_python_type_checking_typed_field_issue1277(bool parallel) {
+    const char *contracts = "class Contract:\n"
+                            "    def process_batch(self) -> None:\n"
+                            "        ...\n";
+    const char *trainer = "from __future__ import annotations\n"
+                          "from typing import TYPE_CHECKING\n\n"
+                          "if TYPE_CHECKING:\n"
+                          "    from contracts import Contract\n\n"
+                          "class Trainer:\n"
+                          "    def __init__(self, strategies: Contract) -> None:\n"
+                          "        self.strategies = strategies\n";
+    const char *loop = "from __future__ import annotations\n"
+                       "import typing\n\n"
+                       "if typing.TYPE_CHECKING:\n"
+                       "    from trainer import Trainer\n\n"
+                       "def run(trainer: Trainer) -> None:\n"
+                       "    trainer.strategies.process_batch()\n\n"
+                       "def bad():\n"
+                       "    return Trainer()\n";
+    if (setup_usages_repo("contracts.py", contracts, "trainer.py", trainer) != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/loop.py", g_usages_tmpdir);
+    if (th_write_file(path, loop) != 0) {
+        teardown_usages_repo();
+        FAIL("failed to write loop.py");
+    }
+    if (parallel) {
+        for (int i = 0; i < 50; i++) {
+            snprintf(path, sizeof(path), "%s/tc_pad_%02d.py", g_usages_tmpdir, i);
+            if (th_write_file(path, "tc_padding = 0\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to write parallel-selection fixture");
+            }
+        }
+    }
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        teardown_usages_repo();
+        FAIL("failed to save pipeline environment");
+    }
+    int pin_workers_rc = parallel ? cbm_setenv("CBM_WORKERS", "4", 1) : 0;
+    int pin_single_rc = parallel ? cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") : 0;
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_1277_tc.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = pin_workers_rc == 0 && pin_single_rc == 0
+                            ? cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL)
+                            : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool store_opened = s != NULL;
+    int via_field = -1, runtime_import = -1, runtime_lsp = -1;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        via_field = count_lsp_calls(s, project, "loop.run", "contracts.Contract.process_batch");
+        runtime_import = count_calls_with(s, project, "loop.bad", "trainer.Trainer",
+                                          "\"strategy\":\"import_map");
+        runtime_lsp = count_lsp_calls(s, project, "loop.bad", "trainer.Trainer");
+        cbm_store_close(s);
+    }
+
+    cbm_pipeline_free(p);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    int restore_single_rc = saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                                         : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+    teardown_usages_repo();
+
+    ASSERT_EQ(pin_workers_rc, 0);
+    ASSERT_EQ(pin_single_rc, 0);
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(restore_single_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(store_opened);
+    ASSERT_EQ(via_field, 1);      /* annotation through TYPE_CHECKING imports */
+    ASSERT_EQ(runtime_import, 0); /* control: no CALLS import map binds the name */
+    ASSERT_EQ(runtime_lsp, 0);    /* control: the LSP binds it for annotations only */
+    PASS();
+}
+
+TEST(python_type_checking_typed_field_issue1277) {
+    return check_python_type_checking_typed_field_issue1277(false);
+}
+
+TEST(python_type_checking_typed_field_issue1277_parallel) {
+    return check_python_type_checking_typed_field_issue1277(true);
 }
 
 /* A base class spelled through a root-binding import (`import pkg.mod.nodes`
@@ -15569,6 +15683,92 @@ TEST(pipeline_python_super_follows_c3_mro) {
 
 TEST(pipeline_python_super_follows_c3_mro_parallel) {
     return pym_run_super_c3(52);
+}
+
+/* ── attribute lookup follows the C3 method resolution order ─────── */
+
+/* The same diamond as the super() test, seen from an ordinary attribute:
+ * `self.write_state()` in RadarrCalendarEntity and `e.write_state()` on a
+ * RadarrCalendarEntity both look the method up along the class's C3 order,
+ * which reaches CalendarEntity before the shared base Entity. */
+static const char pya_radarr_py[] = "from base import CoordinatorEntity, CalendarEntity\n"
+                                    "\n"
+                                    "class RadarrEntity(CoordinatorEntity):\n"
+                                    "    pass\n"
+                                    "\n"
+                                    "class RadarrCalendarEntity(RadarrEntity, CalendarEntity):\n"
+                                    "    def refresh(self):\n"
+                                    "        return self.write_state()\n"
+                                    "\n"
+                                    "class PlainCalendar(CalendarEntity):\n"
+                                    "    def refresh(self):\n"
+                                    "        return self.write_state()\n"
+                                    "\n"
+                                    "def publish(e: RadarrCalendarEntity):\n"
+                                    "    return e.write_state()\n";
+
+static int pya_run_attr_c3(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_attrc3_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "base.py", pym_base_py);
+    write_temp_file(tmp, "radarr.py", pya_radarr_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/attrc3.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    const char *pr = p ? cbm_pipeline_project_name(p) : NULL;
+    const char *c3 = "base.CalendarEntity.write_state";
+    const char *dfs = "base.Entity.write_state";
+    const char *self_src = "radarr.RadarrCalendarEntity.refresh";
+    bool self_c3 = s && pyn_edge(s, pr, self_src, c3, "CALLS");
+    bool self_dfs = s && pyn_edge(s, pr, self_src, dfs, "CALLS");
+    bool typed_c3 = s && pyn_edge(s, pr, "radarr.publish", c3, "CALLS");
+    bool typed_dfs = s && pyn_edge(s, pr, "radarr.publish", dfs, "CALLS");
+    bool plain = s && pyn_edge(s, pr, "radarr.PlainCalendar.refresh", c3, "CALLS");
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(self_c3);   /* self.write_state(): CalendarEntity before Entity */
+    ASSERT_FALSE(self_dfs); /* ... never Entity through RadarrEntity's ancestry */
+    ASSERT_TRUE(typed_c3);  /* e.write_state() on a RadarrCalendarEntity */
+    ASSERT_FALSE(typed_dfs);
+    ASSERT_TRUE(plain); /* control: single inheritance */
+    PASS();
+}
+
+TEST(pipeline_python_attribute_follows_c3_mro) {
+    return pya_run_attr_c3(0);
+}
+
+TEST(pipeline_python_attribute_follows_c3_mro_parallel) {
+    return pya_run_attr_c3(52);
 }
 
 /* L7 review of #1548: a package __init__.py function can share a submodule's QN
@@ -25498,6 +25698,8 @@ SUITE(pipeline) {
     RUN_TEST(override_python_through_intermediate_class);
     RUN_TEST(python_crossfile_typed_field_calls_issue1277);
     RUN_TEST(python_crossfile_typed_field_calls_issue1277_parallel);
+    RUN_TEST(python_type_checking_typed_field_issue1277);
+    RUN_TEST(python_type_checking_typed_field_issue1277_parallel);
     RUN_TEST(python_dotted_base_inheritance);
     RUN_TEST(python_dotted_base_inheritance_parallel);
     RUN_TEST(python_typed_field_external_import_stays_unresolved);
@@ -25526,6 +25728,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548);
     RUN_TEST(pipeline_python_super_follows_c3_mro);
     RUN_TEST(pipeline_python_super_follows_c3_mro_parallel);
+    RUN_TEST(pipeline_python_attribute_follows_c3_mro);
+    RUN_TEST(pipeline_python_attribute_follows_c3_mro_parallel);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_issue1548);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548);
     RUN_TEST(pipeline_python_class_body_sibling_base);
