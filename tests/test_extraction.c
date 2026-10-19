@@ -3790,6 +3790,48 @@ TEST(python_imports) {
     PASS();
 }
 
+/* The module_path recorded for a local name, or NULL. */
+static const char *import_path_of(CBMFileResult *r, const char *local) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name && strcmp(r->imports.items[i].local_name, local) == 0)
+            return r->imports.items[i].module_path;
+    }
+    return NULL;
+}
+
+/* `from . import x` names the importing file's OWN package: the path is ".x",
+ * as `from .m import f` is ".m.f". Joining the all-dots module with another '.'
+ * recorded "..x" (the parent package), so the import resolved one package too
+ * high and fell to an arbitrary same-named definition (home-assistant: 7,175
+ * calls bound to another integration's function). */
+TEST(python_package_relative_import_paths) {
+    CBMFileResult *r = extract("from . import async_register\n"
+                               "from .. import shared\n"
+                               "from . import local_fn as lf\n"
+                               "from .helpers import helper_fn\n"
+                               "from pkg.db import get_row\n",
+                               CBM_LANG_PYTHON, "t", "comp/web/sub/mod.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *own = import_path_of(r, "async_register");
+    const char *parent = import_path_of(r, "shared");
+    const char *aliased = import_path_of(r, "lf");
+    const char *member = import_path_of(r, "helper_fn");
+    const char *absolute = import_path_of(r, "get_row");
+    ASSERT_NOT_NULL(own);
+    ASSERT_NOT_NULL(parent);
+    ASSERT_NOT_NULL(aliased);
+    ASSERT_NOT_NULL(member);
+    ASSERT_NOT_NULL(absolute);
+    ASSERT_STR_EQ(own, ".async_register");
+    ASSERT_STR_EQ(parent, "..shared");
+    ASSERT_STR_EQ(aliased, ".local_fn");
+    ASSERT_STR_EQ(member, ".helpers.helper_fn"); /* control: unchanged */
+    ASSERT_STR_EQ(absolute, "pkg.db.get_row");   /* control: unchanged */
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(js_imports) {
     CBMFileResult *r = extract("import React from 'react';\nimport { useState } from "
                                "'react';\nconst fs = require('fs');\n",
@@ -7174,6 +7216,63 @@ TEST(extract_perl_method_call_flags_is_method) {
     ASSERT_TRUE(commit_calls >= 1);
     /* (d) genuine intra-file function call still extracted. */
     ASSERT_TRUE(count_calls_exact(r, "helper") >= 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The def QN of `name` and the enclosing-function QN of the call `callee` inside
+ * it, from one extraction result. */
+static void rust_def_and_scope(const CBMFileResult *r, const char *name, const char *callee,
+                               const char **def_qn, const char **scope_qn) {
+    *def_qn = NULL;
+    *scope_qn = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && d->qualified_name && strcmp(d->name, name) == 0) {
+            *def_qn = d->qualified_name;
+        }
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, callee) == 0 && c->enclosing_func_qn &&
+            strstr(c->enclosing_func_qn, name)) {
+            *scope_qn = c->enclosing_func_qn;
+        }
+    }
+}
+
+/* F-R4: a method of a generic impl (`impl<T> Gen<T>`, `impl<'a> Life<'a>`) got a
+ * call scope that kept the generic arguments ("...Gen<T>.in_generic") while the
+ * def side strips them ("...Gen.in_generic"), so no node carried the scope and
+ * every call in the body fell back to the File node (base census: 84,331 Rust
+ * CALLS sourced from a File although inside a function, 96% of all File-sourced
+ * Rust CALLS). The def QN and the call scope must agree. */
+TEST(extract_rust_generic_impl_call_scope_matches_def) {
+    CBMFileResult *r = extract("pub struct Plain;\n"
+                               "impl Plain {\n"
+                               "    pub fn in_plain(&self) -> u32 { helper() }\n"
+                               "}\n"
+                               "pub struct Gen<T> { v: T }\n"
+                               "impl<T> Gen<T> {\n"
+                               "    pub fn in_generic(&self) -> u32 { helper() }\n"
+                               "}\n"
+                               "pub struct Life<'a> { s: &'a str }\n"
+                               "impl<'a> Life<'a> {\n"
+                               "    pub fn in_lifetime(&self) -> u32 { helper() }\n"
+                               "}\n"
+                               "pub fn helper() -> u32 { 1 }\n",
+                               CBM_LANG_RUST, "t", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    static const char *const methods[] = {"in_plain", "in_generic", "in_lifetime", NULL};
+    for (int m = 0; methods[m]; m++) {
+        const char *def_qn = NULL;
+        const char *scope_qn = NULL;
+        rust_def_and_scope(r, methods[m], "helper", &def_qn, &scope_qn);
+        ASSERT_NOT_NULL(def_qn);
+        ASSERT_NOT_NULL(scope_qn);
+        ASSERT_STR_EQ(scope_qn, def_qn);
+    }
     cbm_free_result(r);
     PASS();
 }
@@ -12512,6 +12611,7 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_config_string_not_a_callee);
     RUN_TEST(extract_perl_builtin_call_is_function_not_method);
     RUN_TEST(extract_perl_method_call_flags_is_method);
+    RUN_TEST(extract_rust_generic_impl_call_scope_matches_def);
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
     RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
@@ -12789,6 +12889,7 @@ SUITE(extraction) {
     RUN_TEST(python_iris_invokeClassMethod);
     RUN_TEST(go_calls);
     RUN_TEST(python_imports);
+    RUN_TEST(python_package_relative_import_paths);
     RUN_TEST(js_imports);
     RUN_TEST(go_imports);
     RUN_TEST(go_cgo_pseudo_import_dropped);
