@@ -4949,9 +4949,15 @@ static void py_process_class_in(PyLSPContext *ctx, TSNode class_node, const char
                     strcmp(ts_node_type(def), "function_definition") == 0 &&
                     !py_is_init_method(ctx, def)) {
                     py_process_function(ctx, def, ctx->enclosing_class_qn);
+                } else if (!ts_node_is_null(def) &&
+                           strcmp(ts_node_type(def), "class_definition") == 0) {
+                    py_process_class_in(ctx, def, ctx->enclosing_class_qn);
                 }
             } else if (strcmp(ck, "class_definition") == 0) {
-                py_process_class(ctx, c);
+                /* A class nested in a class is qualified by its outer class
+                 * (proj.m.Outer.Inner), the QN extraction gives it; under the
+                 * module its methods' calls never joined their callers. */
+                py_process_class_in(ctx, c, ctx->enclosing_class_qn);
             }
         }
     }

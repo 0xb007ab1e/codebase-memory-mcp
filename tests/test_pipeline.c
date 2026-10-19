@@ -16209,6 +16209,93 @@ TEST(pipeline_python_decorated_nested_class_extracted_parallel) {
     return pyn_run_decorated_nested(52);
 }
 
+/* A class nested in a class is walked by the Python LSP under its outer
+ * class (m.Outer.Inner): a typed-parameter call, a self call and a
+ * constructor call in its methods resolve, and so does a decorated nested
+ * class. Walked under the module (m.Inner) none of the LSP rows joined the
+ * method nodes, so the calls fell to name guesses or got no edge. */
+static const char pyn_nested_class_py[] = "class Helper:\n"
+                                          "    def go(self):\n"
+                                          "        return 1\n"
+                                          "\n"
+                                          "def deco(cls):\n"
+                                          "    return cls\n"
+                                          "\n"
+                                          "class Outer:\n"
+                                          "    class Inner:\n"
+                                          "        def run(self, h: Helper):\n"
+                                          "            return h.go()\n"
+                                          "\n"
+                                          "        def again(self):\n"
+                                          "            return self.run(Helper())\n"
+                                          "\n"
+                                          "    @deco\n"
+                                          "    class Decorated:\n"
+                                          "        def run(self, h: Helper):\n"
+                                          "            return h.go()\n";
+
+static int pyn_run_nested_class(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_nestcls_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "sn.py", pyn_nested_class_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/nestcls.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+    bool typed = s && pyn_edge_with(s, project, "sn.Outer.Inner.run", "sn.Helper.go", "CALLS",
+                                    "\"strategy\":\"lsp_");
+    bool self_call = s && pyn_edge_with(s, project, "sn.Outer.Inner.again", "sn.Outer.Inner.run",
+                                        "CALLS", "\"strategy\":\"lsp_");
+    bool ctor = s && pyn_edge_with(s, project, "sn.Outer.Inner.again", "sn.Helper", "CALLS",
+                                   "\"strategy\":\"lsp_");
+    bool decorated = s && pyn_edge_with(s, project, "sn.Outer.Decorated.run", "sn.Helper.go",
+                                        "CALLS", "\"strategy\":\"lsp_");
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(typed);
+    ASSERT_TRUE(self_call);
+    ASSERT_TRUE(ctor);
+    ASSERT_TRUE(decorated);
+    PASS();
+}
+
+TEST(pipeline_python_nested_class_methods_resolve) {
+    return pyn_run_nested_class(0);
+}
+
+TEST(pipeline_python_nested_class_methods_resolve_parallel) {
+    return pyn_run_nested_class(52);
+}
+
 TEST(pipeline_python_project) {
     /* Port of TestPipelinePythonProject */
     const char *files[] = {"main.py", "utils.py"};
@@ -25738,6 +25825,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_nested_helper_keeps_tests_parallel_issue1548);
     RUN_TEST(pipeline_python_decorated_nested_class_extracted);
     RUN_TEST(pipeline_python_decorated_nested_class_extracted_parallel);
+    RUN_TEST(pipeline_python_nested_class_methods_resolve);
+    RUN_TEST(pipeline_python_nested_class_methods_resolve_parallel);
     RUN_TEST(pipeline_header_include_target_is_independent_of_registration_order);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
