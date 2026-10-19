@@ -11493,9 +11493,12 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_sta
                 wd_push(s, child, enclosing_qn);
             } else {
                 const char *ck = ts_node_type(child);
-                /* A nested class inside #if/#else is still nested here. */
+                /* A nested class inside #if/#else is still nested here, and so is
+                 * a decorated one (Python `@dataclass class Meta:` in a class
+                 * body): the decorated_definition wraps the class_definition. */
                 if (strcmp(ck, "field_declaration") == 0 ||
                     strcmp(ck, "template_declaration") == 0 || strcmp(ck, "declaration") == 0 ||
+                    (ctx->language == CBM_LANG_PYTHON && strcmp(ck, "decorated_definition") == 0) ||
                     cbm_kind_in_set(child, cbm_conditional_block_types(spec->language))) {
                     ts_nstack_push(&nc_stack, child);
                 }

@@ -305,9 +305,15 @@ static const char *pxc_python_dotted_base_qn(const pxc_base_scope_t *bs, const c
  * Returns NULL when the base is not a confidently-known project type;
  * stdlib and third-party bases land here and keep their raw spelling. */
 static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *raw,
-                                       const char *module_qn) {
+                                       const char *module_qn, const char *class_qn) {
     if (!bs || !bs->reg || !raw || !raw[0]) {
         return NULL;
+    }
+    /* A base of a class nested in a class body: an earlier sibling first. */
+    const char *sibling =
+        cbm_registry_resolve_python_class_body_base(bs->reg, bs->gbuf, class_qn, raw, bs->lang);
+    if (sibling) {
+        return sibling;
     }
     const char *dotted = pxc_python_dotted_base_qn(bs, raw);
     if (dotted) {
@@ -338,7 +344,8 @@ static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *r
  * source spelling. Unresolved entries pass through verbatim so a base the
  * registry does not know keeps working exactly as before. */
 static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
-                                     const pxc_base_scope_t *bs, const char *module_qn) {
+                                     const pxc_base_scope_t *bs, const char *module_qn,
+                                     const char *class_qn) {
     if (!bases || !bases[0]) {
         return NULL;
     }
@@ -352,7 +359,7 @@ static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
         return pxc_join_pipe(arena, bases);
     }
     for (int i = 0; i < count; i++) {
-        const char *qn = pxc_resolve_base_qn(bs, bases[i], module_qn);
+        const char *qn = pxc_resolve_base_qn(bs, bases[i], module_qn, class_qn);
         resolved[i] = qn ? qn : bases[i];
     }
     resolved[count] = NULL;
@@ -520,9 +527,10 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     /* Languages whose cross registrars read embedded_types as QNs get their
      * bases resolved against the project registry; everyone else keeps the
      * raw source spelling their own registrar already knows how to handle. */
-    dst->embedded_types = (bs && bs->reg && pxc_lang_resolves_base_qns(lang))
-                              ? pxc_join_base_qns(arena, src->base_classes, bs, module_qn)
-                              : pxc_join_pipe(arena, src->base_classes);
+    dst->embedded_types =
+        (bs && bs->reg && pxc_lang_resolves_base_qns(lang))
+            ? pxc_join_base_qns(arena, src->base_classes, bs, module_qn, src->qualified_name)
+            : pxc_join_pipe(arena, src->base_classes);
     dst->signature_param_types = NULL;
     dst->signature_param_count = 0;
     if (src->signature_param_types && src->signature_param_count > 0) {
@@ -727,7 +735,7 @@ static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result
         fields[f].type_qn = NULL;
         CBMLSPDef *owner = ft->class_qn ? (CBMLSPDef *)cbm_ht_get(by_qn, ft->class_qn) : NULL;
         const char *name = owner ? pxc_py_annotation_type_name(arena, ft->type_text) : NULL;
-        const char *qn = name ? pxc_resolve_base_qn(bs, name, module_qn) : NULL;
+        const char *qn = name ? pxc_resolve_base_qn(bs, name, module_qn, NULL) : NULL;
         if (!qn || !ft->field_name || !ft->field_name[0]) {
             continue;
         }
@@ -876,9 +884,11 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         if (ctx && ctx->registry && pxc_lang_resolves_base_qns(files[fi].language)) {
             bs.reg = ctx->registry;
             bs.gbuf = ctx->gbuf;
-            cbm_pxc_build_import_map(ctx->gbuf, project_name, files[fi].rel_path,
-                                     files[fi].language, fr, &bs.imp_keys, &bs.imp_vals,
-                                     &bs.imp_count);
+            /* Bases and field annotations resolve through annotation-only
+             * imports too: `if TYPE_CHECKING:` exists for them (#1277). */
+            cbm_pxc_build_import_map_ex(ctx->gbuf, project_name, files[fi].rel_path,
+                                        files[fi].language, fr, true, &bs.imp_keys, &bs.imp_vals,
+                                        &bs.imp_count);
         }
         for (int di = 0; di < fr->defs.count; di++) {
             if (pxc_build_lsp_def(arena, &fr->defs.items[di], def_modules[fi], namespace_name,
@@ -1068,10 +1078,26 @@ static char *pxc_python_import_from_metadata(const cbm_gbuf_t *gbuf, const char 
 
 /* Build per-file import map (local_name -> semantic import QN) from gbuf
  * IMPORTS edges. Both pipeline drivers call this implementation. Returns 0
- * with *out_count = 0 when the file has no IMPORTS edges. */
+ * with *out_count = 0 when the file has no IMPORTS edges. The CALLS map. */
 int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
                              CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
                              const char ***out_vals, int *out_count) {
+    return cbm_pxc_build_import_map_ex(gbuf, project_name, rel_path, lang, result, false, out_keys,
+                                       out_vals, out_count);
+}
+
+bool cbm_pxc_result_has_type_only_import(const CBMFileResult *result) {
+    for (int i = 0; result && i < result->imports.count; i++) {
+        if (!cbm_import_binds_runtime_name(&result->imports.items[i]))
+            return true;
+    }
+    return false;
+}
+
+int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name,
+                                const char *rel_path, CBMLanguage lang, const CBMFileResult *result,
+                                bool include_type_only, const char ***out_keys,
+                                const char ***out_vals, int *out_count) {
     *out_keys = NULL;
     *out_vals = NULL;
     *out_count = 0;
@@ -1129,7 +1155,10 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
             continue;
         memcpy(local, start, n);
         local[n] = '\0';
-        char *value = pxc_import_value_qn(lang, result, local, target);
+        /* An annotation-only import (#1277) binds no CALLS name: it gets no value. */
+        bool binds = include_type_only ||
+                     cbm_imports_local_binds_runtime_name(result ? &result->imports : NULL, local);
+        char *value = binds ? pxc_import_value_qn(lang, result, local, target) : NULL;
         if (!value) {
             free(local);
             continue;
@@ -1146,6 +1175,7 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
     for (int i = 0; i < metadata_count; i++) {
         const CBMImport *imp = &result->imports.items[i];
         if (!imp->local_name || !imp->local_name[0] || !imp->module_path ||
+            (!include_type_only && !cbm_import_binds_runtime_name(imp)) ||
             pxc_import_map_has_local(keys, count, imp->local_name)) {
             continue;
         }
@@ -2212,8 +2242,10 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, lang, cache[i],
-                                 &imp_keys, &imp_vals, &imp_count);
+        /* The LSP map: annotation-only imports bind for annotations (#1277).
+         * MUST match the LSP map of pass_parallel.c. */
+        cbm_pxc_build_import_map_ex(ctx->gbuf, ctx->project_name, files[i].rel_path, lang, cache[i],
+                                    true, &imp_keys, &imp_vals, &imp_count);
 
         /* Journal around the resolve: a hang here must be attributed to THIS
          * file, not to a stale extraction marker (the innocent-quarantine
