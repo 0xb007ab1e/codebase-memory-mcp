@@ -62,6 +62,8 @@ const char *cbm_confidence_band(double score) {
 #define CONF_IMPORT_MAP_SUFFIX 0.85
 /* Strategy 2: same_module — same file/package → high confidence */
 #define CONF_SAME_MODULE 0.90
+/* Python lexical scope — a def bound in an enclosing function (LEGB) */
+#define CONF_LEXICAL_SCOPE 0.95
 /* Strategy 3: unique_name — only one candidate project-wide */
 #define CONF_UNIQUE_NAME 0.75
 /* Strategy 4: suffix_match — multiple candidates, filtered */
@@ -438,7 +440,8 @@ void cbm_registry_import_map_cache_end(void) {
  * eliminated. */
 typedef struct {
     cbm_resolution_t res;
-    size_t scope_len; /* raw and Python-scoped requests may share one file cache */
+    size_t scope_len;  /* raw and Python-scoped requests may share one file cache */
+    bool skip_members; /* a C call and a C reference to the same name share it too */
 } resolve_cache_entry_t;
 
 static CBM_TLS CBMHashTable *_resolve_cache = NULL;
@@ -1180,20 +1183,64 @@ static void index_under_name(cbm_registry_t *r, const char *key, const char *own
     }
 }
 
-void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
-                      const char *label) {
-    cbm_registry_add_lang(r, name, qualified_name, label, CBM_LANG_COUNT);
+static bool registry_label_is_callable(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0);
 }
 
-void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
-                           const char *label, CBMLanguage lang) {
-    if (!r || !qualified_name || !label) {
-        return;
+/* Length of the QN prefix the defs of the caller's file carry: its module QN
+ * (cbm_pipeline_fqn_module), minus the trailing `__init__` / `index` segment
+ * that symbol QNs drop (pkg/__init__.py defines proj.pkg.f). 0 when there is
+ * no module QN or `qualified_name` does not extend that prefix. */
+static size_t python_def_prefix_len(const char *module_qn, const char *qualified_name) {
+    static const char *const dropped[] = {".__init__", ".index"};
+    size_t n = module_qn ? strlen(module_qn) : 0;
+    for (size_t i = 0; i < sizeof(dropped) / sizeof(dropped[0]); i++) {
+        size_t k = strlen(dropped[i]);
+        if (n > k && strcmp(module_qn + n - k, dropped[i]) == 0) {
+            n -= k;
+            break;
+        }
     }
+    if (n == 0 || !qualified_name || strncmp(qualified_name, module_qn, n) != 0 ||
+        qualified_name[n] != '.') {
+        return 0;
+    }
+    return n;
+}
 
+/* Whether `qualified_name` sits inside a def of its OWN file: only prefixes
+ * strictly longer than `module_prefix_len` (cbm_pipeline_fqn_symbol_prefix_len
+ * of the defining file) count. A package's __init__.py can define a function
+ * whose QN equals a submodule's (poetry: layouts/__init__.py `def layout` vs
+ * layouts/layout.py), so an unbounded walk read the submodule's classes as
+ * that function's locals -- and the answer depended on which file registered
+ * first. */
+bool cbm_registry_qn_is_function_local(const cbm_registry_t *r, const char *qualified_name,
+                                       size_t module_prefix_len) {
+    char scope[CBM_SZ_512];
+    size_t len = qualified_name ? strlen(qualified_name) : 0;
+    size_t floor = module_prefix_len;
+    if (!r || floor == 0 || len <= floor || len >= sizeof(scope) || qualified_name[floor] != '.') {
+        return false;
+    }
+    memcpy(scope, qualified_name, len + SKIP_ONE);
+    for (char *dot = strrchr(scope, '.'); dot && (size_t)(dot - scope) > floor;
+         dot = strrchr(scope, '.')) {
+        *dot = '\0';
+        if (registry_label_is_callable(cbm_ht_get(r->exact, scope))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Record `qualified_name` in the exact map. Returns the registry's owned copy
+ * of the QN, or NULL when it is already registered or cannot be recorded. */
+static const char *registry_add_exact(cbm_registry_t *r, const char *qualified_name,
+                                      const char *label) {
     /* Check for duplicate */
     if (cbm_ht_get(r->exact, qualified_name)) {
-        return;
+        return NULL;
     }
 
     /* Intern the label (bounded set; linear scan is fine at this size). */
@@ -1210,14 +1257,55 @@ void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qual
         r->label_pool_n++;
     }
     if (!interned) {
-        return; /* pool exhausted (cannot happen with sane label sets) */
+        return NULL; /* pool exhausted (cannot happen with sane label sets) */
     }
 
     /* Store in exact map: QN → interned label. The key is the registry's ONE
-     * owned copy of the QN; by_name below borrows it (same lifetime) instead
+     * owned copy of the QN; by_name borrows it (same lifetime) instead
      * of a second strdup — this pair of copies was ~280 MB on the kernel. */
     cbm_ht_set(r->exact, strdup(qualified_name), (void *)interned);
-    const char *owned_qn = cbm_ht_get_key(r->exact, qualified_name);
+    return cbm_ht_get_key(r->exact, qualified_name);
+}
+
+void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
+                      const char *label) {
+    cbm_registry_add_lang_in_module(r, name, qualified_name, label, CBM_LANG_COUNT, 0);
+}
+
+void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
+                           const char *label, CBMLanguage lang) {
+    cbm_registry_add_lang_in_module(r, name, qualified_name, label, lang, 0);
+}
+
+/* Python nests defs: a def or class declared in a function body -- a closure,
+ * an app factory's route handler, a local class and its methods -- is a local
+ * of that function, and its QN extends the function's
+ * (proj.mod.create_app.index). No code outside the function can name it, so it
+ * stays out of the short-name index: the weak name strategies (unique_name,
+ * suffix_match) must not offer django's per-test `class MyModelAdmin` or a
+ * decorator's `def wrapper` to a caller in another function or file. The exact
+ * map still holds it, for LSP targets and cbm_registry_resolve_lexical. One
+ * file's defs register parent first, so the enclosing function is already in
+ * the exact map when its locals arrive; the walk never leaves the symbol's own
+ * file (`module_prefix_len`, cbm_pipeline_fqn_symbol_prefix_len of the defining
+ * file; 0 = no local detection).
+ * Gated to Python: probing every prefix of every symbol would cost a kernel
+ * index seconds for nothing. */
+void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
+                                     const char *qualified_name, const char *label,
+                                     CBMLanguage lang, size_t module_prefix_len) {
+    if (!r || !qualified_name || !label) {
+        return;
+    }
+    if (lang == CBM_LANG_PYTHON &&
+        cbm_registry_qn_is_function_local(r, qualified_name, module_prefix_len)) {
+        (void)registry_add_exact(r, qualified_name, label);
+        return;
+    }
+    const char *owned_qn = registry_add_exact(r, qualified_name, label);
+    if (!owned_qn) {
+        return;
+    }
 
     /* Index the symbol under the QN's last dot segment, and additionally under
      * the name its caller passed when that segment carries a '#' fence.
@@ -1293,6 +1381,47 @@ const char *cbm_registry_value_target(const cbm_registry_t *r, const char *qn) {
     }
     const char *owned = cbm_ht_get_key(r->exact, twin);
     return owned ? owned : qn;
+}
+
+/* Python evaluates a class statement's bases in the namespace of the body
+ * that encloses it. For a class nested in a class, a bare base naming a class
+ * defined EARLIER in that same class body is that sibling
+ * (`class IntegrityError(DatabaseError)` in sqlalchemy's asyncpg adapter),
+ * whatever same-named classes the project has elsewhere. A sibling defined
+ * later is not bound yet when the base is evaluated. Exact lookups only. */
+const char *cbm_registry_resolve_python_class_body_base(const cbm_registry_t *r,
+                                                        const cbm_gbuf_t *gb, const char *class_qn,
+                                                        const char *base, CBMLanguage lang) {
+    if (lang != CBM_LANG_PYTHON || !r || !gb || !class_qn || !base || !base[0] ||
+        strchr(base, '.')) {
+        return NULL;
+    }
+    const char *dot = strrchr(class_qn, '.');
+    if (!dot || dot == class_qn) {
+        return NULL;
+    }
+    char sibling[CBM_SZ_1K];
+    int enclosing_len = (int)(dot - class_qn);
+    int n = snprintf(sibling, sizeof(sibling), "%.*s", enclosing_len, class_qn);
+    if (n < 0 || (size_t)n >= sizeof(sibling) ||
+        !cbm_label_is_type_like(cbm_registry_label_of(r, sibling))) {
+        return NULL; /* not nested in a class body (module level, or a def) */
+    }
+    n = snprintf(sibling, sizeof(sibling), "%.*s.%s", enclosing_len, class_qn, base);
+    if (n < 0 || (size_t)n >= sizeof(sibling) || strcmp(sibling, class_qn) == 0) {
+        return NULL;
+    }
+    const char *owned = cbm_ht_get_key(r->exact, sibling);
+    if (!owned || !cbm_label_is_type_like(cbm_registry_label_of(r, owned))) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *cls = cbm_gbuf_find_by_qn(gb, class_qn);
+    const cbm_gbuf_node_t *sib = cbm_gbuf_find_by_qn(gb, owned);
+    if (!cls || !sib || !cls->file_path || !sib->file_path ||
+        strcmp(cls->file_path, sib->file_path) != 0 || sib->start_line >= cls->start_line) {
+        return NULL;
+    }
+    return owned;
 }
 
 int cbm_registry_find_by_name(const cbm_registry_t *r, const char *name, const char ***out,
@@ -1667,19 +1796,41 @@ static bool receiver_chain_admits(const char *callee_name, const char *candidate
     return false;
 }
 
-/* Strategy 3+4: Name lookup + suffix match */
-static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
-                                            const char *module_qn, const char **import_vals,
-                                            int import_count) {
-    const char *lookup = simple_name(callee_name);
-    qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
-    if (!arr || arr->count == 0) {
-        return empty_result();
+/* The same-name candidates without the members -- Field and Method nodes --
+ * in `view` (backed by the caller's buffers, at most REG_MAX_CANDIDATES
+ * entries). The side arrays are carried over only when the bucket has them
+ * for every entry. */
+static void candidates_without_members(const cbm_registry_t *r, const qn_array_t *arr,
+                                       qn_array_t *view, char **items, uint8_t *is_test,
+                                       uint8_t *lang) {
+    const uint8_t *flags = qn_test_flags(arr);
+    const uint8_t *langs = qn_lang_flags(arr);
+    bool side = flags && langs;
+    int n = 0;
+    for (int i = 0; i < arr->count; i++) {
+        const char *label = cbm_registry_label_of(r, arr->items[i]);
+        if (label && (strcmp(label, "Field") == 0 || strcmp(label, "Method") == 0)) {
+            continue;
+        }
+        items[n] = arr->items[i];
+        if (side) {
+            is_test[n] = flags[i];
+            lang[n] = langs[i];
+        }
+        n++;
     }
-    if (arr->count > REG_MAX_CANDIDATES) {
-        return empty_result(); /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
-    }
+    *view = (qn_array_t){.items = items,
+                         .count = n,
+                         .cap = n,
+                         .is_test = side ? is_test : NULL,
+                         .is_test_cap = side ? n : 0,
+                         .lang = side ? lang : NULL};
+}
 
+/* Strategies 3.5, 3 and 4 over one same-name candidate set. */
+static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const qn_array_t *arr,
+                                                const char *callee_name, const char *module_qn,
+                                                const char **import_vals, int import_count) {
     /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
      * candidates by full qualified tail, before bare-name scoring collapses
      * them onto a single winner. */
@@ -1719,12 +1870,44 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     return empty_result();
 }
 
+/* Strategy 3+4: Name lookup + suffix match. skip_members: the callee cannot
+ * name a member (a bare C call: C has no methods, and a struct member is only
+ * ever reached through its object), so Field and Method nodes do not compete.
+ * With a Field in the bucket, a unique header function became a suffix_match
+ * that the #725 guard then refused (.h is C++): kernel `put_page(page)`
+ * 345 -> 9 callers (2026-10-13 graph audit). Dropping only the Fields made
+ * libc `read()` the unique name of a C++ adapter's Method instead. */
+static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
+                                            const char *module_qn, const char **import_vals,
+                                            int import_count, bool skip_members) {
+    const char *lookup = simple_name(callee_name);
+    const qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
+    if (!arr || arr->count == 0) {
+        return empty_result();
+    }
+    if (arr->count > REG_MAX_CANDIDATES) {
+        return empty_result(); /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
+    }
+    if (skip_members) {
+        qn_array_t view;
+        char *view_items[REG_MAX_CANDIDATES];
+        uint8_t view_test[REG_MAX_CANDIDATES];
+        uint8_t view_lang[REG_MAX_CANDIDATES];
+        candidates_without_members(r, arr, &view, view_items, view_test, view_lang);
+        if (view.count == 0) {
+            return empty_result();
+        }
+        return resolve_name_candidates(r, &view, callee_name, module_qn, import_vals, import_count);
+    }
+    return resolve_name_candidates(r, arr, callee_name, module_qn, import_vals, import_count);
+}
+
 /* The strategy chain shared by both public resolve variants (no caching here —
  * cbm_registry_resolve owns the per-file cache). */
 static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
                                                const char *module_qn, const char **import_map_keys,
                                                const char **import_map_vals, int import_map_count,
-                                               size_t scope_len) {
+                                               size_t scope_len, bool skip_members) {
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -1761,7 +1944,8 @@ static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const ch
     }
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */
-        res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count);
+        res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count,
+                                  skip_members);
     }
     return res;
 }
@@ -1812,7 +1996,7 @@ bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_
 static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const char *callee_name,
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
-                                                size_t scope_len) {
+                                                size_t scope_len, bool skip_members) {
     if (!r || !callee_name) {
         return empty_result();
     }
@@ -1822,11 +2006,12 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
      * cache key only needs callee_name. */
     resolve_cache_entry_t *cached =
         _resolve_cache ? (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name) : NULL;
-    if (cached && cached->scope_len == scope_len)
+    if (cached && cached->scope_len == scope_len && cached->skip_members == skip_members)
         return cached->res;
 
-    cbm_resolution_t res = registry_resolve_chain(r, callee_name, module_qn, import_map_keys,
-                                                  import_map_vals, import_map_count, scope_len);
+    cbm_resolution_t res =
+        registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                               import_map_count, scope_len, skip_members);
 
     /* Data relations (Table/View) are lineage-only registry members: common
      * table names (users, orders, config) collide with code identifiers across
@@ -1846,11 +2031,13 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
         /* Same key, different effective scope: reuse its owned entry/key. */
         cached->res = res;
         cached->scope_len = scope_len;
+        cached->skip_members = skip_members;
     } else if (_resolve_cache) {
         resolve_cache_entry_t *e = (resolve_cache_entry_t *)malloc(sizeof(*e));
         if (e) {
             e->res = res;
             e->scope_len = scope_len;
+            e->skip_members = skip_members;
             char *kdup = strdup(callee_name);
             if (kdup) {
                 cbm_ht_set(_resolve_cache, kdup, e);
@@ -1866,17 +2053,34 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count) {
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, module_qn ? strlen(module_qn) : 0);
+                                   import_map_count, module_qn ? strlen(module_qn) : 0, false);
+}
+
+static size_t lang_scope_len(const char *module_qn, CBMLanguage lang) {
+    return lang == CBM_LANG_PYTHON ? cbm_fqn_symbol_scope_len(module_qn)
+                                   : (module_qn ? strlen(module_qn) : 0);
 }
 
 cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
                                            const char *module_qn, const char **import_map_keys,
                                            const char **import_map_vals, int import_map_count,
                                            CBMLanguage lang) {
-    size_t scope_len = lang == CBM_LANG_PYTHON ? cbm_fqn_symbol_scope_len(module_qn)
-                                               : (module_qn ? strlen(module_qn) : 0);
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, scope_len);
+                                   import_map_count, lang_scope_len(module_qn, lang), false);
+}
+
+cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
+                                                const char *module_qn, const char **import_map_keys,
+                                                const char **import_map_vals, int import_map_count,
+                                                CBMLanguage lang) {
+    /* A bare C call never names a member: a struct member is reached through
+     * its object (cbm_call_onto_field_policy refuses every Field it lands on)
+     * and C has no methods. So its Field and Method namesakes do not compete
+     * for the name; a C member call and every other language keep them. */
+    bool skip_members = lang == CBM_LANG_C && callee_name && !strchr(callee_name, '.') &&
+                        !strstr(callee_name, "->");
+    return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                   import_map_count, lang_scope_len(module_qn, lang), skip_members);
 }
 
 /* ── Class-qualified route handlers (PHP, #1146) ─────────────────── */
@@ -2044,7 +2248,74 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
      * it would poison one variant with the other's semantics. SQL files hold
      * few distinct relation refs, so the chain walk stays cheap. */
     return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                  import_map_count, module_qn ? strlen(module_qn) : 0);
+                                  import_map_count, module_qn ? strlen(module_qn) : 0, false);
+}
+
+/* Python looks a bare name up in the calling def's own scope, then in each
+ * enclosing def's scope, and only then in the module and the builtins; a class
+ * body is never among them. So a bare `index()` in create_app, or `visit(...)`
+ * in a def nested in method Tree.visit, names the def bound in the nearest
+ * enclosing def -- create_app.index, Tree.visit.visit -- before anything a
+ * module-wide strategy would find. Walks scope_qn outward while its prefixes
+ * are registered defs or classes (skipping the classes) and stops at the
+ * caller's module (`module_qn`), which the other strategies own -- a
+ * same-QN function of a package __init__.py is never an enclosing scope.
+ * Empty unless such a local exists. Uncached: the answer depends on the
+ * caller, not only on the name. */
+cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const char *callee_name,
+                                              const char *scope_qn, const char *module_qn) {
+    char scope[CBM_SZ_512];
+    char candidate[CBM_SZ_512];
+    size_t len = scope_qn ? strlen(scope_qn) : 0;
+    size_t floor = python_def_prefix_len(module_qn, scope_qn);
+    if (!r || !callee_name || !callee_name[0] || strchr(callee_name, '.') ||
+        strstr(callee_name, "::") || len == 0 || len >= sizeof(scope) || floor == 0) {
+        return empty_result();
+    }
+    memcpy(scope, scope_qn, len + SKIP_ONE);
+    while (strlen(scope) > floor) {
+        const char *label = cbm_ht_get(r->exact, scope);
+        if (!label) {
+            break;
+        }
+        if (registry_label_is_callable(label)) {
+            int n = snprintf(candidate, sizeof(candidate), "%s.%s", scope, callee_name);
+            const char *stored_key =
+                n > 0 && (size_t)n < sizeof(candidate) ? cbm_ht_get_key(r->exact, candidate) : NULL;
+            if (stored_key) {
+                return (cbm_resolution_t){stored_key, "lexical_scope", CONF_LEXICAL_SCOPE,
+                                          REG_RESOLVED};
+            }
+        }
+        char *dot = strrchr(scope, '.');
+        if (!dot) {
+            break;
+        }
+        *dot = '\0';
+    }
+    return empty_result();
+}
+
+/* The registry step both call resolvers (pass_calls.c, pass_parallel.c) run
+ * once the LSP has not answered: a Python bare name bound in an enclosing def
+ * first (the LSP binds those locals itself; this covers the sites it did not
+ * resolve), then the language-aware chain. One entry point, so the two
+ * resolvers cannot diverge on the rule. */
+cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const char *callee_name,
+                                                  const char *module_qn,
+                                                  const char **import_map_keys,
+                                                  const char **import_map_vals,
+                                                  int import_map_count, CBMLanguage lang,
+                                                  const char *scope_qn) {
+    if (lang == CBM_LANG_PYTHON) {
+        cbm_resolution_t lexical =
+            cbm_registry_resolve_lexical(r, callee_name, scope_qn, module_qn);
+        if (lexical.qualified_name && lexical.qualified_name[0]) {
+            return lexical;
+        }
+    }
+    return cbm_registry_resolve_call_lang(r, callee_name, module_qn, import_map_keys,
+                                          import_map_vals, import_map_count, lang);
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */

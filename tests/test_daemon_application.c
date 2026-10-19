@@ -19,6 +19,7 @@
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
 #include "pipeline/pipeline.h"
+#include "store/graph_mem.h"
 #include "store/store.h"
 #include "ui/config.h"
 #include "watcher/watcher.h"
@@ -2808,6 +2809,79 @@ TEST(daemon_application_programmatic_index_injects_resource_policy) {
     ASSERT_TRUE(configured);
     ASSERT_TRUE(policy_propagated);
     ASSERT_TRUE(stopped);
+    PASS();
+}
+
+/* The doc_candidates key a programmatic (UI / watcher) index hands its worker
+ * with the setting stored as value (NULL: unset): 1 true, 0 false, -1 absent,
+ * -2 on a failure. */
+static int app_programmatic_index_doc_candidates(const char *value) {
+    /* th_mktempdir returns one static buffer: copy each path. */
+    char *made = th_mktempdir("cbm_app_doccand_root");
+    char *root = made ? strdup(made) : NULL;
+    made = th_mktempdir("cbm_app_doccand_cache");
+    char *cache = made ? strdup(made) : NULL;
+    cbm_config_t *stored_config = cache ? cbm_config_open(cache) : NULL;
+    bool configured =
+        root && stored_config &&
+        (!value || cbm_config_set(stored_config, CBM_CONFIG_DOC_CANDIDATES, value) == 0);
+
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.allow_completion, true);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {
+        .config = stored_config,
+        .worker_ops = &worker_ops,
+    };
+    cbm_daemon_application_t *application = configured ? cbm_daemon_application_new(&config) : NULL;
+    int index_rc =
+        application ? cbm_daemon_application_index(application, "doccand-programmatic", root) : -1;
+    int forwarded = -2;
+    if (index_rc == 0 && app_wait_for_atomic_bool(&fake.args_captured[0], true)) {
+        const char *args = fake.args_json[0];
+        yyjson_doc *document = args ? yyjson_read(args, strlen(args), 0) : NULL;
+        yyjson_val *args_root = document ? yyjson_doc_get_root(document) : NULL;
+        yyjson_val *doc_candidates = args_root && yyjson_is_obj(args_root)
+                                         ? yyjson_obj_get(args_root, "doc_candidates")
+                                         : NULL;
+        forwarded = !args_root                        ? -2
+                    : !doc_candidates                 ? -1
+                    : !yyjson_is_bool(doc_candidates) ? -2
+                    : yyjson_get_bool(doc_candidates) ? 1
+                                                      : 0;
+        yyjson_doc_free(document);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+
+    cbm_daemon_application_free(application);
+    cbm_config_close(stored_config);
+    th_cleanup(root);
+    th_cleanup(cache);
+    free(root);
+    free(cache);
+    return stopped ? forwarded : -2;
+}
+
+/* A doc_candidates setting the user set reaches a programmatic index's
+ * worker, which has no config of its own; unset (or unparseable) it is not
+ * forwarded, so the worker's index mode decides. */
+TEST(daemon_application_programmatic_index_forwards_set_doc_candidates) {
+    int unset = app_programmatic_index_doc_candidates(NULL);
+    int off = app_programmatic_index_doc_candidates("false");
+    int on = app_programmatic_index_doc_candidates("on");
+    int garbage = app_programmatic_index_doc_candidates("maybe");
+    ASSERT_EQ(unset, -1);
+    ASSERT_EQ(off, 0);
+    ASSERT_EQ(on, 1);
+    ASSERT_EQ(garbage, -1);
     PASS();
 }
 TEST(daemon_application_auto_index_honors_tracked_file_limit) {
@@ -5816,6 +5890,32 @@ TEST(daemon_application_worker_slice_is_aggregate_over_active_jobs) {
     PASS();
 }
 
+/* The daemon's resident adjacency layers are its own memory: a worker's slice
+ * is the aggregate minus them, and never "no cap" (0) when they exceed it. The
+ * held bytes come through the graph_mem seam, so no layer has to be built. */
+TEST(daemon_application_worker_slice_leaves_room_for_graph_cache) {
+    const size_t mib = (size_t)1024U * 1024U;
+    const size_t aggregate = 1000U * mib;
+    cbm_daemon_application_config_t config = {.aggregate_memory_budget_bytes = aggregate};
+    cbm_graph_mem_drop_idle();
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    size_t without_layers = cbm_daemon_application_worker_memory_budget_bytes(application);
+    cbm_graph_mem_set_cached_bytes_for_testing(200U * mib);
+    size_t with_layers = cbm_daemon_application_worker_memory_budget_bytes(application);
+    cbm_graph_mem_set_cached_bytes_for_testing(aggregate + 5U);
+    size_t layers_over_aggregate = cbm_daemon_application_worker_memory_budget_bytes(application);
+    cbm_graph_mem_set_cached_bytes_for_testing(0);
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+
+    ASSERT_NOT_NULL(application);
+    ASSERT_TRUE(stopped);
+    ASSERT_EQ(without_layers, aggregate);
+    ASSERT_EQ(with_layers, aggregate - 200U * mib);
+    ASSERT_EQ(layers_over_aggregate, 1);
+    PASS();
+}
+
 /* Decision A (#1997 #832): the over-budget verdict travels as a CLEAN worker
  * exit carrying an error response. The daemon passes that response through
  * verbatim on the first attempt — no crash/hang recovery loop, no quarantine
@@ -6852,6 +6952,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_unnamed_status_keeps_path_derived_key_issue2134);
     RUN_TEST(daemon_application_unnamed_async_and_status_refuse_ambiguous_root_issue2134);
     RUN_TEST(daemon_application_programmatic_index_injects_resource_policy);
+    RUN_TEST(daemon_application_programmatic_index_forwards_set_doc_candidates);
     RUN_TEST(daemon_application_auto_index_honors_tracked_file_limit);
     RUN_TEST(daemon_application_auto_index_file_count_handles_literal_metacharacter_path);
     RUN_TEST(daemon_application_auto_index_file_count_supports_non_git_roots);
@@ -6886,6 +6987,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_queues_explicit_index_behind_physical_job_limit);
     RUN_TEST(daemon_application_default_limit_admits_four_and_rejects_fifth);
     RUN_TEST(daemon_application_worker_slice_is_aggregate_over_active_jobs);
+    RUN_TEST(daemon_application_worker_slice_leaves_room_for_graph_cache);
     RUN_TEST(daemon_application_over_budget_response_passes_through_without_recovery);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
     RUN_TEST(daemon_application_tool_error_is_failed_job_even_after_clean_worker_exit);

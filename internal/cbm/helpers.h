@@ -23,6 +23,17 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang);
 // stay in sync with kPyBuiltinNodes in internal/cbm/lsp/py_builtins.c.
 bool cbm_is_resolvable_builtin(const char *name, CBMLanguage lang);
 
+// The service an environment variable's value addresses -- never the value
+// itself: the host of a URL, of `host:port`, a `<svc>.<ns>.svc[.<domain>]`
+// name inside it, or the whole value when `key` names an address (*_ADDR,
+// *_ADDRESS, *_HOST, *_URL, *_ENDPOINT, *_URI) and it is a bare DNS name. A
+// templated value, localhost or an IP addresses nothing. Writes the host's
+// first label to `svc` and its second (`svc.ns`, `svc.ns.svc...`) to `ns`
+// ("" for one label), and returns the label count when the host is a
+// service DNS name (`svc`, `svc.ns`, `svc.ns.svc[...]`), else 0.
+int cbm_env_address(const char *key, const char *value, char *svc, size_t svc_sz, char *ns,
+                    size_t ns_sz);
+
 // Classify a string literal as URL, config, or neither.
 // Returns CBM_STRREF_URL (0), CBM_STRREF_CONFIG (1), or -1 for neither.
 int cbm_classify_string(const char *str, int len);
@@ -295,12 +306,17 @@ char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *
 
 // C-family platform variants: the same external-linkage function defined in
 // files that differ only by a platform token (foo_win.c / foo_posix.c,
-// src/unix/fs.c / src/win/fs.c) is ONE function with platform variants — two
+// src/unix/fs.c / src/win/fs.c) is one function with platform variants — two
 // external definitions of one name cannot link into one program, so they are
-// alternatives by construction. Returns the platform-neutral QN (the path with
-// its platform tokens removed) for a non-static file-scope function of
-// C/C++/CUDA/ObjC whose `qn` is the plain file-stem form; otherwise `qn`.
-const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *project,
+// alternatives by construction. Each definition keeps its own path QN (it is
+// found by its file); this returns the KEY that relates the variants: the
+// platform-neutral QN (the path with its platform tokens removed), for a
+// non-static file-scope function of C/C++/CUDA/ObjC whose `qn` is the plain
+// file-stem form and whose path carries a platform token. NULL otherwise. A
+// pure function of the definition's own path, name and linkage: no other file
+// takes part, so a full index and an incremental repair write the same key.
+// It becomes the node's `variant_key` property (CBMDefinition.variant_key).
+const char *cbm_platform_neutral_qn(CBMArena *a, CBMLanguage lang, const char *project,
                                     const char *rel_path, const char *name, const char *qn,
                                     TSNode func_node);
 
