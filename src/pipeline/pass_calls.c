@@ -101,21 +101,24 @@ static const char *itoa_log(int val) {
 
 /* Build per-file import map from cached extraction result or graph buffer edges.
  * Returns parallel arrays of (local_name, module_qn) pairs. Caller frees. */
-/* Parse "local_name":"value" from JSON properties string. Returns strdup'd key or NULL. */
-static char *extract_local_name_from_json(const char *props_json) {
+/* The "local_name":"value" of a JSON properties string, as a span of it;
+ * false when absent or empty. */
+static bool local_name_span_from_json(const char *props_json, const char **out, size_t *len) {
     if (!props_json) {
-        return NULL;
+        return false;
     }
     const char *start = strstr(props_json, "\"local_name\":\"");
     if (!start) {
-        return NULL;
+        return false;
     }
     start += strlen("\"local_name\":\"");
     const char *end = strchr(start, '"');
     if (!end || end <= start) {
-        return NULL;
+        return false;
     }
-    return cbm_strndup(start, end - start);
+    *out = start;
+    *len = (size_t)(end - start);
+    return true;
 }
 
 /* The graph node whose QN is cbm_pipeline_fqn_compute(project, rel_path, name),
@@ -147,7 +150,8 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
 
         for (int i = 0; i < result->imports.count; i++) {
             const CBMImport *imp = &result->imports.items[i];
-            if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
+            if (!imp->local_name || !imp->local_name[0] || !imp->module_path ||
+                !cbm_import_binds_runtime_name(imp)) {
                 continue;
             }
             const cbm_gbuf_node_t *target =
@@ -198,7 +202,16 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
         if (!target) {
             continue;
         }
-        char *key = extract_local_name_from_json(e->properties_json);
+        const char *name = NULL;
+        size_t name_len = 0;
+        /* An annotation-only import (#1277) binds no CALLS name: skipped before
+         * the key is copied. */
+        if (!local_name_span_from_json(e->properties_json, &name, &name_len) ||
+            !cbm_imports_local_span_binds_runtime_name(result ? &result->imports : NULL, name,
+                                                       name_len)) {
+            continue;
+        }
+        char *key = cbm_strndup(name, name_len);
         if (key) {
             keys[count] = key;
             vals[count] = target->qualified_name;
