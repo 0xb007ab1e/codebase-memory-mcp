@@ -9042,6 +9042,94 @@ TEST(pipeline_rust_assoc_call_never_binds_free_namesake_parallel) {
     return rust_assoc_call_free_namesake_case(52);
 }
 
+/* F-R4 (#763, Rust): calls inside a method of a generic impl (`impl<T> Gen<T>`,
+ * `impl<'a> Life<'a>`) were sourced from the File node: the call scope kept the
+ * generic arguments the def side strips. Each method must be the source of its
+ * own call. pad_files > 0 forces the parallel resolver. */
+static int rust_generic_impl_attribution_case(int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_gimpl_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "pub struct Gen<T> { v: T }\n"
+        "impl<T> Gen<T> {\n"
+        "    pub fn in_generic(&self) -> u32 { helper_a() + self.other_g() + Self::assoc_g() }\n"
+        "    pub fn other_g(&self) -> u32 { 3 }\n"
+        "    pub fn assoc_g() -> u32 { 4 }\n"
+        "}\n"
+        "pub struct Life<'a> { s: &'a str }\n"
+        "impl<'a> Life<'a> {\n"
+        "    pub fn in_lifetime(&self) -> u32 { helper_b() + self.other_l() }\n"
+        "    pub fn other_l(&self) -> u32 { 5 }\n"
+        "}\n"
+        "pub fn helper_a() -> u32 { 1 }\n"
+        "pub fn helper_b() -> u32 { 2 }\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.rs", i);
+        snprintf(body, sizeof(body), "pub fn filler%d() -> u32 {\n    %d\n}\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *saved = NULL;
+    if (pad_files > 0) {
+        char *old_workers = getenv("CBM_WORKERS");
+        saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/rust_gimpl.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_TRUE(cross_file_call_exists(s, project, "in_generic", "helper_a"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "in_lifetime", "helper_b"));
+    /* ... and not from the file. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "lib.rs", "helper_a"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "lib.rs", "helper_b"));
+    /* The LSP side names the impl's self type without its arguments too: its
+     * rows join these callers (lsp_*, not a registry fallback), and `self.` /
+     * `Self::` dispatch inside a generic impl resolves (Self::assoc_g had no
+     * edge at all). */
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_generic", "helper_a", "\"strategy\":\"lsp_"));
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_generic", "other_g", "\"strategy\":\"lsp_"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "in_generic", "assoc_g"));
+    ASSERT_TRUE(
+        cross_file_call_has_strategy(s, project, "in_lifetime", "other_l", "\"strategy\":\"lsp_"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (pad_files > 0) {
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_generic_impl_method_sources_its_calls) {
+    return rust_generic_impl_attribution_case(0);
+}
+
+TEST(pipeline_rust_generic_impl_method_sources_its_calls_parallel) {
+    return rust_generic_impl_attribution_case(52);
+}
+
 TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
     /* Parallel twin of the test above: USAGE and WRITES/READS each have a
      * second, independent resolver in pass_parallel.c (resolve_file_usages /
@@ -15121,6 +15209,114 @@ TEST(pipeline_python_local_def_shadows_module_def_issue1548) {
 
 TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548) {
     return pyn_run_shadowing(52);
+}
+
+/* ── super() follows the C3 method resolution order ──────────────── */
+
+/* The home-assistant radarr shape: RadarrCalendarEntity(RadarrEntity,
+ * CalendarEntity), where RadarrEntity reaches the common base Entity through
+ * CoordinatorEntity and CalendarEntity overrides Entity's method. Python's C3
+ * order is [RadarrCalendarEntity, RadarrEntity, CoordinatorEntity,
+ * CalendarEntity, Entity]: a common base comes after every class that
+ * derives from it, so super() reaches CalendarEntity, not Entity through the
+ * first base's ancestry. */
+static const char pym_base_py[] = "class Entity:\n"
+                                  "    def __init__(self):\n"
+                                  "        self.ready = False\n"
+                                  "\n"
+                                  "    def write_state(self):\n"
+                                  "        return 0\n"
+                                  "\n"
+                                  "class CoordinatorEntity(Entity):\n"
+                                  "    pass\n"
+                                  "\n"
+                                  "class CalendarEntity(Entity):\n"
+                                  "    def __init__(self):\n"
+                                  "        self.events = []\n"
+                                  "\n"
+                                  "    def write_state(self):\n"
+                                  "        return 1\n";
+
+static const char pym_radarr_py[] = "from base import CoordinatorEntity, CalendarEntity\n"
+                                    "\n"
+                                    "class RadarrEntity(CoordinatorEntity):\n"
+                                    "    pass\n"
+                                    "\n"
+                                    "class RadarrCalendarEntity(RadarrEntity, CalendarEntity):\n"
+                                    "    def __init__(self):\n"
+                                    "        super().__init__()\n"
+                                    "\n"
+                                    "    def write_state(self):\n"
+                                    "        return super().write_state()\n"
+                                    "\n"
+                                    "class PlainCalendar(CalendarEntity):\n"
+                                    "    def write_state(self):\n"
+                                    "        return super().write_state()\n";
+
+static int pym_run_super_c3(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_superc3_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "base.py", pym_base_py);
+    write_temp_file(tmp, "radarr.py", pym_radarr_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/superc3.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    const char *pr = p ? cbm_pipeline_project_name(p) : NULL;
+    const char *rce = "radarr.RadarrCalendarEntity";
+    char src[256];
+    snprintf(src, sizeof(src), "%s.write_state", rce);
+    bool m_c3 = s && pyn_edge(s, pr, src, "base.CalendarEntity.write_state", "CALLS");
+    bool m_dfs = s && pyn_edge(s, pr, src, "base.Entity.write_state", "CALLS");
+    snprintf(src, sizeof(src), "%s.__init__", rce);
+    bool i_c3 = s && pyn_edge(s, pr, src, "base.CalendarEntity.__init__", "CALLS");
+    bool i_dfs = s && pyn_edge(s, pr, src, "base.Entity.__init__", "CALLS");
+    bool plain = s && pyn_edge(s, pr, "radarr.PlainCalendar.write_state",
+                               "base.CalendarEntity.write_state", "CALLS");
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(m_c3);   /* super().write_state(): CalendarEntity comes before Entity */
+    ASSERT_FALSE(m_dfs); /* ... never Entity through RadarrEntity's ancestry */
+    ASSERT_TRUE(i_c3);   /* super().__init__(): the same order */
+    ASSERT_FALSE(i_dfs);
+    ASSERT_TRUE(plain); /* control: single inheritance */
+    PASS();
+}
+
+TEST(pipeline_python_super_follows_c3_mro) {
+    return pym_run_super_c3(0);
+}
+
+TEST(pipeline_python_super_follows_c3_mro_parallel) {
+    return pym_run_super_c3(52);
 }
 
 /* L7 review of #1548: a package __init__.py function can share a submodule's QN
@@ -24923,6 +25119,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_call_never_binds_another_language_parallel);
     RUN_TEST(pipeline_rust_assoc_call_never_binds_free_namesake);
     RUN_TEST(pipeline_rust_assoc_call_never_binds_free_namesake_parallel);
+    RUN_TEST(pipeline_rust_generic_impl_method_sources_its_calls);
+    RUN_TEST(pipeline_rust_generic_impl_method_sources_its_calls_parallel);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
@@ -24999,6 +25197,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_nested_def_local_after_incremental_issue1548);
     RUN_TEST(pipeline_python_local_def_shadows_module_def_issue1548);
     RUN_TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548);
+    RUN_TEST(pipeline_python_super_follows_c3_mro);
+    RUN_TEST(pipeline_python_super_follows_c3_mro_parallel);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_issue1548);
     RUN_TEST(pipeline_python_init_function_shares_submodule_qn_parallel_issue1548);
     RUN_TEST(pipeline_python_nested_helper_keeps_tests_issue1548);
