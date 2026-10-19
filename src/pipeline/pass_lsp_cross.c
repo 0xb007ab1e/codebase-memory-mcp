@@ -2774,6 +2774,123 @@ void cbm_pxc_free_module_def_index(CBMModuleDefIndex *idx) {
     free(idx);
 }
 
+/* A Python namespace record that points at another module (a re-export or a
+ * star import; `__all__` points nowhere). */
+static bool pxc_is_py_reexport_record(const CBMLSPDef *d) {
+    return d->lang == CBM_LANG_PYTHON && d->label && d->receiver_type &&
+           (strcmp(d->label, "PyReexport") == 0 || strcmp(d->label, "PyStarImport") == 0);
+}
+
+/* The index entry of the Python module `qn` (a module file, or a package via
+ * its `__init__`), or NULL. */
+static const pxc_module_entry_t *pxc_py_module_entry(const CBMModuleDefIndex *idx, const char *qn,
+                                                     size_t len) {
+    char key[CBM_SZ_1K];
+    if (len + sizeof(".__init__") > sizeof(key))
+        return NULL;
+    memcpy(key, qn, len);
+    key[len] = '\0';
+    const pxc_module_entry_t *e = (const pxc_module_entry_t *)cbm_ht_get(idx->ht, key);
+    if (e)
+        return e;
+    memcpy(key + len, ".__init__", sizeof(".__init__"));
+    return (const pxc_module_entry_t *)cbm_ht_get(idx->ht, key);
+}
+
+/* The entry of the module `spec` names from inside the module `module_qn`:
+ * a relative spec (leading dots) against that module's package, exactly; an
+ * absolute spec under the longest prefix of module_qn that has it (the
+ * project and any source root precede the import path). `member`, when set,
+ * also names a submodule (`from . import base`). NULL when nothing matches. */
+static const pxc_module_entry_t *pxc_py_spec_entry(const CBMModuleDefIndex *idx,
+                                                   const char *module_qn, const char *spec,
+                                                   const char *member) {
+    char qn[CBM_SZ_1K];
+    size_t level = strspn(spec, ".");
+    const char *rest = spec + level;
+    if (level > 0) {
+        size_t base = strlen(module_qn); /* drop the module's own segment first */
+        for (size_t up = 0; up < level; up++) {
+            while (base > 0 && module_qn[base - 1] != '.')
+                base--;
+            if (base == 0)
+                return NULL;
+            base--;
+        }
+        int n = rest[0] ? snprintf(qn, sizeof(qn), "%.*s.%s", (int)base, module_qn, rest)
+                        : snprintf(qn, sizeof(qn), "%.*s", (int)base, module_qn);
+        if (n < 0 || (size_t)n >= sizeof(qn))
+            return NULL;
+        const pxc_module_entry_t *e = pxc_py_module_entry(idx, qn, (size_t)n);
+        if (!e && member) {
+            int m = snprintf(qn + n, sizeof(qn) - (size_t)n, ".%s", member);
+            if (m > 0 && (size_t)(n + m) < sizeof(qn))
+                e = pxc_py_module_entry(idx, qn, (size_t)(n + m));
+        }
+        return e;
+    }
+    for (size_t cut = strlen(module_qn); cut > 0; cut--) {
+        if (module_qn[cut - 1] != '.')
+            continue;
+        int n = snprintf(qn, sizeof(qn), "%.*s%s", (int)cut, module_qn, rest);
+        if (n < 0 || (size_t)n >= sizeof(qn))
+            continue;
+        const pxc_module_entry_t *e = pxc_py_module_entry(idx, qn, (size_t)n);
+        if (e)
+            return e;
+    }
+    return NULL;
+}
+
+/* A per-file selection holds the defs of the caller's own and imported
+ * modules. A Python package that re-exports a name keeps only the record;
+ * the definition lives in the module the record points at, possibly through
+ * further re-exports. Select those modules' defs too, following every
+ * selected record once (a worklist over def indices: linear in the defs it
+ * reaches), so the per-file LSP can fold the chain as the shared registry
+ * does. */
+static void pxc_mark_reexport_targets(const CBMModuleDefIndex *idx, bool *selected,
+                                      const CBMLSPDef *all_defs, int *total) {
+    int cap = idx->def_count;
+    int *work = (int *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)cap * sizeof(int));
+    bool *queued = (bool *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, (size_t)cap * sizeof(bool));
+    if (!work || !queued) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, work);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, queued);
+        return;
+    }
+    int n = 0;
+    for (int i = 0; i < cap; i++) {
+        if (selected[i] && pxc_is_py_reexport_record(&all_defs[i])) {
+            queued[i] = true;
+            work[n++] = i;
+        }
+    }
+    for (int w = 0; w < n; w++) {
+        const CBMLSPDef *r = &all_defs[work[w]];
+        bool star = strcmp(r->label, "PyStarImport") == 0;
+        const pxc_module_entry_t *e =
+            r->def_module_qn ? pxc_py_spec_entry(idx, r->def_module_qn, r->receiver_type,
+                                                 star ? NULL : r->method_names_str)
+                             : NULL;
+        for (int j = 0; e && j < e->count; j++) {
+            int di = e->indices[j];
+            if (di < 0 || di >= cap || all_defs[di].lang != CBM_LANG_PYTHON)
+                continue;
+            if (!selected[di]) {
+                selected[di] = true;
+                (*total)++;
+            }
+            if (!queued[di] && pxc_is_py_reexport_record(&all_defs[di])) {
+                queued[di] = true;
+                work[n++] = di;
+            }
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_EXTRACT, work);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, queued);
+}
+
 CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef *all_defs,
                                         CBMLanguage caller_lang, const char *caller_namespace,
                                         const char *own_module, const char *const *imp_qns,
@@ -2805,6 +2922,9 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
         const char *namespace_key = pxc_namespace_index_key(caller_namespace);
         pxc_module_entry_t *e = (pxc_module_entry_t *)cbm_ht_get(idx->namespace_ht, namespace_key);
         total += pxc_mark_entry_defs(selected, e, all_defs, caller_lang);
+    }
+    if (caller_lang == CBM_LANG_PYTHON) {
+        pxc_mark_reexport_targets(idx, selected, all_defs, &total);
     }
 
     if (total == 0) {
