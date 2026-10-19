@@ -600,8 +600,6 @@ static bool py_ns_import_fact(PyNamespaceBuilder *b, TSNode child, bool from,
                             .module_name = module_name,
                             .relative_level = level};
     if (from && strcmp(kind, "wildcard_import") == 0) {
-        if (level == 0 && module_name && strcmp(module_name, "__future__") == 0)
-            return false; /* a syntax error in Python: stays unsupported */
         f.kind = CBM_PY_NS_IMPORT_STAR;
         *out = f;
         return true;

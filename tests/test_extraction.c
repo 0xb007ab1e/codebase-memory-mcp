@@ -12314,8 +12314,9 @@ TEST(python_namespace_facts_string_statements_and_future_imports) {
         {"concatenated f-string field", "from .impl import a\n\"x\" f\"{a!r}\"\n",
          CBM_PY_NS_REASON_EFFECT},
         {"call", "from .impl import a\nprint(a)\n", CBM_PY_NS_REASON_EFFECT},
+        /* Python rejects it, and so does the grammar: the whole file is unknown */
         {"star from __future__", "from .impl import a\nfrom __future__ import *\n",
-         CBM_PY_NS_REASON_UNSUPPORTED},
+         CBM_PY_NS_REASON_PARSE},
     };
     for (size_t i = 0; i < sizeof(barriers) / sizeof(barriers[0]); i++) {
         r = extract(barriers[i].source, CBM_LANG_PYTHON, "t", "pkg/__init__.py");
