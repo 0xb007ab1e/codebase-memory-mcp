@@ -4426,6 +4426,11 @@ static const CBMType *py_resolve_annotation(PyLSPContext *ctx, const char *ann) 
     const CBMType *t = cbm_scope_lookup(ctx->current_scope, ann);
     if (!cbm_type_is_unknown(t))
         return t;
+    if (ctx->annotation_scope) {
+        t = cbm_scope_lookup(ctx->annotation_scope, ann);
+        if (!cbm_type_is_unknown(t))
+            return t;
+    }
     if (ctx->module_qn) {
         const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, ann);
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, qn);
@@ -5508,6 +5513,27 @@ static void py_replay_import_statement(PyLSPContext *ctx, TSNode stmt, unsigned 
     }
 }
 
+/* The consequence block of a module-level `if TYPE_CHECKING:` /
+ * `if <module>.TYPE_CHECKING:` statement, else a null node. Mirrors the
+ * extraction's py_is_type_checking_condition (extract_imports.c). */
+static TSNode py_type_checking_body(PyLSPContext *ctx, TSNode stmt) {
+    TSNode none = {0};
+    if (strcmp(ts_node_type(stmt), "if_statement") != 0)
+        return none;
+    TSNode cond = ts_node_child_by_field_name(stmt, "condition", 9);
+    if (ts_node_is_null(cond))
+        return none;
+    TSNode name = cond;
+    if (strcmp(ts_node_type(cond), "attribute") == 0)
+        name = ts_node_child_by_field_name(cond, "attribute", 9);
+    if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") != 0)
+        return none;
+    char *text = py_node_text(ctx, name);
+    if (!text || strcmp(text, "TYPE_CHECKING") != 0)
+        return none;
+    return ts_node_child_by_field_name(stmt, "consequence", 11);
+}
+
 static bool py_expression_is_annotation_only_assignment(TSNode statement) {
     if (ts_node_named_child_count(statement) != 1)
         return false;
@@ -5592,6 +5618,29 @@ void py_lsp_process_file(PyLSPContext *ctx, TSNode root) {
              * Invalidate only syntactic binding targets at the control-flow
              * join; a later unconditional statement may restore exact proof. */
             py_invalidate_possible_bindings(ctx, c, 0);
+            /* `if TYPE_CHECKING:` holds the imports annotations are written
+             * against (#1277). Bind them into the annotation-only frame: an
+             * annotation resolves through them, a runtime call never does (the
+             * interpreter never runs the block). Extraction recorded them
+             * flagged type_checking_only, so they reach this walk through the
+             * LSP import map only, never a CALLS import map. */
+            TSNode tc_body = py_type_checking_body(ctx, c);
+            if (!ts_node_is_null(tc_body)) {
+                if (!ctx->annotation_scope)
+                    ctx->annotation_scope = cbm_scope_push(ctx->arena, NULL);
+                CBMScope *runtime_scope = ctx->current_scope;
+                PyKids tk = py_kids(ctx->arena, tc_body);
+                for (uint32_t t = 0; ctx->annotation_scope && t < tk.n && !ctx->eval_failure; t++) {
+                    TSNode stmt = py_kid(&tk, t);
+                    const char *sk = ts_node_type(stmt);
+                    if (strcmp(sk, "import_statement") == 0 ||
+                        strcmp(sk, "import_from_statement") == 0) {
+                        ctx->current_scope = ctx->annotation_scope;
+                        py_replay_import_statement(ctx, stmt, consumed_imports);
+                        ctx->current_scope = runtime_scope;
+                    }
+                }
+            }
         }
     }
     // Pass 2: top-level calls (rare) and nested definitions.
