@@ -916,15 +916,17 @@ struct cbm_helm_defines {
     hd_file_t **files; /* each allocated once: defines point into them */
     int nfiles;
     int cap;
-    CBMHashTable *names; /* name -> hd_def_t* */
+    CBMHashTable *names;  /* name -> hd_def_t* */
+    CBMHashTable *by_rel; /* path -> hd_file_t* */
 };
 
 cbm_helm_defines_t *cbm_helm_defines_new(void) {
     cbm_helm_defines_t *d = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*d));
     if (d) {
         d->names = cbm_ht_create(0);
-        if (!d->names) {
-            cbm_free(CBM_MEM_CLASS_OTHER, d);
+        d->by_rel = cbm_ht_create(0);
+        if (!d->names || !d->by_rel) {
+            cbm_helm_defines_free(d);
             return NULL;
         }
     }
@@ -1018,6 +1020,7 @@ void cbm_helm_defines_add(cbm_helm_defines_t *d, const char *rel, const char *sr
         ts_parser_delete(parser);
     }
     d->files[d->nfiles++] = f;
+    cbm_ht_set(d->by_rel, f->rel, f);
     if (f->tree) {
         hd_scan(d, f, ts_tree_root_node(f->tree), hd_depth(rel));
     }
@@ -1037,6 +1040,9 @@ void cbm_helm_defines_free(cbm_helm_defines_t *d) {
         cbm_ht_foreach(d->names, hd_free_def, NULL);
         cbm_ht_free(d->names);
     }
+    if (d->by_rel) {
+        cbm_ht_free(d->by_rel); /* its keys are the files' own */
+    }
     for (int i = 0; i < d->nfiles; i++) {
         if (d->files[i]->tree) {
             ts_tree_delete(d->files[i]->tree);
@@ -1051,12 +1057,7 @@ void cbm_helm_defines_free(cbm_helm_defines_t *d) {
 
 /* Template file `rel` of the set; NULL: none. */
 static const hd_file_t *hd_file_find(const cbm_helm_defines_t *d, const char *rel) {
-    for (int i = 0; d && i < d->nfiles; i++) {
-        if (strcmp(d->files[i]->rel, rel) == 0) {
-            return d->files[i];
-        }
-    }
-    return NULL;
+    return d && d->by_rel ? cbm_ht_get(d->by_rel, rel) : NULL;
 }
 
 static const hd_def_t *hd_find(const cbm_helm_defines_t *d, const char *name) {
@@ -1394,6 +1395,11 @@ typedef struct {
      * and for a merge of values also by values path (everything below it) */
     CBMHashTable *poison_maps;
     CBMHashTable *poison_paths;
+    /* the values path of each values map changed (a set or a merge): a merge
+     * above one of them reaches what it put there */
+    const char **changes;
+    int nchanges;
+    int chcap;
     /* a change of maps not run exactly: every capture ending later is UNKNOWN */
     bool tainted;
     CBMHashTable *mutates;      /* define name -> it may change a map (he_define_may_mutate) */
@@ -1655,6 +1661,37 @@ static bool hst_poison(hst_t *st, const hv_t *v, bool deep) {
     return hst_poison_at(st, v, deep, 0);
 }
 
+/* Has a values map at path p or below it been changed? */
+static bool hst_changed_below(hst_t *st, const char *p) {
+    size_t lp = strlen(p);
+    for (int i = 0; i < st->nchanges; i++) {
+        const char *c = st->changes[i];
+        if (!hst_step(st) ||
+            (strncmp(c, p, lp) == 0 && (c[lp] == '\0' || c[lp] == '.' || c[lp] == '['))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Values map at path p changed in place; false with no room to say so. */
+static bool hst_record_change(hst_t *st, const char *p) {
+    if (st->nchanges == st->chcap) {
+        int cap = st->chcap ? st->chcap * PAIR_LEN : CBM_SZ_16;
+        const char **g = cbm_arena_alloc(st->a, (size_t)cap * sizeof(*g));
+        if (!g) {
+            return false;
+        }
+        if (st->nchanges) {
+            memcpy(g, st->changes, (size_t)st->nchanges * sizeof(*g));
+        }
+        st->changes = g;
+        st->chcap = cap;
+    }
+    st->changes[st->nchanges++] = p;
+    return true;
+}
+
 static bool hst_poison_at(hst_t *st, const hv_t *v, bool deep, int depth) {
     if (depth > HELM_MAX_NESTING || !hst_step(st)) {
         return false;
@@ -1666,9 +1703,12 @@ static bool hst_poison_at(hst_t *st, const hv_t *v, bool deep, int depth) {
         return false;
     }
     /* a deep change reaches every map within: one not known, one a change
-     * already made unknown, the values root (every path below it), or a map
-     * not of the values (whose maps no path covers) cannot be poisoned whole */
-    if (deep && (hv_poisoned(st, v) || (v->path && !v->path[0]) || (v->k == HV_JSON && !v->path))) {
+     * already made unknown, the values root (every path below it), a map not
+     * of the values (whose maps no path covers), or a values map below which
+     * a change was made (it may hold another's map now) cannot be poisoned
+     * whole */
+    if (deep && (hv_poisoned(st, v) || (v->path && !v->path[0]) || (v->k == HV_JSON && !v->path) ||
+                 (v->path && hst_changed_below(st, v->path)))) {
         return false;
     }
     if (deep && v->k == HV_MAP) {
@@ -1681,7 +1721,7 @@ static bool hst_poison_at(hst_t *st, const hv_t *v, bool deep, int depth) {
     }
     char key[CBM_SZ_32];
     snprintf(key, sizeof(key), "%p", map);
-    if (!hst_set_add(st, &st->poison_maps, key)) {
+    if (!hst_set_add(st, &st->poison_maps, key) || (v->path && !hst_record_change(st, v->path))) {
         return false;
     }
     return !(deep && v->path) || hst_set_add(st, &st->poison_paths, v->path);
@@ -1935,12 +1975,15 @@ static void hst_capture_end(hst_t *st) {
         p->keys[p->n] = whole ? keys : NULL;
         p->n++;
     }
+    /* the keys this capture recorded, one by one: a clear walks the set's
+     * whole capacity, which one huge capture leaves behind for every later
+     * one */
+    for (int i = 0; st->ckset && i < st->nck; i++) {
+        (void)cbm_ht_delete(st->ckset, st->ckeys[i]);
+    }
     st->capture = -SKIP_ONE;
     st->cap = (hsink_t){0};
     st->nck = 0;
-    if (st->ckset) {
-        cbm_ht_clear(st->ckset);
-    }
 }
 
 /* Output of the top-level template: into the capture until its newline. */
@@ -2415,10 +2458,16 @@ static hv_t he_strfn(hst_t *st, const char *fn, const hv_t *a, int n) {
     return HV_UNKNOWN;
 }
 
-/* Sprig functions that change a map in place. */
+/* Sprig functions that change their argument in place: set / unset / merge
+ * a map, sortAlpha a []string (splitList, keys, regexSplit give one; a list
+ * is never poisoned, so it always counts as a change not run). Every other
+ * list function copies its argument (push, append, prepend, reverse, uniq,
+ * without, compact, rest, initial, concat, chunk) or reads it (first, last,
+ * has, slice -- which shares it but changes nothing). */
 static bool he_mutator(const char *s, size_t n) {
     static const char *const MUTATORS[] = {
-        "set", "unset", "merge", "mergeOverwrite", "mustMerge", "mustMergeOverwrite", NULL};
+        "set",       "unset", "merge", "mergeOverwrite", "mustMerge", "mustMergeOverwrite",
+        "sortAlpha", NULL};
     return hy_in(s, n, MUTATORS);
 }
 
@@ -2478,8 +2527,8 @@ static bool he_is_fn(const char *s, size_t n, const char *name) {
  * looked into), or an include / template of a name not known or of one that
  * may (he_define_may_mutate). A variable's name ($set) is no call. */
 static bool he_may_mutate(hst_t *st, const char *src, TSNode n, int depth) {
-    if (depth > HELM_MAX_NESTING) {
-        return true;
+    if (depth > HELM_MAX_NESTING || ts_node_has_error(n)) {
+        return true; /* a form the grammar rejects (Go may not) may hide a change */
     }
     TSTreeCursor cur = ts_tree_cursor_new(n);
     bool found = false;
@@ -2514,6 +2563,9 @@ static bool he_may_mutate(hst_t *st, const char *src, TSNode n, int depth) {
     return found || st->stop;
 }
 
+/* Memo states of he_define_may_mutate / he_file_may_mutate. */
+enum { HM_NO = 1, HM_YES = 2, HM_BUSY = 3, HM_STALE = 4 };
+
 /* The chart's template file an include names -- Helm names each one
  * `<.Template.BasePath>/<file>` -- or NULL: none of this chart's. */
 static const hd_file_t *he_template_file(hst_t *st, const char *name) {
@@ -2534,7 +2586,6 @@ static const hd_file_t *he_template_file(hst_t *st, const char *name) {
  * while it is being scanned -- one including itself -- may. A no that leaned
  * on a define still being scanned is not kept. */
 static bool he_file_may_mutate(hst_t *st, const hd_file_t *f, int depth) {
-    enum { HM_NO = 1, HM_YES = 2, HM_BUSY = 3 };
     if (!f->tree) {
         return true;
     }
@@ -2564,20 +2615,27 @@ static bool he_file_may_mutate(hst_t *st, const hd_file_t *f, int depth) {
  * scanned again when next asked), so defines including each other never fix
  * a wrong no -- a yes is final. */
 static bool he_define_may_mutate(hst_t *st, const char *name, int depth) {
-    enum { HM_NO = 1, HM_YES = 2, HM_BUSY = 3, HM_STALE = 4 };
-    const hd_def_t *d = hd_find(st->defs, name);
-    if (!d) {
-        /* a template file of the chart by its name (the checksum idiom) is
-         * looked into; a name not the chart's (a library's) may */
-        const hd_file_t *f = he_template_file(st, name);
-        return f ? he_file_may_mutate(st, f, depth) : true;
-    }
     if (!st->mutates) {
         st->mutates = cbm_ht_create(0);
     }
     uintptr_t memo = st->mutates ? (uintptr_t)cbm_ht_get(st->mutates, name) : 0;
     if (memo == HM_YES || memo == HM_NO) {
         return memo == HM_YES;
+    }
+    const hd_def_t *d = hd_find(st->defs, name);
+    if (!d) {
+        /* a template file of the chart by its name (the checksum idiom) is
+         * looked into; a name not the chart's (a library's) may. Kept by
+         * name once final, so an include in a loop asks once */
+        const hd_file_t *f = he_template_file(st, name);
+        bool m = f ? he_file_may_mutate(st, f, depth) : true;
+        bool final =
+            m || (st->file_mutates && (uintptr_t)cbm_ht_get(st->file_mutates, f->rel) == HM_NO);
+        const char *key = final && st->mutates ? cbm_arena_strdup(st->a, name) : NULL;
+        if (key) {
+            cbm_ht_set(st->mutates, key, (void *)(uintptr_t)(m ? HM_YES : HM_NO));
+        }
+        return m;
     }
     if (memo == HM_BUSY) {
         st->busy_hits++;
@@ -2988,7 +3046,15 @@ static hv_t he_call(hst_t *st, hframe_t *fr, TSNode call, const hv_t *piped) {
         uint32_t total = na + (piped ? SKIP_ONE : 0);
         for (uint32_t i = 0; i < total; i++) {
             v = i < na ? he_eval(st, fr, ts_node_named_child(args, i)) : *piped;
-            if (v.k == HV_UNK) {
+            if (v.k == HV_UNK || hv_poisoned(st, &v)) {
+                /* its truth is not known (a poisoned map's either): whether
+                 * the operands after it run is not, nor a change they make */
+                for (uint32_t j = i + SKIP_ONE; j < na; j++) {
+                    if (he_may_mutate(st, fr->src, ts_node_named_child(args, j), st->nesting)) {
+                        hst_taint(st, fn);
+                        break;
+                    }
+                }
                 return HV_UNKNOWN;
             }
             bool t = hv_truth(&v);
@@ -3212,20 +3278,25 @@ static int he_scan_skipped(hst_t *st, hframe_t *fr, TSNode n, bool in_range) {
     return leave;
 }
 
-/* The children of n but its condition / collection (what was run), each:
+/* The children of n but what was run -- its collection, its conditions up
+ * to `ran` (the one run; an else if / else with after it would be) -- each:
  * the variables it would assign UNKNOWN, and a change of maps it may make
  * (he_may_mutate) leaves every image after it UNKNOWN; returns how it would
  * leave the loop. */
-static int he_spoil_parts(hst_t *st, hframe_t *fr, TSNode n, const char *only, bool in_range) {
+static int he_spoil_parts(hst_t *st, hframe_t *fr, TSNode n, TSNode ran, const char *only,
+                          bool in_range) {
     int leave = HL_NONE;
     bool mutates = false;
+    bool after = false; /* past `ran` */
     uint32_t cc = ts_node_child_count(n);
     for (uint32_t i = 0; i < cc; i++) {
         TSNode c = ts_node_child(n, i);
         const char *f = ts_node_field_name_for_child(n, i);
-        if (!ts_node_is_named(c) || hn_is(c, "range_variable_definition") ||
-            (f && (strcmp(f, "condition") == 0 || strcmp(f, "range") == 0)) ||
-            (only && !(f && strcmp(f, only) == 0))) {
+        bool cond = f && strcmp(f, "condition") == 0;
+        bool was_run = cond && !after;
+        after = after || (cond && ts_node_eq(c, ran));
+        if (!ts_node_is_named(c) || hn_is(c, "range_variable_definition") || was_run ||
+            (f && strcmp(f, "range") == 0) || (only && !(f && strcmp(f, only) == 0))) {
             continue;
         }
         leave |= he_scan_skipped(st, fr, c, in_range);
@@ -3237,16 +3308,17 @@ static int he_spoil_parts(hst_t *st, hframe_t *fr, TSNode n, const char *only, b
     return leave;
 }
 
-/* The bodies of if / with / range n, not run because its condition or
- * collection is UNKNOWN (that one was run): their output, the variables they
- * would assign and a change they would make are UNKNOWN. A break / continue
- * in them may or may not leave the loop around: what the rest of that loop's
- * body would assign or change is UNKNOWN too, and a break leaves it now (its
- * later iterations are not known), a continue this iteration. */
-static void he_skipped(hst_t *st, hframe_t *fr, TSNode n) {
+/* The bodies of if / with / range n, not run because its condition `ran` or
+ * its collection (a null `ran`) is UNKNOWN (that one was run): their output,
+ * the variables they -- and the conditions after `ran` -- would assign and a
+ * change they would make are UNKNOWN. A break / continue in them may or may
+ * not leave the loop around: what the rest of that loop's body would assign
+ * or change is UNKNOWN too, and a break leaves it now (its later iterations
+ * are not known), a continue this iteration. */
+static void he_skipped(hst_t *st, hframe_t *fr, TSNode n, TSNode ran) {
     hst_out_unknown(st, fr);
     bool range = hn_is(n, "range_action");
-    int leave = he_spoil_parts(st, fr, n, NULL, range);
+    int leave = he_spoil_parts(st, fr, n, ran, NULL, range);
     if (leave == HL_NONE) {
         return;
     }
@@ -3257,7 +3329,7 @@ static void he_skipped(hst_t *st, hframe_t *fr, TSNode n) {
         loop = ts_node_parent(loop);
     }
     if (hn_is(loop, "range_action")) {
-        (void)he_spoil_parts(st, fr, loop, "body", true);
+        (void)he_spoil_parts(st, fr, loop, (TSNode){0}, "body", true);
     }
     if (leave & HL_BREAK) {
         st->brk = true;
@@ -3293,7 +3365,7 @@ static void he_branches(hst_t *st, hframe_t *fr, TSNode n, bool with) {
             if (v.k == HV_UNK || hv_poisoned(st, &v)) {
                 stop = true;
                 active = false;
-                he_skipped(st, fr, n); /* which branch renders is unknown */
+                he_skipped(st, fr, n, c); /* which branch renders is unknown */
                 continue;
             }
             active = hv_truth(&v);
@@ -3331,7 +3403,7 @@ static void he_range(hst_t *st, hframe_t *fr, TSNode n) {
     }
     hv_t coll = he_eval(st, fr, expr);
     if (coll.k == HV_UNK || hv_poisoned(st, &coll)) {
-        he_skipped(st, fr, n);
+        he_skipped(st, fr, n, (TSNode){0});
         return;
     }
     hv_t *items = NULL;
@@ -3472,6 +3544,9 @@ static hv_t he_render_define(hst_t *st, const char *name, hv_t arg, hsink_t *int
         hst_taint(st, "include"); /* nested too deep: not run */
         return HV_UNKNOWN;
     }
+    if (ts_node_has_error(d->node)) {
+        hst_taint(st, "parse"); /* a form the grammar rejects may hide a change */
+    }
     int mark = st->nvars;
     hframe_t sub = {.src = d->file->src, .dot = arg, .var_base = st->nvars, .out = into};
     hst_var_push(st, "", 0, arg);
@@ -3584,6 +3659,11 @@ bool cbm_helm_render(CBMArena *a, const char *rel, const char *src, size_t len,
     uint32_t *lines = cbm_arena_alloc(&work, (size_t)nl * sizeof(*lines));
     TSTree *tree = lines ? ts_parser_parse_string(st.parser, NULL, src, (uint32_t)len) : NULL;
     if (tree) {
+        /* a template that does not parse may hide a change (Go may take a
+         * form the grammar rejects): no image of it is known */
+        if (ts_node_has_error(ts_tree_root_node(tree))) {
+            hst_taint(&st, "parse");
+        }
         int k = 0;
         lines[k++] = 0;
         for (size_t i = 0; i < len; i++) {

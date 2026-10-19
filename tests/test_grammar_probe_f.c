@@ -4947,7 +4947,14 @@ TEST(probe_helm_release_terraform_postrender_forms) {
  * app/charts/cache/templates, as Helm sets it (an image here shows it). Its
  * checksum of cm.yaml names its own file, which changes no map -- not app's
  * cm.yaml, which sets a value: its image stays known, as does app's (which
- * checksums its Secret). */
+ * checksums its Secret).
+ *
+ * NOT a cross-file guarantee: app's cm.yaml sets .Values.image.tag, and Helm
+ * renders a chart's files with one shared .Values (a subchart's is the
+ * parent's .Values.<alias>). Each file renders alone here, so app's image is
+ * known only because nothing models that set reaching deploy.yaml -- the
+ * known limit (review round 4, R4-5), whose exact fix is to run the family's
+ * files in Helm's order with one .Values (the run-included-files follow-up). */
 TEST(probe_helm_checksum_include_by_base_path) {
     static const GpfFile files[] = {
         {"charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\ndependencies:\n"

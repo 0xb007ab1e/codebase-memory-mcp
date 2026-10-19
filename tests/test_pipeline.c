@@ -5050,6 +5050,176 @@ TEST(helm_template_file_including_itself) {
     PASS();
 }
 
+static const char HELM_IMAGE_VALUES[] =
+    "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\ncfg: {a: {}}\nempty: {}\n";
+#define HELM_IMAGE_LINE "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"
+
+/* A set below a values map puts .Values.image at cfg.a.d; a deep merge into
+ * the map above it (.Values.cfg) reaches .Values.image there: the image after
+ * it is UNKNOWN. */
+TEST(helm_deep_merge_over_a_change_below) {
+    static const char tpl[] =
+        "{{- $_ := set .Values.cfg.a \"d\" .Values.image }}\n"
+        "{{- $_ := mergeOverwrite .Values.cfg (dict \"a\" (dict \"d\" (dict \"tag\" \"2.0\"))) }}\n"
+        HELM_IMAGE_LINE;
+    char *got = helm_capture(HELM_IMAGE_VALUES, tpl, NULL, 3);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* and / or stop at an operand whose truth is not known (.Release.Namespace;
+ * a map a set changed -- .Values.empty is empty no more): whether the
+ * operands after it run is not known, nor a change they make -- the image
+ * after it is UNKNOWN. A known false one runs none: the image stays known. */
+TEST(helm_and_or_with_an_unknown_operand) {
+    static const char *const tpls[] = {
+        "{{- $_ := and .Release.Namespace (set .Values.image \"tag\" \"2.0\") }}\n" HELM_IMAGE_LINE,
+        "{{- $_ := or .Release.Namespace (set .Values.image \"tag\" \"2.0\") }}\n" HELM_IMAGE_LINE,
+        "{{- $_ := set .Values.empty \"x\" \"y\" }}{{- $_ := and .Values.empty "
+        "(set .Values.image \"tag\" \"2.0\") }}\n" HELM_IMAGE_LINE};
+    for (size_t i = 0; i < sizeof(tpls) / sizeof(tpls[0]); i++) {
+        char *got = helm_capture(HELM_IMAGE_VALUES, tpls[i], NULL, 2);
+        bool unknown = strcmp(got, "<UNKNOWN>") == 0;
+        free(got);
+        ASSERT_TRUE(unknown);
+    }
+    static const char known[] =
+        "{{- $_ := and false (set .Values.image \"tag\" \"2.0\") }}\n" HELM_IMAGE_LINE;
+    char *got = helm_capture(HELM_IMAGE_VALUES, known, NULL, 2);
+    ASSERT_STR_EQ(got, "ghcr.io/acme/app:1.0");
+    free(got);
+    PASS();
+}
+
+/* An if whose first condition is UNKNOWN: Helm evaluates the else-if
+ * conditions after it -- a set there, or an assignment ($tag = ...), may run:
+ * the image after it is UNKNOWN. */
+TEST(helm_later_condition_of_a_skipped_if) {
+    static const char set[] =
+        "{{- if regexMatch \"^v\" .Values.image.tag }}{{- else if set .Values.image \"tag\" \"2.0\" }}"
+        "{{- end }}\n" HELM_IMAGE_LINE;
+    char *got = helm_capture(HELM_IMAGE_VALUES, set, NULL, 2);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    static const char assign[] =
+        "{{- $tag := \"1.0\" }}{{- if regexMatch \"^v\" .Values.image.tag }}"
+        "{{- else if $tag = \"2.0\" }}{{- end }}\n"
+        "image: \"ghcr.io/acme/app:{{ $tag }}\"\n";
+    got = helm_capture(HELM_IMAGE_VALUES, assign, NULL, 2);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* sortAlpha sorts a []string in place (splitList gives one): the list $tags
+ * holds changes -- not run here, so the image after it is UNKNOWN. */
+TEST(helm_sort_alpha_changes_its_list) {
+    static const char tpl[] = "{{- $tags := splitList \",\" .Values.tags }}"
+                              "{{- $_ := sortAlpha $tags }}\n"
+                              "image: \"ghcr.io/acme/app:{{ first $tags }}\"\n";
+    char *got = helm_capture("tags: \"2.0,1.0\"\n", tpl, NULL, 2);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    PASS();
+}
+
+/* A form the grammar rejects may hide a change (Go may take it): a template,
+ * a define it runs, or a template file it includes that does not parse
+ * leaves its images UNKNOWN. */
+TEST(helm_parse_error_spoils) {
+    static const char bad[] = "{{- $x := }}\n" HELM_IMAGE_LINE;
+    char *got = helm_capture(HELM_IMAGE_VALUES, bad, NULL, 2);
+    ASSERT_STR_EQ(got, "<UNKNOWN>");
+    free(got);
+    static const char defs_src[] =
+        "{{- define \"bad\" -}}{{- $x := }}{{- end -}}\n"
+        "{{- define \"good\" -}}ok{{- end -}}\n";
+    cbm_helm_defines_t *d = cbm_helm_defines_new();
+    ASSERT_NOT_NULL(d);
+    cbm_helm_defines_add(d, "charts/app/templates/_bad.tpl", defs_src, strlen(defs_src));
+    static const char bad_file[] = "{{- $x := }}\nkind: ConfigMap\n";
+    cbm_helm_defines_add(d, "charts/app/templates/bad.yaml", bad_file, strlen(bad_file));
+    static const char good[] = "x: {{ include \"good\" . }}\n" HELM_IMAGE_LINE;
+    static const char via_define[] = "x: {{ include \"bad\" . }}\n" HELM_IMAGE_LINE;
+    static const char via_file[] =
+        "x: {{ include (print $.Template.BasePath \"/bad.yaml\") . | sha256sum }}\n" HELM_IMAGE_LINE;
+    char *ok = helm_capture_chart(HELM_IMAGE_VALUES, good, d, &HELM_APP, 2);
+    char *by_define = helm_capture_chart(HELM_IMAGE_VALUES, via_define, d, &HELM_APP, 2);
+    char *by_file = helm_capture_chart(HELM_IMAGE_VALUES, via_file, d, &HELM_APP, 2);
+    cbm_helm_defines_free(d);
+    ASSERT_STR_EQ(ok, "ghcr.io/acme/app:1.0");
+    ASSERT_STR_EQ(by_define, "<UNKNOWN>");
+    ASSERT_STR_EQ(by_file, "<UNKNOWN>");
+    free(ok);
+    free(by_define);
+    free(by_file);
+    PASS();
+}
+
+/* One capture reading 20,000 keys, then 2,000 captures of two keys each:
+ * every image and mark after the big one stays right (its keys leave the
+ * set one by one; the set is never cleared by walking its capacity). */
+TEST(helm_captures_after_a_huge_capture) {
+    enum { ITEMS = 20000, LATER = 2000 };
+    size_t cap = (size_t)ITEMS * 8 + CBM_SZ_256;
+    char *vals = malloc(cap);
+    ASSERT_NOT_NULL(vals);
+    size_t o = (size_t)snprintf(vals, cap, "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n"
+                                            "big: [");
+    for (int i = 0; i < ITEMS; i++) {
+        o += (size_t)snprintf(vals + o, cap - o, "%s{x: a}", i ? "," : "");
+    }
+    snprintf(vals + o, cap - o, "]\n");
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *v = doc ? cbm_helm_values_parse(doc, vals, strlen(vals)) : NULL;
+    free(vals);
+    static const char tpl[] =
+        "image: \"r/{{ range .Values.big }}{{ .x }}{{ end }}\"\n"
+        "{{- range 2000 }}\n"
+        "image: \"{{ $.Values.image.repository }}:{{ $.Values.image.tag }}\"\n"
+        "{{- end }}\n";
+    CBMArena a;
+    cbm_arena_init_lazy(&a, CBM_SZ_4K);
+    cbm_helm_probe_t probes[2] = {{.line = 1}, {.line = 3}};
+    bool ok = cbm_helm_render(&a, "t.yaml", tpl, strlen(tpl), v, NULL, NULL, probes, 2);
+    int n = probes[1].n;
+    bool last = n == LATER && probes[1].image[n - 1] &&
+                strcmp(probes[1].image[n - 1], "ghcr.io/acme/app:1.0") == 0 &&
+                probes[1].keys[n - 1] &&
+                strcmp(probes[1].keys[n - 1], "[\"image.repository\",\"image.tag\"]") == 0;
+    cbm_arena_destroy(&a);
+    if (doc) {
+        yyjson_mut_doc_free(doc);
+    }
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(n, LATER);
+    ASSERT_TRUE(last);
+    PASS();
+}
+
+/* 5,000 includes of one name in a loop -- a template file of the chart with
+ * no change, or a name that is none -- get one answer each time (asked
+ * once): the first spoils nothing, the second every image after it. */
+TEST(helm_includes_of_one_name_in_a_loop) {
+    cbm_helm_defines_t *d = helm_chart_files();
+    ASSERT_NOT_NULL(d);
+    static const char clean[] =
+        "{{- range 5000 }}{{ $_ := include (print $.Template.BasePath \"/secret.yaml\") $ }}"
+        "{{ end }}\n" HELM_IMAGE_LINE;
+    static const char missing[] =
+        "{{- range 5000 }}{{ $_ := include (print $.Template.BasePath \"/missing.yaml\") $ }}"
+        "{{ end }}\n" HELM_IMAGE_LINE;
+    char *kept = helm_capture_chart(HELM_IMAGE_VALUES, clean, d, &HELM_APP, 2);
+    char *spoiled = helm_capture_chart(HELM_IMAGE_VALUES, missing, d, &HELM_APP, 2);
+    cbm_helm_defines_free(d);
+    ASSERT_STR_EQ(kept, "ghcr.io/acme/app:1.0");
+    ASSERT_STR_EQ(spoiled, "<UNKNOWN>");
+    free(kept);
+    free(spoiled);
+    PASS();
+}
+
 /* A compose project's .env feeds its compose file (variables in image,
  * build): changing it is no closure repair -- the unchanged compose file's
  * services would keep the old image. It rebuilds; no stale image remains. */
@@ -24811,6 +24981,13 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(helm_subchart_base_path_names_its_own_file);
     RUN_TEST(helm_include_of_a_missing_template_file);
     RUN_TEST(helm_template_file_including_itself);
+    RUN_TEST(helm_deep_merge_over_a_change_below);
+    RUN_TEST(helm_and_or_with_an_unknown_operand);
+    RUN_TEST(helm_later_condition_of_a_skipped_if);
+    RUN_TEST(helm_sort_alpha_changes_its_list);
+    RUN_TEST(helm_parse_error_spoils);
+    RUN_TEST(helm_captures_after_a_huge_capture);
+    RUN_TEST(helm_includes_of_one_name_in_a_loop);
     RUN_TEST(incremental_compose_dotenv_change_rebuilds);
     RUN_TEST(incremental_dockerfile_edit_keeps_docker_build_edges);
     RUN_TEST(incremental_second_build_declarer_keeps_the_edge);
