@@ -677,12 +677,6 @@ static void finish_data_flow_props(char *props, size_t propsz, size_t pos,
     }
 }
 
-typedef struct {
-    int64_t source_id;
-    const char *props;
-    const char *edge_type;
-} caller_edge_ref_t;
-
 static bool http_call_edge_has_valid_route(const cbm_gbuf_edge_t *edge) {
     char url_buf[CBM_SZ_512];
     const char *url = json_extract(edge->properties_json, "url_path", url_buf, sizeof(url_buf));
@@ -747,84 +741,82 @@ static int try_create_data_flow(cbm_gbuf_t *gb, int64_t caller_id, int64_t handl
     return SKIP_ONE;
 }
 
-/* Collect extra handler IDs reachable via INFRA_MAPS chain from a route. */
-static int collect_infra_handlers(cbm_gbuf_t *gb, int64_t route_id, int64_t *out, int max_out) {
-    const cbm_gbuf_edge_t **infra_edges = NULL;
-    int infra_count = 0;
-    cbm_gbuf_find_edges_by_source_type(gb, route_id, "INFRA_MAPS", &infra_edges, &infra_count);
+/* One route's DATA_FLOWS context: its direct handlers (handler -[HANDLES]-> route) and its
+ * INFRA_MAPS hops (route -[INFRA_MAPS]-> endpoint, whose handlers are reached via the endpoint).
+ * The edge arrays are the graph buffer's own index arrays. Inserting DATA_FLOWS never appends to
+ * a HANDLES, INFRA_MAPS, HTTP_CALLS or ASYNC_CALLS array, so they stay valid while flows are added
+ * (only edge deletion rebuilds the indexes). */
+typedef struct {
+    cbm_gbuf_t *gb;
+    const cbm_gbuf_node_t *route;
+    const cbm_gbuf_edge_t **handles;
+    int handles_count;
+    const cbm_gbuf_edge_t **infra;
+    int infra_count;
+    int flows;
+    int skipped;
+} route_flows_t;
 
-    int n = 0;
-    for (int ie = 0; ie < infra_count; ie++) {
-        const cbm_gbuf_edge_t **ep_handles = NULL;
-        int ep_hcount = 0;
-        cbm_gbuf_find_edges_by_target_type(gb, infra_edges[ie]->target_id, "HANDLES", &ep_handles,
-                                           &ep_hcount);
-        for (int eh = 0; eh < ep_hcount && n < max_out; eh++) {
-            out[n++] = ep_handles[eh]->source_id;
-        }
+static void route_flow_add(route_flows_t *rf, const cbm_gbuf_edge_t *caller, int64_t handler_id,
+                           const char *edge_type, bool via_infra) {
+    int rc = try_create_data_flow(rf->gb, caller->source_id, handler_id, rf->route, edge_type,
+                                  caller->properties_json, via_infra);
+    if (rc > 0) {
+        rf->flows++;
+    } else if (rc < 0) {
+        rf->skipped++;
     }
-    return n;
 }
 
-/* Collect caller edges (HTTP_CALLS + ASYNC_CALLS) targeting a route. */
-static int collect_caller_edges(cbm_gbuf_t *gb, int64_t route_id, caller_edge_ref_t *out,
-                                int max_out) {
-    int n = 0;
+/* DATA_FLOWS from one caller edge to every handler of the route, direct and via infra. */
+static void caller_data_flows(route_flows_t *rf, const cbm_gbuf_edge_t *caller,
+                              const char *edge_type) {
+    for (int hi = 0; hi < rf->handles_count; hi++) {
+        route_flow_add(rf, caller, rf->handles[hi]->source_id, edge_type, false);
+    }
+    for (int ie = 0; ie < rf->infra_count; ie++) {
+        const cbm_gbuf_edge_t **ep_handles = NULL;
+        int ep_hcount = 0;
+        cbm_gbuf_find_edges_by_target_type(rf->gb, rf->infra[ie]->target_id, "HANDLES", &ep_handles,
+                                           &ep_hcount);
+        for (int eh = 0; eh < ep_hcount; eh++) {
+            route_flow_add(rf, caller, ep_handles[eh]->source_id, edge_type, true);
+        }
+    }
+}
+
+/* Create DATA_FLOWS between EVERY caller (HTTP_CALLS + ASYNC_CALLS) and EVERY handler of one
+ * route node.
+ *
+ * Callers were copied into a 64-slot buffer and infra handlers into a 32-slot one, each keeping the
+ * first entries in edge-insertion order -- i.e. in parallel worker interleaving. Which DATA_FLOWS
+ * existed therefore changed between two indexes of the same tree with the same binary
+ * (thingsboard, 2026-10-17), and every caller past the 64th lost its flow outright. The flow set
+ * is now the full caller x handler product. A (caller, handler) pair reached twice -- through two
+ * routes, or directly and via infra -- keeps the order-free property winner of
+ * cbm_gbuf_insert_edge. */
+static void create_route_data_flows(cbm_gbuf_t *gb, const cbm_gbuf_node_t *route, int *flows,
+                                    int *skipped) {
+    route_flows_t rf = {.gb = gb, .route = route};
+    cbm_gbuf_find_edges_by_target_type(gb, route->id, "HANDLES", &rf.handles, &rf.handles_count);
+    cbm_gbuf_find_edges_by_source_type(gb, route->id, "INFRA_MAPS", &rf.infra, &rf.infra_count);
+
     const cbm_gbuf_edge_t **http_edges = NULL;
     int http_count = 0;
-    cbm_gbuf_find_edges_by_target_type(gb, route_id, "HTTP_CALLS", &http_edges, &http_count);
-    for (int i = 0; i < http_count && n < max_out; i++) {
-        if (!http_call_edge_has_valid_route(http_edges[i])) {
-            continue;
+    cbm_gbuf_find_edges_by_target_type(gb, route->id, "HTTP_CALLS", &http_edges, &http_count);
+    for (int i = 0; i < http_count; i++) {
+        if (http_call_edge_has_valid_route(http_edges[i])) {
+            caller_data_flows(&rf, http_edges[i], "HTTP_CALLS");
         }
-        out[n].source_id = http_edges[i]->source_id;
-        out[n].props = http_edges[i]->properties_json;
-        out[n].edge_type = "HTTP_CALLS";
-        n++;
     }
     const cbm_gbuf_edge_t **async_edges = NULL;
     int async_count = 0;
-    cbm_gbuf_find_edges_by_target_type(gb, route_id, "ASYNC_CALLS", &async_edges, &async_count);
-    for (int i = 0; i < async_count && n < max_out; i++) {
-        out[n].source_id = async_edges[i]->source_id;
-        out[n].props = async_edges[i]->properties_json;
-        out[n].edge_type = "ASYNC_CALLS";
-        n++;
+    cbm_gbuf_find_edges_by_target_type(gb, route->id, "ASYNC_CALLS", &async_edges, &async_count);
+    for (int i = 0; i < async_count; i++) {
+        caller_data_flows(&rf, async_edges[i], "ASYNC_CALLS");
     }
-    return n;
-}
-
-/* Create DATA_FLOWS between callers and handlers for one route node. */
-static void create_route_data_flows(cbm_gbuf_t *gb, const cbm_gbuf_node_t *route,
-                                    const caller_edge_ref_t *callers, int n_callers, int *flows,
-                                    int *skipped) {
-    const cbm_gbuf_edge_t **handles_edges = NULL;
-    int handles_count = 0;
-    cbm_gbuf_find_edges_by_target_type(gb, route->id, "HANDLES", &handles_edges, &handles_count);
-
-    int64_t extra_handlers[CBM_SZ_32];
-    int n_extra = collect_infra_handlers(gb, route->id, extra_handlers, CBM_SZ_32);
-
-    for (int ci = 0; ci < n_callers; ci++) {
-        for (int hi = 0; hi < handles_count; hi++) {
-            int rc = try_create_data_flow(gb, callers[ci].source_id, handles_edges[hi]->source_id,
-                                          route, callers[ci].edge_type, callers[ci].props, false);
-            if (rc > 0) {
-                (*flows)++;
-            } else if (rc < 0) {
-                (*skipped)++;
-            }
-        }
-        for (int xi = 0; xi < n_extra; xi++) {
-            int rc = try_create_data_flow(gb, callers[ci].source_id, extra_handlers[xi], route,
-                                          callers[ci].edge_type, callers[ci].props, true);
-            if (rc > 0) {
-                (*flows)++;
-            } else if (rc < 0) {
-                (*skipped)++;
-            }
-        }
-    }
+    *flows += rf.flows;
+    *skipped += rf.skipped;
 }
 
 /* Find the enclosing proto service for a function by file + line range. */
@@ -931,9 +923,7 @@ static void create_data_flows(cbm_gbuf_t *gb) {
     int skipped = 0;
 
     for (int ri = 0; ri < route_count; ri++) {
-        caller_edge_ref_t caller_edges[CBM_SZ_64];
-        int n_callers = collect_caller_edges(gb, routes[ri]->id, caller_edges, CBM_SZ_64);
-        create_route_data_flows(gb, routes[ri], caller_edges, n_callers, &flows, &skipped);
+        create_route_data_flows(gb, routes[ri], &flows, &skipped);
     }
 
     if (flows > 0 || skipped > 0) {
