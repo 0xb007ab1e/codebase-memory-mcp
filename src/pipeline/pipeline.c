@@ -29,6 +29,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 7 };
 #include "store/store.h"
 #include "macro_table.h"
 #include "arena.h"
+#include "helpers.h" /* cbm_fqn_module_source_lang */
 #include "discover/discover.h"
 #include "discover/userconfig.h"
 #include "foundation/platform.h"
@@ -181,6 +182,13 @@ void cbm_pipeline_unlock(void) {
 
 /* ── Internal state ──────────────────────────────────────────────── */
 
+/* doc_candidates: unset (the mode decides), or explicitly on / off. */
+typedef enum {
+    PIPELINE_DOC_CANDIDATES_BY_MODE = 0,
+    PIPELINE_DOC_CANDIDATES_ON,
+    PIPELINE_DOC_CANDIDATES_OFF,
+} pipeline_doc_candidates_t;
+
 struct cbm_pipeline {
     cbm_pipeline_frozen_t *frozen; /* NULL for every ordinary caller */
     char *repo_path;
@@ -252,6 +260,15 @@ struct cbm_pipeline {
      * "invalid_existing_db" (#1864). */
     bool final_existed;
     bool existing_generation;
+    /* The copy into the stage is deferred until routing needs it: an
+     * unchanged repository is proven current on the live generation
+     * (live_db_path, read-only) and never copies, seals or renames a
+     * database. backup_succeeded records the copy once it ran; live_noop
+     * marks a run that ended on the live proof with nothing staged. */
+    bool stage_backup_pending;
+    bool backup_succeeded;
+    bool live_noop;
+    const char *live_db_path; /* borrowed from cbm_pipeline_run */
 
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
@@ -278,8 +295,9 @@ struct cbm_pipeline {
      * cbm_pipeline_free). NULL when the pass found none or did not run. */
     cbm_doc_candidate_t *doc_candidates;
     int doc_candidate_count;
-    /* doc_candidates setting off (calloc'd false = on, the default). */
-    bool doc_candidates_off;
+    /* The doc_candidates choice. Unset (calloc'd) lets the index mode
+     * decide: on for full, off for moderate and fast. */
+    pipeline_doc_candidates_t doc_candidates_choice;
 
     /* Deterministic test-only seam at the final publication boundary. Kept
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
@@ -839,7 +857,10 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->repo_path = strdup(repo_path);
     p->db_path = db_path ? strdup(db_path) : NULL;
     p->project_name = cbm_project_name_from_path(repo_path);
-    (void)cbm_git_context_resolve(repo_path, &p->git_ctx);
+    /* The Git context is resolved once, when the run starts
+     * (pipeline_refresh_git_context): a context resolved here was always
+     * replaced before any use, at the cost of seven git subprocesses per
+     * index call. Until then the branch QN names the working tree. */
     p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
     p->requested_mode = mode;
     p->mode = mode;
@@ -878,12 +899,22 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
 
 void cbm_pipeline_set_doc_candidates_enabled(cbm_pipeline_t *p, bool enabled) {
     if (p) {
-        p->doc_candidates_off = !enabled;
+        p->doc_candidates_choice =
+            enabled ? PIPELINE_DOC_CANDIDATES_ON : PIPELINE_DOC_CANDIDATES_OFF;
     }
 }
 
+/* Unset: the mode decides. p->mode is the effective mode -- a run promoted to
+ * an existing index's fuller coverage scores candidates like that index. No
+ * pipeline (a pass driven directly) keeps the pass's historic on. */
 bool cbm_pipeline_doc_candidates_enabled(const cbm_pipeline_t *p) {
-    return !p || !p->doc_candidates_off;
+    if (!p) {
+        return true;
+    }
+    if (p->doc_candidates_choice != PIPELINE_DOC_CANDIDATES_BY_MODE) {
+        return p->doc_candidates_choice == PIPELINE_DOC_CANDIDATES_ON;
+    }
+    return p->mode == CBM_MODE_FULL;
 }
 
 void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p,
@@ -1440,13 +1471,75 @@ static void free_seen_dir_key(const char *key, void *val, void *ud) {
 
 /* ── Pass 1: Structure ──────────────────────────────────────────── */
 
+/* True for languages whose module QN is the CONTAINING DIRECTORY (Java/Go
+ * package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c). */
+static bool stem_module_is_dir(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
+}
+
+/* Each file's Module QN, computed as extraction computes it. */
+void cbm_stem_marks_init(cbm_stem_marks_t *m, const char *project, const cbm_file_info_t *files,
+                         int file_count) {
+    cbm_arena_init(&m->arena);
+    m->module_qns = cbm_ht_create(CBM_SZ_256);
+    m->dir_module_qns = cbm_ht_create(CBM_SZ_64);
+    for (int i = 0; i < file_count; i++) {
+        if (!files[i].rel_path) {
+            continue;
+        }
+        char *qn =
+            cbm_fqn_module_source_lang(&m->arena, project, files[i].rel_path, files[i].language);
+        if (qn) {
+            cbm_ht_set(stem_module_is_dir(files[i].language) ? m->dir_module_qns : m->module_qns,
+                       qn, qn);
+        }
+    }
+}
+
+void cbm_stem_marks_free(cbm_stem_marks_t *m) {
+    cbm_ht_free(m->module_qns);
+    cbm_ht_free(m->dir_module_qns);
+    cbm_arena_destroy(&m->arena);
+}
+
+/* The extension names the yielding Module's file ("sh" for genproto.sh);
+ * "file" when there is none. */
+static const char *stem_mark_suffix(const char *rel_path) {
+    const char *base = strrchr(rel_path, '/');
+    base = base ? base + SKIP_ONE : rel_path;
+    const char *dot = strrchr(base, '.');
+    return dot && dot != base && dot[SKIP_ONE] ? dot + SKIP_ONE : "file";
+}
+
+const char *cbm_stem_marks_module_qn(const cbm_stem_marks_t *m, const char *qn,
+                                     const char *rel_path, CBMLanguage lang, char *buf,
+                                     size_t buf_size) {
+    if (!m || !qn || !rel_path || stem_module_is_dir(lang) || !cbm_ht_get(m->dir_module_qns, qn)) {
+        return qn;
+    }
+    int n = snprintf(buf, buf_size, "%s#%s", qn, stem_mark_suffix(rel_path));
+    return n > 0 && (size_t)n < buf_size ? buf : qn;
+}
+
+const char *cbm_stem_marks_folder_qn(const cbm_stem_marks_t *m, const char *project,
+                                     const char *rel_dir, char *buf, size_t buf_size) {
+    char *qn = cbm_pipeline_fqn_folder(project, rel_dir);
+    bool mark = qn && m && cbm_ht_get(m->module_qns, qn) && !cbm_ht_get(m->dir_module_qns, qn);
+    int n = qn ? snprintf(buf, buf_size, "%s%s", qn, mark ? "/" : "") : -1;
+    free(qn);
+    return n >= 0 && (size_t)n < buf_size ? buf : NULL;
+}
+
 /* Create Project, Folder/Package, and File nodes in the graph buffer. */
 /* Walk directory chain upward, creating Folder nodes and CONTAINS_FOLDER edges. */
-static void create_folder_chain(cbm_pipeline_t *p, const char *dir, CBMHashTable *seen_dirs) {
+static void create_folder_chain(cbm_pipeline_t *p, const cbm_stem_marks_t *marks, const char *dir,
+                                CBMHashTable *seen_dirs) {
     char *walk = strdup(dir);
     while (walk[0] != '\0' && !cbm_ht_get(seen_dirs, walk)) {
         cbm_ht_set(seen_dirs, strdup(walk), intptr_to_ptr(SKIP_ONE));
-        char *folder_qn = cbm_pipeline_fqn_folder(p->project_name, walk);
+        char folder_buf[CBM_SZ_8K];
+        const char *folder_qn =
+            cbm_stem_marks_folder_qn(marks, p->project_name, walk, folder_buf, sizeof(folder_buf));
         const char *dir_base = strrchr(walk, '/');
         dir_base = dir_base ? dir_base + SKIP_ONE : walk;
         cbm_gbuf_upsert_node(p->gbuf, "Folder", dir_base, folder_qn, walk, 0, 0, "{}");
@@ -1460,20 +1553,17 @@ static void create_folder_chain(cbm_pipeline_t *p, const char *dir, CBMHashTable
             pdir = strdup("");
         }
         const char *pqn;
-        char *pqn_heap = NULL;
+        char pqn_buf[CBM_SZ_8K];
         if (pdir[0] == '\0') {
             pqn = p->branch_qn ? p->branch_qn : p->project_name;
         } else {
-            pqn_heap = cbm_pipeline_fqn_folder(p->project_name, pdir);
-            pqn = pqn_heap;
+            pqn = cbm_stem_marks_folder_qn(marks, p->project_name, pdir, pqn_buf, sizeof(pqn_buf));
         }
-        const cbm_gbuf_node_t *fn = cbm_gbuf_find_by_qn(p->gbuf, folder_qn);
-        const cbm_gbuf_node_t *pn = cbm_gbuf_find_by_qn(p->gbuf, pqn);
+        const cbm_gbuf_node_t *fn = folder_qn ? cbm_gbuf_find_by_qn(p->gbuf, folder_qn) : NULL;
+        const cbm_gbuf_node_t *pn = pqn ? cbm_gbuf_find_by_qn(p->gbuf, pqn) : NULL;
         if (fn && pn) {
             cbm_gbuf_insert_edge(p->gbuf, pn->id, fn->id, "CONTAINS_FOLDER", "{}");
         }
-        free(folder_qn);
-        free(pqn_heap);
         char *up = strrchr(walk, '/');
         if (up) {
             *up = '\0';
@@ -1485,7 +1575,8 @@ static void create_folder_chain(cbm_pipeline_t *p, const char *dir, CBMHashTable
     free(walk);
 }
 
-static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int file_count) {
+static int pass_structure(cbm_pipeline_t *p, const cbm_stem_marks_t *marks,
+                          const cbm_file_info_t *files, int file_count) {
     cbm_log_info("pass.start", "pass", "structure", "files", itoa_buf(file_count));
 
     /* Project node */
@@ -1544,27 +1635,26 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
         }
 
         const char *parent_qn;
-        char *parent_qn_heap = NULL;
+        char parent_buf[CBM_SZ_8K];
         if (dir[0] == '\0') {
             parent_qn = branch_qn;
         } else {
-            parent_qn_heap = cbm_pipeline_fqn_folder(p->project_name, dir);
-            parent_qn = parent_qn_heap;
+            parent_qn = cbm_stem_marks_folder_qn(marks, p->project_name, dir, parent_buf,
+                                                 sizeof(parent_buf));
         }
 
         /* Walk up directory chain, creating Folder nodes */
-        create_folder_chain(p, dir, seen_dirs);
+        create_folder_chain(p, marks, dir, seen_dirs);
 
         /* Now create the CONTAINS_FILE edge */
         const cbm_gbuf_node_t *fnode = cbm_gbuf_find_by_qn(p->gbuf, file_qn);
-        const cbm_gbuf_node_t *pnode = cbm_gbuf_find_by_qn(p->gbuf, parent_qn);
+        const cbm_gbuf_node_t *pnode = parent_qn ? cbm_gbuf_find_by_qn(p->gbuf, parent_qn) : NULL;
         if (fnode && pnode) {
             cbm_gbuf_insert_edge(p->gbuf, pnode->id, fnode->id, "CONTAINS_FILE", "{}");
         }
 
         free(file_qn);
         free(dir);
-        free(parent_qn_heap);
     }
 
     /* Free seen_dirs keys */
@@ -2045,7 +2135,8 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
             str_def_fp += def->fingerprint ? (size_t)def->fingerprint_k * sizeof(uint32_t) : 0;
             str_def_misc += census_len(def->route_path) + census_len(def->route_method) +
                             census_len(def->impl_trait) + census_len(def->http_base_url) +
-                            census_list(def->extra_props) + census_len(def->decl_namespace);
+                            census_list(def->extra_props) + census_len(def->decl_namespace) +
+                            census_len(def->variant_key);
         }
         for (int c = 0; c < r->calls.count; c++) {
             const CBMCall *call = &r->calls.items[c];
@@ -2152,26 +2243,44 @@ static void log_result_arenas(const char *tag, CBMFileResult **cache, int file_c
     log_result_census(tag, cache, file_count);
 }
 
+/* Which modes run a predump pass. */
+typedef enum {
+    PREDUMP_EVERY_MODE,
+    PREDUMP_SKIP_FAST,
+    /* Fast mode runs it only for doc -> code candidates (doc_candidates
+     * explicitly on); the semantic pass then emits no edges (doc-only). */
+    PREDUMP_FAST_DOC_CANDIDATES,
+} predump_gate_t;
+
+static bool predump_pass_runs(const cbm_pipeline_t *p, predump_gate_t gate) {
+    /* Compare explicitly against FAST rather than `> MODERATE` so a heavier
+     * mode with a larger value is never mistaken for a lighter one. */
+    if (p->mode != CBM_MODE_FAST || gate == PREDUMP_EVERY_MODE) {
+        return true;
+    }
+    return gate == PREDUMP_FAST_DOC_CANDIDATES && cbm_pipeline_doc_candidates_enabled(p);
+}
+
 /* Results are gone after resolve; so is the store. Logs what spill did. */
 static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
         predump_pass_fn fn;
         const char *name;
-        bool moderate_only; /* true = skip in fast mode */
+        predump_gate_t gate;
     } passes[] = {
-        {predump_deco, "decorator_tags", false},
-        {predump_cfg, "configlink", false},
-        {predump_operator, "operator", false},
-        {predump_doclinks, "doclinks", false},
-        {predump_route, "route_match", false},
-        {predump_ensemble, "ensemble_routing", false},
-        {predump_sim, "similarity", true},
-        {predump_sem, "semantic_edges", true},
-        {predump_complexity, "complexity", false},
+        {predump_deco, "decorator_tags", PREDUMP_EVERY_MODE},
+        {predump_cfg, "configlink", PREDUMP_EVERY_MODE},
+        {predump_operator, "operator", PREDUMP_EVERY_MODE},
+        {predump_doclinks, "doclinks", PREDUMP_EVERY_MODE},
+        {predump_route, "route_match", PREDUMP_EVERY_MODE},
+        {predump_ensemble, "ensemble_routing", PREDUMP_EVERY_MODE},
+        {predump_sim, "similarity", PREDUMP_SKIP_FAST},
+        {predump_sem, "semantic_edges", PREDUMP_FAST_DOC_CANDIDATES},
+        {predump_complexity, "complexity", PREDUMP_EVERY_MODE},
         /* Importance runs LAST: it reads CALLS/USAGE (extraction) and TESTS
          * (pass_tests, which run_post_extraction runs before this loop), so
          * every edge type its score depends on already exists here. */
-        {predump_importance, "importance", false},
+        {predump_importance, "importance", PREDUMP_EVERY_MODE},
     };
     /* Derived from the table, never hand-written. A hand-written count that
      * lags a newly appended entry silently skips the LAST pass while every
@@ -2180,11 +2289,7 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     enum { PREDUMP_PASS_COUNT = (int)(sizeof(passes) / sizeof(passes[0])) };
     struct timespec t;
     for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
-        /* "moderate_only" passes (similarity/semantic edges) run in FULL,
-         * MODERATE and ADVANCED — they are skipped only in FAST. Compare
-         * explicitly against FAST rather than `> MODERATE` so ADVANCED
-         * (numerically 3) is not mistaken for a lighter mode than FULL. */
-        if (passes[i].moderate_only && p->mode == CBM_MODE_FAST) {
+        if (!predump_pass_runs(p, passes[i].gate)) {
             continue;
         }
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
@@ -2645,12 +2750,69 @@ static int capture_existing_adr(cbm_pipeline_t *p, const char *db_path) {
     return 0;
 }
 
+static int remove_stage_files(const char *stage_path);
+
+/* Copy the live generation into this run's stage: every route except the
+ * live no-op works on that copy. A failed copy behaves as the eager copy it
+ * replaces did: the stage files go (the name and its lock stay this run's,
+ * the rebuilt generation is renamed over it later) and the run has no
+ * previous generation, so it rebuilds in full. */
+static void materialize_stage_backup(cbm_pipeline_t *p) {
+    p->stage_backup_pending = false;
+    p->backup_succeeded = cbm_store_backup_path(p->live_db_path, p->db_path) == CBM_STORE_OK;
+    if (!p->backup_succeeded) {
+        cbm_log_warn("pipeline.stage", "action", "backup_failed_full_rebuild", "path",
+                     p->live_db_path);
+        (void)remove_stage_files(p->db_path);
+    }
+    p->existing_generation = p->backup_succeeded;
+}
+
+/* The live generation is provably current: read-only, it passes the shallow
+ * integrity and format checks the staged route applies to its copy, and the
+ * exact semantic-manifest test the staged route would answer no-op with. A
+ * copy of it would route to that no-op and publish the same database again,
+ * so the run ends here with nothing copied, sealed or renamed. Any doubt
+ * answers false and the run copies and routes exactly as before. */
+static bool live_generation_current(cbm_pipeline_t *p, const cbm_file_hash_t *baseline_manifest,
+                                    int baseline_count) {
+    struct stat db_st;
+    if (!p->live_db_path || stat(p->live_db_path, &db_st) != 0) {
+        return false;
+    }
+    cbm_store_t *store = cbm_store_open_path_query(p->live_db_path);
+    if (!store) {
+        return false;
+    }
+    int fmt = 0;
+    bool current = cbm_store_check_integrity(store);
+    if (current) {
+        cbm_store_get_format_version(store, &fmt);
+        current =
+            fmt == CBM_INDEX_FORMAT_VERSION &&
+            cbm_pipeline_incremental_generation_exact(p, store, baseline_manifest, baseline_count);
+    }
+    cbm_store_close(store);
+    return current;
+}
+
 /* Route an existing generation. Full rebuilds never delete the live DB here:
  * publication owns the eventual atomic replacement after every pass and
  * metadata write has succeeded. */
 static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count,
                                         const cbm_file_hash_t *baseline_manifest,
                                         int baseline_count, bool force_full_on_mismatch) {
+    if (p->stage_backup_pending) {
+        if (live_generation_current(p, baseline_manifest, baseline_count)) {
+            p->stage_backup_pending = false;
+            p->live_noop = true;
+            cbm_log_info("pipeline.route", "path", "incremental_manifest", "generation", "live");
+            cbm_log_info("incremental.noop", "reason", "semantic_manifest_equal", "generation",
+                         "live");
+            return 0;
+        }
+        materialize_stage_backup(p);
+    }
     if (!p->existing_generation) {
         /* Nothing to be incremental against: a first index, or a
          * destination that could not be copied (already reported as
@@ -2753,12 +2915,15 @@ static bool promote_mode_to_existing_coverage(cbm_pipeline_t *p) {
     if (!p || !p->project_name) {
         return false;
     }
-    char *db_path = resolve_db_path(p);
+    /* Until routing copies it, the stage is an empty placeholder: the
+     * coverage the copy would carry is read from the live generation. */
+    char *resolved = p->stage_backup_pending ? NULL : resolve_db_path(p);
+    const char *db_path = p->stage_backup_pending ? p->live_db_path : resolved;
     if (!db_path) {
         return false;
     }
     cbm_store_t *store = cbm_store_open_path_query(db_path);
-    free(db_path);
+    free(resolved);
     if (!store) {
         return false;
     }
@@ -3674,12 +3839,12 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 #define MIN_FILES_FOR_PARALLEL 50
 
 /* Run structure + extraction passes (parallel or sequential). */
-static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
-                                const cbm_file_info_t *files, int file_count) {
+static int run_structure_and_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
+                                        const cbm_file_info_t *files, int file_count) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     CBM_PROF_START(t_struct);
-    pass_structure(p, files, file_count);
+    pass_structure(p, ctx->stem_marks, files, file_count);
     CBM_PROF_END_N("pipeline", "pass_structure", t_struct, file_count);
     cbm_log_info("pass.timing", "pass", "structure", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
     pipeline_phase_mark("structure");
@@ -3704,6 +3869,19 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     /* A repository Image whose edges all went to its components (pass_docker.c
      * P4.2b) is left without any: it goes, as on the incremental routes. */
     (void)cbm_gbuf_delete_unreferenced(p->gbuf, "Image", DK_IMAGE_EDGES);
+    return rc;
+}
+
+/* The stem collisions decide Folder QNs (structure) and Module QNs
+ * (extraction); both phases read the one set. */
+static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
+                                const cbm_file_info_t *files, int file_count) {
+    cbm_stem_marks_t marks;
+    cbm_stem_marks_init(&marks, p->project_name, files, file_count);
+    ctx->stem_marks = &marks;
+    int rc = run_structure_and_extraction(p, ctx, files, file_count);
+    ctx->stem_marks = NULL;
+    cbm_stem_marks_free(&marks);
     return rc;
 }
 
@@ -4436,6 +4614,29 @@ static void sweep_orphan_stages(const char *final_path) {
     free(dir_path);
 }
 
+/* End a run whose exact no-op was proven on the live generation. Nothing was
+ * staged, so nothing is sealed or renamed and the live database stays the
+ * current generation. The checks publication makes on the run's sources and
+ * destination still decide success, and the artifact is refreshed from the
+ * live database exactly as it would be from a republished one. */
+static int finish_live_noop(cbm_pipeline_t *p, const char *final_path) {
+    cbm_userconfig_t *fresh_config = cbm_userconfig_load_with_source(p->repo_path);
+    bool source_matches = cbm_pipeline_project_source_matches(p, fresh_config);
+    cbm_userconfig_free(fresh_config);
+    struct stat final_st;
+    int rc = 0;
+    if (!source_matches) {
+        cbm_log_error("pipeline.err", "phase", "test_declarations_source_changed");
+        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+    } else if (stat(final_path, &final_st) != 0) {
+        /* The destination vanished during the run: someone else owns it. */
+        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+    } else {
+        rc = export_after_publish(p, final_path);
+    }
+    return rc;
+}
+
 int cbm_pipeline_run(cbm_pipeline_t *p) {
     /* Per-index attribution: peaks and phase totals are about THIS index, not
      * the process history, so they start clean here. The first mark opens
@@ -4465,21 +4666,12 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return CBM_NOT_FOUND;
     }
 
-    bool backup_succeeded = false;
-    if (final_existed) {
-        backup_succeeded = cbm_store_backup_path(final_path, staging_path) == CBM_STORE_OK;
-        if (!backup_succeeded) {
-            cbm_log_warn("pipeline.stage", "action", "backup_failed_full_rebuild", "path",
-                         final_path);
-            /* The copy is gone but the NAME stays ours: the rebuilt
-             * generation is renamed over it by the inner finalize and then
-             * published from it below, so its lock is held to the end. */
-            remove_stage_files(staging_path);
-        }
-    }
-
+    /* The existing generation is copied into the stage only when routing
+     * needs a copy (materialize_stage_backup): an exact no-op is proven on
+     * the live generation and copies nothing -- on a kernel-scale index the
+     * copy alone was a 19 GB write per unchanged re-index. */
     p->final_existed = final_existed;
-    p->existing_generation = final_existed && backup_succeeded;
+    p->existing_generation = final_existed;
     char *configured_db_path = p->db_path;
     p->db_path = strdup(staging_path);
     if (!p->db_path) {
@@ -4489,10 +4681,19 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         free(final_path);
         return CBM_NOT_FOUND;
     }
+    p->stage_backup_pending = final_existed;
+    p->backup_succeeded = false;
+    p->live_noop = false;
+    p->live_db_path = final_path;
     cbm_log_debug("pipeline.setup", "step", "staged");
     int rc = cbm_pipeline_run_staged(p);
     free(p->db_path);
     p->db_path = configured_db_path;
+    bool backup_succeeded = p->backup_succeeded;
+    bool live_noop = p->live_noop;
+    p->stage_backup_pending = false;
+    p->live_noop = false;
+    p->live_db_path = NULL;
 
     /* Report WHY the run stopped. Everything below happens before the final
      * rename, so the live database is still the previous generation and an
@@ -4506,12 +4707,17 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         pipeline_release_test_config(p);
         return rc;
     }
-    if (check_cancel(p)) {
+    /* A cancelled run and a live no-op both end here without publishing:
+     * the stage placeholder is discarded, and only the no-op goes on to
+     * finish on the live generation. */
+    bool cancelled = check_cancel(p);
+    if (cancelled || live_noop) {
         cleanup_staging_db(staging_path);
         free(staging_path);
+        rc = cancelled ? CBM_PIPELINE_ABORT_PRESERVE_DB : finish_live_noop(p, final_path);
         free(final_path);
         pipeline_release_test_config(p);
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        return rc;
     }
     if (seal_staging_db(staging_path) != 0) {
         cleanup_staging_db(staging_path);

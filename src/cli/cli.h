@@ -48,13 +48,24 @@ const char *cbm_cli_get_version(void);
  * must free. Caller frees the returned JSON string. */
 char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char **err_out);
 
+/* What a descriptor is, as far as the stdin argument gate cares. */
+typedef enum {
+    CBM_CLI_STDIN_TERMINAL = 0, /* interactive: nothing piped to read */
+    CBM_CLI_STDIN_FILE = 1,     /* regular file (`< args.json`): always reaches EOF */
+    CBM_CLI_STDIN_STREAM = 2,   /* pipe, socket, device: EOF only when the writer closes */
+} cbm_cli_stdin_kind_t;
+
+/* Classify an open descriptor: terminal (isatty), regular file (fstat), else stream. */
+cbm_cli_stdin_kind_t cbm_cli_stdin_kind(int fd);
+
 /* Decide whether `cli <tool>` may take its JSON arguments from stdin, given
  * that no --args-file, raw-JSON positional and no --flag form was supplied.
- * stdin_is_tty is the caller's isatty(0) result. True only for a non-terminal
- * stdin AND a tool whose input_schema declares at least one property; a
- * zero-argument tool such as list_projects must never read stdin, because an
- * inherited-but-never-closed pipe makes that read block forever (#1359). */
-bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty);
+ * Never from a terminal, never for a tool whose input_schema declares no
+ * properties. A regular file is read for any tool that takes arguments; a
+ * stream only for a tool with a REQUIRED argument. A tool callable without
+ * arguments (list_projects) is complete with `{}`, and an inherited stream
+ * nobody closes would block that read forever (#1359). */
+bool cbm_cli_args_from_stdin_allowed(const char *tool_name, cbm_cli_stdin_kind_t stdin_kind);
 
 /* Print per-tool help (usage + the tool's flags with type/description/required)
  * derived from its input_schema, to stdout. Returns 0 if the tool is known,
@@ -433,6 +444,11 @@ const char *cbm_config_get(cbm_config_t *cfg, const char *key, const char *defau
 
 /* Get a config value as bool. "true"/"1"/"on" → true. */
 bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val);
+
+/* A key the user set to a boolean ("true"/"1"/"on", "false"/"0"/"off"):
+ * true, with *value. Unset or unparseable: false, *value untouched -- the
+ * caller's own default applies (cbm_config_get_bool's reading). */
+bool cbm_config_get_bool_set(cbm_config_t *cfg, const char *key, bool *value);
 
 /* Get a config value as int. Returns default_val if not found or invalid. */
 int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val);

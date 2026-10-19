@@ -1946,16 +1946,16 @@ static bool func_is_static(TSNode func_node) {
     return false;
 }
 
-const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *project,
+const char *cbm_platform_neutral_qn(CBMArena *a, CBMLanguage lang, const char *project,
                                     const char *rel_path, const char *name, const char *qn,
                                     TSNode func_node) {
     if (!c_family_variant_lang(lang) || !rel_path || !name || !name[0] || !qn ||
         ts_node_is_null(func_node) || func_is_static(func_node)) {
-        return qn;
+        return NULL;
     }
     char *plain = cbm_fqn_compute(a, project, rel_path, name);
     if (!plain || strcmp(plain, qn) != 0) {
-        return qn; /* namespaced or otherwise scoped: not a file-scope function */
+        return NULL; /* namespaced or otherwise scoped: not a file-scope function */
     }
     /* Rebuild the path without platform tokens: a directory segment that is
      * one is dropped; a filename stem loses its platform suffix, and a stem
@@ -1963,7 +1963,7 @@ const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *p
     size_t len = strlen(rel_path);
     char *neutral = (char *)cbm_arena_alloc(a, len + SKIP_ONE);
     if (!neutral) {
-        return qn;
+        return NULL;
     }
     size_t out = 0;
     bool changed = false;
@@ -2010,16 +2010,15 @@ const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *p
     }
     neutral[out] = '\0';
     if (!changed) {
-        return qn;
+        return NULL;
     }
     if (dir_level) {
         /* No file stem left: the folder form keeps every directory segment
          * (cbm_fqn_compute would strip a dotted segment as an extension). */
         char *folder = cbm_fqn_folder(a, project ? project : "", neutral);
-        return folder ? cbm_arena_sprintf(a, "%s.%s", folder, name) : qn;
+        return folder ? cbm_arena_sprintf(a, "%s.%s", folder, name) : NULL;
     }
-    char *variant = cbm_fqn_compute(a, project, neutral, name);
-    return variant ? variant : qn;
+    return cbm_fqn_compute(a, project, neutral, name);
 }
 
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir) {
@@ -2139,6 +2138,170 @@ static bool is_env_var_pattern(const char *s, int len) {
         }
     }
     return has_upper && has_underscore;
+}
+
+/* ── Service addresses in environment values ──────────────────────── */
+
+static bool env_addr_key(const char *key) {
+    static const char *const SUFFIXES[] = {"_ADDR", "_ADDRESS",  "_HOST",
+                                           "_URL",  "_ENDPOINT", "_URI"};
+    size_t kl = strlen(key);
+    for (size_t i = 0; i < sizeof(SUFFIXES) / sizeof(SUFFIXES[0]); i++) {
+        size_t sl = strlen(SUFFIXES[i]);
+        if (kl >= sl && strcmp(key + kl - sl, SUFFIXES[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool env_label_char(char c) {
+    return islower((unsigned char)c) || isdigit((unsigned char)c) || c == '-';
+}
+
+/* A bare DNS name: `[a-z0-9][a-z0-9-]*(\.[a-z0-9-]+)*`, not only digits. */
+static bool env_bare_name(const char *v) {
+    bool digits_only = true;
+    if (!env_label_char(v[0]) || v[0] == '-') {
+        return false;
+    }
+    for (const char *p = v; *p; p++) {
+        if (*p == '.' ? (p[SKIP_ONE] == '\0' || p[SKIP_ONE] == '.') : !env_label_char(*p)) {
+            return false;
+        }
+        digits_only = digits_only && (isdigit((unsigned char)*p) || *p == '.');
+    }
+    return !digits_only;
+}
+
+static bool env_copy(char *out, size_t sz, const char *s, size_t n) {
+    if (n == 0 || n >= sz) {
+        return false;
+    }
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return true;
+}
+
+/* The host of a URL value (after any user@, before :port). */
+static bool env_url_host(const char *v, char *host, size_t sz) {
+    const char *q = v;
+    if (!islower((unsigned char)*q)) {
+        return false;
+    }
+    while (islower((unsigned char)*q) || isdigit((unsigned char)*q) || *q == '+' || *q == '.' ||
+           *q == '-') {
+        q++;
+    }
+    if (strncmp(q, "://", strlen("://")) != 0) {
+        return false;
+    }
+    const char *h = q + strlen("://");
+    size_t hl = strcspn(h, "/ \t\r\n\"'");
+    for (size_t i = hl; i > 0; i--) {
+        if (h[i - SKIP_ONE] == '@') {
+            hl -= i;
+            h += i;
+            break;
+        }
+    }
+    size_t colon = strcspn(h, ":");
+    return env_copy(host, sz, h, colon < hl ? colon : hl);
+}
+
+/* `host:port` with a 2-5 digit port. */
+static bool env_hostport(const char *v, char *host, size_t sz) {
+    enum { PORT_MIN = 2, PORT_MAX = 5 };
+    const char *c = strrchr(v, ':');
+    size_t pl = c ? strlen(c + SKIP_ONE) : 0;
+    if (!c || c == v || !isalnum((unsigned char)v[0]) || pl < PORT_MIN || pl > PORT_MAX ||
+        strspn(c + SKIP_ONE, "0123456789") != pl) {
+        return false;
+    }
+    for (const char *p = v; p < c; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-') {
+            return false;
+        }
+    }
+    return env_copy(host, sz, v, (size_t)(c - v));
+}
+
+/* A `<svc>.<ns>.svc` name anywhere in the value. */
+static bool env_svc_dns(const char *v, char *host, size_t sz) {
+    for (const char *m = strstr(v, ".svc"); m; m = strstr(m + SKIP_ONE, ".svc")) {
+        char after = m[strlen(".svc")];
+        if (isalnum((unsigned char)after) || after == '_') {
+            continue;
+        }
+        const char *ns = m;
+        while (ns > v && env_label_char(ns[-SKIP_ONE])) {
+            ns--;
+        }
+        if (ns == m || ns == v || ns[-SKIP_ONE] != '.' || ns[0] == '-') {
+            continue;
+        }
+        const char *name = ns - SKIP_ONE;
+        while (name > v && env_label_char(name[-SKIP_ONE])) {
+            name--;
+        }
+        bool word_start =
+            name == v || !(isalnum((unsigned char)name[-SKIP_ONE]) || name[-SKIP_ONE] == '_');
+        if (name == ns - SKIP_ONE || name[0] == '-' || !word_start) {
+            continue;
+        }
+        return env_copy(host, sz, name, (size_t)(m + strlen(".svc") - name));
+    }
+    return false;
+}
+
+int cbm_env_address(const char *key, const char *value, char *svc, size_t svc_sz, char *ns,
+                    size_t ns_sz) {
+    char host[CBM_SZ_256];
+    if (!key || !value || !svc || !ns || svc_sz == 0 || ns_sz == 0) {
+        return 0;
+    }
+    bool found = env_addr_key(key) && env_bare_name(value) &&
+                 env_copy(host, sizeof(host), value, strlen(value));
+    if (!found && (strstr(value, "{{") || strchr(value, '$'))) {
+        return 0;
+    }
+    found = found || env_url_host(value, host, sizeof(host)) ||
+            env_hostport(value, host, sizeof(host)) || env_svc_dns(value, host, sizeof(host));
+    if (!found) {
+        return 0;
+    }
+    int labels = 0;
+    const char *third = NULL;
+    for (const char *p = host; p;) {
+        const char *dot = strchr(p, '.');
+        size_t len = dot ? (size_t)(dot - p) : strlen(p);
+        if (labels == 0 && !env_copy(svc, svc_sz, p, len)) {
+            return 0;
+        }
+        if (labels == SKIP_ONE && !env_copy(ns, ns_sz, p, len)) {
+            return 0;
+        }
+        if (labels == PAIR_LEN) {
+            third = p;
+        }
+        labels++;
+        p = dot ? dot + SKIP_ONE : NULL;
+    }
+    if (labels == SKIP_ONE) {
+        ns[0] = '\0';
+    }
+    for (const char *p = svc; *p; p++) {
+        if (!env_label_char(*p)) {
+            return 0;
+        }
+    }
+    if (strcmp(svc, "localhost") == 0 || strspn(svc, "0123456789") == strlen(svc)) {
+        return 0;
+    }
+    bool svc_form =
+        labels <= PAIR_LEN || (third && strncmp(third, "svc", strlen("svc")) == 0 &&
+                               (third[strlen("svc")] == '\0' || third[strlen("svc")] == '.'));
+    return svc_form ? labels : 0;
 }
 
 int cbm_classify_string(const char *str, int len) {

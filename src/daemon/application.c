@@ -21,6 +21,7 @@
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
 #include "pipeline/pipeline.h"
+#include "store/graph_mem.h"
 #include "ui/config.h"
 #include "watcher/watcher.h"
 
@@ -1893,7 +1894,13 @@ static size_t application_active_job_count_locked(cbm_daemon_application_t *appl
 /* Decision 2 (#1997 #832): a worker's memory slice is the aggregate budget
  * divided by the jobs active at spawn time. The job being spawned is already
  * in the table, so the divisor never drops below one; a zero aggregate means
- * "no cap" and the worker falls back to its own RAM-fraction budget. */
+ * "no cap" and the worker falls back to its own RAM-fraction budget.
+ *
+ * The daemon's resident adjacency layers (store/graph_mem.h) are part of the
+ * same aggregate, so workers split what is left after them. They are capped at
+ * a quarter of the daemon budget, which the aggregate defaults to; only a
+ * smaller configured aggregate can be exceeded, and then every job still gets
+ * at least one byte, as above — a zero slice would read as "no cap". */
 static size_t application_worker_memory_slice_locked(cbm_daemon_application_t *application,
                                                      size_t *active_jobs_out) {
     size_t active = application_active_job_count_locked(application);
@@ -1903,7 +1910,16 @@ static size_t application_worker_memory_slice_locked(cbm_daemon_application_t *a
     if (active_jobs_out) {
         *active_jobs_out = active;
     }
-    return application->aggregate_memory_budget_bytes / active;
+    size_t aggregate = application->aggregate_memory_budget_bytes;
+    if (aggregate == 0) {
+        return 0;
+    }
+    size_t held = cbm_graph_mem_cached_bytes();
+    size_t available = held < aggregate ? aggregate - held : 0;
+    if (available < active) {
+        available = active;
+    }
+    return available / active;
 }
 
 /* Compare the effective index request, not its JSON spelling. yyjson's deep
@@ -2319,12 +2335,16 @@ static bool application_index_args_add_policy(cbm_daemon_application_t *applicat
     cbm_index_resource_policy_t policy;
     char error[CBM_SZ_256] = {0};
     bool loaded = cbm_config_load_index_policy(config, &policy, error, sizeof(error));
+    /* The worker reads no config: a doc_candidates setting the user set
+     * travels with the request; unset, the worker's index mode decides. */
+    bool doc_candidates_encoded =
+        !loaded || cbm_mcp_index_doc_candidates_add_to_args(document, root, config);
     cbm_config_close(owned_config);
     if (!loaded) {
         cbm_log_error("daemon.index.policy", "error", error);
         return false;
     }
-    return cbm_mcp_index_policy_add_to_args(document, root, &policy);
+    return doc_candidates_encoded && cbm_mcp_index_policy_add_to_args(document, root, &policy);
 }
 
 static char *application_auto_index_args(cbm_daemon_application_t *application,
