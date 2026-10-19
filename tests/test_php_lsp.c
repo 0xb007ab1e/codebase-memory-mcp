@@ -19,6 +19,9 @@
 #include "cbm.h"
 #include "../src/pipeline/lsp_resolve.h"
 #include "lsp/php_lsp.h"
+#include "lsp/lsp_work.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ── Helpers ───────────────────────────────────────────────────── */
@@ -622,6 +625,79 @@ TEST(phplsp_class_aliased_trait_name_collision_terminates) {
     CBMFileResult *r = extract_php(src);
     ASSERT(r);
     cbm_free_result(r);
+    PASS();
+}
+
+/* ── 23e. #765 / #1265: trait flattening work is counted, bounded, linear ──
+ *
+ * The guards above prove only that extraction returns; a regression would hang
+ * the runner instead of failing it. These tests count the LSP work
+ * (CBM_LSP_WORK, which flatten_trait_into_class adds to once per registry
+ * function it visits) under a test-only ceiling (lsp_work.h): if a flatten
+ * bound is reverted, the runaway loop stops at the ceiling and the test is RED
+ * deterministically. No clock is read (O9). */
+enum { PHPLSP_FLATTEN_CEILING = 50000000 };
+
+static uint64_t phplsp_counted_work(const char *src, int *ceiling_hit, CBMFileResult **out) {
+    (void)cbm_lsp_work_take();
+    cbm_lsp_work_ceiling = PHPLSP_FLATTEN_CEILING;
+    CBMFileResult *r = extract_php(src);
+    uint64_t work = cbm_lsp_work_take();
+    cbm_lsp_work_ceiling = 0;
+    *ceiling_hit = work > PHPLSP_FLATTEN_CEILING;
+    if (out) {
+        *out = r;
+    } else if (r) {
+        cbm_free_result(r);
+    }
+    return work;
+}
+
+/* F12: the single-file PHP LSP (cbm_run_php_lsp) never indexed its registry,
+ * so every type and method lookup was a linear scan over the stdlib plus every
+ * definition of the file. Each class here looks up the previous class and its
+ * method once: twice the classes must cost about twice the counted work; the
+ * linear scans drift toward four. */
+static char *phplsp_chain_classes_source(int n) {
+    size_t sz = (size_t)n * 96 + 256;
+    char *src = malloc(sz);
+    if (!src) {
+        return NULL;
+    }
+    size_t pos = (size_t)snprintf(src, sz,
+                                  "<?php\nnamespace App\\Chain;\n\n"
+                                  "class C0 { public function m(): int { return 0; } }\n");
+    for (int i = 1; i < n; i++) {
+        pos += (size_t)snprintf(src + pos, sz - pos,
+                                "class C%d { public function m(): int { return (new C%d())->m(); } }\n",
+                                i, i - 1);
+    }
+    return src;
+}
+
+TEST(phplsp_single_file_lookup_work_is_linear_f12) {
+    enum { N1 = 1000, N2 = 2000 };
+    char *s1 = phplsp_chain_classes_source(N1);
+    char *s2 = phplsp_chain_classes_source(N2);
+    ASSERT_NOT_NULL(s1);
+    ASSERT_NOT_NULL(s2);
+    int hit1 = 0;
+    int hit2 = 0;
+    CBMFileResult *r2 = NULL;
+    uint64_t w1 = phplsp_counted_work(s1, &hit1, NULL);
+    uint64_t w2 = phplsp_counted_work(s2, &hit2, &r2);
+    free(s1);
+    free(s2);
+    printf("    chained classes %d -> %d: work %llu -> %llu (ratio %.2f)\n", N1, N2,
+           (unsigned long long)w1, (unsigned long long)w2, w1 ? (double)w2 / (double)w1 : 0.0);
+    ASSERT_NOT_NULL(r2);
+    ASSERT_FALSE(hit1);
+    ASSERT_FALSE(hit2);
+    ASSERT(w1 > 0);
+    /* The last class's call still resolves to the previous class's method. */
+    ASSERT(find_resolved(r2, "C1999.m", "C1998.m") >= 0);
+    cbm_free_result(r2);
+    ASSERT(w2 * 10 <= w1 * 25); /* ratio <= 2.5 */
     PASS();
 }
 
@@ -5671,6 +5747,7 @@ SUITE(php_lsp) {
     RUN_TEST(phplsp_trait_self_use_terminates);
     RUN_TEST(phplsp_trait_aliased_import_name_collision_terminates);
     RUN_TEST(phplsp_class_aliased_trait_name_collision_terminates);
+    RUN_TEST(phplsp_single_file_lookup_work_is_linear_f12);
     RUN_TEST(phplsp_match_result_type);
     RUN_TEST(phplsp_ternary_result_type);
     RUN_TEST(phplsp_method_chain_depth_three);
