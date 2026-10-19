@@ -1268,11 +1268,6 @@ static const CBMRegisteredFunc *py_lookup_attribute_depth(PyLSPContext *ctx, con
     return NULL;
 }
 
-static const CBMRegisteredFunc *py_lookup_attribute(PyLSPContext *ctx, const char *type_qn,
-                                                    const char *member_name) {
-    return py_lookup_attribute_depth(ctx, type_qn, member_name, 0);
-}
-
 static PyModuleMember py_module_member_exact(PyLSPContext *ctx, const char *module_qn,
                                              const char *name) {
     PyModuleMember m = {0};
@@ -1352,20 +1347,85 @@ static void py_emit_module_member_call(PyLSPContext *ctx, const char *callee_qn,
     }
 }
 
-/* ── super(): the C3 method resolution order ──────────────────────── */
+/* ── The C3 method resolution order ──────────────────────────────── */
 
 /* Longest linearization followed. A longer one (or more bases than this) keeps
- * the base-by-base walk of the caller. */
+ * the depth-first walk above. */
 #define PY_C3_MAX 64
 
-/* The linearizations computed during one super() lookup: every class of a
- * diamond is linearized once, however many paths reach it. */
-typedef struct {
-    const char *qn[PY_C3_MAX];
-    const char **mro[PY_C3_MAX];
-    int len[PY_C3_MAX];
-    int count;
-} py_c3_cache_t;
+enum { PY_MRO_CACHE_INITIAL_CAP = 64 };  /* power of two (index masking) */
+enum { PY_MRO_CACHE_MAX_CAP = 1 << 20 }; /* hard stop for adversarial files */
+
+static uint32_t py_mro_hash(const char *qn) {
+    uint32_t h = 2166136261u; /* FNV-1a */
+    for (const unsigned char *p = (const unsigned char *)qn; *p; p++) {
+        h = (h ^ *p) * 16777619u;
+    }
+    return h;
+}
+
+static const CBMPyMroCacheEntry *py_mro_cache_find(const PyLSPContext *ctx, const char *qn,
+                                                   uint32_t h) {
+    if (!ctx->mro_cache || ctx->mro_cache_cap == 0)
+        return NULL;
+    uint32_t mask = (uint32_t)ctx->mro_cache_cap - 1;
+    uint32_t idx = h & mask;
+    for (int probed = 0; probed < ctx->mro_cache_cap; probed++) {
+        const CBMPyMroCacheEntry *e = &ctx->mro_cache[idx];
+        if (!e->qn)
+            return NULL;
+        if (e->hash == h && strcmp(e->qn, qn) == 0)
+            return e;
+        idx = (idx + 1) & mask;
+    }
+    return NULL;
+}
+
+/* Doubles the table (arena allocation: the old table is freed with the
+ * per-file arena). */
+static bool py_mro_cache_grow(PyLSPContext *ctx) {
+    if (ctx->mro_cache_cap >= PY_MRO_CACHE_MAX_CAP)
+        return false;
+    int new_cap = ctx->mro_cache_cap ? ctx->mro_cache_cap * 2 : PY_MRO_CACHE_INITIAL_CAP;
+    CBMPyMroCacheEntry *entries = (CBMPyMroCacheEntry *)cbm_arena_alloc(
+        ctx->arena, (size_t)new_cap * sizeof(CBMPyMroCacheEntry));
+    if (!entries)
+        return false;
+    memset(entries, 0, (size_t)new_cap * sizeof(CBMPyMroCacheEntry));
+    uint32_t mask = (uint32_t)new_cap - 1;
+    for (int i = 0; i < ctx->mro_cache_cap; i++) {
+        const CBMPyMroCacheEntry *e = &ctx->mro_cache[i];
+        if (!e->qn)
+            continue;
+        uint32_t idx = e->hash & mask;
+        while (entries[idx].qn)
+            idx = (idx + 1) & mask;
+        entries[idx] = *e;
+    }
+    ctx->mro_cache = entries;
+    ctx->mro_cache_cap = new_cap;
+    return true;
+}
+
+/* Records the order of `qn` (len -1: none). A table that cannot grow only
+ * costs a recomputation later. */
+static void py_mro_cache_put(PyLSPContext *ctx, const char *qn, uint32_t h, const char **mro,
+                             int len) {
+    if ((ctx->mro_cache_count + 1) * 4 > ctx->mro_cache_cap * 3 && !py_mro_cache_grow(ctx))
+        return;
+    const char *key = cbm_arena_strdup(ctx->arena, qn);
+    if (!key)
+        return;
+    uint32_t mask = (uint32_t)ctx->mro_cache_cap - 1;
+    uint32_t idx = h & mask;
+    while (ctx->mro_cache[idx].qn)
+        idx = (idx + 1) & mask;
+    ctx->mro_cache[idx].qn = key;
+    ctx->mro_cache[idx].hash = h;
+    ctx->mro_cache[idx].len = len;
+    ctx->mro_cache[idx].mro = mro;
+    ctx->mro_cache_count++;
+}
 
 static bool py_c3_in_tail(const char *qn, const char *const *seq, int head, int len) {
     for (int k = head + 1; k < len; k++) {
@@ -1393,72 +1453,104 @@ static const char *py_c3_pick(const char **const *seqs, const int *lens, const i
     return NULL;
 }
 
-/* Python's method resolution order of `type_qn`: the class, then the C3 merge
- * of its bases' linearizations and of the base list. A common base therefore
- * follows every class deriving from it. Sets *out to an arena array and returns
- * its length, or -1 when there is no C3 order, the hierarchy is deeper than
- * CBM_LSP_MAX_LOOKUP_DEPTH, or the order is longer than PY_C3_MAX. A base the
- * registry does not know (external, unresolved) linearizes to itself. */
-static int py_c3_linearize(PyLSPContext *ctx, py_c3_cache_t *cache, const char *type_qn,
-                           const char ***out, int depth) {
-    for (int c = 0; c < cache->count; c++) {
-        if (strcmp(cache->qn[c], type_qn) == 0) {
-            *out = cache->mro[c];
-            return cache->len[c];
-        }
-    }
-    if (depth > CBM_LSP_MAX_LOOKUP_DEPTH)
-        return -1;
-    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, type_qn);
-    if (rt && rt->alias_of)
-        return py_c3_linearize(ctx, cache, rt->alias_of, out, depth + 1);
-    const char **bases = rt ? rt->embedded_types : NULL;
-    int nb = 0;
-    while (bases && bases[nb])
-        nb++;
-    if (nb >= PY_C3_MAX)
-        return -1;
-    const char **seqs[PY_C3_MAX];
-    int lens[PY_C3_MAX];
-    int heads[PY_C3_MAX];
-    for (int b = 0; b < nb; b++) {
-        lens[b] = py_c3_linearize(ctx, cache, bases[b], &seqs[b], depth + 1);
-        if (lens[b] < 0)
-            return -1;
-        heads[b] = 0;
-    }
-    seqs[nb] = bases;
-    lens[nb] = nb;
-    heads[nb] = 0;
-    const char **mro = (const char **)cbm_arena_alloc(ctx->arena, PY_C3_MAX * sizeof(char *));
-    if (!mro)
-        return -1;
-    int n = 0;
-    mro[n++] = type_qn;
+/* The C3 merge of `nseq` sequences into mro[1..]: returns the order's length,
+ * or -1 when there is none or it is longer than PY_C3_MAX. */
+static int py_c3_merge(const char **const *seqs, const int *lens, int *heads, int nseq,
+                       const char **mro) {
+    int n = 1;
     for (;;) {
         bool pending = false;
-        for (int s = 0; s <= nb && !pending; s++) {
+        for (int s = 0; s < nseq && !pending; s++) {
             pending = heads[s] < lens[s];
         }
         if (!pending)
-            break;
-        const char *pick = py_c3_pick((const char **const *)seqs, lens, heads, nb + 1);
+            return n;
+        const char *pick = py_c3_pick(seqs, lens, heads, nseq);
         if (!pick || n >= PY_C3_MAX)
             return -1;
         mro[n++] = pick;
-        for (int s = 0; s <= nb; s++) {
+        for (int s = 0; s < nseq; s++) {
             if (heads[s] < lens[s] && strcmp(seqs[s][heads[s]], pick) == 0)
                 heads[s]++;
         }
     }
-    if (cache->count < PY_C3_MAX) {
-        cache->qn[cache->count] = type_qn;
-        cache->mro[cache->count] = mro;
-        cache->len[cache->count] = n;
-        cache->count++;
+}
+
+/* Python's method resolution order of `type_qn`: the class, then the C3 merge
+ * of its bases' linearizations and of the base list. A common base therefore
+ * follows every class deriving from it. Computed once per class and file
+ * (ctx->mro_cache). Sets *out to an arena array and returns its length, or -1
+ * when there is no C3 order, the hierarchy is deeper than
+ * CBM_LSP_MAX_LOOKUP_DEPTH, or the order is longer than PY_C3_MAX. A base the
+ * registry does not know (external, unresolved) linearizes to itself. Only an
+ * order computed from the top (depth 0) is cached as missing: below it, the
+ * depth cap may have cut a hierarchy that is fine on its own. */
+static int py_c3_linearize(PyLSPContext *ctx, const char *type_qn, const char ***out, int depth) {
+    uint32_t h = py_mro_hash(type_qn);
+    const CBMPyMroCacheEntry *hit = py_mro_cache_find(ctx, type_qn, h);
+    if (hit) {
+        *out = hit->mro;
+        return hit->len;
     }
-    *out = mro;
+    int n = -1;
+    const char **mro = NULL;
+    const CBMRegisteredType *rt =
+        depth <= CBM_LSP_MAX_LOOKUP_DEPTH ? cbm_registry_lookup_type(ctx->registry, type_qn) : NULL;
+    const char **bases = rt ? rt->embedded_types : NULL;
+    int nb = 0;
+    while (bases && bases[nb])
+        nb++;
+    if (depth > CBM_LSP_MAX_LOOKUP_DEPTH || nb >= PY_C3_MAX) {
+        n = -1;
+    } else if (rt && rt->alias_of) {
+        n = py_c3_linearize(ctx, rt->alias_of, &mro, depth + 1);
+    } else {
+        const char ***seqs =
+            (const char ***)cbm_arena_alloc(ctx->arena, (size_t)(nb + 1) * sizeof(const char **));
+        int *lens = (int *)cbm_arena_alloc(ctx->arena, (size_t)(nb + 1) * 2 * sizeof(int));
+        mro = (const char **)cbm_arena_alloc(ctx->arena, PY_C3_MAX * sizeof(const char *));
+        bool ok = seqs && lens && mro;
+        int *heads = lens ? lens + nb + 1 : NULL;
+        for (int b = 0; ok && b < nb; b++) {
+            lens[b] = py_c3_linearize(ctx, bases[b], &seqs[b], depth + 1);
+            heads[b] = 0;
+            ok = lens[b] >= 0;
+        }
+        if (ok) {
+            seqs[nb] = bases;
+            lens[nb] = nb;
+            heads[nb] = 0;
+            mro[0] = cbm_arena_strdup(ctx->arena, type_qn);
+            n = mro[0] ? py_c3_merge((const char **const *)seqs, lens, heads, nb + 1, mro) : -1;
+        }
+    }
+    if (n >= 0 || depth == 0)
+        py_mro_cache_put(ctx, type_qn, h, n >= 0 ? mro : NULL, n);
+    *out = n >= 0 ? mro : NULL;
     return n;
+}
+
+/* Attribute lookup along the class's C3 order: the class itself, then each
+ * class of its order that declares the member. A hierarchy without a C3 order
+ * keeps the depth-first walk. */
+static const CBMRegisteredFunc *py_lookup_attribute(PyLSPContext *ctx, const char *type_qn,
+                                                    const char *member_name) {
+    if (!ctx || !type_qn || !member_name)
+        return NULL;
+    const CBMRegisteredFunc *f = cbm_registry_lookup_method(ctx->registry, type_qn, member_name);
+    if (f)
+        return f;
+    const char **mro = NULL;
+    int n = py_c3_linearize(ctx, type_qn, &mro, 0);
+    if (n < 0)
+        return py_lookup_attribute_depth(ctx, type_qn, member_name, 0);
+    /* mro[0] is the class itself, already asked, or an alias's target. */
+    for (int i = strcmp(mro[0], type_qn) == 0 ? 1 : 0; i < n; i++) {
+        f = cbm_registry_lookup_method(ctx->registry, mro[i], member_name);
+        if (f)
+            return f;
+    }
+    return NULL;
 }
 
 /* The method super() reaches from inside `class_qn`: the first class AFTER it in
@@ -1469,10 +1561,8 @@ static const CBMRegisteredFunc *py_lookup_super_attribute(PyLSPContext *ctx, con
     *have_mro = false;
     if (!ctx || !class_qn || !member)
         return NULL;
-    py_c3_cache_t cache;
-    cache.count = 0;
     const char **mro = NULL;
-    int n = py_c3_linearize(ctx, &cache, class_qn, &mro, 0);
+    int n = py_c3_linearize(ctx, class_qn, &mro, 0);
     if (n < 0)
         return NULL;
     *have_mro = true;
