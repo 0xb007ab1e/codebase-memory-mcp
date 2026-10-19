@@ -4372,6 +4372,17 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
         }
     }
 
+    /* Index the registry (F12). Unindexed, every lookup below was a linear
+     * scan over the stdlib plus every definition of the file: O(lookups x
+     * definitions), quadratic in the size of one file. First-registered
+     * answers keep the result of that scan (the first registration of a
+     * duplicate QN wins), so the output does not change. Index memory goes to
+     * a scratch arena that dies with this call, as in cbm_run_php_lsp_cross. */
+    reg.index_first_registered = true;
+    CBMArena idx_arena;
+    cbm_arena_init(&idx_arena);
+    cbm_registry_finalize_into(&reg, &idx_arena);
+
     /* Phase C: run the resolver. */
     PHPLSPContext ctx;
     php_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
@@ -4401,6 +4412,11 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
         ctx.use_count = 0;
     }
 
+    /* Trait flattening registered methods after the index was built; lookups
+     * would tail-scan them. Re-index once, first-registered as above, so the
+     * answers equal those of the indexed part followed by the tail scan. */
+    cbm_registry_finalize_into(&reg, &idx_arena);
+
     php_lsp_process_file(&ctx, root);
 
     if (ctx.debug) {
@@ -4414,6 +4430,7 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
                     rc->confidence);
         }
     }
+    cbm_arena_destroy(&idx_arena);
 }
 
 /* ── Cross-file + batch ───────────────────────────────────────── */
