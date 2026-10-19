@@ -2195,6 +2195,9 @@ TEST(server_handle_analysis_profile_filters_and_rejects_mutators) {
     ASSERT_NOT_NULL(strstr(resp, "analysis tool profile"));
     ASSERT_NOT_NULL(strstr(resp, "check_index_coverage"));
     ASSERT_NULL(strstr(resp, "index_repository"));
+    /* Profile instructions name the structural questions, like the default. */
+    ASSERT_NOT_NULL(strstr(resp, "who calls a function"));
+    ASSERT_NOT_NULL(strstr(resp, "which code a change affects"));
     free(resp);
 
     resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":220,\"method\":\"tools/list\"}");
@@ -2237,6 +2240,7 @@ TEST(server_handle_scout_profile_exposes_only_the_fast_tier) {
     ASSERT_NOT_NULL(strstr(resp, "scout tool profile"));
     ASSERT_NOT_NULL(strstr(resp, "check_index_coverage"));
     ASSERT_NULL(strstr(resp, "index_repository"));
+    ASSERT_NOT_NULL(strstr(resp, "who calls a function"));
     ASSERT_FALSE(mcp_saw_autoindex_log);
     free(resp);
 
