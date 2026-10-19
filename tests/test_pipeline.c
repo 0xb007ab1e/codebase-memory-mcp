@@ -22988,26 +22988,32 @@ TEST(pipeline_python_namespace_codec_owns_ordered_facts) {
 }
 
 TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
-    /* Numeric values below are the frozen version-1 namespace wire values.
-     * Even an empty LSP array must validate its namespace envelope. */
+    /* Numeric values below are the frozen namespace wire values (version 2
+     * changed which statements extraction proves harmless, not the wire
+     * shape). Even an empty LSP array must validate its namespace envelope,
+     * and a payload of an older facts version is no authority: its facts
+     * were extracted under other rules, so the incremental run that reads
+     * it re-extracts in full. */
     const char *bad[] = {
         "{\"v\":1,\"lsp\":[]}",
         "{\"v\":2,\"lang\":1,\"lsp\":[]}",
         "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":null}",
         "{\"v\":2,\"lang\":1.0,\"lsp\":[],\"py\":null}",
         "{\"v\":2,\"v\":2,\"lang\":0,\"lsp\":[],\"py\":null}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":3,\"failure\":2,\"events\":[]}}",
+        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
         "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\\u0000suffix\",\"status\":2,"
         "\"failure\":0,\"events\":[]}}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":999,\"d\":0,\"s\":0,\"r\":0,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":8,\"d\":0,\"s\":1,\"r\":0,\"f\":0,\"l\":4294967296,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
@@ -23027,7 +23033,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
         cbm_arena_destroy(&arena);
     }
     const char *unknown =
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":2,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}";
@@ -23040,6 +23046,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
                     facts.facts.items[0].kind == CBM_PY_NS_UNKNOWN &&
                     facts.facts.items[0].reason == CBM_PY_NS_REASON_PARSE;
     cbm_arena_destroy(&arena);
+    ASSERT_EQ(CBM_PY_NAMESPACE_FACTS_VERSION, 2u); /* the rows above spell it */
     ASSERT_TRUE(rejected);
     ASSERT_EQ(unknown_rc, 1);
     ASSERT_EQ(equal_rc, 0);
