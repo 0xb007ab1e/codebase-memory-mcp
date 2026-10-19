@@ -8819,6 +8819,208 @@ static void write_go_c_ref_guard_fixture(const char *tmp, int pad_files) {
     }
 }
 
+/* F-G8 D1: a variable bound by a CROSS-file multi-value or named-result call
+ * is typed. The cross-file registrar received the raw result text
+ * `(*Encoder, error)`, which did not parse, so `e, err := enc.NewEncoder()`
+ * left e untyped and e.EncodeTuple() fell to a name guess. A single result
+ * keeps its raw text: `[]Sample` must stay a slice so that `xs[0].TS()` is
+ * typed (the extractor's cleaned return_types read it as `Sample`). Every
+ * target method has two same-named decoys, so a guess cannot pass.
+ * pad_files > 0 forces the parallel resolver. */
+static void write_go_multi_return_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "go.mod", "module example.com/fx\n\ngo 1.22\n");
+    write_temp_file(tmp, "enc/enc.go",
+                    "package enc\n"
+                    "\n"
+                    "type Encoder struct{ n int }\n"
+                    "\n"
+                    "func NewEncoder() (*Encoder, error) { return &Encoder{}, nil }\n"
+                    "\n"
+                    "func NewNamed() (e *Encoder) { e = &Encoder{}; return }\n"
+                    "\n"
+                    "func NewPair() (a, b *Encoder) { return &Encoder{}, &Encoder{} }\n"
+                    "\n"
+                    "func (e *Encoder) EncodeTuple() int { return e.n }\n"
+                    "\n"
+                    "func (e *Encoder) EncodeNamed() int { return e.n }\n"
+                    "\n"
+                    "func (e *Encoder) EncodeGrouped() int { return e.n }\n");
+    write_temp_file(tmp, "samples/samples.go",
+                    "package samples\n"
+                    "\n"
+                    "type Sample interface{ TS() int64 }\n"
+                    "\n"
+                    "type sample struct{}\n"
+                    "\n"
+                    "func (sample) TS() int64 { return 0 }\n"
+                    "\n"
+                    "func Generate() []Sample { return []Sample{sample{}} }\n"
+                    "\n"
+                    "func List() ([]Sample, error) { return []Sample{sample{}}, nil }\n");
+    write_temp_file(tmp, "diag/diag.go",
+                    "package diag\n"
+                    "\n"
+                    "type Diagnostic struct{ msg string }\n"
+                    "\n"
+                    "type Diagnostics []Diagnostic\n"
+                    "\n"
+                    "func (d Diagnostics) HasErrorsSlice() bool { return len(d) > 0 }\n"
+                    "\n"
+                    "func Run() (int, Diagnostics) { return 0, nil }\n");
+    write_temp_file(tmp, "app/types.go",
+                    "package app\n"
+                    "\n"
+                    "type isolation struct{}\n"
+                    "\n"
+                    "func (i *isolation) LowWatermarkField() int { return 0 }\n"
+                    "\n"
+                    "type Head struct{ iso *isolation }\n"
+                    "\n"
+                    "func newHead() (*Head, error) { return &Head{iso: &isolation{}}, nil }\n");
+    write_temp_file(tmp, "app/app.go",
+                    "package app\n"
+                    "\n"
+                    "import (\n"
+                    "\t\"example.com/fx/diag\"\n"
+                    "\t\"example.com/fx/enc\"\n"
+                    "\t\"example.com/fx/samples\"\n"
+                    ")\n"
+                    "\n"
+                    "func UseIndex() int64 {\n"
+                    "\txs := samples.Generate()\n"
+                    "\treturn xs[0].TS()\n"
+                    "}\n"
+                    "\n"
+                    "func UseTupleSlice() int64 {\n"
+                    "\tys, _ := samples.List()\n"
+                    "\treturn ys[0].TS()\n"
+                    "}\n"
+                    "\n"
+                    "func UseGrouped() int {\n"
+                    "\tx, _ := enc.NewPair()\n"
+                    "\treturn x.EncodeGrouped()\n"
+                    "}\n"
+                    "\n"
+                    "func UseTuple() int {\n"
+                    "\te, err := enc.NewEncoder()\n"
+                    "\t_ = err\n"
+                    "\treturn e.EncodeTuple()\n"
+                    "}\n"
+                    "\n"
+                    "func UseNamed() int {\n"
+                    "\te := enc.NewNamed()\n"
+                    "\treturn e.EncodeNamed()\n"
+                    "}\n"
+                    "\n"
+                    "func UseField() int {\n"
+                    "\th, _ := newHead()\n"
+                    "\treturn h.iso.LowWatermarkField()\n"
+                    "}\n"
+                    "\n"
+                    "func UseSlice() bool {\n"
+                    "\t_, d := diag.Run()\n"
+                    "\treturn d.HasErrorsSlice()\n"
+                    "}\n");
+    write_temp_file(tmp, "decoy/decoy.go",
+                    "package decoy\n"
+                    "\n"
+                    "type D1 struct{}\n"
+                    "\n"
+                    "type D2 struct{}\n"
+                    "\n"
+                    "func (D1) EncodeTuple() int { return 0 }\n"
+                    "func (D2) EncodeTuple() int { return 0 }\n"
+                    "func (D1) EncodeNamed() int { return 0 }\n"
+                    "func (D2) EncodeNamed() int { return 0 }\n"
+                    "func (D1) LowWatermarkField() int { return 0 }\n"
+                    "func (D2) LowWatermarkField() int { return 0 }\n"
+                    "func (D1) HasErrorsSlice() bool { return false }\n"
+                    "func (D2) HasErrorsSlice() bool { return false }\n"
+                    "func (D1) EncodeGrouped() int { return 0 }\n"
+                    "func (D2) EncodeGrouped() int { return 0 }\n"
+                    "func (D1) TS() int64 { return 0 }\n"
+                    "func (D2) TS() int64 { return 0 }\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler/filler%d.go", i);
+        snprintf(body, sizeof(body), "package filler\n\nfunc Filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+static int go_multi_return_case(int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_multiret_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_multi_return_fixture(tmp, pad_files);
+    char *saved = NULL;
+    if (pad_files > 0) {
+        char *old_workers = getenv("CBM_WORKERS");
+        saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_multiret.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    if (pad_files > 0) {
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+    }
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(rc, 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    static const struct {
+        const char *caller;
+        const char *method;
+        const char *file;
+    } want[] = {
+        {"UseTuple", "EncodeTuple", "enc/enc.go"},         /* e, err := enc.NewEncoder() */
+        {"UseNamed", "EncodeNamed", "enc/enc.go"},         /* named result (e *Encoder) */
+        {"UseField", "LowWatermarkField", "app/types.go"}, /* h, _ := newHead(); h.iso.X() */
+        {"UseSlice", "HasErrorsSlice", "diag/diag.go"},    /* _, d := diag.Run() */
+        {"UseGrouped", "EncodeGrouped", "enc/enc.go"},     /* (a, b *Encoder) */
+        {"UseIndex", "TS", "samples/samples.go"},          /* single []Sample, xs[0] */
+        {"UseTupleSlice", "TS", "samples/samples.go"},     /* ([]Sample, error) */
+    };
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        int right = named_edge_to_file_count(s, project, "CALLS", want[i].caller, want[i].method,
+                                             want[i].file);
+        int decoy = named_edge_to_file_count(s, project, "CALLS", want[i].caller, want[i].method,
+                                             "decoy/decoy.go");
+        bool typed = cross_file_call_has_strategy(s, project, want[i].caller, want[i].method,
+                                                  "\"strategy\":\"lsp_");
+        if (right < 1 || decoy != 0 || !typed) {
+            printf("  %s -> %s: right=%d decoy=%d lsp=%d\n", want[i].caller, want[i].method, right,
+                   decoy, typed);
+            FAIL("multi-value / named-result receiver not typed");
+        }
+    }
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_multi_return_receiver_is_typed) {
+    return go_multi_return_case(0);
+}
+
+TEST(pipeline_go_multi_return_receiver_is_typed_parallel) {
+    return go_multi_return_case(52);
+}
+
 TEST(pipeline_go_rw_usage_never_cross_into_c) {
     /* #1928: USAGE and WRITES/READS resolve through the same short-name
      * registry as CALLS but never consulted the #725 cross-language guard.
@@ -16480,6 +16682,93 @@ TEST(pipeline_python_decorated_nested_class_extracted_parallel) {
     return pyn_run_decorated_nested(52);
 }
 
+/* A class nested in a class is walked by the Python LSP under its outer
+ * class (m.Outer.Inner): a typed-parameter call, a self call and a
+ * constructor call in its methods resolve, and so does a decorated nested
+ * class. Walked under the module (m.Inner) none of the LSP rows joined the
+ * method nodes, so the calls fell to name guesses or got no edge. */
+static const char pyn_nested_class_py[] = "class Helper:\n"
+                                          "    def go(self):\n"
+                                          "        return 1\n"
+                                          "\n"
+                                          "def deco(cls):\n"
+                                          "    return cls\n"
+                                          "\n"
+                                          "class Outer:\n"
+                                          "    class Inner:\n"
+                                          "        def run(self, h: Helper):\n"
+                                          "            return h.go()\n"
+                                          "\n"
+                                          "        def again(self):\n"
+                                          "            return self.run(Helper())\n"
+                                          "\n"
+                                          "    @deco\n"
+                                          "    class Decorated:\n"
+                                          "        def run(self, h: Helper):\n"
+                                          "            return h.go()\n";
+
+static int pyn_run_nested_class(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_nestcls_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "sn.py", pyn_nested_class_py);
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/nestcls.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+    bool typed = s && pyn_edge_with(s, project, "sn.Outer.Inner.run", "sn.Helper.go", "CALLS",
+                                    "\"strategy\":\"lsp_");
+    bool self_call = s && pyn_edge_with(s, project, "sn.Outer.Inner.again", "sn.Outer.Inner.run",
+                                        "CALLS", "\"strategy\":\"lsp_");
+    bool ctor = s && pyn_edge_with(s, project, "sn.Outer.Inner.again", "sn.Helper", "CALLS",
+                                   "\"strategy\":\"lsp_");
+    bool decorated = s && pyn_edge_with(s, project, "sn.Outer.Decorated.run", "sn.Helper.go",
+                                        "CALLS", "\"strategy\":\"lsp_");
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(typed);
+    ASSERT_TRUE(self_call);
+    ASSERT_TRUE(ctor);
+    ASSERT_TRUE(decorated);
+    PASS();
+}
+
+TEST(pipeline_python_nested_class_methods_resolve) {
+    return pyn_run_nested_class(0);
+}
+
+TEST(pipeline_python_nested_class_methods_resolve_parallel) {
+    return pyn_run_nested_class(52);
+}
+
 TEST(pipeline_python_project) {
     /* Port of TestPipelinePythonProject */
     const char *files[] = {"main.py", "utils.py"};
@@ -23065,7 +23354,7 @@ TEST(pipeline_python_namespace_change_admission) {
     }
     int body = -9, signature = -9, alias = -9, order = -9;
     int empty = -9, literal = -9, unknown = -9, deletion = -9, transition = -9;
-    const char *non_python = "{\"v\":2,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
+    const char *non_python = "{\"v\":3,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
     if (complete) {
         body = cbm_lsp_surface_python_change(json[0], json[1]);
         signature = cbm_lsp_surface_python_change(json[0], json[2]);
@@ -23196,24 +23485,24 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
      * it re-extracts in full. */
     const char *bad[] = {
         "{\"v\":1,\"lsp\":[]}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[]}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":null}",
-        "{\"v\":2,\"lang\":1.0,\"lsp\":[],\"py\":null}",
-        "{\"v\":2,\"v\":2,\"lang\":0,\"lsp\":[],\"py\":null}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[]}",
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":null}",
+        "{\"v\":3,\"lang\":1.0,\"lsp\":[],\"py\":null}",
+        "{\"v\":3,\"v\":3,\"lang\":0,\"lsp\":[],\"py\":null}",
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":3,\"failure\":2,\"events\":[]}}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\\u0000suffix\",\"status\":2,"
         "\"failure\":0,\"events\":[]}}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":999,\"d\":0,\"s\":0,\"r\":0,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":8,\"d\":0,\"s\":1,\"r\":0,\"f\":0,\"l\":4294967296,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
@@ -23233,7 +23522,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
         cbm_arena_destroy(&arena);
     }
     const char *unknown =
-        "{\"v\":2,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}";
@@ -23261,7 +23550,7 @@ TEST(pipeline_lsp_surface_large_object_array_decode) {
     const size_t capacity = (size_t)count * 192 + 64;
     char *json = malloc(capacity);
     ASSERT_NOT_NULL(json);
-    size_t used = (size_t)snprintf(json, capacity, "{\"v\":2,\"lang\":0,\"py\":null,\"lsp\":[");
+    size_t used = (size_t)snprintf(json, capacity, "{\"v\":3,\"lang\":0,\"py\":null,\"lsp\":[");
     for (int i = 0; i < count; i++) {
         int n = snprintf(json + used, capacity - used,
                          "%s{\"qn\":\"pkg.f%d\",\"sn\":\"f%d\",\"lb\":\"Function\","
@@ -23351,9 +23640,10 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
         ASSERT_TRUE(row_a->surface_sha && row_a->surface_sha[0]);
         if (round == 0) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
-            /* The row is the versioned codec envelope with the def present. */
+            /* The row is the versioned codec envelope (codec version 3) with
+             * the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":2") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":3") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -25914,6 +26204,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_keeps_specific_unique_name_member_call);
     RUN_TEST(pipeline_html_embedded_member_call_stays_unbound);
+    RUN_TEST(pipeline_go_multi_return_receiver_is_typed);
+    RUN_TEST(pipeline_go_multi_return_receiver_is_typed_parallel);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
     RUN_TEST(pipeline_rust_call_never_binds_another_language);
@@ -26017,6 +26309,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_nested_helper_keeps_tests_parallel_issue1548);
     RUN_TEST(pipeline_python_decorated_nested_class_extracted);
     RUN_TEST(pipeline_python_decorated_nested_class_extracted_parallel);
+    RUN_TEST(pipeline_python_nested_class_methods_resolve);
+    RUN_TEST(pipeline_python_nested_class_methods_resolve_parallel);
     RUN_TEST(pipeline_header_include_target_is_independent_of_registration_order);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
