@@ -49,6 +49,10 @@ typedef struct {
      * cbm_registry_*_for_update, never into anything behind ->fallback. */
     CBMTypeRegistry *registry_head;
     CBMScope *current_scope;
+    // Names a module-level `if TYPE_CHECKING:` imports (#1277): consulted by
+    // annotation resolution only, after the ordinary scope chain misses, so a
+    // runtime call through such a name never resolves. NULL when none.
+    CBMScope *annotation_scope;
 
     // Import map: local_name -> module_qn (arena-allocated, NULL-terminated).
     // Built from CBMFileResult.imports.
