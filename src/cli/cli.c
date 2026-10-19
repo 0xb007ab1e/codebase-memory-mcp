@@ -14,6 +14,7 @@
 #include "cli/config_toml_edit.h"
 #include "ui/config.h"
 #include "cli/config_yaml_edit.h"
+#include "cli/runtime_settings.h"
 #include "daemon/bootstrap.h"
 #include "daemon/ipc.h"
 #include "daemon/runtime.h"
@@ -1568,7 +1569,9 @@ static const char skill_content[] =
     "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CALL_REFERENCE, CONFIGURES, REFERENCES_FILE,\n"
     "MENTIONS (doc comment -> referenced code), FILE_CHANGES_WITH, SIMILAR_TO,\n"
     "SEMANTICALLY_RELATED, CONTAINS_FILE, CONTAINS_FOLDER,\n"
-    "INFRA_MAPS (K8s Service -> selected workloads), DEPENDS_ON (chart / manifest -> dependency)\n"
+    "INFRA_MAPS (K8s Service -> selected workloads), DEPENDS_ON (chart / manifest -> dependency),\n"
+    "DEPLOYS (what puts manifests / charts on a cluster -> what it puts there),\n"
+    "CONNECTS_TO (workload / compose service -> the Service its environment addresses)\n"
     "\n"
     "## Cypher Examples (for query_graph)\n"
     "```\n"
@@ -7407,6 +7410,9 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
         }
         return NULL;
     }
+    /* Another process mid-commit is waited out; failing here failed every
+     * settings write behind it, the daemon's UI save included. */
+    cbm_runtime_settings_wait_for_writers(db);
 
     /* Create table if not exists */
     const char *sql = "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)";
@@ -7461,18 +7467,29 @@ const char *cbm_config_get(cbm_config_t *cfg, const char *key, const char *defau
     return result;
 }
 
-bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val) {
+bool cbm_config_get_bool_set(cbm_config_t *cfg, const char *key, bool *value) {
     const char *val = cbm_config_get(cfg, key, NULL);
     if (!val) {
-        return default_val;
-    }
-    if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcmp(val, "on") == 0) {
-        return true;
-    }
-    if (strcmp(val, "false") == 0 || strcmp(val, "0") == 0 || strcmp(val, "off") == 0) {
         return false;
     }
-    return default_val;
+    bool parsed;
+    if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcmp(val, "on") == 0) {
+        parsed = true;
+    } else if (strcmp(val, "false") == 0 || strcmp(val, "0") == 0 || strcmp(val, "off") == 0) {
+        parsed = false;
+    } else {
+        return false;
+    }
+    if (value) {
+        *value = parsed;
+    }
+    return true;
+}
+
+bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val) {
+    bool value = default_val;
+    (void)cbm_config_get_bool_set(cfg, key, &value);
+    return value;
 }
 
 int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val) {
@@ -7574,6 +7591,9 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_AUTO_INDEX, "false", "Enable auto-indexing on MCP session start"},
     {CBM_CONFIG_AUTO_INDEX_LIMIT, "50000", "Max files for auto-indexing new projects"},
     {CBM_CONFIG_AUTO_WATCH, "true", "Register background git watcher on session connect"},
+    /* Unset: the index mode decides (cbm_pipeline_doc_candidates_enabled). */
+    {CBM_CONFIG_DOC_CANDIDATES, "auto",
+     "Doc-code candidates: auto = on for full, off for moderate/fast; true/false forces"},
     {CBM_CONFIG_WATCHER_ENABLED, "true",
      "Run the background watcher thread (auto-reindex); false to disable"},
     {CBM_CONFIG_WATCH_NON_GIT, "false",
@@ -14074,13 +14094,29 @@ static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *
     yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), vv);
 }
 
-static bool cli_stdin_allowed_for_schema(const char *schema_str);
+static bool cli_stdin_allowed_for_schema(const char *schema_str, cbm_cli_stdin_kind_t stdin_kind);
 
-bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty) {
+cbm_cli_stdin_kind_t cbm_cli_stdin_kind(int fd) {
+#ifdef _WIN32
+    bool terminal = _isatty(fd) != 0;
+#else
+    bool terminal = isatty(fd) != 0;
+#endif
+    if (terminal) {
+        return CBM_CLI_STDIN_TERMINAL;
+    }
+    struct stat state;
+    if (fstat(fd, &state) == 0 && S_ISREG(state.st_mode)) {
+        return CBM_CLI_STDIN_FILE;
+    }
+    return CBM_CLI_STDIN_STREAM;
+}
+
+bool cbm_cli_args_from_stdin_allowed(const char *tool_name, cbm_cli_stdin_kind_t stdin_kind) {
     /* An interactive run has nothing piped to read: consulting the terminal
      * would just sit waiting for the user to type JSON. Unchanged by #1359 —
      * this is why the hang was only ever reachable from automation. */
-    if (stdin_is_tty) {
+    if (stdin_kind == CBM_CLI_STDIN_TERMINAL) {
         return false;
     }
 
@@ -14091,12 +14127,9 @@ bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty) {
      * parent must call child.stdin.end() explicitly, which almost nobody does
      * for a command they are not writing to. fd 0 then stays open with no
      * writer and the read never returns; the reporter's shell script was still
-     * parked in fread(0) fourteen minutes later. For a tool whose input_schema
-     * declares no properties (list_projects) stdin cannot carry anything the
-     * tool would accept, so that read is pure deadlock with nothing to gain:
-     * never start it, and let the caller fall through to `{}` exactly as an
-     * interactive run already did. Tools that DO declare properties keep the
-     * documented `echo '<json>' | cli <tool>` channel untouched. */
+     * parked in fread(0) fourteen minutes later. A call that is complete
+     * without arguments must therefore never wait on such a stream: see
+     * cli_stdin_allowed_for_schema for which schemas that covers. */
     const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
     if (!schema_str) {
         /* Unknown tool: dispatch rejects it by name and no stdin content can
@@ -14104,35 +14137,50 @@ bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty) {
         return false;
     }
 
-    return cli_stdin_allowed_for_schema(schema_str);
+    return cli_stdin_allowed_for_schema(schema_str, stdin_kind);
 }
 
-/* Schema→decision core of the stdin gate, split out so the zero-argument
- * branch stays TESTED even when no shipped tool is zero-argument anymore:
- * #1181 gave list_projects pagination parameters, retiring the last
- * empty-properties schema, and the #1359 regression tests had leaned on it
- * as their live example. The product contract is unchanged — a schema that
- * declares no properties means stdin has nothing to carry and the read is
- * pure deadlock; the tests now exercise this path directly. */
-static bool cli_stdin_allowed_for_schema(const char *schema_str) {
+/* Schema→decision core of the stdin gate, split out so every schema shape
+ * stays TESTED whatever the shipped tool table holds.
+ *   no properties   -> never: stdin cannot carry anything the tool accepts.
+ *   optional only   -> a regular file only. The bare call is already complete
+ *                      with `{}`, so blocking on a stream for optional extras
+ *                      is the #1359 deadlock again — #1181 gave list_projects
+ *                      paging properties and re-opened exactly that hang for
+ *                      every caller that leaves an inherited pipe open (ssh,
+ *                      Node spawn). A `< args.json` file always reaches EOF.
+ *   any required    -> file or stream: the bare call cannot succeed anyway, so
+ *                      the documented `echo '<json>' | cli <tool>` channel is
+ *                      the only way this invocation can carry its arguments. */
+static bool cli_stdin_allowed_for_schema(const char *schema_str, cbm_cli_stdin_kind_t stdin_kind) {
+    if (stdin_kind == CBM_CLI_STDIN_TERMINAL) {
+        return false;
+    }
     yyjson_doc *schema_doc = yyjson_read(schema_str, strlen(schema_str), 0);
     if (!schema_doc) {
         /* The schemas are compile-time constants, so a parse failure means a
          * malformed literal rather than caller input. Keep the documented stdin
          * channel rather than silently narrowing it on a schema we could not
-         * read — the gate must only ever fire on positive evidence that the
-         * tool takes no arguments. */
+         * read — the gate must only ever fire on positive evidence about the
+         * tool's arguments. */
         return true;
     }
-    yyjson_val *props = yyjson_obj_get(yyjson_doc_get_root(schema_doc), "properties");
+    yyjson_val *root = yyjson_doc_get_root(schema_doc);
+    yyjson_val *props = yyjson_obj_get(root, "properties");
+    yyjson_val *required = yyjson_obj_get(root, "required");
     bool accepts_arguments = props && yyjson_is_obj(props) && yyjson_obj_size(props) > 0;
+    bool requires_arguments = required && yyjson_is_arr(required) && yyjson_arr_size(required) > 0;
     yyjson_doc_free(schema_doc);
-    return accepts_arguments;
+    if (!accepts_arguments) {
+        return false;
+    }
+    return requires_arguments || stdin_kind == CBM_CLI_STDIN_FILE;
 }
 
 #ifdef CBM_CLI_ENABLE_TEST_API
-bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str) {
-    return cli_stdin_allowed_for_schema(schema_str);
+bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str,
+                                               cbm_cli_stdin_kind_t stdin_kind) {
+    return cli_stdin_allowed_for_schema(schema_str, stdin_kind);
 }
 #endif
 

@@ -22,8 +22,6 @@ class BrowserLicenseInventory(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.ui = Path(self.tmp.name) / "graph-ui"
         self.ui.mkdir()
-        self.package("@img/sharp-wasm32", "0.35.0",
-                     "Apache-2.0 AND LGPL-3.0-or-later AND MIT")
         self.package("@huggingface/transformers", "4.2.0", "Apache-2.0")
         source = ROOT / "graph-ui/node_modules/@huggingface/transformers/dist/transformers.web.js"
         if not source.is_file():
@@ -62,8 +60,7 @@ class BrowserLicenseInventory(unittest.TestCase):
         }
         self.write_proof()
         self.tree = {"dependencies": {
-            "@huggingface/transformers": {"version": "4.2.0", "dependencies": {
-                "@img/sharp-wasm32": {"version": "0.35.0"}}}}}
+            "@huggingface/transformers": {"version": "4.2.0", "dependencies": {}}}}
         self.bin = Path(self.tmp.name) / "bin"
         self.bin.mkdir()
         shim = self.bin / "npm.py"
@@ -72,12 +69,17 @@ class BrowserLicenseInventory(unittest.TestCase):
         (self.bin / "npm").chmod(0o755)
         (self.bin / "npm.cmd").write_text('@python "%~dp0npm.py"\r\n')
 
-    def package(self, name, version, license_id):
+    def package(self, name, version, license_id, **platform):
         folder = self.ui / "node_modules" / name
         folder.mkdir(parents=True)
         (folder / "package.json").write_text(json.dumps({
-            "name": name, "version": version, "license": license_id}))
+            "name": name, "version": version, "license": license_id, **platform}))
         (folder / "LICENSE").write_text(license_id)
+
+    def add_transformers_dependency(self, name, version, license_id, **platform):
+        self.package(name, version, license_id, **platform)
+        deps = self.tree["dependencies"]["@huggingface/transformers"]["dependencies"]
+        deps[name] = {"version": version}
 
     def write_proof(self):
         path = self.ui / ".vite/license-build.json"
@@ -96,16 +98,40 @@ class BrowserLicenseInventory(unittest.TestCase):
         result = self.run_script("license-gate-check-npm.py")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_verified_absent_package_does_not_block_browser_release(self):
+    def test_permissive_tree_with_verified_build_passes(self):
         result = self.run_script("license-gate-check-npm.py")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("@img/sharp-wasm32@0.35.0", result.stdout)
+        self.assertIn("all allow-listed", result.stdout)
 
-    def test_notices_use_the_same_shipped_package_decision(self):
+    def test_notices_cover_the_production_tree(self):
         result = self.run_script("gen-ui-licenses.py")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn("### @img/sharp-wasm32@", result.stdout)
         self.assertIn("### @huggingface/transformers@4.2.0", result.stdout)
+
+    def test_lgpl_package_blocks_even_when_unshipped(self):
+        # No exception for "installed but not bundled": sharp's wasm build
+        # (LGPL libvips inside) once passed that way. It must block now.
+        self.add_transformers_dependency("@img/sharp-wasm32", "0.35.0",
+                                         "Apache-2.0 AND LGPL-3.0-or-later AND MIT")
+        result = self.run_script("license-gate-check-npm.py")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("@img/sharp-wasm32@0.35.0", result.stdout)
+
+    def test_platform_restricted_lgpl_package_blocks(self):
+        # os/cpu-restricted native packages used to be skipped as build
+        # tooling; that skip let all ten @img/sharp-libvips-* (LGPL) through.
+        self.add_transformers_dependency("@img/sharp-libvips-darwin-arm64", "1.3.4",
+                                         "LGPL-3.0-or-later", os=["darwin"], cpu=["arm64"])
+        result = self.run_script("license-gate-check-npm.py")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("@img/sharp-libvips-darwin-arm64@1.3.4", result.stdout)
+
+    def test_platform_restricted_permissive_package_passes(self):
+        # Checking platform packages must not turn into blocking them.
+        self.add_transformers_dependency("@example/native-darwin-arm64", "1.0.0", "MIT",
+                                         os=["darwin"], cpu=["arm64"])
+        result = self.run_script("license-gate-check-npm.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_missing_proof_blocks(self):
         (self.ui / ".vite/license-build.json").unlink()
@@ -232,14 +258,6 @@ class BrowserLicenseInventory(unittest.TestCase):
     def test_unrelated_disallowed_dependency_still_blocks(self):
         self.package("unrelated", "1.0.0", "GPL-3.0-only")
         self.tree["dependencies"]["unrelated"] = {"version": "1.0.0"}
-        self.assert_blocked()
-
-    def test_new_package_version_requires_review(self):
-        package = self.ui / "node_modules/@img/sharp-wasm32/package.json"
-        meta = json.loads(package.read_text())
-        meta["version"] = "0.36.0"
-        package.write_text(json.dumps(meta))
-        self.tree["dependencies"]["@huggingface/transformers"]["dependencies"]["@img/sharp-wasm32"]["version"] = "0.36.0"
         self.assert_blocked()
 
 
