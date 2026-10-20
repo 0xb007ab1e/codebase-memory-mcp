@@ -71,7 +71,8 @@ if 'LANES' in os.environ:
         'test / test-lsan-macos': 'lsan-macos', 'test / test-windows-guards': 'windows-guards',
         'test / shard-completeness': 'shard-completeness', 'contracts': 'contracts',
     }
-    matrix = ('test / test-unix (', 'test / test-windows (', 'test / test-tsan (', 'pr-smoke (')
+    matrix = ('test / test-unix (', 'test / test-windows (', 'test / test-tsan (', 'pr-smoke (',
+              'codeql / analyze (')
     def lane_of(name):
         if name in single:
             return single[name]
