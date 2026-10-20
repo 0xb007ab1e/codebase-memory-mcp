@@ -2192,9 +2192,9 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
             if (is_string_like(ak) && ca->expr) {
                 ca->value = strip_quotes(ctx->arena, ca->expr);
             } else if (strcmp(ak, "template_string") == 0) {
-                /* Resolve known constants; dynamic substitutions keep the route placeholder. */
-                ca->value = cbm_template_string_text(ctx->arena, arg_node, ctx->source,
-                                                     &ctx->string_constants);
+                /* Flattened {} form so downstream url-arg detection joins the
+                 * canonical server route shape (issue #1006/#1009). */
+                ca->value = cbm_template_string_text(ctx->arena, arg_node, ctx->source);
             } else if (strcmp(ak, "identifier") == 0 && ca->expr) {
                 ca->value = lookup_string_constant(ctx, ca->expr);
             } else if (strcmp(ak, "object") == 0) {
@@ -2259,8 +2259,7 @@ static bool is_queue_topic_field(const char *key) {
 static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node) {
     const char *vk = ts_node_type(val_node);
     if (strcmp(vk, "template_string") == 0) {
-        return cbm_template_string_text(ctx->arena, val_node, ctx->source,
-                                        &ctx->string_constants);
+        return cbm_template_string_text(ctx->arena, val_node, ctx->source);
     }
     if (is_string_like(vk)) {
         char *text = cbm_node_text(ctx->arena, val_node, ctx->source);
@@ -2435,10 +2434,10 @@ static TSNode swift_unwrap_url_constructor(CBMExtractCtx *ctx, TSNode arg) {
 }
 
 static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const char *ak) {
-    /* Resolve constants while keeping dynamic route parts in canonical form. */
+    /* JS/TS template literals: `/things/${id}` normalizes to "/things/{}" so the
+     * client URL joins the server route's canonical placeholder (issue #1006). */
     if (strcmp(ak, "template_string") == 0) {
-        const char *flat = cbm_template_string_text(ctx->arena, arg, ctx->source,
-                                                    &ctx->string_constants);
+        const char *flat = cbm_template_string_text(ctx->arena, arg, ctx->source);
         if (flat) {
             return strip_and_validate_string_arg(ctx->arena, (char *)flat);
         }
