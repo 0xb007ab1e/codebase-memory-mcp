@@ -2483,6 +2483,59 @@ TEST(pylsp_scale_work_is_linear) {
     PASS();
 }
 
+/* #2413 (O9: no clock): the shared Tier-2 build registers one def at a time
+ * into a registry it finalizes only at the end, so a receiver probe that scans
+ * the types registered so far makes it O(methods x types). The registry
+ * primitives count every candidate they examine (CBM_LSP_WORK): 4x the classes
+ * must cost at most ~4x the work; the scanning probe lands at ~16x. */
+static uint64_t cross_registry_work_for(int n_classes, int *out_types) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int n_defs = n_classes * 3;
+    CBMLSPDef *defs = (CBMLSPDef *)cbm_arena_calloc(&arena, (size_t)n_defs * sizeof(*defs));
+    if (!defs) {
+        cbm_arena_destroy(&arena);
+        *out_types = -1;
+        return 0;
+    }
+    /* Extraction order: each class followed by its two methods. */
+    for (int i = 0; i < n_classes; i++) {
+        CBMLSPDef *cls = &defs[i * 3];
+        cls->qualified_name = cbm_arena_sprintf(&arena, "scale.mod.Cls%d", i);
+        cls->short_name = cls->qualified_name + strlen("scale.mod.");
+        cls->label = "Class";
+        cls->def_module_qn = "scale.mod";
+        cls->lang = CBM_LANG_PYTHON;
+        for (int j = 1; j <= 2; j++) {
+            CBMLSPDef *m = &defs[i * 3 + j];
+            m->qualified_name = cbm_arena_sprintf(&arena, "%s.m%d", cls->qualified_name, j);
+            m->short_name = j == 1 ? "m1" : "m2";
+            m->label = "Method";
+            m->receiver_type = cls->qualified_name;
+            m->def_module_qn = "scale.mod";
+            m->lang = CBM_LANG_PYTHON;
+        }
+    }
+    (void)cbm_lsp_work_take();
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, n_defs);
+    uint64_t work = cbm_lsp_work_take();
+    *out_types = reg ? reg->type_count : -1;
+    cbm_arena_destroy(&arena);
+    return work;
+}
+
+TEST(pylsp_cross_registry_build_work_is_linear) {
+    int t1 = 0, t4 = 0;
+    uint64_t w1 = cross_registry_work_for(1000, &t1);
+    uint64_t w4 = cross_registry_work_for(4000, &t4);
+    printf("    cross registry work: 1000=%llu (types=%d)  4000=%llu (types=%d)\n",
+           (unsigned long long)w1, t1, (unsigned long long)w4, t4);
+    /* Every class registered exactly once (no duplicate placeholder). */
+    ASSERT_EQ(t4 - t1, 3000);
+    ASSERT(w4 <= 5 * w1 + 1000);
+    PASS();
+}
+
 extern const TSLanguage *tree_sitter_python(void);
 
 TEST(pylsp_issue1527_memo_allocation_failure_is_reported) {
@@ -4885,6 +4938,7 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_issue1527_long_binary_chain_is_not_nesting);
     RUN_TEST(pylsp_issue1527_long_receiver_chain_is_not_nesting);
     RUN_TEST(pylsp_scale_work_is_linear);
+    RUN_TEST(pylsp_cross_registry_build_work_is_linear);
     /* Phase 2 — smoke */
     RUN_TEST(pylsp_smoke_empty);
     RUN_TEST(pylsp_smoke_one_function);
