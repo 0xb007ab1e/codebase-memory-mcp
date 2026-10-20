@@ -110,7 +110,7 @@
             --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         }
         * { box-sizing: border-box; }
-        html { scroll-behavior: smooth; scroll-padding-top: 140px; }
+        html { scroll-behavior: smooth; scroll-padding-top: 100px; }
         body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 16px; line-height: 1.65; }
         a { color: var(--green); text-decoration: none; text-underline-offset: 4px; }
         a:hover { text-decoration: underline; }
@@ -133,13 +133,16 @@
         .nav { display: flex; align-items: center; justify-content: space-between; min-height: 76px; gap: 28px; }
         .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; color: var(--text); letter-spacing: -.025em; white-space: nowrap; }
         .brand svg { width: 27px; height: 27px; color: var(--green); }
-        .nav-links { display: flex; gap: 28px; align-items: center; font-size: 13px; }
+        .nav-links { display: flex; gap: 24px; align-items: center; margin-left: auto; font-size: 13px; white-space: nowrap; }
         .nav-links a { color: var(--muted); }
         .nav-links a:hover { color: var(--green); }
-        .nav-links .nav-install { border: 1px solid var(--line); border-radius: 6px; padding: 8px 15px; color: var(--text); }
-        .community-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 10px; padding-bottom: 12px; }
-        .community-badges a { display: inline-flex; }
-        .community-badges img { height: 20px; width: auto; }
+        .nav-actions, .community-badges { display: flex; align-items: center; gap: 10px; }
+        .community-link, .nav-install { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 40px; padding: 8px 13px; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; font-weight: 500; white-space: nowrap; }
+        .community-link { color: var(--muted); background: var(--panel); }
+        .community-link svg { width: 16px; height: 16px; flex: none; color: var(--green); }
+        .nav-install { color: var(--green); background: var(--selected); }
+        .community-link:hover, .nav-install:hover { color: var(--text); border-color: var(--green); text-decoration: none; }
+        @media (max-width: 950px) { .nav-links { display: none; } }
         .eyebrow { font-family: var(--mono); font-size: 11px; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; color: var(--green); margin-bottom: 23px; }
         .hero { padding: 80px 0 0; }
         .hero-top { display: grid; grid-template-columns: 1fr 270px; gap: 65px; align-items: end; }
@@ -254,7 +257,6 @@
         @media (max-width: 950px) {
             .hero-top { grid-template-columns: 1fr; gap: 25px; }
             .hero-aside { display: none; }
-            .nav-links { gap: 17px; }
             .section-head { align-items: start; gap: 30px; }
             .section-head p { max-width: 300px; }
             .connection-grid { gap: 24px; }
@@ -266,12 +268,15 @@
         }
         @media (max-width: 680px) {
             .container { width: calc(100% - 36px); }
-            .nav { min-height: 65px; gap: 12px; }
+            html { scroll-padding-top: 140px; }
+            .nav { display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 12px 0; }
+            .nav .brand { grid-column: 1; grid-row: 1; }
+            .nav-actions { display: contents; }
+            .nav-install { grid-column: 2; grid-row: 1; }
+            .community-badges { grid-column: 1 / -1; grid-row: 2; }
+            .community-link { flex: 1; }
             .brand { font-size: 14px; }
             .brand svg { width: 23px; }
-            .nav-links { gap: 12px; font-size: 12px; }
-            .nav-links .desktop-link { display: none; }
-            .nav-links .nav-install { padding: 7px 12px; }
             .hero { padding-top: 50px; }
             h1 { font-size: clamp(42px, 10.5vw, 64px); }
             .hero-intro { font-size: 17px; }
@@ -318,14 +323,18 @@
             Codebase Memory
         </a>
         <div class="nav-links">
-            <a class="desktop-link" href="#features">Capabilities</a>
-            <a class="desktop-link" href="#lens">Lens beta</a>
-            <a class="desktop-link" href="#smart-ci">Smart CI</a>
-            <a href="https://github.com/DeusData/codebase-memory-mcp">GitHub ↗</a>
+            <a href="#features">Capabilities</a>
+            <a href="#lens">Lens beta</a>
+            <a href="#smart-ci">Smart CI</a>
+        </div>
+        <div class="nav-actions">
+            <div class="community-badges" role="group" aria-label="Community links">
+                <a class="community-link" href="https://discord.gg/KguGXxg2X" title="Join the community on Discord"><svg viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2.5h10v8H7l-3.5 3v-3H3z"/><path d="M5.5 5.5h5M5.5 8h3"/></svg>Discord</a>
+                <a class="community-link" href="https://github.com/DeusData/codebase-memory-mcp" title="Star Codebase Memory on GitHub"><svg viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m8 1.5 2 4.1 4.5.7-3.3 3.2.8 4.5L8 11.9 4 14l.8-4.5L1.5 6.3l4.5-.7z"/></svg>Star on GitHub</a>
+            </div>
             <a class="nav-install" href="#install">Get started</a>
         </div>
     </nav>
-    <nav class="container community-badges" aria-label="Community links"><a href="https://discord.gg/KguGXxg2X"><img src="https://img.shields.io/badge/Discord-Join_the_community-5865F2?logo=discord&amp;logoColor=white" alt="Join the community on Discord" width="187" height="20"></a><a href="https://github.com/DeusData/codebase-memory-mcp"><img src="https://img.shields.io/github/stars/DeusData/codebase-memory-mcp?style=social&amp;label=Star%20on%20GitHub" alt="Star Codebase Memory on GitHub" height="20"></a></nav>
 </header>
 <main id="main" class="container">
     <section class="hero" id="what-is-it">
