@@ -16,6 +16,7 @@
 - CBM Lens Beta: local browser interface with source exploration, Galaxy graph navigation, architecture and behavior views, ADR editing, index-coverage diagnostics, daemon/system information, and optional local code chat. Static graph animations are not live execution traces. Activity overlays are experimental source-build features, not a standard-release promise.
 - Agent integrations: 45 automatic or conditional client surfaces. Installation configures supported MCP entries, durable instructions, skills, Scout/Verify/Auditor profiles, and applicable session, compaction, search, and read hooks. Coverage and activation vary by client and platform. Hooks provide context without blocking or replacing the user's tool call; some clients require trust or use parent-agent handoff instead.
 - Persistent operation: a per-account daemon coordinates sessions and indexing. Existing indexes can stay synchronized during eligible active MCP sessions; initial auto-indexing is separately opt-in. Optional team graph artifacts share a baseline while each user keeps a local query database.
+- Token-efficient retrieval: targeted graph queries, focused source snippets, and compact, paged results can reduce token use and repeated file reads during code exploration.
 - Distribution: native C backend, MIT license, standard native releases for macOS, Linux, and Windows include CBM Lens; Linux portable archives provide static builds. Nix and development source builds can omit the UI. Package-manager options and release verification are documented in the README.
 
 ## Client coverage
@@ -24,7 +25,9 @@
 
 ## Measurement and limits
 
-Published performance and token comparisons apply to specific workloads, hardware, and agent setups, not a universal percentage saving. The README Performance section preserves the historical comparison and research quality tradeoff. Check index generation, freshness, and exact path/scope coverage before relying on graph results, especially absence claims; read source when coverage is partial, skipped, excluded, stale, or unknown. Infrastructure relationships are static, and test-selection support is narrower than language-indexing support.
+A March 2026 preprint across 31 real-world repositories reports 10× lower token use and 2.1× fewer tool calls compared with file-by-file exploration, with answer-quality scores of 83% for CBM and 92% for file-by-file exploration. These historical results describe the study's workloads and agent setup; they are not a universal percentage saving or a promise of lower cost for every session. The README Performance section preserves the comparisons and their limits.
+
+Graph evidence depends on index generation, freshness, and exact path/scope coverage. Partial, skipped, excluded, stale, or unknown coverage requires source verification, especially for absence claims. Infrastructure relationships are static, and test-selection support is narrower than language-indexing support.
 
 ## Links
 
@@ -39,6 +42,7 @@ Published performance and token comparisons apply to specific workloads, hardwar
 - Smart CI guide: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/SMART_CI.md
 - Configuration: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/CONFIGURATION.md
 - MCP tools: https://github.com/DeusData/codebase-memory-mcp#mcp-tools
+- Token savings and evidence: https://deusdata.github.io/codebase-memory-mcp/#token-savings
 - Performance and research limits: https://github.com/DeusData/codebase-memory-mcp#performance
 - Benchmark report: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md
 - Research paper: https://arxiv.org/abs/2603.27277
