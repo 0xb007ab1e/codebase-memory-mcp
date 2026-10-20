@@ -14902,16 +14902,20 @@ static const char *const py_reexport_calls[][2] = {
     {"ctl_from_fn", "direct.impl.direct_fn"},
     {"lazy_tc", "lz.lazy_mod.Lazy"},
     {"doc_reexport", "docp.impl.Doc"},
+    {"go_reexport", "gop.impl.Thing"},
 };
 enum { PY_REEXPORT_N_CALLS = sizeof(py_reexport_calls) / sizeof(py_reexport_calls[0]) };
 
 /* Calls that must NOT reach their target by the LSP: an `__all__`-unlisted
  * name, a private name under a star, a re-export the module shadows later,
- * and one made before a whole-namespace barrier (a top-level `try:`). */
+ * one made before a whole-namespace barrier (a top-level `try:`), a
+ * re-export a submodule import of `__go` replaces, and one behind a `__go`
+ * that writes its parameter. */
 static const char *const py_reexport_excluded[][2] = {
     {"excl_unlisted", "pkg.all_mod.Unlisted"}, {"excl_private", "pkg.star_mod._private_fn"},
     {"excl_shadowed", "shad.impl.Gone"},       {"excl_barrier", "barr.impl.Before"},
     {"excl_compat", "cmp.types_only.Shim"},    {"excl_fstring", "fsp.impl.Kept"},
+    {"excl_go_submodule", "gop.impl.base"},    {"excl_go_param", "gox.impl.Kept"},
 };
 enum { PY_REEXPORT_N_EXCLUDED = sizeof(py_reexport_excluded) / sizeof(py_reexport_excluded[0]) };
 
@@ -14984,6 +14988,25 @@ static int py_reexport_run(bool parallel, bool incremental, bool *lsp, bool *exc
                     "from .impl import Kept\n"
                     "f\"{Kept}\"\n");
     write_temp_file(tmp, "app/fsp/impl.py", "class Kept:\n    pass\n");
+    /* sqlalchemy's sql/__init__.py shape: a top-level `__go(locals())`. */
+    write_temp_file(tmp, "app/gop/__init__.py",
+                    "from typing import Any\n"
+                    "from .impl import Thing\n"
+                    "from .impl import base\n\n\n"
+                    "def __go(lcls: Any) -> None:\n"
+                    "    from . import base\n"
+                    "    from .annotation import prepare\n"
+                    "    prepare(Thing)\n\n\n"
+                    "__go(locals())\n");
+    write_temp_file(tmp, "app/gop/impl.py",
+                    "class Thing:\n    pass\n\n\ndef base():\n    return 1\n");
+    write_temp_file(tmp, "app/gop/base.py", "def helper():\n    return 1\n");
+    write_temp_file(tmp, "app/gop/annotation.py", "def prepare(cls):\n    return cls\n");
+    write_temp_file(tmp, "app/gox/__init__.py",
+                    "from .impl import Kept\n\n\n"
+                    "def __go(lcls):\n    lcls[\"Kept\"] = None\n\n\n"
+                    "__go(locals())\n");
+    write_temp_file(tmp, "app/gox/impl.py", "class Kept:\n    pass\n");
     write_temp_file(tmp, "app/main.py",
                     "from app import pkg\n"
                     "from app import cyc\n"
@@ -14993,6 +15016,8 @@ static int py_reexport_run(bool parallel, bool incremental, bool *lsp, bool *exc
                     "from app import cmp\n"
                     "from app import docp\n"
                     "from app import fsp\n"
+                    "from app import gop\n"
+                    "from app import gox\n"
                     "from app.db import models\n"
                     "from app.pkg import Explicit, Listed, Deep, star_fn, Renamed\n"
                     "from app.direct.impl import Direct, direct_fn\n\n\n"
@@ -15020,6 +15045,9 @@ static int py_reexport_run(bool parallel, bool incremental, bool *lsp, bool *exc
                     "def lazy_tc():\n    lz.Lazy()\n\n\n"
                     "def doc_reexport():\n    docp.Doc()\n\n\n"
                     "def excl_fstring():\n    fsp.Kept()\n\n\n"
+                    "def go_reexport():\n    gop.Thing()\n\n\n"
+                    "def excl_go_submodule():\n    gop.base()\n\n\n"
+                    "def excl_go_param():\n    gox.Kept()\n\n\n"
                     "def ctl_from_cls():\n    Direct()\n\n\n"
                     "def ctl_from_fn():\n    direct_fn()\n");
     for (int i = 0; parallel && i < 52; i++) {
