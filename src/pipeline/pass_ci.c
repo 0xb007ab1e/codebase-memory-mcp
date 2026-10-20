@@ -25,8 +25,10 @@
  */
 #include "foundation/constants.h"
 #include "foundation/compat.h"
+#include "foundation/str_util.h" /* cbm_json_escape */
 #include "pipeline/pipeline_internal.h"
 #include "cbm.h"
+#include "helpers.h" /* cbm_env_address */
 #include "lang_specs.h"
 
 #include <ctype.h>
@@ -718,8 +720,13 @@ static const char *ci_unquote(const char *v, size_t *len) {
     return v;
 }
 
+static const char *ci_interp(CBMArena *a, const char *s, const ci_env_t *env);
+
 /* One .env line s[0, n): KEY=VALUE (an `export ` prefix, quotes around the
- * value removed) appended to env; a comment, a blank or another line: none. */
+ * value removed) appended to env, its ${X} references expanded from the lines
+ * before it as compose does (`CART_ADDR=cart:${CART_PORT}`; a single-quoted
+ * value stays literal, an unknown variable leaves it as written); a comment,
+ * a blank or another line: none. */
 static void ci_dotenv_line(CBMArena *a, const char *s, size_t n, ci_env_t *env) {
     static const char EXPORT[] = "export ";
     size_t b = 0;
@@ -743,9 +750,12 @@ static void ci_dotenv_line(CBMArena *a, const char *s, size_t n, ci_env_t *env) 
         v++;
     }
     size_t vl = n - v;
+    bool literal = v < n && s[v] == '\'';
     const char *val = ci_unquote(s + v, &vl);
+    const char *raw = cbm_arena_strndup(a, val, vl);
+    const char *expanded = raw && !literal ? ci_interp(a, raw, env) : NULL;
     env->kv[PAIR_LEN * env->n] = cbm_arena_strndup(a, s + b, kl);
-    env->kv[PAIR_LEN * env->n + SKIP_ONE] = cbm_arena_strndup(a, val, vl);
+    env->kv[PAIR_LEN * env->n + SKIP_ONE] = expanded ? expanded : raw;
     env->n++;
 }
 
@@ -774,9 +784,33 @@ static const char *ci_env_lookup(const ci_env_t *env, const char *name, size_t n
     return NULL;
 }
 
+/* JSON array `list` (NULL: empty) with identifier `name` appended once. */
+static const char *ci_names_add(CBMArena *a, const char *list, const char *name, size_t nl) {
+    if (!list) {
+        return cbm_arena_sprintf(a, "[\"%.*s\"]", (int)nl, name);
+    }
+    char quoted[CBM_SZ_256];
+    snprintf(quoted, sizeof(quoted), "\"%.*s\"", (int)nl, name);
+    if (strstr(list, quoted)) {
+        return list;
+    }
+    return cbm_arena_sprintf(a, "%.*s,%s]", (int)(strlen(list) - SKIP_ONE), list, quoted);
+}
+
+static const char *ci_interp_marks(CBMArena *a, const char *s, const ci_env_t *env,
+                                   const char **dflt_of, const char **ovr_of);
+
 /* `s` with ${X} / ${X:-d} / ${X-d} / $X expanded from env; NULL when a
  * variable has no value (and no default). */
 static const char *ci_interp(CBMArena *a, const char *s, const ci_env_t *env) {
+    return ci_interp_marks(a, s, env, NULL, NULL);
+}
+
+/* ci_interp; `dflt_of` (may be NULL) gains, as a JSON array, the variables
+ * whose inline default was used, `ovr_of` those with an inline default that
+ * env set instead. */
+static const char *ci_interp_marks(CBMArena *a, const char *s, const ci_env_t *env,
+                                   const char **dflt_of, const char **ovr_of) {
     if (!s || !strchr(s, '$')) {
         return s;
     }
@@ -830,6 +864,11 @@ static const char *ci_interp(CBMArena *a, const char *s, const ci_env_t *env) {
             }
             use = dflt;
             ul = dl;
+            if (dflt_of) {
+                *dflt_of = ci_names_add(a, *dflt_of, name, nl);
+            }
+        } else if (dflt && ovr_of) {
+            *ovr_of = ci_names_add(a, *ovr_of, name, nl);
         }
         if (len + ul + SKIP_ONE > cap) {
             return NULL;
@@ -988,39 +1027,110 @@ static int ci_compose_deps(const ci_t *c, TSNode svc, const char ***out) {
     return n;
 }
 
+/* The compose service a variable's value addresses (its .env interpolated):
+ * a bare service name only -- the value itself is never kept. NULL: none. */
+static const char *ci_env_host(const ci_t *c, const char *name, const char *raw,
+                               const ci_env_t *env) {
+    enum { CI_DNS_LABEL = 64 };
+    const char *value = raw ? ci_interp(c->a, raw, env) : NULL;
+    char svc[CI_DNS_LABEL];
+    char ns[CI_DNS_LABEL];
+    return value && cbm_env_address(name, value, svc, sizeof(svc), ns, sizeof(ns)) == SKIP_ONE
+               ? cbm_arena_strdup(c->a, svc)
+               : NULL;
+}
+
 /* The variable names a service's environment sets: a mapping's keys, a
  * list's "NAME=value" / "NAME" items (the name only -- a value is never
- * kept), with their 1-based lines. */
-static int ci_compose_env(const ci_t *c, TSNode svc, const char ***out, const int **lines) {
+ * kept), with their 1-based lines and the service each value addresses. */
+static int ci_compose_env(const ci_t *c, TSNode svc, const ci_env_t *dotenv, const char ***out,
+                          const int **lines, const char ***hosts) {
     int n = 0;
     TSNode env = ci_get(c, svc, "environment");
     TSNode *items = ci_items(c, env, &n);
     ci_pair_t *pairs = items ? NULL : ci_pairs(c, env, &n);
     const char **names = cbm_arena_alloc(c->a, (size_t)(n + SKIP_ONE) * sizeof(*names));
     int *rows = cbm_arena_alloc(c->a, (size_t)(n + SKIP_ONE) * sizeof(*rows));
+    const char **to = cbm_arena_alloc(c->a, (size_t)(n + SKIP_ONE) * sizeof(*to));
     int k = 0;
-    for (int i = 0; names && rows && i < n; i++) {
+    for (int i = 0; names && rows && to && i < n; i++) {
         int row = 0;
         const char *name = NULL;
+        const char *raw = NULL;
         if (items) {
             const char *s = ci_scalar(c, items[i], &row);
             const char *eq = s ? strchr(s, '=') : NULL;
             name = eq ? cbm_arena_strndup(c->a, s, (size_t)(eq - s)) : s;
+            raw = eq ? eq + SKIP_ONE : NULL;
         } else {
+            int vrow = 0;
             name = pairs[i].key;
             row = pairs[i].row;
+            raw = ts_node_is_null(pairs[i].value) ? NULL : ci_scalar(c, pairs[i].value, &vrow);
+        }
+        if (name && name[0] && !raw) {
+            /* a name without a value takes the project environment's (.env) */
+            raw = cbm_arena_sprintf(c->a, "${%s}", name);
         }
         if (name && name[0]) {
             names[k] = name;
+            to[k] = ci_env_host(c, name, raw, dotenv);
             rows[k++] = row + SKIP_ONE;
         }
     }
     *out = names;
     *lines = rows;
+    *hosts = to;
     return k;
 }
 
+/* A compose build's `args` (a mapping, or a list of "K=V" items), their
+ * values interpolated, as a JSON object; NULL: none. An argument without a
+ * value (the environment's), with an unknown one or with a secret (by name or
+ * value -- never kept in the graph, never an image) is left out. */
+static const char *ci_compose_build_args(const ci_t *c, TSNode build, const ci_env_t *env) {
+    TSNode args = ts_node_is_null(build) ? build : ci_get(c, build, "args");
+    if (ts_node_is_null(args)) {
+        return NULL;
+    }
+    int n = 0;
+    TSNode *items = ci_items(c, args, &n);
+    ci_pair_t *pairs = items ? NULL : ci_pairs(c, args, &n);
+    const char *json = NULL;
+    for (int i = 0; i < n; i++) {
+        const char *key = NULL;
+        const char *raw = NULL;
+        if (items) {
+            const char *s = ci_scalar(c, items[i], NULL);
+            const char *eq = s ? strchr(s, '=') : NULL;
+            key = eq ? cbm_arena_strndup(c->a, s, (size_t)(eq - s)) : NULL;
+            raw = eq ? eq + SKIP_ONE : NULL;
+        } else {
+            key = pairs[i].key;
+            raw = ts_node_is_null(pairs[i].value) ? NULL : ci_scalar(c, pairs[i].value, NULL);
+        }
+        const char *value = raw ? ci_interp(c->a, raw, env) : NULL;
+        if (!key || !key[0] || !value || cbm_is_secret_binding(key, value)) {
+            continue;
+        }
+        /* JSON escaping writes at most 6 bytes a byte: nothing is cut */
+        int kn = (int)(strlen(key) * 6 + SKIP_ONE);
+        int vn = (int)(strlen(value) * 6 + SKIP_ONE);
+        char *ek = cbm_arena_alloc(c->a, (size_t)kn);
+        char *ev = cbm_arena_alloc(c->a, (size_t)vn);
+        if (!ek || !ev) {
+            return NULL;
+        }
+        cbm_json_escape(ek, kn, key);
+        cbm_json_escape(ev, vn, value);
+        json = cbm_arena_sprintf(c->a, "%s%s\"%s\":\"%s\"", json ? json : "{", json ? "," : "", ek,
+                                 ev);
+    }
+    return json ? cbm_arena_sprintf(c->a, "%s}", json) : NULL;
+}
+
 static void ci_compose(const ci_t *c, TSNode root, const char *dir, const ci_env_t *env) {
+    static const ci_env_t no_env = {0};
     int ns = 0;
     ci_pair_t *svcs = ci_pairs(c, ci_get(c, root, "services"), &ns);
     for (int i = 0; i < ns; i++) {
@@ -1030,21 +1140,32 @@ static void ci_compose(const ci_t *c, TSNode root, const char *dir, const ci_env
         }
         int row = 0;
         const char *raw = ci_scalar(c, ci_get(c, svc, "image"), &row);
-        const char *image = raw ? ci_interp(c->a, raw, env) : NULL;
-        const char *df = ci_compose_dockerfile(c, ci_get(c, svc, "build"), dir, env);
+        const char *dflt_of = NULL;
+        const char *ovr_of = NULL;
+        const char *image = raw ? ci_interp_marks(c->a, raw, env, &dflt_of, &ovr_of) : NULL;
+        /* With .env replacing a default: what the defaults alone would name. */
+        const char *default_image = image && ovr_of ? ci_interp(c->a, raw, &no_env) : NULL;
+        TSNode build = ci_get(c, svc, "build");
+        const char *df = ci_compose_dockerfile(c, build, dir, env);
         if (c->site_fn && image && df) {
-            cbm_build_site_t site = {
-                .via = "compose", .image = image, .dockerfile = df, .line = row + SKIP_ONE};
+            cbm_build_site_t site = {.via = "compose",
+                                     .image = image,
+                                     .dockerfile = df,
+                                     .build_args = ci_compose_build_args(c, build, env),
+                                     .line = row + SKIP_ONE};
             c->site_fn(&site, c->ud);
         }
         if (c->service_fn) {
             cbm_compose_service_t s = {.name = svcs[i].key,
                                        .image = image,
+                                       .image_default_of = image ? dflt_of : NULL,
+                                       .image_override_of = image ? ovr_of : NULL,
+                                       .default_image = default_image,
                                        .dockerfile = df,
                                        .line = (int)ts_node_start_point(svc).row,
                                        .end_line = (int)ts_node_end_point(svc).row + SKIP_ONE};
             s.ndeps = ci_compose_deps(c, svc, &s.deps);
-            s.nenv = ci_compose_env(c, svc, &s.env, &s.env_lines);
+            s.nenv = ci_compose_env(c, svc, env, &s.env, &s.env_lines, &s.env_hosts);
             c->service_fn(&s, c->ud);
         }
     }
