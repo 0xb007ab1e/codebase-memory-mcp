@@ -3463,6 +3463,27 @@ TEST(cypher_exec_where_not_target_node_count) {
     PASS();
 }
 
+/* The early WHERE pass must wait for every alias a condition reads. A function
+ * condition is filed under its first argument's alias, so in
+ * coalesce(a.no_such_prop, b.name) the target b hid behind the bound a: the
+ * seed row read coalesce(NULL, <unbound b>) as a definite mismatch and pruned
+ * every row before CALLS expansion, while the same predicate after WITH was
+ * right. */
+TEST(cypher_exec_where_func_arg_on_unbound_target) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (a)-[:CALLS]->(b) WHERE coalesce(a.no_such_prop, b.name) = "
+                                "\"SubmitOrder\" RETURN a.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "ValidateOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_where_in) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -6332,6 +6353,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_where_not_target_relationship);
     RUN_TEST(cypher_exec_where_not_source_node);
     RUN_TEST(cypher_exec_where_not_target_node_count);
+    RUN_TEST(cypher_exec_where_func_arg_on_unbound_target);
     RUN_TEST(cypher_exec_where_in);
     RUN_TEST(cypher_exec_where_not_in);
     RUN_TEST(cypher_exec_where_is_null);
