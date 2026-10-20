@@ -157,7 +157,9 @@ const char *cbm_native_getenv(const char *name, char *buf, size_t buf_sz, const 
  * cbm_free(CBM_MEM_CLASS_OTHER, ptr), never free(). NULL when the variable is
  * unset or cannot be read; a variable that exists but is empty yields "".
  * On Windows the value is read with the wide API and converted, the same route
- * cbm_safe_getenv takes, so a non-ASCII value survives intact. */
+ * cbm_safe_getenv takes, so a non-ASCII value survives intact. Like
+ * cbm_safe_getenv, an installed settings resolver answers before the process
+ * environment does. */
 char *cbm_env_dup(const char *name);
 
 /* Read an environment variable as a whole number.

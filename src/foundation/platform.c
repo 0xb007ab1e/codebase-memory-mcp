@@ -478,6 +478,12 @@ char *cbm_env_dup(const char *name) {
     if (!name || !name[0]) {
         return NULL;
     }
+    /* The same view cbm_safe_getenv gives: the startup settings resolver
+     * answers first, and a handled NULL masks the variable. */
+    const char *resolved = NULL;
+    if (environment_resolver && environment_resolver(name, &resolved)) {
+        return resolved ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, resolved) : NULL;
+    }
 #ifdef _WIN32
     /* Same wide route as cbm_safe_getenv: _environ holds ANSI-code-page bytes,
      * so a non-ASCII PATH would arrive mojibake'd or with '?' substituted --
