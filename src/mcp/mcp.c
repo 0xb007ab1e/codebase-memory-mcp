@@ -4052,6 +4052,19 @@ enum {
 static const double BM25_LABEL_WEIGHT = 1.0;
 static const double BM25_LABEL_WEIGHT_SCOPED = 0.0;
 
+/* Labels an UNLABELLED query never ranks: path-shaped File/Folder nodes, the
+ * Project node and Variables match almost any token through their qualified
+ * name and file path, and would crowd definitions out of the result. They are
+ * still in nodes_fts, so an explicit `label` that names one of them is served
+ * from its own label-scoped window like any other label (?7 is the caller's
+ * label, NULL when none was given). Excluding them there too returned 0 rows
+ * -- often with an exact "eq" total -- although such nodes match. Section and
+ * Module are NOT excluded (#518/#519): they carry the prose the body column
+ * indexes. Shared by the ranked and the count query, so the two cannot
+ * desynchronise. */
+#define BM25_UNLABELLED_EXCLUSION \
+    "(?7 IS NOT NULL OR n.label NOT IN ('File','Folder','Variable','Project'))"
+
 /* Module-local SQLITE_TRANSIENT wrapper to dodge performance-no-int-to-ptr.
  * See the matching helper in src/store/store.c for the same pattern. */
 static sqlite3_destructor_type mcp_sqlite_transient(void) {
@@ -4134,6 +4147,52 @@ static double bm25_scope_match_to_label(const char *tokens, const char *label, c
     return BM25_LABEL_WEIGHT_SCOPED;
 }
 
+/* A BM25 result is empty although nodes match when the label is spelled in a
+ * case no node carries: labels are case-sensitive, so `label=class` finds
+ * nothing while Class nodes match the query. Returns a hint (memory core,
+ * CBM_MEM_CLASS_OTHER) naming the label this project actually holds, or NULL
+ * when the label exists exactly (a true zero). The exact probe is an index
+ * seek on (project, label); the case-insensitive scan runs only when it
+ * misses. The caller's label is never echoed back, only the stored spelling. */
+static char *bm25_label_zero_hint(sqlite3 *db, const char *project, const char *label) {
+    enum { HINT_BIND_PROJECT = 1, HINT_BIND_LABEL = 2, HINT_COL_LABEL = 0, HINT_PROBE_EXACT = 0 };
+    if (!db || !label || !label[0]) {
+        return NULL;
+    }
+    static const char *const probes[] = {
+        "SELECT label FROM nodes WHERE project = ?1 AND label = ?2 LIMIT 1",
+        "SELECT label FROM nodes WHERE project = ?1 AND label = ?2 COLLATE NOCASE LIMIT 1",
+    };
+    char found[CBM_SZ_256] = "";
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]) && !found[0]; i++) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, probes[i], BM25_SQL_AUTO_LEN, &st, NULL) != SQLITE_OK) {
+            return NULL;
+        }
+        sqlite3_bind_text(st, HINT_BIND_PROJECT, project, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, HINT_BIND_LABEL, label, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *stored = (const char *)sqlite3_column_text(st, HINT_COL_LABEL);
+            snprintf(found, sizeof(found), "%s", stored ? stored : "");
+        }
+        sqlite3_finalize(st);
+        if (found[0] && i == HINT_PROBE_EXACT) {
+            return NULL;
+        }
+    }
+    if (!found[0]) {
+        return cbm_mem_strdup(CBM_MEM_CLASS_OTHER,
+                              "no node in this project carries this label; get_graph_schema "
+                              "lists the labels this index holds");
+    }
+    char hint[CBM_SZ_512];
+    snprintf(hint, sizeof(hint),
+             "no node carries this label as spelled; labels are case-sensitive -- retry with "
+             "label=\"%s\"",
+             found);
+    return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, hint);
+}
+
 static char *bm25_file_pattern_like(const char *file_pattern) {
     if (!file_pattern) {
         return NULL;
@@ -4185,7 +4244,8 @@ static void bm25_lines_str(char *out, size_t size, int start, int end) {
 
 static void bm25_emit_metadata_tree(cbm_sb_t *sb, int total, int offset, int returned,
                                     bool candidate_window_saturated, bool budget_hit,
-                                    bool floor_exceeded, size_t max_output_bytes) {
+                                    bool floor_exceeded, size_t max_output_bytes,
+                                    const char *zero_hint) {
     bool has_more = total > offset + returned;
     cbm_tree_scalar_int(sb, "total", total);
     cbm_tree_scalar_str(sb, "total_relation", candidate_window_saturated ? "gte" : "eq");
@@ -4216,12 +4276,15 @@ static void bm25_emit_metadata_tree(cbm_sb_t *sb, int total, int offset, int ret
         cbm_tree_scalar_str(sb, "hint",
                             "first identity row exceeds max_output_bytes; raise "
                             "max_output_tokens");
+    } else if (zero_hint) {
+        cbm_tree_scalar_str(sb, "hint", zero_hint);
     }
 }
 
 static void bm25_emit_metadata_json(yyjson_mut_doc *doc, yyjson_mut_val *root, int total,
                                     int offset, int returned, bool candidate_window_saturated,
-                                    bool budget_hit, bool floor_exceeded, size_t max_output_bytes) {
+                                    bool budget_hit, bool floor_exceeded, size_t max_output_bytes,
+                                    const char *zero_hint) {
     bool has_more = total > offset + returned;
     yyjson_mut_obj_add_int(doc, root, "total", total);
     yyjson_mut_obj_add_str(doc, root, "total_relation", candidate_window_saturated ? "gte" : "eq");
@@ -4253,12 +4316,14 @@ static void bm25_emit_metadata_json(yyjson_mut_doc *doc, yyjson_mut_val *root, i
         yyjson_mut_obj_add_str(doc, root, "hint",
                                "first identity row exceeds max_output_bytes; raise "
                                "max_output_tokens");
+    } else if (zero_hint) {
+        yyjson_mut_obj_add_strcpy(doc, root, "hint", zero_hint);
     }
 }
 
 static char *bm25_render(const bm25_output_row_t *rows, int returned, int total, int offset,
                          bool candidate_window_saturated, bool tree_format, bool budget_hit,
-                         bool floor_exceeded, size_t max_output_bytes) {
+                         bool floor_exceeded, size_t max_output_bytes, const char *zero_hint) {
     if (tree_format) {
         cbm_sb_t sb;
         cbm_sb_init(&sb);
@@ -4276,7 +4341,7 @@ static char *bm25_render(const bm25_output_row_t *rows, int returned, int total,
             cbm_tree_row_end(&sb);
         }
         bm25_emit_metadata_tree(&sb, total, offset, returned, candidate_window_saturated,
-                                budget_hit, floor_exceeded, max_output_bytes);
+                                budget_hit, floor_exceeded, max_output_bytes, zero_hint);
         return cbm_sb_finish(&sb);
     }
 
@@ -4303,7 +4368,7 @@ static char *bm25_render(const bm25_output_row_t *rows, int returned, int total,
     }
     yyjson_mut_obj_add_val(doc, root, "rows", result_rows);
     bm25_emit_metadata_json(doc, root, total, offset, returned, candidate_window_saturated,
-                            budget_hit, floor_exceeded, max_output_bytes);
+                            budget_hit, floor_exceeded, max_output_bytes, zero_hint);
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return json;
@@ -4372,12 +4437,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         ") fts "
         "JOIN nodes n ON n.id = fts.rowid "
         "WHERE n.project = ?2 "
-        /* Section and Module are NO LONGER excluded (#518/#519): they are the
-         * labels that carry prose — a Markdown section's body, a config file's
-         * description — so excluding them made the body column unreachable.
-         * This exclusion list is MIRRORED in the count query below; the two
-         * must be changed together or results desynchronise from counts. */
-        "  AND n.label NOT IN ('File','Folder','Variable','Project') "
+        "  AND " BM25_UNLABELLED_EXCLUSION " "
         "  AND (?6 IS NULL OR n.file_path LIKE ?6) "
         /* The caller's label filter applies in query mode exactly as it does
          * in the structural mode (2026-09-16 probe: `label=Class` was ignored
@@ -4444,7 +4504,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
             /* MIRRORS the ranked query's filter verbatim — same weights, same
              * label exclusions. Changing one alone reports a total that does
              * not describe the rows returned. */
-            "      AND n.label NOT IN ('File','Folder','Variable','Project')"
+            "      AND " BM25_UNLABELLED_EXCLUSION " "
             "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
             "      AND (?7 IS NULL OR n.label = ?7)"
             "      AND (?9 IS NULL OR (CASE WHEN json_valid(n.properties) "
@@ -4535,13 +4595,15 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     if (!rows) {
         return heap_strdup("out of memory");
     }
+    /* Never a silent zero for a label the index spells differently. */
+    char *zero_hint = total == 0 ? bm25_label_zero_hint(db, project, label) : NULL;
 
     int returned = row_count;
     bool budget_hit = false;
     char *payload = NULL;
     for (;;) {
         payload = bm25_render(rows, returned, total, offset, candidate_window_saturated,
-                              tree_format, budget_hit, false, max_output_bytes);
+                              tree_format, budget_hit, false, max_output_bytes, zero_hint);
         if (!payload || strlen(payload) <= max_output_bytes || returned == 0) {
             break;
         }
@@ -4554,8 +4616,9 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     if (!payload || strlen(payload) > max_output_bytes || (row_count > 0 && returned == 0)) {
         free(payload);
         payload = bm25_render(rows, 0, total, offset, candidate_window_saturated, tree_format, true,
-                              row_count > 0, max_output_bytes);
+                              row_count > 0, max_output_bytes, zero_hint);
     }
+    cbm_free(CBM_MEM_CLASS_OTHER, zero_hint);
     bm25_output_rows_free(rows, row_count);
     return payload;
 }
