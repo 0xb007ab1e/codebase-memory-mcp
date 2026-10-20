@@ -4,12 +4,12 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Codebase Memory — Local Code Intelligence &amp; MCP</title>
-    <meta name="description" content="Local code intelligence for AI agents and developers. Connect code, docs and infrastructure with a persistent knowledge graph, MCP tools and CBM Lens.">
+    <meta name="description" content="A local MCP server for AI coding agents. Connect code, docs and infrastructure in a persistent knowledge graph, with 17 tools and native CLI access.">
     <meta name="author" content="DeusData">
     <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
     <meta name="theme-color" content="#0a0e0d">
     <meta property="og:title" content="Codebase Memory — Local Code Intelligence &amp; MCP">
-    <meta property="og:description" content="Local code intelligence for AI agents and developers. Connect code, docs and infrastructure with a persistent knowledge graph, MCP tools and CBM Lens.">
+    <meta property="og:description" content="A local MCP server for AI coding agents. Connect code, docs and infrastructure in a persistent knowledge graph, with 17 tools and native CLI access.">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://deusdata.github.io/codebase-memory-mcp/">
     <meta property="og:image" content="https://deusdata.github.io/codebase-memory-mcp/images/lens-architecture.png">
@@ -20,7 +20,7 @@
     <meta property="og:site_name" content="Codebase Memory">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="Codebase Memory — Local Code Intelligence &amp; MCP">
-    <meta name="twitter:description" content="Local code intelligence for AI agents and developers. Connect code, docs and infrastructure with a persistent knowledge graph, MCP tools and CBM Lens.">
+    <meta name="twitter:description" content="A local MCP server for AI coding agents. Connect code, docs and infrastructure in a persistent knowledge graph, with 17 tools and native CLI access.">
     <meta name="twitter:image" content="https://deusdata.github.io/codebase-memory-mcp/images/lens-architecture.png">
     <meta name="twitter:image:alt" content="CBM Lens architecture view of the codebase-memory-mcp repository">
     <link rel="canonical" href="https://deusdata.github.io/codebase-memory-mcp/">
@@ -35,7 +35,7 @@
           "@id": "https://deusdata.github.io/codebase-memory-mcp/#webpage",
           "url": "https://deusdata.github.io/codebase-memory-mcp/",
           "name": "Codebase Memory — Local Code Intelligence & MCP",
-          "description": "Local code intelligence for AI agents and developers. Connect code, docs and infrastructure with a persistent knowledge graph, MCP tools and CBM Lens.",
+          "description": "A local MCP server for AI coding agents. Connect code, docs and infrastructure in a persistent knowledge graph, with 17 tools and native CLI access.",
           "inLanguage": "en",
           "mainEntity": {
             "@id": "https://deusdata.github.io/codebase-memory-mcp/#software"
@@ -50,7 +50,7 @@
           ],
           "applicationCategory": "DeveloperApplication",
           "operatingSystem": "macOS, Linux, Windows",
-          "description": "Local code intelligence for AI agents and developers. Connect code, docs and infrastructure with a persistent knowledge graph, MCP tools and CBM Lens.",
+          "description": "A local MCP server for AI coding agents. Connect code, docs and infrastructure in a persistent knowledge graph, with 17 tools and native CLI access.",
           "url": "https://deusdata.github.io/codebase-memory-mcp/",
           "downloadUrl": "https://github.com/DeusData/codebase-memory-mcp/releases/latest",
           "license": "https://opensource.org/licenses/MIT",
@@ -65,7 +65,7 @@
             "Structural, full-text and local semantic search",
             "Hybrid LSP semantic type resolution for supported language families",
             "17 MCP tools, CLI access and Cypher graph queries",
-            "CBM Lens source navigation, architecture maps and Galaxy graph",
+            "Optional CBM Lens visual companion: source navigation, architecture maps and Galaxy graph (open beta)",
             "Documentation sections, PDF text pages and architecture decision records",
             "Static infrastructure, deployment and configuration relationships",
             "Cross-service and cross-repository linking",
@@ -316,7 +316,7 @@
         </a>
         <div class="nav-links">
             <a class="desktop-link" href="#features">Capabilities</a>
-            <a class="desktop-link" href="#lens">CBM Lens</a>
+            <a class="desktop-link" href="#lens">Lens beta</a>
             <a class="desktop-link" href="#smart-ci">Smart CI</a>
             <a href="https://github.com/DeusData/codebase-memory-mcp">GitHub ↗</a>
             <a class="nav-install" href="#install">Get started</a>
@@ -327,29 +327,29 @@
     <section class="hero" id="what-is-it">
         <div class="hero-top">
             <div>
-                <p class="eyebrow">Local code intelligence · Open source</p>
+                <p class="eyebrow">Local MCP server · Open source</p>
                 <h1>Understand the<br><span>whole repository.</span></h1>
-                <p class="hero-intro">Codebase Memory (CBM) is an open-source code intelligence server for the Model Context Protocol (MCP). Connect code, documentation and infrastructure in one persistent knowledge graph. Explore it with your coding agent, the CLI or CBM Lens.</p>
+                <p class="hero-intro">Codebase Memory (CBM) is an open-source server for the Model Context Protocol (MCP). Give your AI coding agent a persistent knowledge graph of code, documentation and infrastructure. Search symbols, trace relationships and retrieve source evidence through 17 MCP tools.</p>
                 <p>Focused graph queries help reduce repeated code reading and token use. <a href="#token-savings">See the evidence →</a></p>
                 <div class="actions">
-                    <a class="button primary" href="#install">Install Codebase Memory <span aria-hidden="true">↗</span></a>
-                    <a class="button" href="#lens">Explore CBM Lens <span aria-hidden="true">↓</span></a>
+                    <a class="button primary" href="#install">Install the MCP server <span aria-hidden="true">↗</span></a>
+                    <a class="button" href="#features">Explore the MCP tools <span aria-hidden="true">↓</span></a>
                 </div>
                 <p class="hero-note">macOS · Linux · Windows &nbsp;/&nbsp; Native C · MIT licensed</p>
             </div>
             <div class="hero-aside">
                 <strong>For your agent</strong><p>17 MCP tools, source evidence and coverage checks, with client-specific skills, profiles and hooks.</p>
-                <strong>For you</strong><p>Source navigation, architecture maps and a visible path from question to code.</p>
+                <strong>For your workflow</strong><p>Native CLI access, persistent indexes and optional visual exploration in Lens.</p>
             </div>
         </div>
         <figure class="product-shot">
-            <div class="shot-bar"><span class="live">CBM LENS BETA</span><span class="shot-path">codebase-memory-mcp / architecture</span><span>LOCAL WORKSPACE</span></div>
+            <div class="shot-bar"><span class="live">CBM LENS · OPEN BETA v0.0.1</span><span class="shot-path">codebase-memory-mcp / architecture</span><span>LOCAL WORKSPACE</span></div>
             <a href="images/lens-overview.gif" aria-label="View the full CBM Lens architecture walkthrough"><picture><source media="(prefers-reduced-motion: reduce)" srcset="images/lens-architecture.png" width="1440" height="900"><img src="images/lens-overview.gif" width="960" height="600" alt="CBM Lens architecture walkthrough: explore the source folders, open src/pipeline, select artifact.c and read its source" fetchpriority="high"></picture></a>
-            <figcaption>CBM Lens, exploring this repository. Real product captures from October 2026. <a href="https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/images/README.md">Capture details ↗</a></figcaption>
+            <figcaption>See the MCP server’s graph through CBM Lens, its optional visual companion. Open beta v0.0.1, captured in October 2026. <a href="https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/images/README.md">Capture details ↗</a></figcaption>
         </figure>
         <div class="facts" aria-label="Project at a glance">
             <div><strong>One connected graph</strong><span>Source, docs and infrastructure</span></div>
-            <div><strong>17 MCP tools</strong><span>Plus a CLI and CBM Lens</span></div>
+            <div><strong>17 MCP tools</strong><span>Plus native CLI access</span></div>
             <div><strong>45 client surfaces</strong><span>Automatic or conditional setup</span></div>
             <div><strong>Local processing</strong><span>Your index stays on your machine</span></div>
         </div>
@@ -386,31 +386,10 @@
         <p class="fine">Relationships come from supported source forms. Dynamic values and unresolved references can leave gaps; PDF extraction requires a text layer and does not perform OCR.</p>
     </section>
 
-    <section class="section" id="lens">
-        <div class="section-head">
-            <div><p class="eyebrow">CBM Lens Beta</p><h2>A workspace for<br>understanding your code.</h2></div>
-            <p>Included in standard native releases. Open the local browser interface and move from the shape of a system to the source behind a symbol.</p>
-        </div>
-        <div class="lens-grid">
-            <figure><a href="images/lens-explore.jpg" aria-label="View the full CBM Lens source navigation screenshot"><img src="images/lens-explore.jpg" width="1280" height="720" alt="Lens source reader beside the file impact summary and graph dependencies for limits.c" loading="lazy"></a><figcaption>Source navigation with indexed relationships and impact context.</figcaption></figure>
-            <div class="lens-copy">
-                <div><h3>Read code in context</h3><p>Browse files and symbols, inspect callers and dependencies, and keep the relevant source beside the graph.</p></div>
-                <div><h3>See the shape of the system</h3><p>Explore architecture, system structure and the Galaxy graph. Inspect coverage diagnostics and architecture decisions from the same workspace.</p></div>
-            </div>
-        </div>
-        <div class="gallery">
-            <figure><a href="images/lens-galaxy.gif" aria-label="View the full CBM Lens Galaxy walkthrough"><picture><source media="(prefers-reduced-motion: reduce)" srcset="images/lens-galaxy.jpg" width="1280" height="720"><img src="images/lens-galaxy.gif" width="960" height="600" alt="CBM Lens Galaxy walkthrough: search a function, expand its outgoing calls and follow a path through the graph" loading="lazy"></picture></a><figcaption><strong>Follow the connections</strong>Search, expand connections and follow paths.</figcaption></figure>
-            <figure><a href="images/lens-system-structure.png" aria-label="View the full Lens system structure screenshot"><img src="images/lens-system-structure.png" width="1440" height="900" alt="CBM Lens system structure showing source groups and their dependencies" loading="lazy"></a><figcaption><strong>Inspect system structure</strong>See source groups and dependencies.</figcaption></figure>
-            <figure><a href="images/lens-chat.png" aria-label="View the full Lens local chat screenshot"><img src="images/lens-chat.png" width="1440" height="1200" alt="CBM Lens optional local chat explaining selected source using indexed facts" loading="lazy"></a><figcaption><strong>Ask about selected code</strong>Optional browser AI, with on-device inference.</figcaption></figure>
-        </div>
-        <p class="fine">Lens is served on loopback. Browser AI downloads its optional model after you enable it. Its explanations should be checked against the displayed source.</p>
-        <a class="source-link" href="https://github.com/DeusData/codebase-memory-mcp#cbm-lens-beta-code-visualization-and-source-navigation">Read the Lens guide and watch the walkthroughs →</a>
-    </section>
-
     <section class="section" id="features">
         <div class="section-head">
             <div><p class="eyebrow">Code intelligence</p><h2>Ask better questions<br>of your repository.</h2></div>
-            <p>Use the same persistent graph through your coding agent, the CLI or Lens. Open source evidence whenever a result needs verification.</p>
+            <p>Give your coding agent structural context through 17 MCP tools. Query the same graph from the CLI and open source evidence whenever a result needs verification.</p>
         </div>
         <article class="feature-row" id="semantic-search"><h3>Find the right starting point</h3><div><p>Search by symbol, structure, text or meaning. Combine regex and graph filters, BM25 full-text search, and local semantic search to find relevant code even when the wording differs.</p><div class="tags"><span class="tag">search_graph</span><span class="tag">search_code</span><span class="tag">get_file_outline</span></div></div></article>
         <article class="feature-row" id="hybrid-lsp"><h3>Follow actual relationships</h3><div><p>Tree-sitter parsing and Hybrid LSP resolution build call and dependency relationships for supported languages. Trace callers, callees, data flow and supported cross-service links; query more complex patterns with Cypher.</p><p>Language and framework coverage varies. <a href="https://github.com/DeusData/codebase-memory-mcp#language-support">Check the support matrix →</a></p></div></article>
@@ -448,8 +427,29 @@
         </details>
     </section>
 
+    <section class="section" id="lens">
+        <div class="section-head">
+            <div><p class="eyebrow">CBM Lens · Open beta v0.0.1</p><h2>A visual companion<br>to the MCP server.</h2></div>
+            <p>An optional way to explore the same graph your agent queries. Included in standard native releases, with source navigation, architecture maps and the Galaxy view.</p>
+        </div>
+        <div class="lens-grid">
+            <figure><a href="images/lens-explore.jpg" aria-label="View the full CBM Lens source navigation screenshot"><img src="images/lens-explore.jpg" width="1280" height="720" alt="Lens source reader beside the file impact summary and graph dependencies for limits.c" loading="lazy"></a><figcaption>Source navigation with indexed relationships and impact context.</figcaption></figure>
+            <div class="lens-copy">
+                <div><h3>Read code in context</h3><p>Browse files and symbols, inspect callers and dependencies, and keep the relevant source beside the graph.</p></div>
+                <div><h3>See the shape of the system</h3><p>Explore architecture, system structure and the Galaxy graph. Inspect coverage diagnostics and architecture decisions from the same workspace.</p></div>
+            </div>
+        </div>
+        <div class="gallery">
+            <figure><a href="images/lens-galaxy.gif" aria-label="View the full CBM Lens Galaxy walkthrough"><picture><source media="(prefers-reduced-motion: reduce)" srcset="images/lens-galaxy.jpg" width="1280" height="720"><img src="images/lens-galaxy.gif" width="960" height="600" alt="CBM Lens Galaxy walkthrough: search a function, expand its outgoing calls and follow a path through the graph" loading="lazy"></picture></a><figcaption><strong>Follow the connections</strong>Search, expand connections and follow paths.</figcaption></figure>
+            <figure><a href="images/lens-system-structure.png" aria-label="View the full Lens system structure screenshot"><img src="images/lens-system-structure.png" width="1440" height="900" alt="CBM Lens system structure showing source groups and their dependencies" loading="lazy"></a><figcaption><strong>Inspect system structure</strong>See source groups and dependencies.</figcaption></figure>
+            <figure><a href="images/lens-chat.gif" aria-label="View the full Lens local chat walkthrough"><picture><source media="(prefers-reduced-motion: reduce)" srcset="images/lens-chat.png" width="1440" height="1200"><img src="images/lens-chat.gif" width="960" height="600" alt="CBM Lens local chat walkthrough: ask about a selected symbol and its callers using indexed source facts" loading="lazy"></picture></a><figcaption><strong>Ask about selected code</strong>Optional browser AI, with on-device inference.</figcaption></figure>
+        </div>
+        <p class="fine">Lens is served on loopback. Browser AI downloads its optional model after you enable it. Its explanations should be checked against the displayed source.</p>
+        <a class="source-link" href="https://github.com/DeusData/codebase-memory-mcp#cbm-lens-beta-code-visualization-and-source-navigation">Read the Lens guide and watch the walkthroughs →</a>
+    </section>
+
     <section class="section" id="install">
-        <div class="section-head"><div><p class="eyebrow">Get started</p><h2>Install. Index. Explore.</h2></div><p>Standard native releases include CBM Lens. The native runtime needs no Docker or language runtime; the core indexer and graph queries need no API key.</p></div>
+        <div class="section-head"><div><p class="eyebrow">Get started</p><h2>Install. Index. Explore.</h2></div><p>Install the MCP server and configure your coding agent. The native runtime needs no Docker or language runtime; indexing and graph queries need no API key. Standard releases also include the optional Lens open beta.</p></div>
         <div class="split">
             <div><div class="terminal"><div class="terminal-head">TERMINAL · macOS / Linux</div><pre><code><span class="comment"># Install the native release and agent integrations</span>
 <span class="command">curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash</span>
@@ -457,7 +457,7 @@
 <span class="comment"># Restart your agent, then ask:</span>
 "Index this project"
 
-<span class="comment"># Open CBM Lens in your browser</span>
+<span class="comment"># Optional: open CBM Lens (open beta)</span>
 <span class="command">codebase-memory-mcp daemon start --open</span></code></pre></div><div class="install-links"><a href="https://github.com/DeusData/codebase-memory-mcp/blob/main/install.sh">Inspect the installer ↗</a><a href="https://github.com/DeusData/codebase-memory-mcp#quick-start">Windows / PowerShell ↗</a><a href="https://github.com/DeusData/codebase-memory-mcp#installation">Other installation methods ↗</a></div></div>
             <div class="install-copy"><h3>Your machine. Your index.</h3><p>Source analysis and graph storage run locally. Native releases contain the executable and authenticated release-owned assets, including the Lens frontend and agent integration templates.</p><p>Use native packages or the npm, PyPI and Go wrappers. Package wrappers use their respective runtimes. Nix and source builds also offer builds without the UI.</p><p>Choose the clients you want to configure, restart them after installation, then build your first index.</p><a class="button" href="https://github.com/DeusData/codebase-memory-mcp/releases/latest">Download the latest release <span aria-hidden="true">↗</span></a></div>
         </div>
@@ -469,7 +469,7 @@
 
     <section class="section" id="faq">
         <div class="faq"><p class="eyebrow">Common questions</p><h2>Is Codebase Memory<br>right for your workflow?</h2>
-            <details><summary>When should I use Codebase Memory?</summary><p>Choose CBM when you want your coding agent and your own source-navigation workspace to use the same local graph of code, docs and infrastructure. It brings structural search, source evidence, CBM Lens, agent integrations and experimental test selection into one open-source package. Native releases run on macOS, Linux and Windows without Docker or a language runtime. <a href="#features">Explore the capabilities</a> and <a href="#smart-ci">Smart CI’s current scope</a>.</p></details>
+            <details><summary>When should I use Codebase Memory?</summary><p>Choose CBM when your coding agent needs a persistent local graph of code, docs and infrastructure. The MCP server brings structural search, source evidence, agent integrations and experimental test selection into one open-source package. The CLI provides direct access, and CBM Lens adds an optional visual workspace in open beta. Native releases run on macOS, Linux and Windows without Docker or a language runtime. <a href="#features">Explore the capabilities</a> and <a href="#smart-ci">Smart CI’s current scope</a>.</p></details>
             <details><summary>How does Codebase Memory reduce AI token use?</summary><p>Your agent can query indexed relationships and retrieve the relevant symbols or source snippets instead of repeatedly exploring whole files. Compact results and pagination control how much context each query returns. The benefit depends on the task; <a href="#token-savings">explore the published token-use measurements</a>.</p></details>
             <details><summary>Does Codebase Memory send my source code anywhere?</summary><p>The backend indexes source and stores and queries its graph locally. Your coding agent has its own data-handling settings. Lens can optionally download a browser model after you enable it, with inference on-device. Installers and update checks use the network to obtain releases and assets.</p></details>
             <details><summary>How does the index stay current?</summary><p>Incremental indexing updates changed files. With auto-watch enabled, an eligible active MCP session can watch an already indexed project. Automatic first indexing is a separate opt-in setting. The local UI daemon is not a promise of a permanent background watcher.</p></details>
