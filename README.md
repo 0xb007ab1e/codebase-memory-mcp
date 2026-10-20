@@ -470,9 +470,9 @@ Published backend benchmarks on Apple M3 Pro. These are separate from the CBM Le
 
 **RAM-first pipeline**: All indexing runs in memory (LZ4 HC compressed read, in-memory SQLite, single dump at end). Memory is released back to the OS after indexing completes.
 
-**Token efficiency, within the reported workloads**: The project's [original README report](https://github.com/DeusData/codebase-memory-mcp/blob/4ff6feeab639c4668da0f491930326ed5ec63093/README.md#performance) lists ~3,400 tokens for five structural queries via codebase-memory-mcp versus ~412,000 via file-by-file exploration: approximately **120× fewer tokens** for that comparison. The separate [31-repository preprint](https://arxiv.org/html/2603.27277v1#S4.SS1) reports **10× lower token use** and **2.1× fewer tool calls**, with answer-quality scores of **83% for CBM versus 92% for file-by-file exploration**. These are scoped backend measurements, not a promised saving for every task or a benchmark of CBM Lens. Actual savings depend on the question, repository, agent, and required verification. The study's [system-performance measurements](https://arxiv.org/html/2603.27277v1#S4.SS3) include the Linux indexing and Cypher timings above.
+**More focused context, fewer tokens**: The project's [31-repository preprint](https://arxiv.org/html/2603.27277v1#S4.SS1) reports **10× lower token use** and **2.1× fewer tool calls** compared with file-by-file exploration. These March 2026 backend measurements cover the study's workloads and agent setup; the paper documents the full evaluation. An earlier [five-query comparison](https://github.com/DeusData/codebase-memory-mcp/blob/4ff6feeab639c4668da0f491930326ed5ec63093/README.md#performance) reported ~3,400 versus ~412,000 tokens for structural queries. The study's [system-performance measurements](https://arxiv.org/html/2603.27277v1#S4.SS3) include the Linux indexing and Cypher timings above.
 
-To measure comparable quality, latency, and agent-efficiency metrics on your own workload, see [Measuring quality, latency, and agent savings](docs/MEASURING_SAVINGS.md). Exact reproduction of the figures above requires the original inputs and raw artifacts.
+Explore the [measurement guide](docs/MEASURING_SAVINGS.md) to evaluate quality, latency and token use on your own workload.
 
 ## Troubleshooting & Diagnostics
 
