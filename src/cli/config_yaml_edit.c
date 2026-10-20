@@ -7,6 +7,7 @@
  */
 #include "cli/config_yaml_edit.h"
 
+#include "cli/config_edit_path.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 
@@ -694,13 +695,26 @@ static int yaml_read_file(const char *path, char **out_data, size_t *out_len,
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
 #endif
-    int descriptor = open(path, flags);
+    /* A symlink the invoking user owns, inside an opted-in configuration
+     * root, is read through the descriptor the helper validated on the
+     * target's pinned parent directory (#1954); everything else is opened by
+     * name with O_NOFOLLOW exactly as before. */
+    cbm_config_edit_target_t target;
+    if (cbm_config_edit_target_open(path, &target) < 0) {
+        return YAML_ERROR;
+    }
+    int descriptor = target.fd;
+    target.fd = -1;
+    if (target.status != CBM_CONFIG_EDIT_PATH_FOLLOWED) {
+        descriptor = open(target.path, flags);
+    }
+    cbm_config_edit_target_close(&target);
     if (descriptor < 0) {
         if (errno != ENOENT) {
             return YAML_ERROR;
         }
         struct stat path_state;
-        if (lstat(path, &path_state) == 0 || errno != ENOENT) {
+        if (lstat(target.path, &path_state) == 0 || errno != ENOENT) {
             return YAML_ERROR;
         }
         char *empty = (char *)calloc(YAML_UNIT, YAML_UNIT);
@@ -869,9 +883,30 @@ static int yaml_replace_file(const char *temp_path, const char *path, bool desti
 #endif
 }
 
-static int yaml_write_atomic(const char *path, const char *data, size_t len,
-                             const char *expected_data, size_t expected_len,
-                             const yaml_file_snapshot_t *expected_snapshot) {
+static const char *yaml_temp_name(const char *temp_path) {
+    const char *slash = strrchr(temp_path, '/');
+    return slash ? slash + 1 : temp_path;
+}
+
+/* Drop a staged temp file: through the pinned parent for a followed link,
+ * by name otherwise. */
+static void yaml_discard_temp(const cbm_config_edit_target_t *target, const char *temp_path) {
+    if (target->status == CBM_CONFIG_EDIT_PATH_FOLLOWED) {
+        (void)cbm_config_edit_target_unlink(target, yaml_temp_name(temp_path));
+    } else {
+        (void)cbm_unlink(temp_path);
+    }
+}
+
+/* For a followed link (#1954) the temp file is created with openat() beside
+ * the target and published with renameat() on the pinned parent, so the link
+ * itself is never replaced; every pre-publish comparison runs against the
+ * resolved path. A direct path keeps the by-name sequence unchanged. */
+static int yaml_write_atomic_at(const cbm_config_edit_target_t *target, const char *data,
+                                size_t len, const char *expected_data, size_t expected_len,
+                                const yaml_file_snapshot_t *expected_snapshot) {
+    const char *path = target->path;
+    bool followed = target->status == CBM_CONFIG_EDIT_PATH_FOLLOWED;
     size_t path_len = 0U;
     if (yaml_bounded_strlen(path, YAML_OUTPUT_MAX, &path_len) != 0 ||
         path_len > SIZE_MAX - YAML_TMP_SUFFIX_MAX - YAML_UNIT) {
@@ -901,12 +936,14 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
 #ifdef O_CLOEXEC
         flags |= O_CLOEXEC;
 #endif
-        int descriptor = open(temp_path, flags, YAML_NEW_FILE_MODE);
+        int descriptor = followed ? cbm_config_edit_target_create_temp(
+                                        target, yaml_temp_name(temp_path), YAML_NEW_FILE_MODE)
+                                  : open(temp_path, flags, YAML_NEW_FILE_MODE);
         if (descriptor >= 0) {
             file = fdopen(descriptor, "wb");
             if (!file) {
                 (void)close(descriptor);
-                (void)cbm_unlink(temp_path);
+                yaml_discard_temp(target, temp_path);
                 free(temp_path);
                 return YAML_ERROR;
             }
@@ -947,7 +984,7 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
         failed = true;
     }
     if (failed) {
-        (void)cbm_unlink(temp_path);
+        yaml_discard_temp(target, temp_path);
         free(temp_path);
         return YAML_ERROR;
     }
@@ -958,7 +995,7 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
         !temp_snapshot.exists || temp_len != len ||
         (len != 0U && memcmp(temp_data, data, len) != 0)) {
         free(temp_data);
-        (void)cbm_unlink(temp_path);
+        yaml_discard_temp(target, temp_path);
         free(temp_path);
         return YAML_ERROR;
     }
@@ -970,7 +1007,7 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
     }
 #endif
     if (yaml_snapshot_matches_path(path, expected_data, expected_len, expected_snapshot) != 0) {
-        (void)cbm_unlink(temp_path);
+        yaml_discard_temp(target, temp_path);
         free(temp_path);
         return YAML_ERROR;
     }
@@ -981,13 +1018,27 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
 #endif
     if (yaml_snapshot_matches_path(path, expected_data, expected_len, expected_snapshot) != 0 ||
         yaml_snapshot_matches_path(temp_path, data, len, &temp_snapshot) != 0 ||
-        yaml_replace_file(temp_path, path, expected_snapshot->exists) != 0) {
-        (void)cbm_unlink(temp_path);
+        (followed ? cbm_config_edit_target_commit(target, yaml_temp_name(temp_path))
+                  : yaml_replace_file(temp_path, path, expected_snapshot->exists)) != 0) {
+        yaml_discard_temp(target, temp_path);
         free(temp_path);
         return YAML_ERROR;
     }
     free(temp_path);
     return 0;
+}
+
+static int yaml_write_atomic(const char *requested_path, const char *data, size_t len,
+                             const char *expected_data, size_t expected_len,
+                             const yaml_file_snapshot_t *expected_snapshot) {
+    cbm_config_edit_target_t target;
+    if (cbm_config_edit_target_open(requested_path, &target) < 0) {
+        return YAML_ERROR;
+    }
+    int result =
+        yaml_write_atomic_at(&target, data, len, expected_data, expected_len, expected_snapshot);
+    cbm_config_edit_target_close(&target);
+    return result;
 }
 
 #ifdef CBM_YAML_ENABLE_TEST_API
@@ -2624,8 +2675,18 @@ static int yaml_sequence_line_has_unsupported(const yaml_doc_t *doc, const yaml_
         if (value == '#' && (i == start || doc->data[i - YAML_UNIT] == ' ')) {
             break;
         }
+        /* Block-scalar (`|`, `>`) and flow-sequence (`[`, `]`) indicators
+         * count only where a NODE begins, the same positional rule
+         * yaml_range_has_unsupported_ex applies to `&`/`*`. Interior ones are
+         * text: `probe: kaomoji face >w< here` is a plain scalar, and a real
+         * Hermes config carried two such personas (#1924). `probe: >`,
+         * `probe: |` and `probe: [a, b]` still begin a value and stay
+         * unsupported here. */
         if (value == '[' || value == ']' || value == '|' || value == '>') {
-            return YAML_MATCH;
+            bool begins_node = previous == '\0' || previous == ':' || previous == '-';
+            if (begins_node) {
+                return YAML_MATCH;
+            }
         }
         if (value != ' ' && value != '\t') {
             previous = value;
@@ -2637,8 +2698,28 @@ static int yaml_sequence_line_has_unsupported(const yaml_doc_t *doc, const yaml_
     return quote != '\0' ? YAML_MATCH : 0;
 }
 
-static int yaml_sequence_validate_document(const yaml_doc_t *doc) {
-    for (size_t i = 0U; i < doc->line_count; i++) {
+/* Validates only the top-level section the edit descends into. The root
+ * mapping itself was already validated when the document was parsed, so the
+ * section boundaries are sound; every OTHER top-level section is opaque user
+ * content, the same contract the mapping-entry editor applies. Validating the
+ * whole document refused the stock Hermes config for flow sequences such as
+ * `cli: [hermes-cli]` under `platform_toolsets:`, which the hook edit never
+ * reads or rewrites (#2209). An absent root key means the sequence is appended
+ * as a new top-level section, which touches no existing line. */
+static int yaml_sequence_validate_document(const yaml_doc_t *doc, const char *root_key,
+                                           size_t root_key_len) {
+    bool found = false;
+    size_t section_line = 0U;
+    size_t section_colon = 0U;
+    if (yaml_find_unique_key(doc, 0U, root_key, root_key_len, &found, &section_line,
+                             &section_colon) != 0) {
+        return YAML_ERROR;
+    }
+    if (!found) {
+        return 0;
+    }
+    size_t section_end = yaml_top_level_section_end(doc, section_line);
+    for (size_t i = section_line; i < section_end; i++) {
         const yaml_line_t *line = &doc->lines[i];
         if (line->blank || line->comment || line->dquote_cont) {
             continue;
@@ -2886,7 +2967,7 @@ static int yaml_sequence_analyze(const yaml_doc_t *doc, const char *const *seque
                                  const char *identity_key, const char *identity_value,
                                  yaml_mapping_sequence_target_t *target) {
     memset(target, 0, sizeof(*target));
-    if (yaml_sequence_validate_document(doc) != 0) {
+    if (yaml_sequence_validate_document(doc, sequence_path[0], path_lengths[0]) != 0) {
         return YAML_ERROR;
     }
     size_t parent_begin = 0U;
