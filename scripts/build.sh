@@ -169,7 +169,8 @@ if [[ "$PHASE" != all ]] && $WITH_UI; then
 fi
 
 # --retrace-from: each listed path becomes `make -W <path>` (treated as changed
-# now -- make's own dependency graph picks the objects; no timestamp race).
+# now -- the retrace helper supplies direct compilation entrypoints, so nested
+# includes do not depend on Makefile wildcard coverage; no timestamp race).
 RETRACE_ARGS=()
 if [[ -n "$RETRACE_FROM" ]]; then
     if [[ "$PHASE" != reuse || ! -f "$RETRACE_FROM" ]]; then

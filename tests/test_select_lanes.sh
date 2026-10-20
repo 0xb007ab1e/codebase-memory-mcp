@@ -263,15 +263,18 @@ env = {k: v for k, v in os.environ.items() if k != "GITHUB_EVENT_NAME"}
 changed = work / "codeql-changed.txt"
 changed.write_text("src/main.c\ninternal/cbm/vendored/grammars/go/parser.c\n"
                    "vendored/sqlite3/sqlite3.c\nvendored/no-such-file.c\n"
+                   "internal/cbm/grammar_json.c\ninternal/cbm/ts_runtime.c\n"
                    "graph-ui/src/App.tsx\n", encoding="utf-8")
 listed = work / "codeql-retrace.txt"
 proc = subprocess.run([bash, str(retrace), "--changed", str(changed), str(listed)],
                       capture_output=True, text=True, env=env)
 got = listed.read_text(encoding="utf-8").split() if listed.exists() else None
-if proc.returncode != 0 or got != ["internal/cbm/vendored/grammars/go/parser.c",
+if proc.returncode != 0 or got != ["internal/cbm/grammar_go.c",
+                                   "internal/cbm/grammar_json.c",
+                                   "internal/cbm/ts_runtime.c",
                                    "vendored/sqlite3/sqlite3.c"]:
-    failures.append(f"codeql (c): the retrace helper must list exactly the changed vendored "
-                    f"C files that exist, got {got} (exit {proc.returncode})")
+    failures.append(f"codeql (c): the retrace helper must list the translation units for "
+                    f"changed vendored code and wrappers, got {got} (exit {proc.returncode})")
 for label, args in (("an unreadable change list", ["--changed", str(work / "missing.txt")]),
                     ("no pull request", [])):
     listed.write_text("stale\n", encoding="utf-8")
