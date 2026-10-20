@@ -20,6 +20,7 @@
 
 #include "cbm.h"
 #include "foundation/arena.h"
+#include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/constants.h"
 #include "foundation/mem_core.h"
 #include "result_spill.h" /* cbm_result_relocate */
@@ -47,6 +48,14 @@ typedef struct {
     bool failed;
     cr_slot_t *slots;
     size_t cap; /* power of two */
+    /* MEASURE records which slot each string reference landed in; COPY, which
+     * presents the very same references in the same order, replays them
+     * instead of measuring, hashing and comparing every string a second time
+     * (20 M repeated strlen + 31 M memcmp on the Go corpus, waste sanitizer
+     * 2026-09-17). */
+    uint32_t *seq;
+    size_t seq_len;
+    size_t seq_pos;
     /* RELOCATE: pointers in [old_base, old_base + old_len) move by delta. */
     const char *old_base;
     size_t old_len;
@@ -131,8 +140,16 @@ static void cr_str(cr_ctx_t *c, const char **field) {
         c->refs++;
         return;
     }
-    cr_slot_t *slot = cr_slot(c, s);
+    cr_slot_t *slot;
+    if (c->phase == CR_COPY && c->seq && c->seq_pos < c->seq_len) {
+        slot = &c->slots[c->seq[c->seq_pos++]];
+    } else {
+        slot = cr_slot(c, s);
+    }
     if (c->phase == CR_MEASURE) {
+        if (c->seq && c->seq_len < c->refs) {
+            c->seq[c->seq_len++] = (uint32_t)(slot - c->slots);
+        }
         if (!slot->dst) {
             slot->dst = (char *)s; /* mark as booked; reset before COPY */
             c->bytes += cr_aligned(slot->len + SKIP_ONE);
@@ -256,6 +273,12 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->structural_profile);
     cr_str(c, &d->body_tokens);
     cr_str(c, &d->impl_trait);
+    cr_str(c, &d->http_client);
+    cr_str(c, &d->http_base_url);
+    cr_str(c, &d->variants);
+    cr_list(c, &d->extra_props);
+    cr_str(c, &d->decl_namespace);
+    cr_str(c, &d->variant_key);
 }
 
 static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
@@ -272,11 +295,60 @@ static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
         for (int i = 0; i < argc && call->args; i++) {
             cr_str(c, &call->args[i].expr);
             cr_str(c, &call->args[i].value);
+            cr_str(c, &call->args[i].url_value);
             cr_str(c, &call->args[i].keyword);
         }
     } else if (c->phase == CR_COPY) {
         call->args = NULL;
         call->arg_count = 0;
+    }
+}
+
+/* Facts have counted lists, not sentinel arrays. Bail before touching a failed
+ * array copy so no string rewrite can land in the original result's storage. */
+static bool cr_py_size(cr_ctx_t *c, size_t size) {
+    if (c->failed)
+        return false;
+    if (c->phase == CR_MEASURE &&
+        (size > SIZE_MAX - CR_ALIGN || c->bytes > SIZE_MAX - cr_aligned(size))) {
+        c->failed = true;
+        return false;
+    }
+    return true;
+}
+
+static bool cr_py_string(cr_ctx_t *c, const char **field) {
+    if (!*field)
+        return true;
+    if (c->phase == CR_COUNT && c->refs == SIZE_MAX) {
+        c->failed = true;
+        return false;
+    }
+    if (c->phase == CR_MEASURE && !cr_py_size(c, strlen(*field) + 1))
+        return false;
+    cr_str(c, field);
+    return !c->failed;
+}
+
+static void cr_walk_py_namespace(cr_ctx_t *c, CBMPyNamespaceFacts *facts) {
+    if (!cr_py_size(c, (size_t)facts->count * sizeof(*facts->items)))
+        return;
+    cr_array(c, (void **)&facts->items, facts->count, sizeof(*facts->items));
+    if (c->failed)
+        return;
+    for (int i = 0; i < facts->count; i++) {
+        CBMPyNamespaceFact *f = &facts->items[i];
+        if (!cr_py_string(c, &f->local_name) || !cr_py_string(c, &f->module_name) ||
+            !cr_py_string(c, &f->member_name) ||
+            !cr_py_size(c, (size_t)f->name_count * sizeof(*f->names)))
+            return;
+        cr_array(c, (void **)&f->names, f->name_count, sizeof(*f->names));
+        if (c->failed)
+            return;
+        for (int j = 0; j < f->name_count; j++) {
+            if (!cr_py_string(c, &f->names[j]))
+                return;
+        }
     }
 }
 
@@ -293,6 +365,7 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     for (int i = 0; i < r->imports.count && r->imports.items; i++) {
         cr_str(c, &r->imports.items[i].local_name);
         cr_str(c, &r->imports.items[i].module_path);
+        cr_str(c, &r->imports.items[i].member);
     }
     cr_array(c, (void **)&r->usages.items, r->usages.count, sizeof(CBMUsage));
     for (int i = 0; i < r->usages.count && r->usages.items; i++) {
@@ -338,6 +411,7 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
         cr_str(c, &r->resolved_calls.items[i].callee_qn);
         cr_str(c, &r->resolved_calls.items[i].strategy);
         cr_str(c, &r->resolved_calls.items[i].reason);
+        cr_str(c, &r->resolved_calls.items[i].callee_sig);
     }
     cr_array(c, (void **)&r->string_refs.items, r->string_refs.count, sizeof(CBMStringRef));
     for (int i = 0; i < r->string_refs.count && r->string_refs.items; i++) {
@@ -352,11 +426,25 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
         cr_str(c, &r->infra_bindings.items[i].target_url);
         cr_str(c, &r->infra_bindings.items[i].broker);
     }
+    cr_array(c, (void **)&r->diagram_arrows.items, r->diagram_arrows.count,
+             sizeof(CBMDiagramArrow));
+    for (int i = 0; i < r->diagram_arrows.count && r->diagram_arrows.items; i++) {
+        cr_str(c, &r->diagram_arrows.items[i].from_qn);
+        cr_str(c, &r->diagram_arrows.items[i].to_qn);
+        cr_str(c, &r->diagram_arrows.items[i].label);
+        cr_str(c, &r->diagram_arrows.items[i].style);
+    }
     cr_array(c, (void **)&r->channels.items, r->channels.count, sizeof(CBMChannel));
     for (int i = 0; i < r->channels.count && r->channels.items; i++) {
         cr_str(c, &r->channels.items[i].channel_name);
         cr_str(c, &r->channels.items[i].transport);
         cr_str(c, &r->channels.items[i].enclosing_func_qn);
+    }
+    cr_array(c, (void **)&r->field_types.items, r->field_types.count, sizeof(CBMFieldType));
+    for (int i = 0; i < r->field_types.count && r->field_types.items; i++) {
+        cr_str(c, &r->field_types.items[i].class_qn);
+        cr_str(c, &r->field_types.items[i].field_name);
+        cr_str(c, &r->field_types.items[i].type_text);
     }
     cr_str(c, &r->module_qn);
     cr_str(c, &r->namespace_name);
@@ -366,7 +454,15 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     cr_list(c, &r->macros);
     cr_str(c, &r->error_msg);
     cr_str(c, &r->error_ranges);
+    cr_str(c, &r->module_doc);
+    cr_array(c, (void **)&r->doc_links.items, r->doc_links.count, sizeof(CBMDocLink));
+    for (int i = 0; i < r->doc_links.count && r->doc_links.items; i++) {
+        cr_str(c, &r->doc_links.items[i].source_qn);
+        cr_str(c, &r->doc_links.items[i].raw);
+    }
+    cr_str(c, &r->doc_scope);
     cr_blob(c, (const void **)&r->source, r->source ? (size_t)r->source_len + SKIP_ONE : 0);
+    cr_walk_py_namespace(c, &r->py_namespace);
 }
 
 void cbm_result_relocate(CBMFileResult *result, const char *old_base, size_t len, char *new_base) {
@@ -390,8 +486,67 @@ static size_t cr_pow2_at_least(size_t n) {
     return cap;
 }
 
+/* The intern table and the replay sequence, kept per pipeline worker: a fresh
+ * zeroed table per file was 21,875 allocations and 2.0 GB of pure churn on the
+ * Go corpus (waste sanitizer, 2026-09-17). Kept only on threads whose
+ * cbm_work_arena_release is guaranteed to run (cbm_work_arena_keeping), and
+ * only up to CR_KEEP_BYTES; anything else allocates per call as before. */
+enum { CR_KEEP_BYTES = 8 * 1024 * 1024 };
+static CBM_TLS void *tl_cr_buf;
+static CBM_TLS size_t tl_cr_bytes;
+
+void cbm_result_compact_release_thread(void) {
+    cbm_free(CBM_MEM_CLASS_EXTRACT, tl_cr_buf);
+    tl_cr_buf = NULL;
+    tl_cr_bytes = 0;
+}
+
+/* One zeroed block holding the slot table followed by the sequence. Returns
+ * whether the block is the kept one (then the caller must not free it). */
+static bool cr_scratch_get(cr_ctx_t *c) {
+    size_t slot_bytes = c->cap * sizeof(cr_slot_t);
+    size_t bytes = slot_bytes + (c->refs * sizeof(uint32_t));
+    bool keep = bytes <= (size_t)CR_KEEP_BYTES && cbm_work_arena_keeping();
+    void *buf = NULL;
+    if (keep && tl_cr_buf && tl_cr_bytes >= bytes) {
+        buf = tl_cr_buf;
+    } else if (keep) {
+        size_t grown = CR_MIN_TABLE; /* powers of two: a growing file mix reallocates rarely */
+        while (grown < bytes) {
+            grown *= PAIR_LEN;
+        }
+        if (grown > (size_t)CR_KEEP_BYTES) {
+            grown = bytes;
+        }
+        cbm_result_compact_release_thread();
+        tl_cr_buf = cbm_alloc(CBM_MEM_CLASS_EXTRACT, grown);
+        tl_cr_bytes = tl_cr_buf ? grown : 0;
+        buf = tl_cr_buf;
+    } else {
+        buf = cbm_alloc(CBM_MEM_CLASS_EXTRACT, bytes);
+    }
+    if (!buf) {
+        return false;
+    }
+    memset(
+        buf, 0,
+        slot_bytes); /* MEASURE needs an empty table; the sequence is written before it is read */
+    c->slots = (cr_slot_t *)buf;
+    c->seq = c->refs ? (uint32_t *)((char *)buf + slot_bytes) : NULL;
+    return true;
+}
+
+static void cr_scratch_put(cr_ctx_t *c) {
+    if ((void *)c->slots != tl_cr_buf) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, c->slots);
+    }
+    c->slots = NULL;
+    c->seq = NULL;
+}
+
 void cbm_result_compact(CBMFileResult *result) {
-    if (!result || result->arena.nblocks == 0) {
+    if (!result || result->arena.nblocks == 0 ||
+        !cbm_py_namespace_facts_valid(&result->py_namespace)) {
         return;
     }
     cr_ctx_t c;
@@ -403,15 +558,23 @@ void cbm_result_compact(CBMFileResult *result) {
 
     c.phase = CR_COUNT;
     cr_walk(&c, &tmp);
+    /* Bound intern-table/replay sizing before the existing power-of-two step. */
+    if (c.failed || c.refs > (SIZE_MAX / (sizeof(cr_slot_t) * 8) - CR_MIN_TABLE))
+        return;
 
     c.cap = cr_pow2_at_least(c.refs * CR_TABLE_LOAD + CR_MIN_TABLE);
-    c.slots = (cr_slot_t *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, c.cap * sizeof(cr_slot_t));
-    if (!c.slots) {
+    if (c.cap > UINT32_MAX) /* replay entries store slot indexes in uint32_t */
+        return;
+    if (!cr_scratch_get(&c)) {
         return;
     }
 
     c.phase = CR_MEASURE;
     cr_walk(&c, &tmp);
+    if (c.failed) {
+        cr_scratch_put(&c);
+        return;
+    }
     for (size_t i = 0; i < c.cap; i++) {
         c.slots[i].dst = NULL; /* MEASURE used dst as a booked marker */
     }
@@ -419,14 +582,14 @@ void cbm_result_compact(CBMFileResult *result) {
     CBMArena fresh;
     cbm_arena_init_exact(&fresh, c.bytes);
     if (fresh.nblocks == 0) {
-        cbm_free(CBM_MEM_CLASS_EXTRACT, c.slots);
+        cr_scratch_put(&c);
         return;
     }
 
     c.phase = CR_COPY;
     c.dst = &fresh;
     cr_walk(&c, &tmp);
-    cbm_free(CBM_MEM_CLASS_EXTRACT, c.slots);
+    cr_scratch_put(&c);
     if (c.failed) {
         cbm_arena_destroy(&fresh);
         return;
@@ -436,6 +599,7 @@ void cbm_result_compact(CBMFileResult *result) {
     tmp.defs.cap = tmp.defs.count;
     tmp.calls.cap = tmp.calls.count;
     tmp.imports.cap = tmp.imports.count;
+    tmp.py_namespace.cap = tmp.py_namespace.count;
     tmp.usages.cap = tmp.usages.count;
     tmp.throws.cap = tmp.throws.count;
     tmp.rw.cap = tmp.rw.count;
@@ -447,6 +611,9 @@ void cbm_result_compact(CBMFileResult *result) {
     tmp.string_refs.cap = tmp.string_refs.count;
     tmp.infra_bindings.cap = tmp.infra_bindings.count;
     tmp.channels.cap = tmp.channels.count;
+    tmp.diagram_arrows.cap = tmp.diagram_arrows.count;
+    tmp.field_types.cap = tmp.field_types.count;
+    tmp.doc_links.cap = tmp.doc_links.count;
 
     /* A composite kept its per-unit results only so shallow-copied strings
      * stayed valid; every string is now a copy of its own. */
