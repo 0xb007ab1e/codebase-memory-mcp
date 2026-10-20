@@ -1136,8 +1136,13 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         if (local_cache) {
             /* The cache lives through every later pass: hold the result as the
              * parallel extract does (pass_parallel.c), without its tree (the
-             * cross-file LSP re-parses) and compacted. */
-            cbm_free_tree(result);
+             * cross-file LSP re-parses) and compacted. A PHP result keeps its
+             * tree: the vendor-import check reads each call and usage site's
+             * syntax from it (php_import_kind_at_site, pass_pkgmap.c), and this
+             * route keeps no source to fall back on. */
+            if (lang != CBM_LANG_PHP) {
+                cbm_free_tree(result);
+            }
             cbm_result_compact(result);
             local_cache[i] = result;
         } else {
@@ -1214,5 +1219,6 @@ configured_failure:
         }
         cbm_free(CBM_MEM_CLASS_EXTRACT, local_cache);
     }
+    cbm_work_arena_release(); /* compaction keeps it between files: release on every exit */
     return CBM_PIPELINE_ABORT_PRESERVE_DB;
 }
