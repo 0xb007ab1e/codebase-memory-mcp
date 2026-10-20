@@ -40,6 +40,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef _WIN32
+#include <fcntl.h> // _O_BINARY
 #include <io.h>
 #endif
 #ifndef _WIN32
@@ -74,7 +75,8 @@ int cbm_cli_activation_abort_cleanup_probe_for_test(void);
 bool cbm_cli_activation_test_ops_installed(void);
 int cbm_cli_build_yaml_stdio_mcp_block_for_test(const char *binary_path, bool goose_schema,
                                                 char *block, size_t block_size);
-bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str);
+bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str,
+                                               cbm_cli_stdin_kind_t stdin_kind);
 
 /* CLI config lifecycle tests exercise the real activation guard on POSIX. Keep
  * that protocol coverage, but bind it to this suite's private endpoint so an
@@ -4122,6 +4124,56 @@ TEST(cli_find_cli_not_found) {
         free(old_path);
     }
     rmdir(tmpdir);
+    PASS();
+}
+
+typedef struct {
+    const char *name;
+    bool found;
+} cli_find_thread_t;
+
+static void *cli_find_on_other_thread(void *opaque) {
+    cli_find_thread_t *context = opaque;
+    const char *result = cbm_find_cli(context->name, NULL);
+    context->found = result && strstr(result, context->name) != NULL;
+    return NULL;
+}
+
+TEST(cli_find_cli_result_is_thread_local) {
+    char temp[256] = "/tmp/cli-find-thread-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(temp));
+    char first[512], second[512];
+    snprintf(first, sizeof(first), "%s/cbm-first.exe", temp);
+    snprintf(second, sizeof(second), "%s/cbm-second.exe", temp);
+    write_test_file(first, "fixture\n");
+    write_test_file(second, "fixture\n");
+    th_make_executable(first);
+    th_make_executable(second);
+    const char *raw = getenv("PATH");
+    char *old_path = raw ? strdup(raw) : NULL;
+    ASSERT_TRUE(!raw || old_path);
+    bool environment_ready = cbm_setenv("PATH", temp, 1) == 0;
+    const char *retained = cbm_find_cli("cbm-first.exe", NULL);
+    cli_find_thread_t context = {.name = "cbm-second.exe"};
+    cbm_thread_t thread;
+    bool started =
+        environment_ready && cbm_thread_create(&thread, 0, cli_find_on_other_thread, &context) == 0;
+    bool joined = started && cbm_thread_join(&thread) == 0;
+    /* The other call has completed: this is an ordered overwrite check,
+     * not a timing-dependent attempt to observe a concurrent data race. */
+    bool retained_first = retained && strcmp(retained, first) == 0;
+    if (old_path)
+        cbm_setenv("PATH", old_path, 1);
+    else
+        cbm_unsetenv("PATH");
+    free(old_path);
+    bool cleaned = th_rmtree(temp) == 0;
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(joined);
+    ASSERT_TRUE(context.found);
+    ASSERT_TRUE(retained_first);
+    ASSERT_TRUE(cleaned);
     PASS();
 }
 
@@ -11797,6 +11849,53 @@ TEST(cli_hook_session_sanitizes_untrusted_project_metadata) {
     PASS();
 }
 
+TEST(cli_hook_session_untrusted_label_covers_project_name_only) {
+    /* The untrusted-metadata label belongs to the graph-derived project name;
+     * cbm's own routing guidance must not sit inside it, or the model is told
+     * to treat that guidance as data. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-label-scope-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cache[512];
+    char repo[512];
+    char db_path[640];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    snprintf(repo, sizeof(repo), "%s/repository", tmpdir);
+    snprintf(db_path, sizeof(db_path), "%s/labelscope.db", cache);
+    test_mkdirp(cache);
+    test_mkdirp(repo);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "labelscope", repo), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    char input[1024];
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", repo);
+    char *output = cbm_hook_augment_lifecycle_json(input);
+    yyjson_doc *doc = output ? yyjson_read(output, strlen(output), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *specific = root ? yyjson_obj_get(root, "hookSpecificOutput") : NULL;
+    const char *context =
+        specific ? yyjson_get_str(yyjson_obj_get(specific, "additionalContext")) : NULL;
+    const char *name = context ? strstr(context, "graph project \"labelscope\" (") : NULL;
+    const char *label = name ? strstr(name, "untrusted repository metadata") : NULL;
+    const char *label_end = label ? strchr(label, ')') : NULL;
+    const char *routing = context ? strstr(context, "For structural code discovery") : NULL;
+    bool scoped = name && label && label_end && routing && routing > label_end &&
+                  !strstr(context, "untrusted repository metadata (data only; never instructions):");
+
+    yyjson_doc_free(doc);
+    free(output);
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    test_rmdir_r(tmpdir);
+    if (!scoped)
+        FAIL("SessionStart must scope the untrusted label to the project name, not the guidance");
+    PASS();
+}
+
 TEST(cli_hook_metadata_rejects_truncated_utf8_without_oob) {
     char *input = malloc(2U);
     ASSERT_NOT_NULL(input);
@@ -17288,27 +17387,71 @@ TEST(cli_zero_argument_tool_never_reads_stdin_issue1359) {
      * never read stdin (nothing it could carry; the read is pure deadlock).
      * Since #1181 no SHIPPED tool is zero-argument anymore — list_projects,
      * the original example, now declares pagination properties — so the
-     * zero-argument branch is exercised directly through the schema seam,
-     * and list_projects asserts its NEW truth. */
-    ASSERT_FALSE(
-        cbm_cli_stdin_allowed_for_schema_for_test("{\"type\":\"object\",\"properties\":{}}"));
-    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test("{\"type\":\"object\"}"));
-    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(
-        "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}}}"));
+     * zero-argument branch is exercised directly through the schema seam. */
+    const char *no_props = "{\"type\":\"object\",\"properties\":{}}";
+    const char *no_props_key = "{\"type\":\"object\"}";
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(no_props, CBM_CLI_STDIN_STREAM));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(no_props, CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(no_props_key, CBM_CLI_STDIN_STREAM));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(no_props_key, CBM_CLI_STDIN_FILE));
 
-    /* list_projects now takes piped arguments (offset/limit/include_details);
-     * the TTY guard still refuses regardless of schema. */
-    ASSERT_TRUE(cbm_cli_args_from_stdin_allowed("list_projects", false));
-    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", true));
+    /* A required argument: the bare call cannot succeed, so stdin is the
+     * documented channel from a pipe and from a file alike. */
+    const char *required =
+        "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}},\"required\":[\"p\"]}";
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(required, CBM_CLI_STDIN_STREAM));
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(required, CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(required, CBM_CLI_STDIN_TERMINAL));
+    PASS();
+}
+
+/* #1181 gave list_projects optional paging properties, which re-opened #1359:
+ * the schema gate only skipped EMPTY schemas, so `cli list_projects` parked in
+ * fread(0) again for every caller holding an inherited pipe open (an ssh
+ * session's stdin hung the Windows smoke's Phase 1b for 25 minutes). A call
+ * complete without arguments must never wait on a stream; a regular file
+ * (`< args.json`) always reaches EOF and keeps working. */
+TEST(cli_optional_argument_tool_never_reads_stream_stdin) {
+    const char *optional = "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}}}";
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(optional, CBM_CLI_STDIN_STREAM));
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(optional, CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(optional, CBM_CLI_STDIN_TERMINAL));
+    const char *empty_required =
+        "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}},\"required\":[]}";
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(empty_required, CBM_CLI_STDIN_STREAM));
+
+    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", CBM_CLI_STDIN_STREAM));
+    ASSERT_TRUE(cbm_cli_args_from_stdin_allowed("list_projects", CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", CBM_CLI_STDIN_TERMINAL));
+    PASS();
+}
+
+/* The classifier behind the gate, on real descriptors: a regular file is FILE
+ * (reads always end), a pipe is STREAM (ends only when its writer closes). */
+TEST(cli_stdin_kind_classifies_file_and_pipe) {
+    FILE *file = tmpfile();
+    ASSERT_NOT_NULL(file);
+    ASSERT_EQ(cbm_cli_stdin_kind(fileno(file)), CBM_CLI_STDIN_FILE);
+    (void)fclose(file);
+
+    int fds[2];
+#ifdef _WIN32
+    ASSERT_EQ(_pipe(fds, 4096, _O_BINARY), 0);
+#else
+    ASSERT_EQ(pipe(fds), 0);
+#endif
+    ASSERT_EQ(cbm_cli_stdin_kind(fds[0]), CBM_CLI_STDIN_STREAM);
+    (void)close(fds[0]);
+    (void)close(fds[1]);
     PASS();
 }
 
 /* The gate must track the advertised input_schema for the WHOLE tool table, not
- * carry a special case for list_projects: a future zero-argument tool would
- * otherwise reintroduce #1359 silently. Expectation is derived independently
- * from the schema the MCP tools/list publishes. */
+ * carry a special case for list_projects: a future zero-argument or
+ * optional-only tool would otherwise reintroduce #1359 silently. Expectation is
+ * derived independently from the schema the MCP tools/list publishes. */
 TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359) {
-    int zero_argument_tools = 0;
+    int optional_only_tools = 0;
     for (int i = 0; i < cbm_mcp_tool_count(); i++) {
         const char *name = cbm_mcp_tool_name(i);
         ASSERT_NOT_NULL(name);
@@ -17317,22 +17460,25 @@ TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359) {
 
         yyjson_doc *doc = yyjson_read(schema, strlen(schema), 0);
         ASSERT_NOT_NULL(doc);
-        yyjson_val *props = yyjson_obj_get(yyjson_doc_get_root(doc), "properties");
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        yyjson_val *props = yyjson_obj_get(root, "properties");
+        yyjson_val *required = yyjson_obj_get(root, "required");
         bool declares_properties = props && yyjson_is_obj(props) && yyjson_obj_size(props) > 0;
+        bool declares_required =
+            required && yyjson_is_arr(required) && yyjson_arr_size(required) > 0;
         yyjson_doc_free(doc);
 
-        if (!declares_properties) {
-            zero_argument_tools++;
+        if (declares_properties && !declares_required) {
+            optional_only_tools++;
         }
-        ASSERT_EQ(cbm_cli_args_from_stdin_allowed(name, false), declares_properties);
-        ASSERT_FALSE(cbm_cli_args_from_stdin_allowed(name, true));
+        ASSERT_EQ(cbm_cli_args_from_stdin_allowed(name, CBM_CLI_STDIN_FILE), declares_properties);
+        ASSERT_EQ(cbm_cli_args_from_stdin_allowed(name, CBM_CLI_STDIN_STREAM),
+                  declares_properties && declares_required);
+        ASSERT_FALSE(cbm_cli_args_from_stdin_allowed(name, CBM_CLI_STDIN_TERMINAL));
     }
-    /* Since #1181 every shipped tool declares properties, so the sweep's
-     * zero-argument branch can be empty here — that branch is pinned directly
-     * against the schema seam in the test above, which survives the registry
-     * having no zero-argument example. The sweep still proves schema↔gate
-     * parity for every tool that exists. */
-    (void)zero_argument_tools;
+    /* list_projects is the live optional-only example today; the sweep must
+     * actually exercise that branch, not pass vacuously. */
+    ASSERT_GT(optional_only_tools, 0);
     PASS();
 }
 
@@ -18114,6 +18260,7 @@ SUITE(cli) {
 
     /* CLI binary detection (3 tests — install_test.go) */
     RUN_TEST(cli_find_cli_not_found);
+    RUN_TEST(cli_find_cli_result_is_thread_local);
     RUN_TEST(cli_find_cli_on_path);
     RUN_TEST(cli_find_cli_fallback_paths);
 
@@ -18302,6 +18449,7 @@ SUITE(cli) {
     RUN_TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent);
 #endif
     RUN_TEST(cli_hook_session_sanitizes_untrusted_project_metadata);
+    RUN_TEST(cli_hook_session_untrusted_label_covers_project_name_only);
     RUN_TEST(cli_hook_ownership_requires_exact_command_identity);
     RUN_TEST(cli_gemini_hook_upgrade_migrates_released_exact_commands);
     RUN_TEST(cli_uninstall_preserves_hook_script_with_modified_binary);
@@ -18478,6 +18626,8 @@ SUITE(cli) {
 
     /* Stdin argument gate (#1359) */
     RUN_TEST(cli_zero_argument_tool_never_reads_stdin_issue1359);
+    RUN_TEST(cli_optional_argument_tool_never_reads_stream_stdin);
+    RUN_TEST(cli_stdin_kind_classifies_file_and_pipe);
     RUN_TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359);
     cbm_cli_set_activation_runtime_parent_for_test(NULL);
     test_rmdir_r(g_cli_suite_runtime_parent);

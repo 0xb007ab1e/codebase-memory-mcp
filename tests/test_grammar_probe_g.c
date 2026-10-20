@@ -688,7 +688,8 @@ TEST(probe_sosl_module_only) {
  *
  * DotEnv golden histogram: Module:1 (pure-data).
  * Environment variable files are pure-data; keys are NOT extracted as nodes.
- * Extension: .env suffix detected by pass_envscan; filename ".env" also works.
+ * Extension: .env suffix and ".env." prefix route to DotEnv (language.c);
+ * filename ".env" also works.
  * ══════════════════════════════════════════════════════════════════ */
 
 /* DotEnv: .env file → only Module node. */

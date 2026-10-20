@@ -91,6 +91,13 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name);
  * Returns the number of projects that were reindexed. */
 int cbm_watcher_poll_once(cbm_watcher_t *w);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Test seam: read one project's committed/pending dirty-state signatures so
+ * failing assertions can self-diagnose (see the definition for why). */
+int cbm_watcher_test_dirty_sigs(cbm_watcher_t *w, const char *project, uint64_t *last_out,
+                                uint64_t *pending_out);
+#endif
+
 /* Run the blocking poll loop. Polls every base_interval_ms until
  * cbm_watcher_stop() is called. Returns 0 on clean shutdown. */
 int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms);
@@ -98,7 +105,17 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms);
 /* Request the run loop to stop (thread-safe). */
 void cbm_watcher_stop(cbm_watcher_t *w);
 
-/* ── Introspection (for testing) ────────────────────────────────── */
+/* ── Introspection ─────────────────────────────────────────────── */
+
+typedef struct {
+    bool registered; /* this project's physical registration exists */
+    bool running;    /* run loop entered and stop has not been requested */
+} cbm_watcher_project_status_t;
+
+/* Thread-safe snapshot with a constant-time registry lookup. A NULL watcher
+ * reports both fields false; a NULL project reports only the run-loop state.
+ * Registrations can remain present after the watcher has stopped. */
+cbm_watcher_project_status_t cbm_watcher_project_status(cbm_watcher_t *w, const char *project_name);
 
 /* Return the number of projects in the watch list. */
 int cbm_watcher_watch_count(cbm_watcher_t *w);
