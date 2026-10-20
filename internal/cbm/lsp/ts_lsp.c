@@ -3845,6 +3845,30 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
     ctx->current_scope = saved_scope;
 }
 
+static void process_top_level_variable_arrows(TSLSPContext *ctx, TSNode declaration) {
+    if (!ctx || ts_node_is_null(declaration) || !ctx->module_qn)
+        return;
+
+    uint32_t count = ts_node_named_child_count(declaration);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode declarator = ts_node_named_child(declaration, i);
+        if (!node_kind_is(declarator, "variable_declarator"))
+            continue;
+
+        TSNode name = ts_node_child_by_field_name(declarator, "name", TS_LSP_FIELD_LEN("name"));
+        TSNode value = ts_node_child_by_field_name(declarator, "value", TS_LSP_FIELD_LEN("value"));
+        if (!node_kind_is(name, "identifier") || !node_kind_is(value, "arrow_function"))
+            continue;
+
+        char *function_name = node_text(ctx, name);
+        if (!function_name)
+            continue;
+        const char *function_qn =
+            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, function_name);
+        process_function_body(ctx, value, function_qn, NULL);
+    }
+}
+
 void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
     if (!ctx || ts_node_is_null(root))
         return;
@@ -3870,7 +3894,9 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
         TSNode child = kids[i];
         const char *kind = ts_node_type(child);
 
-        if (strcmp(kind, "function_declaration") == 0) {
+        if (strcmp(kind, "lexical_declaration") == 0 || strcmp(kind, "variable_declaration") == 0) {
+            process_top_level_variable_arrows(ctx, child);
+        } else if (strcmp(kind, "function_declaration") == 0) {
             TSNode name = ts_node_child_by_field_name(child, "name", TS_LSP_FIELD_LEN("name"));
             if (ts_node_is_null(name) || !ctx->module_qn)
                 continue;
@@ -3909,6 +3935,9 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
                         continue;
                     const char *fqn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, fn);
                     process_function_body(ctx, inner, fqn, NULL);
+                } else if (strcmp(ik, "lexical_declaration") == 0 ||
+                           strcmp(ik, "variable_declaration") == 0) {
+                    process_top_level_variable_arrows(ctx, inner);
                 } else if (strcmp(ik, "class_declaration") == 0 ||
                            strcmp(ik, "internal_module") == 0) {
                     process_node(ctx, inner);
