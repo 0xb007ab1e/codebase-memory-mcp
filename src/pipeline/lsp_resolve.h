@@ -27,6 +27,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 #include "pipeline/pipeline.h" /* cbm_registry_unique_field_qn, cbm_resolution_t */
+#include "service_patterns.h"  /* cbm_service_pattern_match for cbm_pipeline_service_name */
 
 #include <ctype.h>
 #include <stdio.h>
@@ -222,6 +223,24 @@ static inline bool cbm_pipeline_node_is_callable_target(const cbm_gbuf_node_t *n
            strcmp(node->label, "Constructor") == 0 || strcmp(node->label, "Class") == 0;
 }
 
+/* The Kotlin resolver claims a property READ on a typed receiver with an exact
+ * row (lsp_kt_property_ref) so that the raw-name fallback cannot borrow a
+ * same-named function. That row names a property, never a function value. Its
+ * QN is not always materialized under that spelling (a property of a nested
+ * class); the graph lookup then finds nothing, or its unique-callable step
+ * picks a same-named function elsewhere (#1555: okhttp `server.webSocket` -> a
+ * test function `webSocket`, a fabricated CALL_REFERENCE). Such a row is not
+ * admissible: the caller falls back by name, restricted to non-callable
+ * targets, which binds the property's own node as before the receiver was
+ * typed and can never borrow a function. */
+static inline bool cbm_pipeline_reference_target_admissible(const CBMResolvedCall *ref,
+                                                            const cbm_gbuf_node_t *tgt) {
+    if (!ref || !ref->strategy || strcmp(ref->strategy, "lsp_kt_property_ref") != 0) {
+        return true;
+    }
+    return tgt && !cbm_pipeline_node_is_callable_target(tgt);
+}
+
 static inline int cbm_pipeline_qn_class_method_tail_eq(const char *qn, const char *tail) {
     const char *qt = cbm_pipeline_qn_class_method_tail(qn);
     return qt && tail && strcmp(qt, tail) == 0;
@@ -331,6 +350,34 @@ static inline int cbm_pipeline_invocation_site_rank(const CBMResolvedCall *resol
         return 0;
     }
     return call->requires_lsp_resolution || call->source_origin != resolved->source_origin ? 0 : 1;
+}
+
+/* A resolver row that proves the call's receiver is a type OUTSIDE the project:
+ * PHP `$r->m()` / `R::m()` where `R` is imported from a vendor namespace
+ * (#1186). When its target has no graph node, it rules out every name-only
+ * fallback: the method of a vendor class is not a same-named project method. */
+static inline bool cbm_pipeline_lsp_external_receiver(const CBMResolvedCall *resolved) {
+    return resolved && resolved->strategy &&
+           strcmp(resolved->strategy, "php_external_receiver") == 0;
+}
+
+/* The service-pattern name of a call: its callee text, or, when that names no
+ * service and the LSP proved the receiver a vendor class, the vendor method
+ * (`GuzzleClient::get` -> `GuzzleHttp.Client.get`). The extractor names a
+ * scoped call by its method alone, and such a call never reaches the
+ * registry, so the vendor class is its only service evidence (#1186). */
+static inline const char *cbm_pipeline_service_name(const CBMCall *call,
+                                                    const CBMResolvedCall *external,
+                                                    cbm_svc_kind_t *kind) {
+    *kind = cbm_service_pattern_match(call->callee_name);
+    if (*kind == CBM_SVC_NONE && cbm_pipeline_lsp_external_receiver(external) &&
+        external->callee_qn && external->callee_qn[0]) {
+        *kind = cbm_service_pattern_match(external->callee_qn);
+        if (*kind != CBM_SVC_NONE) {
+            return external->callee_qn;
+        }
+    }
+    return call->callee_name;
 }
 
 static inline bool cbm_pipeline_invocation_reason_join_strategy(const char *strategy) {

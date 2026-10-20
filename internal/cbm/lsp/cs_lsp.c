@@ -3883,7 +3883,9 @@ CBMTypeRegistry *cbm_cs_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
     }
     cs_register_lsp_defs(arena, reg, cs, type_count);
     cbm_registry_finalize(reg);
-    cs_register_lsp_defs(arena, reg, cs + type_count, total - type_count);
+    if (total > type_count) { /* cs is NULL for an empty corpus: no offset */
+        cs_register_lsp_defs(arena, reg, cs + type_count, total - type_count);
+    }
     cbm_registry_finalize(reg);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
