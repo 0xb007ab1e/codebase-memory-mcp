@@ -159,7 +159,6 @@ MATRIX = {"unix-x86": "_test.yml", "unix-arm64": "_test.yml", "unix-macos14": "_
           "smoke-mac": "pr.yml", "smoke-win": "pr.yml"}
 SINGLE = {"lint": ("_lint.yml", "lint"), "lint-mem": ("_lint.yml", "lint-mem"),
           "license-gate": ("_security.yml", "license-gate"),
-          "codeql-gate": ("_security.yml", "codeql-gate"),
           "pkg-wrappers": ("_test.yml", "test-package-wrappers"),
           "diag": ("_test.yml", "test-diag"), "msan": ("_test.yml", "test-msan"),
           "lsan-macos": ("_test.yml", "test-lsan-macos"),

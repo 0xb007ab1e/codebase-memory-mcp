@@ -293,7 +293,7 @@ def tier_of(cats):
 
 
 # ── Tier -> lanes (R1) ──
-FULL = {"codeql-gate", "diag", "license-gate", "lint", "lint-mem", "lsan-macos",
+FULL = {"diag", "license-gate", "lint", "lint-mem", "lsan-macos",
         "memwaste", "msan", "pkg-wrappers", "security-static", "shard-completeness",
         "smoke-mac", "smoke-ubuntu", "smoke-win", "tsan-arm", "tsan-mac", "tsan-x86",
         "unix-arm64", "unix-macos-intel", "unix-macos14", "unix-x86", "windows",
@@ -308,8 +308,8 @@ R1 = {
     # The contract steps police test-infrastructure/ and lint config too.
     "T0b-nonproduct": LINT | {"contracts"},
     "T1-tests": LINT | CORE_LEGS,
-    "T2-extract": LINT | CORE_LEGS | {"codeql-gate", "tsan-x86", "smoke-ubuntu"},
-    "T3-mid": LINT | CORE_LEGS | {"codeql-gate", "tsan-x86", "smoke-ubuntu"},
+    "T2-extract": LINT | CORE_LEGS | {"tsan-x86", "smoke-ubuntu"},
+    "T3-mid": LINT | CORE_LEGS | {"tsan-x86", "smoke-ubuntu"},
     "T4-platform": FULL - {"msan", "diag", "memwaste"},
     "T5-core": FULL,
 }

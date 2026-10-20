@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The code-scanning gate must FAIL CLOSED.
 #
-# History. `codeql-gate` in .github/workflows/_security.yml counted open alerts
-# with:
+# History. `codeql-gate` in .github/workflows/_security.yml (since moved, as
+# the `alerts` job, to .github/workflows/codeql.yml) counted open alerts with:
 #
 #   ALERTS=$(gh api '.../code-scanning/alerts?state=open' --jq 'length' 2>/dev/null || echo "0")
 #
@@ -20,7 +20,9 @@
 #
 # A security gate that cannot read its input must stop the build, not wave it
 # through. This test pins both halves of that: the permission that makes the
-# read possible, and the fail-closed handling for when it still is not.
+# read possible, and the fail-closed handling for when it still is not. It also
+# pins where the gate runs: never in PR CI (it starved PR CI of runners), on
+# push to main, and inside the dry run and the release, whose verify needs it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -41,24 +43,36 @@ def require(condition: bool, message: str) -> None:
         failures.append(message)
 
 
-workflow = (root / ".github" / "workflows" / "_security.yml").read_text(encoding="utf-8")
+workflow_dir = root / ".github" / "workflows"
+workflow = (workflow_dir / "codeql.yml").read_text(encoding="utf-8")
 
-# Isolate the codeql-gate job so a permission granted to some OTHER job cannot
-# satisfy this test.
-gate = re.search(r"\n  codeql-gate:\n(?P<body>(?:    .*\n|\n)*)", workflow)
-require(gate is not None, "_security.yml no longer defines a codeql-gate job")
-body = gate.group("body") if gate else ""
+
+def job_body(source: str, job: str) -> str | None:
+    m = re.search(rf"\n  {re.escape(job)}:\n(?P<body>(?:    .*\n|\n)*)", source)
+    return m.group("body") if m else None
+
+
+# Isolate the alerts job so a permission granted to some OTHER job cannot
+# satisfy this test. (It was _security.yml's codeql-gate job until CodeQL
+# left PR CI; the logic moved unchanged.)
+gate = job_body(workflow, "alerts")
+require(gate is not None, "codeql.yml no longer defines an alerts job")
+body = gate or ""
+require(
+    re.search(r"^    needs: \[analyze\]\s*$", body, re.M) is not None,
+    "codeql.yml alerts must need analyze -- it counts the alerts that analysis uploaded",
+)
 
 # 1. The read has to be possible at all.
 require(
     re.search(r"^    permissions:\s*$", body, re.M) is not None,
-    "codeql-gate must declare its own permissions block -- inheriting the "
+    "alerts must declare its own permissions block -- inheriting the "
     "workflow default leaves it without security-events access and the alert "
     "API answers 403",
 )
 require(
     re.search(r"^      security-events:\s*read\s*$", body, re.M) is not None,
-    "codeql-gate must request security-events: read, or the code-scanning "
+    "alerts must request security-events: read, or the code-scanning "
     "alert query 403s and the gate cannot see any alert",
 )
 
@@ -71,11 +85,11 @@ require(
 )
 require(
     "BLOCKED: cannot read code scanning alerts" in body,
-    "codeql-gate must fail with a named error when the alert API cannot be read",
+    "alerts must fail with a named error when the alert API cannot be read",
 )
 require(
     re.search(r"alert count was not a number", body) is not None,
-    "codeql-gate must reject a non-numeric alert count instead of comparing it",
+    "alerts must reject a non-numeric alert count instead of comparing it",
 )
 
 # 3. The count is produced in a command substitution, so a bare `exit` inside
@@ -92,53 +106,64 @@ require(
     "inside a command substitution does not stop the caller on its own",
 )
 
-# 4. Every caller must GRANT what the job requests. A reusable workflow cannot
-#    request more permission than its caller holds: asking for
-#    security-events:read from a caller that grants only contents:read does not
+# 4. Where CodeQL runs. Never per pull request (a per-PR analysis plus a PR-CI
+#    job waiting up to 150 min for it starved PR CI of runners); on push to
+#    main, and callable so the dry run and the release can require it.
+on = re.search(r"(?ms)^on:\n(?P<body>.*?)(?=^\S)", workflow)
+triggers = set(re.findall(r"(?m)^  ([a-z_]+):", on.group("body"))) if on else set()
+require("pull_request" not in triggers and "pull_request_target" not in triggers,
+        "codeql.yml must not run per pull request")
+require({"push", "workflow_call"} <= triggers,
+        f"codeql.yml must run on push to main and be callable, has {sorted(triggers)}")
+require(re.search(r"(?m)^  push:\n    branches: \[main\]$", workflow) is not None,
+        "codeql.yml's push trigger must be main")
+for name in ("pr.yml", "_security.yml"):
+    code = "\n".join(
+        line for line in (workflow_dir / name).read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    require("codeql" not in code.lower(),
+            f"{name} must neither run nor wait for CodeQL (PR CI)")
+
+# 5. Every caller must GRANT what codeql.yml's jobs request. A reusable
+#    workflow cannot request more permission than its caller holds: asking for
+#    security-events from a caller that grants only contents:read does not
 #    downgrade, it fails the entire run with a startup_failure before a single
-#    job executes. Checking only the called workflow is how this test passed
-#    while the PR pipeline never started.
-#    The caller list is DERIVED, never hardcoded. An earlier revision listed
-#    ("pr.yml", "release.yml") by hand and stayed green while dry-run.yml -- a
-#    third caller nobody had listed -- failed every run at startup. A test that
-#    only checks the callers you remembered cannot catch the one you forgot.
-workflow_dir = root / ".github" / "workflows"
+#    job executes. The caller list is DERIVED, never hardcoded: an earlier
+#    revision listed callers by hand and stayed green while a third caller
+#    nobody had listed failed every run at startup.
 callers = sorted(
     path.name
     for path in workflow_dir.glob("*.yml")
-    if "uses: ./.github/workflows/_security.yml" in path.read_text(encoding="utf-8")
+    if "uses: ./.github/workflows/codeql.yml" in path.read_text(encoding="utf-8")
 )
 require(
-    len(callers) >= 3,
-    "expected at least 3 callers of _security.yml, found: "
-    + (", ".join(callers) or "none")
-    + " -- if a caller was deliberately removed, lower this floor on purpose",
+    {"dry-run.yml", "release.yml"} <= set(callers),
+    "the dry run and the release must call codeql.yml (their CodeQL pass), callers: "
+    + (", ".join(callers) or "none"),
 )
-
 for caller_name in callers:
     caller = (workflow_dir / caller_name).read_text(encoding="utf-8")
-    # The next sibling may be a comment line, not a key, so the lookahead has to
-    # accept any 2-space-indented non-space -- matching only `  \w` silently
-    # failed to find release.yml's job at all.
-    call = re.search(
-        r"\n  security:\n(?P<body>(?:    .*\n|\n)*?)(?=\n?  \S|\Z)", caller
-    )
-    require(call is not None, f"{caller_name} no longer has a security: job")
-    call_body = call.group("body") if call else ""
+    call_body = job_body(caller, "codeql") or ""
     require(
-        "uses: ./.github/workflows/_security.yml" in call_body,
-        f"{caller_name}'s security job must call _security.yml",
+        "uses: ./.github/workflows/codeql.yml" in call_body,
+        f"{caller_name} must call codeql.yml from a job named codeql",
     )
-    require(
-        re.search(r"^      security-events:\s*read\s*$", call_body, re.M) is not None,
-        f"{caller_name} must grant security-events: read to the security job -- "
-        "a called workflow cannot request more than its caller grants, and the "
-        "run fails at startup rather than degrading",
-    )
-    require(
-        re.search(r"^      actions:\s*read\s*$", call_body, re.M) is not None,
-        f"{caller_name} must grant actions: read to the security job",
-    )
+    for perm, level in (("security-events", "write"), ("actions", "read"), ("contents", "read")):
+        require(
+            re.search(rf"^      {perm}:\s*{level}\s*$", call_body, re.M) is not None,
+            f"{caller_name} must grant {perm}: {level} to the codeql job -- a "
+            "called workflow cannot request more than its caller grants, and the "
+            "run fails at startup rather than degrading",
+        )
+
+# 6. The release publishes nothing without the CodeQL pass.
+release = (workflow_dir / "release.yml").read_text(encoding="utf-8")
+verify = job_body(release, "verify") or ""
+require(re.search(r"(?m)^    needs: \[[^\]]*\bcodeql\b[^\]]*\]$", verify) is not None,
+        "release.yml verify must need the codeql job")
+require("needs.codeql.result == 'success'" in verify,
+        "release.yml verify must require needs.codeql.result == 'success'")
 
 if failures:
     print("Security gate fail-closed contract FAILED:")

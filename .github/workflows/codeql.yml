@@ -1,31 +1,55 @@
 name: CodeQL SAST
 
+# CodeQL runs on main, on a schedule and inside the dry run and the release --
+# never per pull request. A per-PR analysis (40-120 min each) plus the PR-CI
+# job that waited up to 150 min for it held runners that the PR legs needed:
+# with ~30 PRs pushed at once, PR CI starved for hours.
+#
+#   push to main       every merge is analysed; the `alerts` job fails the run
+#                      while any code-scanning alert is open (alert policy).
+#   schedule           weekly, so a CodeQL query update that finds something in
+#                      unchanged code is noticed without a push.
+#   workflow_call      dry-run.yml and release.yml analyse the exact commit they
+#                      test; their `codeql` job (analyze + alerts) must pass.
+#   workflow_dispatch  a manual re-run on any ref.
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
-# One analysis per pull request and one per pushed branch. A newer push to main
-# cancels the analysis of an older main commit; only the newest commit's
-# results matter for main, and a merge-heavy day otherwise queues one 40-100
-# minute analysis per merge ahead of every pull request run.
-concurrency:
-  group: codeql-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    # A newer push to main cancels the analysis of an older main commit; only
+    # the newest commit's results matter for main. Every other trigger gets a
+    # group of its own and is never cancelled, so a dry run and a release
+    # dispatched together cannot cancel each other's gate. In a called workflow
+    # `github` is the CALLER's context: github.workflow names the dry run or
+    # the release, github.run_id is the caller's run.
+    concurrency:
+      group: codeql-${{ github.event_name == 'push' && github.ref || format('{0}-{1}', github.workflow, github.run_id) }}
+      cancel-in-progress: ${{ github.event_name == 'push' }}
     # CodeQL needs security-events: write to upload results; scoped to this job so
     # the workflow's top-level token stays read-only (Scorecard TokenPermissions).
     permissions:
       security-events: write
       actions: read
       contents: read
+    env:
+      # One code-scanning configuration for every trigger. The action derives
+      # the key from the RUN's workflow file, which for a called workflow is
+      # the caller: dry-run.yml / release.yml would each open a configuration
+      # of their own on main, and an alert fixed by a later push would stay
+      # open in the stale one until the next dry run. The value is the key the
+      # push-to-main analysis has always used (the action documents this
+      # variable as settable for non-standard setups).
+      CODEQL_ACTION_ANALYSIS_KEY: .github/workflows/codeql.yml:analyze
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -45,3 +69,73 @@ jobs:
         uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           category: "/language:c-cpp"
+
+  # Alert policy: the default branch carries ZERO open code-scanning alerts.
+  # Any open alert -- a new finding from a merge, from the weekly run, or one
+  # this commit adds -- fails this job: the main commit turns red, GitHub
+  # notifies whoever triggered the run, and the dry run and the release (which
+  # call this workflow) cannot pass until the alert is fixed or dismissed with
+  # a reason in the Security tab. With a zero baseline, "any open alert" is
+  # exactly "a new alert". Moved here unchanged from _security.yml's former
+  # PR-CI codeql-gate job; it reads the default branch's alerts, as it did there.
+  alerts:
+    needs: [analyze]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Without security-events:read this job inherits the workflow's
+    # contents:read, the code-scanning alert API answers 403, and the former
+    # gate reported "0 alerts" on every run it ever made.
+    permissions:
+      contents: read
+      security-events: read
+    steps:
+      - name: Check for open code scanning alerts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # FAIL CLOSED. The previous form was `gh api ... 2>/dev/null || echo "0"`,
+          # which looks defensive and is the opposite. gh writes the API error
+          # BODY to stdout, so a 403 made ALERTS the string
+          #   {"message":"Resource not accessible by integration",...,"status":"403"}0
+          # every `[` comparison then failed as non-integer, the `if` took its
+          # false branch, and the step printed "CodeQL gate passed (0 alerts)"
+          # and exited 0. That is exactly how a security gate should NEVER fail:
+          # silently, in the direction of "everything is fine". An unreadable
+          # alert list is now an error, not a zero.
+          # NOTE: this runs in a command substitution, so it must `return`, not
+          # `exit` -- an `exit` here would only end the subshell and let the
+          # caller continue with an empty count, recreating the very bug this
+          # replaces. The callers below check the status explicitly.
+          count_open_alerts() {
+            local body status
+            body=$(gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' \
+                     --jq 'length' 2>/dev/null)
+            status=$?
+            if [ $status -ne 0 ]; then
+              echo "BLOCKED: cannot read code scanning alerts (gh exit $status)." >&2
+              echo "  Refusing to treat an unreadable alert list as zero." >&2
+              echo "  Most likely cause: the job lacks security-events:read." >&2
+              return 1
+            fi
+            case "$body" in
+              ''|*[!0-9]*)
+                echo "BLOCKED: alert count was not a number: ${body:-<empty>}" >&2
+                return 1
+                ;;
+            esac
+            printf '%s' "$body"
+          }
+          echo "Waiting 60s for alert API to settle..."
+          sleep 60
+          ALERTS=$(count_open_alerts) || exit 1
+          sleep 15
+          ALERTS2=$(count_open_alerts) || exit 1
+          [ "$ALERTS" -lt "$ALERTS2" ] && ALERTS=$ALERTS2
+          if [ "$ALERTS" -gt 0 ]; then
+            echo "::error title=Open code scanning alerts::$ALERTS open alert(s) on the default branch -- fix, or dismiss with a reason in the Security tab"
+            echo "BLOCKED: $ALERTS open alert(s)"
+            gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' \
+              --jq '.[] | "  #\(.number) [\(.rule.security_severity_level // .rule.severity)] \(.rule.id) — \(.most_recent_instance.location.path):\(.most_recent_instance.location.start_line)"' 2>/dev/null || true
+            exit 1
+          fi
+          echo "=== CodeQL gate passed (0 alerts) ==="

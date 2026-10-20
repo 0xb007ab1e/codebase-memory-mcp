@@ -66,7 +66,7 @@ if 'LANES' in os.environ:
     single = {
         'lint / lint': 'lint', 'lint / lint-mem': 'lint-mem',
         'security / security-static': 'security-static',
-        'security / license-gate': 'license-gate', 'security / codeql-gate': 'codeql-gate',
+        'security / license-gate': 'license-gate',
         'test / test-diag': 'diag', 'test / test-msan': 'msan',
         'test / test-lsan-macos': 'lsan-macos', 'test / test-windows-guards': 'windows-guards',
         'test / shard-completeness': 'shard-completeness', 'contracts': 'contracts',

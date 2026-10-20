@@ -47,7 +47,7 @@ failures = []
 # Every lane of the full PR pipeline, spelled out here rather than read from
 # the selector, so a lane silently dropped from the selector's universe fails.
 FULL = {
-    "codeql-gate", "diag", "license-gate", "lint", "lint-mem", "lsan-macos",
+    "diag", "license-gate", "lint", "lint-mem", "lsan-macos",
     "memwaste", "msan", "pkg-wrappers", "security-static",
     "shard-completeness", "smoke-mac", "smoke-ubuntu", "smoke-win",
     "tsan-arm", "tsan-mac", "tsan-x86", "unix-arm64", "unix-macos-intel",
