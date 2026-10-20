@@ -6,7 +6,8 @@
 #include "foundation/mem_events.h" // waste sanitizer: the bound allocators bypass every observer
 #include "foundation/log.h"        // cbm_log_warn -- extract.lsp.skipped
 #include "cbm.h"
-#include "arena.h" // CBMArena, cbm_arena_init/alloc/strdup/destroy
+#include "arena.h"   // CBMArena, cbm_arena_init/alloc/strdup/destroy
+#include "doclink.h" // cbm_doclinks_extract: doc-comment references + doc-link scope
 #include "helpers.h"
 #include "lang_specs.h"
 #include "extract_unified.h"
@@ -20,6 +21,7 @@
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
 #include "lsp/rust_lsp.h"
+#include "lsp/lsp_work.h"
 #include "preprocessor.h"
 #include "sql_values.h" // #1735: literal INSERT rows kept out of the SQL parse
 #include "cpp_branch_views.h"
@@ -110,6 +112,190 @@ void cbm_reset_profile(void) {
     atomic_store(&total_preprocess_ns, 0);
     atomic_store(&total_files_preprocessed, 0);
     atomic_store(&total_files, 0);
+}
+
+/* New facts use checked allocation and atomic publication; legacy extraction
+ * arrays retain their existing contracts. */
+static bool py_namespace_nonempty(const char *s) {
+    return s && s[0];
+}
+
+static bool py_namespace_fact_valid(const CBMPyNamespaceFact *f) {
+    if (!f || f->name_count < 0 || (size_t)f->name_count > SIZE_MAX / sizeof(*f->names) ||
+        (f->name_count == 0 ? f->names != NULL : f->names == NULL))
+        return false;
+    bool literal = f->kind == CBM_PY_NS_ALL_SET || f->kind == CBM_PY_NS_ALL_APPEND;
+    if (!literal && (f->names || f->name_count || f->sequence_kind != CBM_PY_NS_SEQUENCE_NONE))
+        return false;
+    if (f->kind != CBM_PY_NS_OWN_DEF && f->def_kind != CBM_PY_NS_DEF_NONE)
+        return false;
+    if (f->kind != CBM_PY_NS_IMPORT_MODULE && f->flags)
+        return false;
+    if (f->kind != CBM_PY_NS_IMPORT_NAME && f->kind != CBM_PY_NS_IMPORT_STAR && f->relative_level)
+        return false;
+    bool unknown = f->kind == CBM_PY_NS_SHADOW || f->kind == CBM_PY_NS_UNKNOWN ||
+                   f->kind == CBM_PY_NS_ALL_UNKNOWN;
+    if (!unknown && f->reason != CBM_PY_NS_REASON_NONE)
+        return false;
+    switch (f->kind) {
+    case CBM_PY_NS_OWN_DEF:
+        return py_namespace_nonempty(f->local_name) && !f->module_name && !f->member_name &&
+               (f->def_kind == CBM_PY_NS_DEF_FUNCTION || f->def_kind == CBM_PY_NS_DEF_CLASS);
+    case CBM_PY_NS_IMPORT_MODULE:
+        return py_namespace_nonempty(f->local_name) && py_namespace_nonempty(f->module_name) &&
+               !f->member_name && !(f->flags & ~CBM_PY_NS_IMPORT_BINDS_ROOT);
+    case CBM_PY_NS_IMPORT_NAME:
+    case CBM_PY_NS_IMPORT_STAR:
+        if (!f->module_name || (!f->module_name[0] && !f->relative_level))
+            return false;
+        return f->kind == CBM_PY_NS_IMPORT_NAME
+                   ? py_namespace_nonempty(f->local_name) && py_namespace_nonempty(f->member_name)
+                   : !f->local_name && !f->member_name;
+    case CBM_PY_NS_SHADOW:
+        return py_namespace_nonempty(f->local_name) && !f->module_name && !f->member_name &&
+               (f->reason == CBM_PY_NS_REASON_VALUE || f->reason == CBM_PY_NS_REASON_DECORATED ||
+                f->reason == CBM_PY_NS_REASON_UNPROVEN_CLASS ||
+                f->reason == CBM_PY_NS_REASON_UNSUPPORTED);
+    case CBM_PY_NS_DELETE:
+        return py_namespace_nonempty(f->local_name) && strcmp(f->local_name, "__all__") != 0 &&
+               !f->module_name && !f->member_name;
+    case CBM_PY_NS_UNKNOWN:
+        return !f->local_name && !f->module_name && !f->member_name &&
+               (f->reason == CBM_PY_NS_REASON_COMPOUND || f->reason == CBM_PY_NS_REASON_EFFECT ||
+                f->reason == CBM_PY_NS_REASON_UNSUPPORTED || f->reason == CBM_PY_NS_REASON_PARSE);
+    case CBM_PY_NS_ALL_UNKNOWN:
+        return !f->local_name && !f->module_name && !f->member_name &&
+               (f->reason == CBM_PY_NS_REASON_VALUE || f->reason == CBM_PY_NS_REASON_EFFECT ||
+                f->reason == CBM_PY_NS_REASON_UNSUPPORTED || f->reason == CBM_PY_NS_REASON_PARSE);
+    case CBM_PY_NS_ALL_SET:
+    case CBM_PY_NS_ALL_APPEND:
+        if (f->local_name || f->module_name || f->member_name ||
+            (f->sequence_kind != CBM_PY_NS_SEQUENCE_LIST &&
+             f->sequence_kind != CBM_PY_NS_SEQUENCE_TUPLE))
+            return false;
+        for (int i = 0; i < f->name_count; i++) {
+            if (!f->names[i])
+                return false;
+        }
+        return true;
+    case CBM_PY_NS_ALL_DELETE:
+        return !f->local_name && !f->module_name && !f->member_name;
+    default:
+        return false;
+    }
+}
+
+bool cbm_py_namespace_facts_valid(const CBMPyNamespaceFacts *f) {
+    if (!f)
+        return false;
+    bool empty = !f->items && f->count == 0 && f->cap == 0;
+    if (f->version == 0)
+        return f->status == CBM_PY_NS_NOT_CAPTURED && f->failure == CBM_PY_NS_FAILURE_NONE && empty;
+    if (f->version != CBM_PY_NAMESPACE_FACTS_VERSION || f->language < 0 ||
+        f->language >= CBM_LANG_COUNT)
+        return false;
+    switch (f->status) {
+    case CBM_PY_NS_NOT_CAPTURED:
+        return empty && f->failure == CBM_PY_NS_FAILURE_NONE;
+    case CBM_PY_NS_NOT_APPLICABLE:
+        return empty && f->language != CBM_LANG_PYTHON && f->failure == CBM_PY_NS_FAILURE_NONE;
+    case CBM_PY_NS_INCOMPLETE:
+        return empty && f->failure >= CBM_PY_NS_FAILURE_INVALID_INPUT &&
+               f->failure <= CBM_PY_NS_FAILURE_LIMIT;
+    case CBM_PY_NS_COMPLETE:
+        if (f->language != CBM_LANG_PYTHON || f->failure != CBM_PY_NS_FAILURE_NONE ||
+            f->count < 0 || f->cap < f->count || (size_t)f->cap > SIZE_MAX / sizeof(*f->items) ||
+            (f->count == 0 ? !empty : f->items == NULL))
+            return false;
+        for (int i = 0; i < f->count; i++) {
+            if (!py_namespace_fact_valid(&f->items[i]))
+                return false;
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static CBM_TLS int py_namespace_copy_left = -1;
+void cbm_py_namespace_test_copy_fail_after(int successful_allocations) {
+    py_namespace_copy_left = successful_allocations;
+}
+#endif
+
+static void *py_namespace_copy_alloc(CBMArena *arena, size_t size) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (py_namespace_copy_left == 0)
+        return NULL;
+    if (py_namespace_copy_left > 0)
+        py_namespace_copy_left--;
+#endif
+    return cbm_arena_alloc(arena, size);
+}
+
+static bool py_namespace_copy_string(CBMArena *arena, const char *source, const char **out) {
+    *out = NULL;
+    if (!source)
+        return true;
+    size_t len = strlen(source);
+    if (len == SIZE_MAX)
+        return false;
+    char *copy = py_namespace_copy_alloc(arena, len + 1);
+    if (!copy)
+        return false;
+    memcpy(copy, source, len + 1);
+    *out = copy;
+    return true;
+}
+
+bool cbm_py_namespace_facts_copy(CBMArena *arena, const CBMPyNamespaceFacts *source,
+                                 CBMPyNamespaceFacts *out) {
+    if (!out || source == out)
+        return false;
+    CBMPyNamespaceFacts failure = {.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+                                   .language = CBM_LANG_PYTHON,
+                                   .status = CBM_PY_NS_INCOMPLETE,
+                                   .failure = CBM_PY_NS_FAILURE_INVALID_INPUT};
+    if (!arena || !cbm_py_namespace_facts_valid(source)) {
+        *out = failure;
+        return false;
+    }
+    failure.language = source->language;
+    failure.failure = CBM_PY_NS_FAILURE_ALLOCATION;
+    CBMPyNamespaceFacts copy = *source;
+    copy.items = NULL;
+    copy.cap = copy.count;
+    if (copy.count) {
+        copy.items = py_namespace_copy_alloc(arena, (size_t)copy.count * sizeof(*copy.items));
+        if (!copy.items)
+            goto failed;
+        memcpy(copy.items, source->items, (size_t)copy.count * sizeof(*copy.items));
+    }
+    for (int i = 0; i < copy.count; i++) {
+        const CBMPyNamespaceFact *src = &source->items[i];
+        CBMPyNamespaceFact *dst = &copy.items[i];
+        if (!py_namespace_copy_string(arena, src->local_name, &dst->local_name) ||
+            !py_namespace_copy_string(arena, src->module_name, &dst->module_name) ||
+            !py_namespace_copy_string(arena, src->member_name, &dst->member_name))
+            goto failed;
+        dst->names = NULL;
+        if (src->name_count) {
+            dst->names =
+                py_namespace_copy_alloc(arena, (size_t)src->name_count * sizeof(*dst->names));
+            if (!dst->names)
+                goto failed;
+            for (int j = 0; j < src->name_count; j++) {
+                if (!py_namespace_copy_string(arena, src->names[j], &dst->names[j]))
+                    goto failed;
+            }
+        }
+    }
+    *out = copy;
+    return true;
+failed:
+    *out = failure;
+    return false;
 }
 
 // --- Growable array push functions ---
@@ -216,6 +402,31 @@ void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp) {
     arr->items[arr->count++] = imp;
 }
 
+bool cbm_imports_local_span_binds_runtime_name(const CBMImportArray *imports, const char *name,
+                                               size_t len) {
+    if (!imports || !name) {
+        return true;
+    }
+    bool seen = false;
+    for (int i = 0; i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (!imp->local_name || strncmp(imp->local_name, name, len) != 0 ||
+            imp->local_name[len] != '\0') {
+            continue;
+        }
+        if (cbm_import_binds_runtime_name(imp)) {
+            return true;
+        }
+        seen = true;
+    }
+    return !seen;
+}
+
+bool cbm_imports_local_binds_runtime_name(const CBMImportArray *imports, const char *local_name) {
+    return !local_name ||
+           cbm_imports_local_span_binds_runtime_name(imports, local_name, strlen(local_name));
+}
+
 void cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = usage;
@@ -261,6 +472,11 @@ void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBindi
     arr->items[arr->count++] = ib;
 }
 
+void cbm_k8sfact_push(CBMK8sFactArray *arr, CBMArena *a, CBMK8sFact f) {
+    GROW_ARRAY(arr, a);
+    arr->items[arr->count++] = f;
+}
+
 void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = it;
@@ -274,6 +490,11 @@ void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCa
 void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = ch;
+}
+
+void cbm_diagram_arrows_push(CBMDiagramArrowArray *arr, CBMArena *a, CBMDiagramArrow da) {
+    GROW_ARRAY(arr, a);
+    arr->items[arr->count++] = da;
 }
 
 // --- String input reader (for parse_with_options) ---
@@ -1356,24 +1577,63 @@ static bool cbm_is_eof_terminator_miss(TSNode n, const char *source, int source_
     return true;
 }
 
+/* The two walks below visit, in source order, every ERROR or MISSING node that
+ * is top-most in its chain: they step into a child that merely contains an
+ * error and never into an ERROR subtree. That descent follows the nesting of
+ * the construct that failed — every ancestor of the failing node carries
+ * ts_node_has_error — so a recursive walk used one stack frame per nesting
+ * level of the indexed file, and a deep enough nest ran the worker thread out
+ * of stack. The cursor keeps that path on the heap. The nodes visited and
+ * their order are those of the child-index loop it replaced: the cursor
+ * stops on exactly the visible children ts_node_child enumerates. */
+typedef void (*cbm_error_node_fn)(TSNode node, void *arg);
+
+static void cbm_walk_error_nodes(TSNode root, const char *source, int source_len,
+                                 cbm_error_node_fn fn, void *arg) {
+    /* The thread's reusable cursor: the walk completes before anything else on
+     * this thread can ask for it, and the callbacks never do. */
+    TSTreeCursor *cursor = cbm_thread_cursor(root);
+    if (!ts_tree_cursor_goto_first_child(cursor)) {
+        return;
+    }
+    int depth = 0; /* 0 while on a direct child of root */
+    for (;;) {
+        TSNode c = ts_tree_cursor_current_node(cursor);
+        bool descend = false;
+        if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
+            /* An absent final newline only means nothing was dropped. Anything
+             * else is the top-most region; do not descend. */
+            if (!cbm_is_eof_terminator_miss(c, source, source_len)) {
+                fn(c, arg);
+            }
+        } else if (ts_node_has_error(c)) {
+            descend = true;
+        }
+        if (descend && ts_tree_cursor_goto_first_child(cursor)) {
+            depth++;
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(cursor)) {
+            if (depth == 0) {
+                return;
+            }
+            (void)ts_tree_cursor_goto_parent(cursor);
+            depth--;
+        }
+    }
+}
+
 /* Walks to the end even after the cap is full, so `dropped` is the real number
  * of ranges lost rather than a lower bound. This costs little: the walk never
  * descends into an ERROR subtree — it records the top-most node and moves on —
  * so it only visits the spine of nodes that contain an error, plus one level. */
+static void cbm_collect_error_region(TSNode c, void *arg) {
+    cbm_error_regions_push((cbm_error_regions_t *)arg, c);
+}
+
 static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, const char *source,
                                       int source_len) {
-    uint32_t k = ts_node_child_count(n);
-    for (uint32_t i = 0; i < k; i++) {
-        TSNode c = ts_node_child(n, i);
-        if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
-            if (cbm_is_eof_terminator_miss(c, source, source_len)) {
-                continue; /* absent final newline only — nothing was dropped */
-            }
-            cbm_error_regions_push(acc, c); /* top-most region; do not descend */
-        } else if (ts_node_has_error(c)) {
-            cbm_collect_error_regions(c, acc, source, source_len);
-        }
-    }
+    cbm_walk_error_nodes(n, source, source_len, cbm_collect_error_region, acc);
 }
 
 /* ── Phase 2 line map: what the preprocessed parse already explained ───────
@@ -1480,24 +1740,24 @@ static void cbm_mark_no_code_lines(const char *src, int src_len, uint8_t *map,
  * Step 2 walks the expanded lines and, for each one that is unmarked, belongs
  * to the file itself (not an included header) and maps back to a real
  * original line, records that original line as parsed. */
+typedef struct {
+    uint8_t *rows;
+    uint32_t row_count;
+} cbm_pp_error_rows_t;
+
+static void cbm_mark_pp_error_row(TSNode c, void *arg) {
+    cbm_pp_error_rows_t *marks = (cbm_pp_error_rows_t *)arg;
+    uint32_t s = ts_node_start_point(c).row + 1;
+    uint32_t e = ts_node_end_point(c).row + 1;
+    for (uint32_t r = s; r <= e && r <= marks->row_count; r++) {
+        marks->rows[r] = 1;
+    }
+}
+
 static void cbm_mark_pp_error_rows(TSNode n, uint8_t *rows, uint32_t row_count, const char *src,
                                    int src_len) {
-    uint32_t k = ts_node_child_count(n);
-    for (uint32_t i = 0; i < k; i++) {
-        TSNode c = ts_node_child(n, i);
-        if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
-            if (cbm_is_eof_terminator_miss(c, src, src_len)) {
-                continue; /* absent final newline only — nothing was dropped */
-            }
-            uint32_t s = ts_node_start_point(c).row + 1;
-            uint32_t e = ts_node_end_point(c).row + 1;
-            for (uint32_t r = s; r <= e && r <= row_count; r++) {
-                rows[r] = 1;
-            }
-        } else if (ts_node_has_error(c)) {
-            cbm_mark_pp_error_rows(c, rows, row_count, src, src_len);
-        }
-    }
+    cbm_pp_error_rows_t marks = {rows, row_count};
+    cbm_walk_error_nodes(n, src, src_len, cbm_mark_pp_error_row, &marks);
 }
 
 /* The ONE line counter for a source buffer (#1967). Every caller that asks
@@ -1844,6 +2104,420 @@ static bool cbm_remap_preprocessed_def(CBMDefinition *def, const CBMPreprocessed
     def->end_line = original_end;
     def->lines = (int)(original_end - original_start + 1);
     return true;
+}
+
+/* ── One definition, two parses: which copy the rescue keeps ──────────────
+ *
+ * The #961/#1989 rescue re-extracts definitions from the preprocessed parse to
+ * recover what the raw parse LOST. When an expanded def d and a raw def r sit
+ * at the same site (same label, name and start line, cbm_raw_def_same_site)
+ * but carry different QNs, the two parses scoped ONE definition differently,
+ * and adopting d minted a second node for it. One decision, in the rescue:
+ *
+ *   - By default the RAW copy wins and d is not adopted. The expanded parse is
+ *     no better judge of scope: it nests utilcode.h's classes inside
+ *     CUnorderedArrayWithAllocator, puts rapidjson reader.h's StackStream and
+ *     NumberStream specializations at file scope instead of inside
+ *     GenericReader, and picks one of the `namespace SVR` / `namespace WKS`
+ *     branches of coreclr gc's #ifdef. What the expanded pass gave d's QN
+ *     (call and usage scopes, resolved targets, members only it saw) moves to
+ *     r's QN (cbm_requalify_result).
+ *   - EXCEPT when r's enclosing scope exists only because of a raw ERROR
+ *     region the expanded parse resolved (cbm_misnested_raw_twin). A
+ *     macro-generated body (`struct s { mixed_members };`, the kernel's
+ *     lib/tests/randstruct_kunit.c) keeps the raw field list from closing, and
+ *     every later struct of the file nests inside it; the expanded parse gets
+ *     them flat. Then d REPLACES r, and whatever carried r's QN or sat under it
+ *     (Fields, nested definitions, call/usage scopes, resolved member
+ *     references) moves to d's QN (cbm_requalify_result). Every condition is
+ *     required:
+ *       - d lies in a raw ERROR region;
+ *       - r's QN is d's scope plus at least one more segment: the raw parse
+ *         nested the definition DEEPER under the same outer scope;
+ *       - r's immediate raw parent p is a raw type definition whose span holds
+ *         r, and the expanded parse has p too (same label, name and start
+ *         line) but closes it BEFORE d starts;
+ *       - a raw ERROR region lies between p's opening and d: the raw parse
+ *         lost p's closing brace there;
+ *       - the original text closes p's braces on exactly the line where the
+ *         expanded parse closes p (comments, literals and directive lines
+ *         skipped): the source itself ends p there, so no expanded error
+ *         closed p early (a local expanded error, such as an attribute macro
+ *         the expanded pass does not know, leaves that intact).
+ *     A real nested type keeps its nesting: the expanded parse still holds it
+ *     inside p, so r is not replaced, and r's own QN follows p's move. */
+/* Per expanded def of the rescue: CBM_PP_DEF_UNMAPPED, CBM_PP_DEF_NO_TWIN, or
+ * the index of the raw def it replaces. */
+enum { CBM_PP_DEF_UNMAPPED = -2, CBM_PP_DEF_NO_TWIN = -1 };
+
+typedef struct {
+    const CBMDefinition *defs; /* raw defs [0, raw_count), expanded [raw_count, count) */
+    int raw_count;
+    int count;
+    const int *pp_state;                 /* one per expanded def */
+    const cbm_error_regions_t *raw_regs; /* original lines */
+    const char *source;                  /* the original file */
+    int source_len;
+} cbm_twin_ctx_t;
+
+/* The losing copy's QN and the winner's. raw_wins: the expanded copy lost (the
+ * default); otherwise a mis-nested raw twin lost to its flat expanded copy. */
+typedef struct {
+    const char *from;
+    const char *to;
+    bool raw_wins;
+} cbm_requalify_rule_t;
+
+/* Record that `from` now names `to`, allocating room for one rule per expanded
+ * def (`cap`) on first use; an allocation failure only skips the move. */
+static void cbm_requalify_push(cbm_requalify_rule_t **rules, int *n, int cap, const char *from,
+                               const char *to, bool raw_wins) {
+    if (!from || !to || strcmp(from, to) == 0 || *n >= cap) {
+        return;
+    }
+    if (!*rules) {
+        *rules = (cbm_requalify_rule_t *)cbm_calloc(CBM_MEM_CLASS_EXTRACT,
+                                                    (size_t)cap * sizeof(cbm_requalify_rule_t));
+        if (!*rules) {
+            return;
+        }
+    }
+    (*rules)[(*n)++] = (cbm_requalify_rule_t){from, to, raw_wins};
+}
+
+/* True when raw def `r` and the remapped expanded def `d` are one definition's
+ * site: same label and name, starting on the same original line. */
+static bool cbm_raw_def_same_site(const CBMDefinition *r, const CBMDefinition *d) {
+    return r->name && d->name && r->label && d->label && r->start_line == d->start_line &&
+           strcmp(r->name, d->name) == 0 && strcmp(r->label, d->label) == 0;
+}
+
+/* True when another raw def of a different label already holds raw def j's
+ * QN. A raw copy that lost its scope can collide with a misparsed raw def of
+ * that name (coreclr inc/holder.h: Class `AddressInitHolder` outside its
+ * `BaseWrapper` scope vs the raw parse's FORCEINLINE constructor read as a
+ * Function), and the graph keeps one node per QN -- "raw wins" would then
+ * keep neither the class nor its correctly scoped expanded copy. */
+static bool cbm_raw_qn_held_by_other_label(const CBMDefinition *defs, int count, int j) {
+    const CBMDefinition *r = &defs[j];
+    if (!r->qualified_name || !r->label) {
+        return false;
+    }
+    for (int k = 0; k < count; k++) {
+        const CBMDefinition *o = &defs[k];
+        if (k != j && o->qualified_name && o->label &&
+            strcmp(o->qualified_name, r->qualified_name) == 0 && strcmp(o->label, r->label) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cbm_regions_overlap(const cbm_error_regions_t *regs, uint32_t lo, uint32_t hi) {
+    for (int i = 0; i < regs->count; i++) {
+        if (regs->starts[i] <= hi && regs->ends[i] >= lo) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* `qn` (length `len`) is `<scope>.<name>`; returns the scope length, or 0. */
+static size_t cbm_qn_scope_len(const char *qn, size_t len, const char *name, size_t name_len) {
+    if (len <= name_len + 1 || qn[len - name_len - 1] != '.' ||
+        strcmp(qn + len - name_len, name) != 0) {
+        return 0;
+    }
+    return len - name_len - 1;
+}
+
+/* The raw type def whose QN is `r`'s scope (`scope_len` bytes of r's QN) and
+ * whose span holds r, or NULL. */
+static const CBMDefinition *cbm_misnested_raw_parent(const CBMDefinition *defs, int raw_count,
+                                                     const CBMDefinition *r, size_t scope_len) {
+    for (int k = 0; k < raw_count; k++) {
+        const CBMDefinition *p = &defs[k];
+        if (p != r && p->qualified_name && p->name && cbm_def_label_is_type(p->label) &&
+            p->start_line <= r->start_line && p->end_line >= r->end_line &&
+            strncmp(p->qualified_name, r->qualified_name, scope_len) == 0 &&
+            p->qualified_name[scope_len] == '\0') {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+/* Index just past a preprocessor directive starting at `i` (its continuation
+ * lines included), and the lines it spans added to *line. */
+static int cbm_skip_directive(const char *src, int len, int i, uint32_t *line) {
+    while (i < len) {
+        if (src[i] != '\n') {
+            i++;
+            continue;
+        }
+        int b = i - 1;
+        if (b >= 0 && src[b] == '\r') {
+            b--;
+        }
+        (*line)++;
+        i++;
+        if (b < 0 || src[b] != '\\') {
+            break;
+        }
+    }
+    return i;
+}
+
+/* Index just past a comment or a string/character literal starting at `i`
+ * (lines it spans added to *line), or `i` when none starts there. */
+static int cbm_skip_comment_or_literal(const char *src, int len, int i, uint32_t *line) {
+    if (src[i] == '/' && i + 1 < len && src[i + 1] == '/') {
+        while (i < len && src[i] != '\n') {
+            i++;
+        }
+        return i;
+    }
+    if (src[i] == '/' && i + 1 < len && src[i + 1] == '*') {
+        for (i += 2; i < len && !(src[i] == '*' && i + 1 < len && src[i + 1] == '/'); i++) {
+            *line += src[i] == '\n';
+        }
+        return i + 2;
+    }
+    if (src[i] == '"' || src[i] == '\'') {
+        char quote = src[i];
+        for (i++; i < len && src[i] != quote && src[i] != '\n'; i++) {
+            i += src[i] == '\\';
+        }
+        return i + 1;
+    }
+    return i;
+}
+
+/* True when the ORIGINAL text, read from the start of `start_line`, opens a
+ * brace and closes it again exactly on `end_line`: the source itself ends the
+ * definition there. Comments, literals and directive lines are skipped. */
+static bool cbm_source_braces_close_on(const char *src, int len, uint32_t start_line,
+                                       uint32_t end_line) {
+    uint32_t line = 1;
+    int i = 0;
+    for (; i < len && line < start_line; i++) {
+        line += src[i] == '\n';
+    }
+    int depth = 0;
+    bool line_start = true;
+    while (i < len && line <= end_line) {
+        if (line_start) {
+            int k = i;
+            while (k < len && (src[k] == ' ' || src[k] == '\t')) {
+                k++;
+            }
+            if (k < len && src[k] == '#') {
+                i = cbm_skip_directive(src, len, k, &line);
+                continue;
+            }
+            line_start = false;
+        }
+        int next = cbm_skip_comment_or_literal(src, len, i, &line);
+        if (next != i) {
+            i = next;
+            continue;
+        }
+        if (src[i] == '\n') {
+            line++;
+            line_start = true;
+        } else if (src[i] == '{') {
+            depth++;
+        } else if (src[i] == '}' && --depth <= 0) {
+            return depth == 0 && line == end_line;
+        }
+        i++;
+    }
+    return false;
+}
+
+/* True when raw parent `rp` encloses the expanded def at `di` only because of
+ * a raw ERROR region: the raw parse failed between rp's opening and that def,
+ * and the expanded parse has rp too but closes it before the def starts, on
+ * the line where the original text closes it. */
+static bool cbm_raw_parent_is_error_artifact(const cbm_twin_ctx_t *c, const CBMDefinition *rp,
+                                             int di) {
+    const CBMDefinition *d = &c->defs[di];
+    if (!cbm_regions_overlap(c->raw_regs, rp->start_line, d->start_line)) {
+        return false;
+    }
+    for (int e = c->raw_count; e < c->count; e++) {
+        const CBMDefinition *ep = &c->defs[e];
+        if (c->pp_state[e - c->raw_count] != CBM_PP_DEF_UNMAPPED &&
+            ep->start_line == rp->start_line && ep->end_line < d->start_line && ep->name &&
+            ep->label && strcmp(ep->name, rp->name) == 0 && strcmp(ep->label, rp->label) == 0 &&
+            cbm_source_braces_close_on(c->source, c->source_len, ep->start_line, ep->end_line)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Index of the raw def that the expanded def at `di` replaces under the rule
+ * above, or CBM_PP_DEF_NO_TWIN. */
+static int cbm_misnested_raw_twin(const cbm_twin_ctx_t *c, int di) {
+    const CBMDefinition *d = &c->defs[di];
+    if (!d->name || !d->label || !d->qualified_name || d->qn_sig_off ||
+        !cbm_regions_overlap(c->raw_regs, d->start_line, d->end_line)) {
+        return CBM_PP_DEF_NO_TWIN;
+    }
+    size_t name_len = strlen(d->name);
+    size_t d_scope =
+        cbm_qn_scope_len(d->qualified_name, strlen(d->qualified_name), d->name, name_len);
+    if (d_scope == 0) {
+        return CBM_PP_DEF_NO_TWIN;
+    }
+    for (int j = 0; j < c->raw_count; j++) {
+        const CBMDefinition *r = &c->defs[j];
+        if (!cbm_raw_def_same_site(r, d) || !r->qualified_name || r->qn_sig_off) {
+            continue;
+        }
+        size_t r_scope =
+            cbm_qn_scope_len(r->qualified_name, strlen(r->qualified_name), d->name, name_len);
+        /* Deeper under d's own scope: "<d scope>.<at least one segment>". */
+        if (r_scope <= d_scope + 1 || r->qualified_name[d_scope] != '.' ||
+            strncmp(r->qualified_name, d->qualified_name, d_scope) != 0) {
+            continue;
+        }
+        const CBMDefinition *rp = cbm_misnested_raw_parent(c->defs, c->raw_count, r, r_scope);
+        if (rp && cbm_raw_parent_is_error_artifact(c, rp, di)) {
+            return j;
+        }
+    }
+    return CBM_PP_DEF_NO_TWIN;
+}
+
+/* Remap every expanded def [raw_count, count) to original lines and find the
+ * raw twin each one replaces: pp_state[i - raw_count] becomes
+ * CBM_PP_DEF_UNMAPPED, CBM_PP_DEF_NO_TWIN or the twin's raw index. Returns the
+ * number of twins found. */
+static int cbm_prepare_preprocessed_defs(CBMFileResult *result, int raw_count,
+                                         const CBMPreprocessedSource *pp,
+                                         const cbm_error_regions_t *raw_regs, const char *source,
+                                         int source_len, int *pp_state) {
+    int count = result->defs.count;
+    CBMDefinition *defs = result->defs.items;
+    for (int i = raw_count; i < count; i++) {
+        pp_state[i - raw_count] =
+            cbm_remap_preprocessed_def(&defs[i], pp) ? CBM_PP_DEF_NO_TWIN : CBM_PP_DEF_UNMAPPED;
+    }
+    cbm_twin_ctx_t ctx = {defs, raw_count, count, pp_state, raw_regs, source, source_len};
+    int twins = 0;
+    for (int i = raw_count; i < count; i++) {
+        if (pp_state[i - raw_count] == CBM_PP_DEF_UNMAPPED) {
+            continue;
+        }
+        int twin = cbm_misnested_raw_twin(&ctx, i);
+        if (twin >= 0) {
+            pp_state[i - raw_count] = twin;
+            twins++;
+        }
+    }
+    return twins;
+}
+
+/* `qn` with the longest rule prefix ("<from>" or "<from>.<rest>") replaced
+ * by that rule's "<to>"; `qn` itself when no rule applies. With
+ * `replacements_only`, raw_wins rules are not applied. */
+static const char *cbm_requalify_qn(CBMArena *a, const char *qn, const cbm_requalify_rule_t *rules,
+                                    int rule_count, bool replacements_only) {
+    if (!qn) {
+        return qn;
+    }
+    int best = -1;
+    size_t best_len = 0;
+    for (int i = 0; i < rule_count; i++) {
+        if (!rules[i].from || (replacements_only && rules[i].raw_wins)) {
+            continue;
+        }
+        size_t len = strlen(rules[i].from);
+        if (len > best_len && strncmp(qn, rules[i].from, len) == 0 &&
+            (qn[len] == '\0' || qn[len] == '.')) {
+            best = i;
+            best_len = len;
+        }
+    }
+    if (best < 0) {
+        return qn;
+    }
+    const char *moved = cbm_arena_sprintf(a, "%s%s", rules[best].to, qn + best_len);
+    return moved ? moved : qn;
+}
+
+/* Move everything the losing copies owned to the winners' QNs: definitions
+ * nested under them (Fields, nested types, expanded-only members) and every
+ * scope or target QN the result carries (call and usage scopes, resolved
+ * callers and targets), so no child and no edge is left on a QN with no node.
+ * A losing expanded QN that a kept definition still carries (a raw def at
+ * another site, a second expanded copy) leaves nothing dangling and does not
+ * move. A raw winner can itself sit under a mis-nested twin that moved: its
+ * final QN is resolved first. */
+static void cbm_requalify_result(CBMArena *a, CBMFileResult *r, cbm_requalify_rule_t *rules,
+                                 int n) {
+    for (int i = 0; i < n; i++) {
+        for (int k = 0; rules[i].raw_wins && k < r->defs.count; k++) {
+            const char *kept = r->defs.items[k].qualified_name;
+            if (kept && strcmp(kept, rules[i].from) == 0) {
+                rules[i].from = NULL;
+                break;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (rules[i].from && rules[i].raw_wins) {
+            rules[i].to = cbm_requalify_qn(a, rules[i].to, rules, n, true);
+        }
+    }
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        d->qualified_name = cbm_requalify_qn(a, d->qualified_name, rules, n, false);
+        d->parent_class = cbm_requalify_qn(a, d->parent_class, rules, n, false);
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        c->enclosing_func_qn = cbm_requalify_qn(a, c->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->usages.count; i++) {
+        CBMUsage *u = &r->usages.items[i];
+        u->enclosing_func_qn = cbm_requalify_qn(a, u->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->throws.count; i++) {
+        CBMThrow *t = &r->throws.items[i];
+        t->enclosing_func_qn = cbm_requalify_qn(a, t->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->rw.count; i++) {
+        CBMReadWrite *w = &r->rw.items[i];
+        w->enclosing_func_qn = cbm_requalify_qn(a, w->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->type_refs.count; i++) {
+        CBMTypeRef *t = &r->type_refs.items[i];
+        t->enclosing_func_qn = cbm_requalify_qn(a, t->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->env_accesses.count; i++) {
+        CBMEnvAccess *e = &r->env_accesses.items[i];
+        e->enclosing_func_qn = cbm_requalify_qn(a, e->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->type_assigns.count; i++) {
+        CBMTypeAssign *t = &r->type_assigns.items[i];
+        t->enclosing_func_qn = cbm_requalify_qn(a, t->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->string_refs.count; i++) {
+        CBMStringRef *s = &r->string_refs.items[i];
+        s->enclosing_func_qn = cbm_requalify_qn(a, s->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->channels.count; i++) {
+        CBMChannel *c = &r->channels.items[i];
+        c->enclosing_func_qn = cbm_requalify_qn(a, c->enclosing_func_qn, rules, n, false);
+    }
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        CBMResolvedCall *c = &r->resolved_calls.items[i];
+        c->caller_qn = cbm_requalify_qn(a, c->caller_qn, rules, n, false);
+        c->callee_qn = cbm_requalify_qn(a, c->callee_qn, rules, n, false);
+    }
 }
 
 static void cbm_subtract_recovered_regions(cbm_error_regions_t *regs, const CBMDefArray *defs,
@@ -2765,6 +3439,183 @@ static void extract_cpp_branch_views(const CBMExtractCtx *raw, const TSLanguage 
     }
 }
 
+/* ── Innermost enclosing Function/Method per call (#1527) ──────────────
+ * The call-context metrics attribute each call to the Function/Method def with
+ * the SMALLEST line span containing the call's line, ties to the lowest def
+ * index. Scanning every def for every call made that O(calls x defs) per file
+ * -- quadratic in file size, the largest single cost on a module with
+ * thousands of methods. The sweep below gives the identical answer in
+ * O((calls + defs) log defs): calls in line order, candidates entering a
+ * min-heap keyed (span, index) once their start line is reached and leaving it
+ * lazily once their end line has passed -- lines only grow, so a def that has
+ * ended never contains a later call. The heap top is then the smallest
+ * (span, index) among the defs that contain the line. */
+static bool enclosing_is_callable(const CBMDefinition *d) {
+    return d->name && d->label &&
+           (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0);
+}
+
+/* The reference answer for one line (and the path when the sweep's arrays
+ * cannot be allocated). */
+static int cbm_enclosing_callable_scan(const CBMFileResult *result, int line) {
+    int best = -1;
+    int best_span = -1;
+    for (int di = 0; di < result->defs.count; di++) {
+        const CBMDefinition *d = &result->defs.items[di];
+        CBM_LSP_WORK(1);
+        if (!enclosing_is_callable(d)) {
+            continue;
+        }
+        if ((int)d->start_line <= line && line <= (int)d->end_line) {
+            int span = (int)d->end_line - (int)d->start_line;
+            if (best < 0 || span < best_span) {
+                best_span = span;
+                best = di;
+            }
+        }
+    }
+    return best;
+}
+
+static CBM_TLS const CBMFileResult *tl_enclosing_result;
+
+static int enclosing_def_by_start(const void *a, const void *b) {
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    uint32_t la = tl_enclosing_result->defs.items[ia].start_line;
+    uint32_t lb = tl_enclosing_result->defs.items[ib].start_line;
+    return la < lb ? -1 : la > lb ? 1 : ia - ib;
+}
+
+static int enclosing_call_by_line(const void *a, const void *b) {
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    int la = tl_enclosing_result->calls.items[ia].start_line;
+    int lb = tl_enclosing_result->calls.items[ib].start_line;
+    return la < lb ? -1 : la > lb ? 1 : ia - ib;
+}
+
+/* Heap order: smaller span first, then smaller def index. */
+static bool enclosing_heap_less(const CBMFileResult *r, int a, int b) {
+    const CBMDefinition *da = &r->defs.items[a];
+    const CBMDefinition *db = &r->defs.items[b];
+    int sa = (int)da->end_line - (int)da->start_line;
+    int sb = (int)db->end_line - (int)db->start_line;
+    return sa != sb ? sa < sb : a < b;
+}
+
+static void enclosing_heap_push(const CBMFileResult *r, int *heap, int *n, int di) {
+    int i = (*n)++;
+    heap[i] = di;
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        CBM_LSP_WORK(1);
+        if (!enclosing_heap_less(r, heap[i], heap[parent])) {
+            break;
+        }
+        int t = heap[i];
+        heap[i] = heap[parent];
+        heap[parent] = t;
+        i = parent;
+    }
+}
+
+static void enclosing_heap_pop(const CBMFileResult *r, int *heap, int *n) {
+    heap[0] = heap[--(*n)];
+    int i = 0;
+    for (;;) {
+        int l = (2 * i) + 1;
+        int m = i;
+        CBM_LSP_WORK(1);
+        if (l < *n && enclosing_heap_less(r, heap[l], heap[m])) {
+            m = l;
+        }
+        if (l + 1 < *n && enclosing_heap_less(r, heap[l + 1], heap[m])) {
+            m = l + 1;
+        }
+        if (m == i) {
+            break;
+        }
+        int t = heap[i];
+        heap[i] = heap[m];
+        heap[m] = t;
+        i = m;
+    }
+}
+
+/* enclosing[ci] = innermost Function/Method def index for call ci, or -1.
+ * Returns NULL when the working arrays cannot be allocated; the caller then
+ * asks cbm_enclosing_callable_scan per call (same answer, old cost). */
+static int *cbm_enclosing_callables(const CBMFileResult *result, int call_count) {
+    int def_count = result->defs.count;
+    if (call_count <= 0) {
+        return NULL;
+    }
+    size_t call_bytes = (size_t)call_count * sizeof(int);
+    size_t def_bytes = (size_t)(def_count > 0 ? def_count : 1) * sizeof(int);
+    int *enclosing = cbm_alloc(CBM_MEM_CLASS_OTHER, call_bytes);
+    int *call_order = cbm_alloc(CBM_MEM_CLASS_OTHER, call_bytes);
+    int *cands = cbm_alloc(CBM_MEM_CLASS_OTHER, def_bytes);
+    int *heap = cbm_alloc(CBM_MEM_CLASS_OTHER, def_bytes);
+    if (!enclosing || !call_order || !cands || !heap) {
+        cbm_free(CBM_MEM_CLASS_OTHER, enclosing);
+        cbm_free(CBM_MEM_CLASS_OTHER, call_order);
+        cbm_free(CBM_MEM_CLASS_OTHER, cands);
+        cbm_free(CBM_MEM_CLASS_OTHER, heap);
+        return NULL;
+    }
+    int ncand = 0;
+    for (int di = 0; di < def_count; di++) {
+        if (enclosing_is_callable(&result->defs.items[di])) {
+            cands[ncand++] = di;
+        }
+    }
+    for (int ci = 0; ci < call_count; ci++) {
+        call_order[ci] = ci;
+        enclosing[ci] = -1;
+    }
+    tl_enclosing_result = result;
+    qsort(cands, (size_t)ncand, sizeof(int), enclosing_def_by_start);
+    qsort(call_order, (size_t)call_count, sizeof(int), enclosing_call_by_line);
+    tl_enclosing_result = NULL;
+
+    int heap_n = 0;
+    int next = 0;
+    for (int k = 0; k < call_count; k++) {
+        int ci = call_order[k];
+        int line = result->calls.items[ci].start_line;
+        while (next < ncand && (int)result->defs.items[cands[next]].start_line <= line) {
+            enclosing_heap_push(result, heap, &heap_n, cands[next++]);
+        }
+        while (heap_n > 0 && (int)result->defs.items[heap[0]].end_line < line) {
+            enclosing_heap_pop(result, heap, &heap_n);
+        }
+        enclosing[ci] = heap_n > 0 ? heap[0] : -1;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, call_order);
+    cbm_free(CBM_MEM_CLASS_OTHER, cands);
+    cbm_free(CBM_MEM_CLASS_OTHER, heap);
+    return enclosing;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+int cbm_test_enclosing_sweep_mismatches(const CBMFileResult *result) {
+    int *enclosing = cbm_enclosing_callables(result, result->calls.count);
+    if (!enclosing) {
+        return result->calls.count > 0 ? -1 : 0;
+    }
+    int mismatches = 0;
+    for (int ci = 0; ci < result->calls.count; ci++) {
+        int line = result->calls.items[ci].start_line;
+        if (line > 0 && enclosing[ci] != cbm_enclosing_callable_scan(result, line)) {
+            mismatches++;
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, enclosing);
+    return mismatches;
+}
+#endif
+
 static CBMFileResult *extract_file_ex_body(const char *source, int source_len, CBMLanguage language,
                                            const char *project, const char *rel_path,
                                            int64_t timeout_micros, const char **extra_defines,
@@ -2779,6 +3630,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         return NULL;
     }
 
+    result->py_namespace.version = CBM_PY_NAMESPACE_FACTS_VERSION;
+    result->py_namespace.language = language;
+    result->py_namespace.status =
+        language == CBM_LANG_PYTHON ? CBM_PY_NS_NOT_CAPTURED : CBM_PY_NS_NOT_APPLICABLE;
     cbm_work_arena_take(&result->arena);
     CBMArena *a = &result->arena;
     if (!cbm_test_declarations_validate(result, test_declarations)) {
@@ -2800,6 +3655,65 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
 #ifdef CBM_ENABLE_TEST_SEAMS
     cbm_test_fault_inject(rel_path);
 #endif
+
+    /* A PDF has no grammar: its text layer is read directly, a Section per
+     * page plus the pages' code mentions (doc_pdf.c). */
+    if (language == CBM_LANG_PDF) {
+        result->module_qn = cbm_fqn_module_source_lang(a, project, rel_path, language);
+        CBMExtractCtx pdf_ctx = {
+            .arena = a,
+            .scratch = scratch,
+            .result = result,
+            .source = source,
+            .source_len = source_len,
+            .language = language,
+            .project = project,
+            .rel_path = rel_path,
+            .module_qn = result->module_qn,
+        };
+        cbm_pdf_extract_document(&pdf_ctx);
+        cbm_index_mark_done(rel_path);
+        return result;
+    }
+    /* AsciiDoc has no grammar either: its headings, includes, attribute
+     * references and monospace spans are read from the text (doc_adoc.c). */
+    if (language == CBM_LANG_ASCIIDOC) {
+        result->module_qn = cbm_fqn_module_source_lang(a, project, rel_path, language);
+        CBMExtractCtx adoc_ctx = {
+            .arena = a,
+            .scratch = scratch,
+            .result = result,
+            .source = source,
+            .source_len = source_len,
+            .language = language,
+            .project = project,
+            .rel_path = rel_path,
+            .module_qn = result->module_qn,
+        };
+        cbm_adoc_extract_document(&adoc_ctx);
+        cbm_extract_diagrams(&adoc_ctx); /* after the Sections they hang under */
+        cbm_index_mark_done(rel_path);
+        return result;
+    }
+    /* Diagram files have no grammar either: each format is read from the text
+     * (diagram.c). */
+    if (language == CBM_LANG_DIAGRAM) {
+        result->module_qn = cbm_fqn_module_source_lang(a, project, rel_path, language);
+        CBMExtractCtx diagram_ctx = {
+            .arena = a,
+            .scratch = scratch,
+            .result = result,
+            .source = source,
+            .source_len = source_len,
+            .language = language,
+            .project = project,
+            .rel_path = rel_path,
+            .module_qn = result->module_qn,
+        };
+        cbm_extract_diagram_file(&diagram_ctx);
+        cbm_index_mark_done(rel_path);
+        return result;
+    }
 
     // Get language spec
     const CBMLangSpec *spec = cbm_lang_spec(language);
@@ -2965,6 +3879,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     cbm_extract_definitions(&ctx);
     cbm_test_declarations_finish(&ctx);
     cbm_extract_imports(&ctx);
+    cbm_extract_python_namespace_facts(&ctx);
     cbm_extract_unified(&ctx);
     if (cbm_lang_needs_cpp_branch_views(language)) {
         extract_cpp_branch_views(&ctx, ts_lang, timeout_micros);
@@ -2980,6 +3895,12 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
 
     // Channel detection (Socket.IO / EventEmitter) — JS/TS only.
     cbm_extract_channels(&ctx);
+
+    // Diagrams: blocks of documents and diagram files (self-gated by language).
+    cbm_extract_diagrams(&ctx);
+
+    // OpenAPI operations as Routes (self-gated: API description documents).
+    cbm_extract_openapi(&ctx);
 
     // K8s / Kustomize semantic pass (additional structured extraction for YAML-based infra files).
     if (ctx.language == CBM_LANG_KUSTOMIZE || ctx.language == CBM_LANG_K8S) {
@@ -3148,8 +4069,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                     // Also run LSP on expanded source for additional type-resolved
                     // calls (language is already C/C++/CUDA — checked in enclosing
                     // block). Runs in every mode.
-                    cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
-                                  language != CBM_LANG_C, CBM_SOURCE_ORIGIN_PREPROCESSED);
+                    if (!result->lsp_skipped) {
+                        cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
+                                      language != CBM_LANG_C, CBM_SOURCE_ORIGIN_PREPROCESSED);
+                    }
 
                     /* All C-LSP emitters stamp origin directly so rewrite-time
                      * comparisons are already safe. Keep this boundary sweep as
@@ -3198,6 +4121,29 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                 superseded =
                                     (char *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, (size_t)defs_before);
                             }
+                            /* Remap every expanded def up front and find the
+                             * mis-nested raw twins that flat expanded copies
+                             * replace (cbm_misnested_raw_twin). A twin is
+                             * dropped only once its replacement is adopted. */
+                            /* Counted through the context the extraction
+                             * appended to (pp_ctx.result is `result`). */
+                            int pp_count = pp_ctx.result->defs.count - defs_before;
+                            int *pp_state = pp_count > 0
+                                                ? (int *)cbm_calloc(CBM_MEM_CLASS_EXTRACT,
+                                                                    (size_t)pp_count * sizeof(int))
+                                                : NULL;
+                            int twin_count = pp_state ? cbm_prepare_preprocessed_defs(
+                                                            result, defs_before, preprocessed,
+                                                            &raw_regs, source, source_len, pp_state)
+                                                      : 0;
+                            char *misnested =
+                                twin_count > 0
+                                    ? (char *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, (size_t)defs_before)
+                                    : NULL;
+                            /* Losing copy -> winner, one per expanded def at
+                             * most (cbm_requalify_push allocates on use). */
+                            cbm_requalify_rule_t *requalify = NULL;
+                            int requalify_count = 0;
                             /* #1989: spans of defs already adopted from the
                              * expanded tree. A def nested inside one of these
                              * (an inline method of a rescued class) was dropped
@@ -3215,7 +4161,12 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                 CBMDefinition *d = &result->defs.items[i];
                                 bool adopt = false;
                                 int supersede_j = -1;
-                                if (cbm_remap_preprocessed_def(d, preprocessed)) {
+                                int pp_twin =
+                                    pp_state ? pp_state[i - defs_before] : CBM_PP_DEF_NO_TWIN;
+                                bool mapped = pp_state
+                                                  ? pp_twin != CBM_PP_DEF_UNMAPPED
+                                                  : cbm_remap_preprocessed_def(d, preprocessed);
+                                if (mapped) {
                                     for (int rj = 0; rj < raw_regs.count && !adopt; rj++) {
                                         if (d->start_line <= raw_regs.ends[rj] &&
                                             d->end_line >= raw_regs.starts[rj]) {
@@ -3316,11 +4267,41 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                         }
                                         adopt = false;
                                     }
+                                    /* Same site, different QN: one definition the
+                                     * two parses scoped differently. The raw copy
+                                     * wins, unless it is the mis-nested twin this
+                                     * def replaces (cbm_misnested_raw_twin) or its
+                                     * QN is already another label's
+                                     * (cbm_raw_qn_held_by_other_label); what the
+                                     * expanded pass gave this copy's QN moves to
+                                     * the raw one. */
+                                    if (adopt && j != pp_twin &&
+                                        cbm_raw_def_same_site(&result->defs.items[j], d) &&
+                                        !cbm_raw_qn_held_by_other_label(result->defs.items,
+                                                                        defs_before, j)) {
+                                        adopt = false;
+                                        cbm_requalify_push(&requalify, &requalify_count, pp_count,
+                                                           d->qualified_name,
+                                                           result->defs.items[j].qualified_name,
+                                                           true);
+                                    }
                                 }
                                 if (adopt) {
                                     if (supersede_j >= 0 && supersede_j < defs_before &&
                                         superseded) {
                                         superseded[supersede_j] = 1;
+                                    }
+                                    /* The flat copy replaces its mis-nested raw
+                                     * twin; what sat under the twin's QN moves
+                                     * to this one below. Without room for that
+                                     * move the twin stays. */
+                                    if (pp_twin >= 0 && misnested && !misnested[pp_twin]) {
+                                        int moves = requalify_count;
+                                        cbm_requalify_push(
+                                            &requalify, &requalify_count, pp_count,
+                                            result->defs.items[pp_twin].qualified_name,
+                                            d->qualified_name, false);
+                                        misnested[pp_twin] = (char)(requalify_count > moves);
                                     }
                                     /* Phantom-artifact suppression (#1989): on the
                                      * raw tree `class MOD_API Foo : public Base
@@ -3359,10 +4340,11 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                     result->defs.items[w++] = *d;
                                 }
                             }
-                            if (superseded) {
+                            if (superseded || misnested) {
                                 int rw = 0;
                                 for (int j = 0; j < defs_before; j++) {
-                                    if (!superseded[j]) {
+                                    if (!(superseded && superseded[j]) &&
+                                        !(misnested && misnested[j])) {
                                         result->defs.items[rw++] = result->defs.items[j];
                                     }
                                 }
@@ -3376,6 +4358,12 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                 cbm_free(CBM_MEM_CLASS_EXTRACT, superseded);
                             }
                             result->defs.count = w;
+                            if (requalify_count > 0) {
+                                cbm_requalify_result(a, result, requalify, requalify_count);
+                            }
+                            cbm_free(CBM_MEM_CLASS_EXTRACT, misnested);
+                            cbm_free(CBM_MEM_CLASS_EXTRACT, requalify);
+                            cbm_free(CBM_MEM_CLASS_EXTRACT, pp_state);
                         }
                     }
 
@@ -3472,28 +4460,14 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         d->param_count = pc;
     }
 
+    int *enclosing = cbm_enclosing_callables(result, orig_calls_count);
     for (int ci = 0; ci < orig_calls_count; ci++) {
         const CBMCall *c = &result->calls.items[ci];
         if (!c->callee_name || c->start_line <= 0) {
             continue;
         }
         // Innermost enclosing Function/Method def by line range (smallest span).
-        int best = -1;
-        int best_span = -1;
-        for (int di = 0; di < def_count; di++) {
-            const CBMDefinition *d = &result->defs.items[di];
-            if (!d->name || !d->label ||
-                (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0)) {
-                continue;
-            }
-            if ((int)d->start_line <= c->start_line && c->start_line <= (int)d->end_line) {
-                int span = (int)d->end_line - (int)d->start_line;
-                if (best < 0 || span < best_span) {
-                    best_span = span;
-                    best = di;
-                }
-            }
-        }
+        int best = enclosing ? enclosing[ci] : cbm_enclosing_callable_scan(result, c->start_line);
         if (best < 0) {
             continue;
         }
@@ -3538,6 +4512,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     }
     free(has_self);
     free(has_guarded);
+    cbm_free(CBM_MEM_CLASS_OTHER, enclosing);
 
     uint64_t t2 = now_ns();
 
@@ -3600,6 +4575,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     }
 
     result->imports_count = result->imports.count;
+
+    /* Doc-comment references of the documented definitions, and the file's
+     * doc-link scope: both read the complete docstrings and the tree. */
+    cbm_doclinks_extract(&ctx);
 
     // Accumulate profiling counters
     atomic_fetch_add(&total_parse_ns, t1 - t0);
@@ -3716,6 +4695,35 @@ CBMFileResult *cbm_extract_file_ex_with_tests(
     CBMFileResult *result = extract_file_ex_body(
         source, source_len, language, project, rel_path, timeout_micros, extra_defines,
         include_paths, macro_table, return_type_table, &scratch, test_declarations);
+    /* Even early parse/quarantine exits publish conservative Python metadata.
+     * No tree is reparsed, and existing best-effort extraction flags stay intact. */
+    if (result && language == CBM_LANG_PYTHON &&
+        result->py_namespace.status == CBM_PY_NS_NOT_CAPTURED) {
+        CBMPyNamespaceFailure failure = CBM_PY_NS_FAILURE_NONE;
+        if (!result->module_qn || !result->module_qn[0]) {
+            if (!project || !project[0] || !rel_path || !rel_path[0]) {
+                failure = CBM_PY_NS_FAILURE_INVALID_INPUT;
+            } else {
+                result->module_qn =
+                    cbm_fqn_module_source_lang(&result->arena, project, rel_path, language);
+                if (!result->module_qn || !result->module_qn[0])
+                    failure = CBM_PY_NS_FAILURE_ALLOCATION;
+            }
+        }
+        if (failure) {
+            result->py_namespace = (CBMPyNamespaceFacts){.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+                                                         .language = language,
+                                                         .status = CBM_PY_NS_INCOMPLETE,
+                                                         .failure = failure};
+        } else {
+            CBMExtractCtx facts_ctx = {.arena = &result->arena,
+                                       .result = result,
+                                       .source = source,
+                                       .source_len = source_len,
+                                       .language = language};
+            cbm_extract_python_namespace_facts(&facts_ctx);
+        }
+    }
     /* !tl_scratch_live: a nested extraction (an embedded language inside this
      * file) may already have parked its own; never overwrite it. */
     /* Kept up to CBM_EXTRACT_SCRATCH_KEEP_BYTES, grown blocks included: the
