@@ -13498,6 +13498,50 @@ TEST(cli_hook_augment_context_tracks_search_json_shape) {
     PASS();
 }
 
+/* A search that found symbols closes with cbm's own follow-up line, after the
+ * untrusted symbol list and on its own line, naming the graph tools for the
+ * next question; it carries no repository-derived value. */
+TEST(cli_hook_augment_context_names_graph_follow_ups) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "hookproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/hookproj");
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "someIndexedSymbol",
+                    .qualified_name = "hookproj.mod.someIndexedSymbol",
+                    .file_path = "mod.py",
+                    .start_line = 1,
+                    .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+    char *envelope =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"hookproj\",\"name_pattern\":\".*someIndexedSymbol.*\","
+                            "\"limit\":5,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(envelope);
+
+    bool is_error = true;
+    char *ctx =
+        cbm_hook_augment_format_context_for_testing(envelope, "someIndexedSymbol", &is_error);
+    ASSERT_FALSE(is_error);
+    ASSERT_NOT_NULL(ctx);
+    const char *list = strstr(ctx, "\n- hookproj.mod.someIndexedSymbol");
+    const char *follow = strstr(ctx, "\n[codebase-memory] For these symbols, trace_path lists "
+                                     "callers and callees, get_code_snippet returns the exact "
+                                     "source, and search_graph finds related symbols by name.");
+    ASSERT_NOT_NULL(list);
+    ASSERT_NOT_NULL(follow);
+    ASSERT_TRUE(follow > list);
+    ASSERT_NULL(strstr(follow, "someIndexedSymbol"));
+    ASSERT_NULL(strstr(follow, "mod.py"));
+    free(ctx);
+    free(envelope);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Exercise the real PreToolUse + Bash route instead of calling only the
  * tokenizer seam. This pins the event guard and the graph lookup path together.
  */
@@ -18479,6 +18523,7 @@ SUITE(cli) {
     RUN_TEST(cli_codex_preflight_reports_heading_and_reason);
 #endif
     RUN_TEST(cli_hook_augment_context_tracks_search_json_shape);
+    RUN_TEST(cli_hook_augment_context_names_graph_follow_ups);
     RUN_TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter);
     RUN_TEST(cli_hook_augment_bash_pattern_extractor);
     RUN_TEST(cli_hook_augment_coverage_requests_machine_json);
