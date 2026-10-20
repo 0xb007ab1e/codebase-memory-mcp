@@ -3768,8 +3768,7 @@ static void process_top_level_variable_arrows(TSLSPContext *ctx, TSNode declarat
             continue;
 
         TSNode name = ts_node_child_by_field_name(declarator, "name", TS_LSP_FIELD_LEN("name"));
-        TSNode value =
-            ts_node_child_by_field_name(declarator, "value", TS_LSP_FIELD_LEN("value"));
+        TSNode value = ts_node_child_by_field_name(declarator, "value", TS_LSP_FIELD_LEN("value"));
         if (!node_kind_is(name, "identifier") || !node_kind_is(value, "arrow_function"))
             continue;
 
@@ -3799,14 +3798,6 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
         const char *kind = ts_node_type(child);
         if (strcmp(kind, "lexical_declaration") == 0 || strcmp(kind, "variable_declaration") == 0) {
             ts_process_statement(ctx, child);
-        } else if (strcmp(kind, "export_statement") == 0) {
-            uint32_t count = ts_node_named_child_count(child);
-            for (uint32_t j = 0; j < count; j++) {
-                TSNode inner = ts_node_named_child(child, j);
-                if (node_kind_is(inner, "lexical_declaration") ||
-                    node_kind_is(inner, "variable_declaration"))
-                    ts_process_statement(ctx, inner);
-            }
         }
     }
 

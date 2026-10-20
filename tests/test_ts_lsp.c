@@ -1239,6 +1239,42 @@ TEST(tslsp_jsx_top_level_async_arrow_callers_keep_exact_identity) {
     PASS();
 }
 
+/* An exported arrow const is a module definition, not a lexical local.  Bound
+ * into the module scope, it made the JSX resolver fail closed on `<Badge />`
+ * (the edge was lost: JSX carriers have no other resolver) and the exact
+ * same-module call path skip `formatLabel()`.  Both callers must resolve both
+ * targets exactly, whether the caller is a function or an arrow const. */
+static bool ts_resolved_with_strategy(const CBMFileResult *r, const char *caller,
+                                      const char *callee, const char *strategy) {
+    int idx = require_resolved(r, caller, callee);
+    const char *got = idx >= 0 ? r->resolved_calls.items[idx].strategy : NULL;
+    if (idx >= 0 && (!got || strcmp(got, strategy) != 0)) {
+        printf("  %s -> %s resolved by %s, expected %s\n", caller, callee, got ? got : "(null)",
+               strategy);
+    }
+    return got && strcmp(got, strategy) == 0;
+}
+
+TEST(tslsp_jsx_exported_arrow_component_resolves_in_same_module) {
+    CBMFileResult *r =
+        extract_tsx("export const Badge = () => <span/>;\n"
+                    "export const formatLabel = (s: string) => s.trim();\n"
+                    "export function FnUser() { formatLabel('a'); return <Badge/>; }\n"
+                    "export const ArrowUser = () => { formatLabel('b'); return <Badge/>; };\n");
+    ASSERT_NOT_NULL(r);
+    bool fn_jsx = ts_resolved_with_strategy(r, "main.FnUser", "main.Badge", "lsp_ts_jsx");
+    bool arrow_jsx = ts_resolved_with_strategy(r, "main.ArrowUser", "main.Badge", "lsp_ts_jsx");
+    bool fn_call = ts_resolved_with_strategy(r, "main.FnUser", "main.formatLabel", "lsp_ts_local");
+    bool arrow_call =
+        ts_resolved_with_strategy(r, "main.ArrowUser", "main.formatLabel", "lsp_ts_local");
+    cbm_free_result(r);
+    ASSERT_TRUE(fn_jsx);
+    ASSERT_TRUE(arrow_jsx);
+    ASSERT_TRUE(fn_call);
+    ASSERT_TRUE(arrow_call);
+    PASS();
+}
+
 /* A callable value named like a module component owns the JSX tag.  The LSP
  * pass must not confidently redirect it to the module function, and the
  * carrier must require semantic resolution so graph construction cannot do
@@ -4947,6 +4983,7 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_jsx_import_requires_registered_component);
     RUN_TEST(tslsp_jsx_component_resolutions_join_exact_tag_sites);
     RUN_TEST(tslsp_jsx_top_level_async_arrow_callers_keep_exact_identity);
+    RUN_TEST(tslsp_jsx_exported_arrow_component_resolves_in_same_module);
     RUN_TEST(tslsp_jsx_local_tag_shadow_blocks_module_component);
     RUN_TEST(tslsp_jsx_intrinsic_skipped);
     RUN_TEST(tslsp_jsx_nested_component);
