@@ -452,7 +452,7 @@ TEST(ws_approve_sensitive_matches_across_separator_styles) {
 
     char grant[2048];
     snprintf(grant, sizeof(grant), "!%s\\.ssh\\cfg\n", cache);
-    FILE *f = fopen(path, "w");
+    FILE *f = cbm_fopen(path, "wb");
     ASSERT_NOT_NULL(f);
     (void)fprintf(f, "%s", grant);
     (void)fclose(f);
@@ -495,6 +495,10 @@ TEST(ws_approve_sensitive_matches_across_separator_styles) {
             *p = '/';
         }
     }
+    /* Containment canonicalizes the candidate, which on Windows opens it
+     * (CreateFileW, OPEN_EXISTING): a descendant that is not on disk is
+     * "outside the allowed root" instead of reaching the sensitive hint. */
+    ASSERT_TRUE(cbm_mkdir_p(descendant, 0700));
     err[0] = '\0';
     ASSERT_FALSE(cbm_workspace_root_allowed(descendant, NULL, cache, NULL, err, sizeof(err)));
     ASSERT_TRUE(strstr(err, "--approve-sensitive") != NULL);
