@@ -75,11 +75,11 @@ TEST(ws_posix_top_level_trees_are_too_shallow) {
     PASS();
 }
 
-/* PATH_ALLOW_BROAD is deliberately not part of the grant store's overridability:
- * cbm_workspace_classify_root and cbm_workspace_verdict_is_overridable must stay
- * exactly as strict as the test above already checked. Only the top-level
- * decision, cbm_workspace_root_allowed, knows about it, and only as an exact
- * match. */
+/* A recorded broad approval (allow-root --approve-broad) is the only thing that
+ * lifts CBM_WS_DENY_TOO_SHALLOW, and only for that exact path. Classification
+ * and cbm_workspace_verdict_is_overridable stay exactly as strict as the test
+ * above checks; the approval is a grant, so it is listed like any other human
+ * decision, and it lifts no other verdict. */
 TEST(ws_allow_broad_root_lifts_too_shallow_for_an_exact_match_only) {
     char cache[256];
     char *created = th_mktempdir("cbm_ws_allow_broad");
@@ -87,28 +87,57 @@ TEST(ws_allow_broad_root_lifts_too_shallow_for_an_exact_match_only) {
     snprintf(cache, sizeof(cache), "%s", created);
 
     char err[1024];
-    ASSERT_FALSE(cbm_workspace_root_allowed("/srv", "/home/dev", cache, NULL, NULL, err,
-                                            sizeof(err)));
-    ASSERT_NOT_NULL(strstr(err, "PATH_ALLOW_BROAD"));
+    char listed[4096];
+    /* Refused out of the box, and the refusal names the command a person runs. */
+    ASSERT_FALSE(cbm_workspace_root_allowed("/usr", HOME, cache, NULL, err, sizeof(err)));
+    ASSERT_NOT_NULL(strstr(err, "allow-root --approve-broad /usr"));
 
-    ASSERT_TRUE(
-        cbm_workspace_root_allowed("/srv", "/home/dev", cache, NULL, "/srv", err, sizeof(err)));
-
-    /* A grant for the root does not extend to a sibling: PATH_ALLOW_BROAD names
-     * one path, not a prefix. */
-    ASSERT_FALSE(cbm_workspace_root_allowed("/opt", "/home/dev", cache, NULL, "/srv", err,
-                                            sizeof(err)));
-
-    /* Sensitive and absolute refusals are a different verdict and stay refused
-     * even when PATH_ALLOW_BROAD happens to name that exact path. */
-    ASSERT_FALSE(cbm_workspace_root_allowed("/home/dev", "/home/dev", cache, NULL, "/home/dev",
-                                            err, sizeof(err)));
-    ASSERT_FALSE(
-        cbm_workspace_root_allowed("/", "/home/dev", cache, NULL, "/", err, sizeof(err)));
-
-    /* Environment, not a grant: it never shows up in the recorded list. */
-    char listed[64];
+    /* Neither an ordinary grant nor a sensitive approval lifts breadth; a broad
+     * approval lifts neither an absolute nor a sensitive verdict. A refused grant
+     * records nothing. */
+    ASSERT_FALSE(cbm_workspace_grant_add(cache, HOME, "/usr", false, false, err, sizeof(err)));
+    ASSERT_NOT_NULL(strstr(err, "--approve-broad"));
+    ASSERT_FALSE(cbm_workspace_grant_add(cache, HOME, "/usr", true, false, err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_grant_add(cache, HOME, "/", false, true, err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_grant_add(cache, HOME, HOME, false, true, err, sizeof(err)));
+    ASSERT_NOT_NULL(strstr(err, "--approve-sensitive"));
     ASSERT_FALSE(cbm_workspace_grant_list(cache, listed, sizeof(listed)));
+
+    /* The explicit approval is recorded and marked. */
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, HOME, "/usr", false, true, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_list(cache, listed, sizeof(listed)));
+    ASSERT_STR_EQ(listed, "(approved broad) /usr\n");
+
+#ifndef _WIN32
+    /* Containment resolves real paths, so the rest needs a top-level directory
+     * that exists on every POSIX host: "/usr". A repeated approval is recognized
+     * rather than appended again. */
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, HOME, "/usr", false, true, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_list(cache, listed, sizeof(listed)));
+    ASSERT_STR_EQ(listed, "(approved broad) /usr\n");
+
+    /* It lifts exactly that path. A configured root of "/" puts "/dev" inside the
+     * declared boundary too, so the only thing still refusing it is that the
+     * approval names another path. */
+    ASSERT_TRUE(cbm_workspace_root_allowed("/usr", HOME, cache, NULL, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_root_allowed("/usr", HOME, cache, "/", err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_root_allowed("/dev", HOME, cache, "/", err, sizeof(err)));
+    ASSERT_NOT_NULL(strstr(err, "allow-root --approve-broad /dev"));
+#endif
+
+    /* Each marker lifts only its own verdict: a broad mark on a credential
+     * directory, which grant_add would never write, still does not lift it. */
+    char secret[1024];
+    snprintf(secret, sizeof(secret), "%s/.ssh", cache);
+    ASSERT_EQ(cbm_mkdir(secret), 0);
+    char store[1024];
+    ASSERT_TRUE(cbm_workspace_grant_path(cache, store, sizeof(store)));
+    FILE *f = cbm_fopen(store, "a");
+    ASSERT_NOT_NULL(f);
+    (void)fprintf(f, "^%s\n", secret);
+    ASSERT_EQ(fclose(f), 0);
+    ASSERT_FALSE(cbm_workspace_root_allowed(secret, HOME, cache, NULL, err, sizeof(err)));
+    ASSERT_NOT_NULL(strstr(err, "--approve-sensitive"));
 
     th_cleanup(cache);
     PASS();
@@ -214,10 +243,10 @@ TEST(ws_sensitive_root_explicit_approval_is_preserved) {
     snprintf(cache, sizeof(cache), "%s", created);
 
     char err[1024];
-    ASSERT_FALSE(cbm_workspace_root_allowed(root, root, cache, NULL, NULL, err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
     ASSERT_NOT_NULL(strstr(err, "--approve-sensitive"));
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, err, sizeof(err)));
-    ASSERT_TRUE(cbm_workspace_root_allowed(root, root, cache, NULL, NULL, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, false, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
 
     th_cleanup(root);
     th_cleanup(cache);
@@ -236,14 +265,14 @@ TEST(ws_sensitive_approval_upgrades_existing_ordinary_exact_grant) {
     snprintf(cache, sizeof(cache), "%s", created);
 
     char err[1024];
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, NULL, root, false, err, sizeof(err)));
-    ASSERT_FALSE(cbm_workspace_root_allowed(root, root, cache, NULL, NULL, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, NULL, root, false, false, err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
 
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, err, sizeof(err)));
-    ASSERT_TRUE(cbm_workspace_root_allowed(root, root, cache, NULL, NULL, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, false, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
     /* A repeated explicit approval must recognize the marked exact grant rather
      * than append another exception. */
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, false, err, sizeof(err)));
 
     char listed[4096];
     char expected[4096];
@@ -271,13 +300,15 @@ TEST(ws_sensitive_approval_adds_exact_exception_under_ordinary_ancestor) {
     snprintf(sensitive, sizeof(sensitive), "%s/private-project", ancestor);
     ASSERT_EQ(cbm_mkdir(sensitive), 0);
     char err[1024];
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, NULL, ancestor, false, err, sizeof(err)));
-    ASSERT_FALSE(cbm_workspace_root_allowed(sensitive, sensitive, cache, NULL, NULL, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, NULL, ancestor, false, false, err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_root_allowed(sensitive, sensitive, cache, NULL, err, sizeof(err)));
 
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, sensitive, sensitive, true, err, sizeof(err)));
     ASSERT_TRUE(
-        cbm_workspace_root_allowed(sensitive, sensitive, cache, NULL, NULL, err, sizeof(err)));
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, sensitive, sensitive, true, err, sizeof(err)));
+        cbm_workspace_grant_add(cache, sensitive, sensitive, true, false, err, sizeof(err)));
+    ASSERT_TRUE(
+        cbm_workspace_root_allowed(sensitive, sensitive, cache, NULL, err, sizeof(err)));
+    ASSERT_TRUE(
+        cbm_workspace_grant_add(cache, sensitive, sensitive, true, false, err, sizeof(err)));
 
     char listed[4096];
     char expected[4096];
@@ -719,7 +750,7 @@ TEST(ws_manifest_ordinary_entries_unchanged) {
 
     char err[1024];
     /* The grant store names a root the sdk is not under. */
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, HOME, granted, false, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, HOME, granted, false, false, err, sizeof(err)));
 
     ws_manifest_write_line(base, sdk);
     ASSERT_TRUE(cbm_workspace_manifest_approve(cache, HOME, base, err, sizeof(err)));

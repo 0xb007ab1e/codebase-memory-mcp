@@ -12214,8 +12214,7 @@ static char *index_status_project_key(cbm_mcp_server_t *srv, const char *args, c
         srv->allowed_root_policy_set ? srv->allowed_root : getenv("CBM_ALLOWED_ROOT");
     if (repo_path && repo_path[0] &&
         !cbm_workspace_root_allowed(repo_path, cbm_workspace_home_dir(), cbm_workspace_cache_dir(),
-                                    allowed_root, getenv("PATH_ALLOW_BROAD"), error_out,
-                                    error_size)) {
+                                    allowed_root, error_out, error_size)) {
         safe_free(repo_path);
         return NULL;
     }
@@ -12318,8 +12317,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char boundary_err[CBM_SZ_1K];
     if (repo_path && repo_path[0] &&
         !cbm_workspace_root_allowed(repo_path, cbm_workspace_home_dir(), cbm_workspace_cache_dir(),
-                                    allowed_root, getenv("PATH_ALLOW_BROAD"), boundary_err,
-                                    sizeof(boundary_err))) {
+                                    allowed_root, boundary_err, sizeof(boundary_err))) {
         index_args_free(repo_path, mode_str, name_override);
         return cbm_mcp_text_result(boundary_err, true);
     }
@@ -20828,8 +20826,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         srv->allowed_root_policy_set ? srv->allowed_root : getenv("CBM_ALLOWED_ROOT");
     char boundary_err[CBM_SZ_1K];
     if (!cbm_workspace_root_allowed(srv->session_root, cbm_workspace_home_dir(),
-                                    cbm_workspace_cache_dir(), allowed_root,
-                                    getenv("PATH_ALLOW_BROAD"), boundary_err,
+                                    cbm_workspace_cache_dir(), allowed_root, boundary_err,
                                     sizeof(boundary_err))) {
         cbm_log_warn("autoindex.skip", "reason", "workspace_boundary", "detail", boundary_err);
         return;
