@@ -33,7 +33,6 @@ enum {
     CR_PATH_BUF = 4096,
     CR_QN_BUF = 512,
     CR_PROPS_BUF = 2048,
-    CR_MAX_EDGES = 4096,
     CR_DB_EXT_LEN = 3, /* strlen(".db") */
     CR_INIT_CAP = 32,
     CR_MAX_PROJECTS = 4096,
@@ -481,9 +480,9 @@ static bool cr_path_matches_template(const char *concrete, const char *templ) {
  * the route QN into out_qn and return the handler id; returns 0 on no match.
  *
  * COST: this scans every Route node of the target project once per unmatched
- * HTTP_CALLS edge — O(calls × routes) per project pair. Acceptable while both
- * factors stay small (calls are capped at CR_MAX_EDGES and it only runs for
- * edges the exact lookup missed); revisit with a prepared template index if
+ * HTTP_CALLS edge — O(calls × routes) per project pair. It only runs for edges
+ * the exact lookup missed; no row count stops a scan (a cap decided which
+ * calls were matched at all); revisit with a prepared template index if
  * cross-repo matching ever shows up in profiles. (#523) */
 static int64_t find_route_handler_fuzzy(cbm_store_t *target_store, const char *concrete_path,
                                         const char *method, char *out_qn, size_t out_qn_sz,
@@ -504,11 +503,8 @@ static int64_t find_route_handler_fuzzy(cbm_store_t *target_store, const char *c
         return 0;
     }
     int64_t found = 0;
-    int scanned = 0;
     int step_rc = SQLITE_DONE;
-    while (scanned < CR_MAX_EDGES && !cr_cancel_requested(ctx) &&
-           (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
-        scanned++;
+    while (!cr_cancel_requested(ctx) && (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
         const char *qn = (const char *)sqlite3_column_text(s, 0);
         if (!qn || strncmp(qn, "__route__", CR_ROUTE_PREFIX_LEN) != 0) {
             continue;
@@ -550,7 +546,7 @@ static int64_t find_route_handler_fuzzy(cbm_store_t *target_store, const char *c
             break;
         }
     }
-    if (!cr_cancel_requested(ctx) && scanned < CR_MAX_EDGES && step_rc != SQLITE_DONE) {
+    if (!cr_cancel_requested(ctx) && step_rc != SQLITE_DONE) {
         *failed = true;
     }
     if (sqlite3_finalize(s) != SQLITE_OK) {
@@ -713,12 +709,9 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
     }
 
     int count = 0;
-    int scanned = 0;
     int step_rc = SQLITE_DONE;
     bool failed = false;
-    while (scanned < CR_MAX_EDGES && !cr_cancel_requested(ctx) &&
-           (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
-        scanned++;
+    while (!cr_cancel_requested(ctx) && (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
         int64_t caller_id = sqlite3_column_int64(s, 0);
         int64_t route_id = sqlite3_column_int64(s, SKIP_ONE);
         const char *props = (const char *)sqlite3_column_text(s, PAIR_LEN);
@@ -772,7 +765,7 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
 
         count++;
     }
-    if (!failed && !cr_cancel_requested(ctx) && scanned < CR_MAX_EDGES && step_rc != SQLITE_DONE) {
+    if (!failed && !cr_cancel_requested(ctx) && step_rc != SQLITE_DONE) {
         failed = true;
     }
     if (sqlite3_finalize(s) != SQLITE_OK) {
@@ -804,12 +797,9 @@ static cr_match_result_t match_async_routes(cbm_store_t *src_store, const char *
     }
 
     int count = 0;
-    int scanned = 0;
     int step_rc = SQLITE_DONE;
     bool failed = false;
-    while (scanned < CR_MAX_EDGES && !cr_cancel_requested(ctx) &&
-           (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
-        scanned++;
+    while (!cr_cancel_requested(ctx) && (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
         int64_t caller_id = sqlite3_column_int64(s, 0);
         int64_t route_id = sqlite3_column_int64(s, SKIP_ONE);
         const char *props = (const char *)sqlite3_column_text(s, PAIR_LEN);
@@ -854,7 +844,7 @@ static cr_match_result_t match_async_routes(cbm_store_t *src_store, const char *
         }
         count++;
     }
-    if (!failed && !cr_cancel_requested(ctx) && scanned < CR_MAX_EDGES && step_rc != SQLITE_DONE) {
+    if (!failed && !cr_cancel_requested(ctx) && step_rc != SQLITE_DONE) {
         failed = true;
     }
     if (sqlite3_finalize(s) != SQLITE_OK) {
@@ -969,12 +959,9 @@ static cr_match_result_t match_channels(cbm_store_t *src_store, const char *src_
     }
 
     int count = 0;
-    int scanned = 0;
     int step_rc = SQLITE_DONE;
     bool failed = false;
-    while (scanned < CR_MAX_EDGES && !cr_cancel_requested(ctx) &&
-           (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
-        scanned++;
+    while (!cr_cancel_requested(ctx) && (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
         const char *channel_name = (const char *)sqlite3_column_text(s, SKIP_ONE);
         const char *channel_qn = (const char *)sqlite3_column_text(s, PAIR_LEN);
         if (!channel_name || !channel_qn) {
@@ -1007,7 +994,7 @@ static cr_match_result_t match_channels(cbm_store_t *src_store, const char *src_
             count++;
         }
     }
-    if (!failed && !cr_cancel_requested(ctx) && scanned < CR_MAX_EDGES && step_rc != SQLITE_DONE) {
+    if (!failed && !cr_cancel_requested(ctx) && step_rc != SQLITE_DONE) {
         failed = true;
     }
     if (sqlite3_finalize(s) != SQLITE_OK) {
@@ -1084,12 +1071,9 @@ static cr_match_result_t match_typed_routes(cbm_store_t *src_store, const char *
     }
 
     int count = 0;
-    int scanned = 0;
     int step_rc = SQLITE_DONE;
     bool failed = false;
-    while (scanned < CR_MAX_EDGES && !cr_cancel_requested(ctx) &&
-           (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
-        scanned++;
+    while (!cr_cancel_requested(ctx) && (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
         int64_t caller_id = sqlite3_column_int64(s, 0);
         int64_t route_id = sqlite3_column_int64(s, SKIP_ONE);
         const char *props = (const char *)sqlite3_column_text(s, PAIR_LEN);
@@ -1139,7 +1123,7 @@ static cr_match_result_t match_typed_routes(cbm_store_t *src_store, const char *
         }
         count++;
     }
-    if (!failed && !cr_cancel_requested(ctx) && scanned < CR_MAX_EDGES && step_rc != SQLITE_DONE) {
+    if (!failed && !cr_cancel_requested(ctx) && step_rc != SQLITE_DONE) {
         failed = true;
     }
     if (sqlite3_finalize(s) != SQLITE_OK) {

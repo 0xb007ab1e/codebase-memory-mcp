@@ -33,7 +33,11 @@
 #if defined(__clang__)
 #define SHA256_ARM_TARGET __attribute__((target("sha2")))
 #else
-#define SHA256_ARM_TARGET __attribute__((target("+sha2")))
+/* "+crypto", not "+sha2": GCC 11's arm_neon.h declares the SHA2 intrinsics
+ * under "+nothing+crypto", so a "+sha2" function cannot inline them ("target
+ * specific option mismatch"). "+crypto" implies "+sha2" on every GCC; the
+ * function uses only SHA2 instructions and the runtime HWCAP check gates it. */
+#define SHA256_ARM_TARGET __attribute__((target("+crypto")))
 #endif
 #elif defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
 #define SHA256_HW_X86 1
