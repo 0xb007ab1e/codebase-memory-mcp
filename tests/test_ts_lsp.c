@@ -310,6 +310,21 @@ TEST(tslsp_return_inferred_local) {
     PASS();
 }
 
+/* infer_return_type_from_body visits children last-child first, so of two returns
+ * the one later in the body is tried first. Pinned so that a change to the walk
+ * order (#2091) is a visible decision rather than a side effect. */
+TEST(tslsp_return_walk_order_prefers_later_return) {
+    CBMFileResult *r =
+        extract_ts("class A { a(): void {} }\n"
+                   "class B { b(): void {} }\n"
+                   "function pick(f) { if (f) { return new A(); } return new B(); }\n"
+                   "function go() { const x = pick(true); x.b(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, ".go", "b"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(tslsp_return_async_promise) {
     CBMFileResult *r = extract_ts("class User { hello(): void {} }\n"
                                   "async function load(): Promise<User> { return new User(); }\n"
@@ -3321,8 +3336,7 @@ TEST(tslsp_stress_declarations_past_stack_cap) {
      * the first extraction pass had guessed. */
     enum { BUF_CAP = 64 * 1024 };
     char *buf = (char *)malloc(BUF_CAP);
-    if (!buf)
-        PASS();
+    ASSERT_NOT_NULL(buf);
     char *p = buf;
     char *end = buf + BUF_CAP;
     for (int i = 0; i < 300; i++) {
@@ -3350,8 +3364,7 @@ TEST(tslsp_stress_return_past_stack_cap) {
      * and answer "unknown return type". */
     enum { BUF_CAP = 64 * 1024 };
     char *buf = (char *)malloc(BUF_CAP);
-    if (!buf)
-        PASS();
+    ASSERT_NOT_NULL(buf);
     char *p = buf;
     char *end = buf + BUF_CAP;
     p += snprintf(p, (size_t)(end - p), "class Conn { ping(): void {} }\n");
@@ -4799,6 +4812,7 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_return_simple);
     RUN_TEST(tslsp_return_chain);
     RUN_TEST(tslsp_return_inferred_local);
+    RUN_TEST(tslsp_return_walk_order_prefers_later_return);
     RUN_TEST(tslsp_return_async_promise);
     RUN_TEST(tslsp_return_method_no_rttype);
 

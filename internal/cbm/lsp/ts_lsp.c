@@ -28,7 +28,7 @@
 
 #include "ts_lsp.h"
 #include "../../../src/foundation/platform.h"
-#include "extract_node_stack.h"
+#include "../helpers.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -4685,21 +4685,61 @@ static void register_file_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMFileRes
     }
 }
 
-// Find the first `return EXPR` inside a body and evaluate EXPR's type. Returns
-// UNKNOWN if the body has no return or every return is unresolvable.
+// AST walk stacks for the passes below. The first chunk lives on the C stack, the
+// same 256 slots the old fixed arrays used; a wider pending set grows on the heap
+// through cbm_walk_stack_reserve and is released when the walk ends, so nothing
+// is cut from the per-file result arena. A fixed cap used to stop pushing without
+// a word, which skipped every top-level declaration past the 256th and left the
+// return walk short of returns it had never reached (#2388).
+enum { TS_WALK_STACK_INLINE = 256 };
+
+// Push every child of n in cursor order (one O(N) pass). The walk pops the stack,
+// so children are visited last-child first: the order these walks have always
+// used. False means the stack could not grow; cbm_walk_stack_reserve has logged it.
+static bool ts_walk_push_children(TSNode **stack, int *cap, int *top, TSNode n,
+                                  const TSNode *inline_buf, const char *walker) {
+    uint32_t count = ts_node_child_count(n);
+    if (count == 0)
+        return true;
+    if (!cbm_walk_stack_reserve((void **)stack, cap, *top + (int)count, sizeof(TSNode), inline_buf,
+                                walker))
+        return false;
+    TSTreeCursor cursor = ts_tree_cursor_new(n);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        uint32_t pushed = 0;
+        do {
+            (*stack)[(*top)++] = ts_tree_cursor_current_node(&cursor);
+            pushed++;
+        } while (pushed < count && ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return true;
+}
+
+static bool ts_walk_push(TSNode **stack, int *cap, int *top, TSNode n, const TSNode *inline_buf,
+                         const char *walker) {
+    if (!cbm_walk_stack_reserve((void **)stack, cap, *top + 1, sizeof(TSNode), inline_buf, walker))
+        return false;
+    (*stack)[(*top)++] = n;
+    return true;
+}
+
+// Find a `return EXPR` inside a body and evaluate EXPR's type. Children are visited
+// last-child first, so of several returns the one latest in the body is tried
+// first; the first one that resolves wins. Returns UNKNOWN if the body has no
+// return, every return is unresolvable, or the walk stack could not grow.
 static const CBMType *infer_return_type_from_body(TSLSPContext *ctx, TSNode body) {
     if (ts_node_is_null(body))
         return cbm_type_unknown();
 
-    // Iterative DFS to avoid C-stack blowup on big bodies. The stack grows, so a
-    // body wider than any fixed cap is still walked in full: a fixed 256 slots
-    // used to stop pushing without a word, and this function then answered
-    // "unknown return type" for a body whose return it had never reached.
-    TSNodeStack stack;
-    ts_nstack_init_arena(&stack, ctx->arena, 256);
-    ts_nstack_push(&stack, body);
-    while (stack.count > 0) {
-        TSNode n = ts_nstack_pop(&stack);
+    TSNode inline_stack[TS_WALK_STACK_INLINE];
+    TSNode *stack = inline_stack;
+    int cap = TS_WALK_STACK_INLINE;
+    int top = 0;
+    const CBMType *found = cbm_type_unknown();
+    stack[top++] = body;
+    while (top > 0) {
+        TSNode n = stack[--top];
         if (ts_node_is_null(n))
             continue;
         const char *k = ts_node_type(n);
@@ -4712,8 +4752,10 @@ static const CBMType *infer_return_type_from_body(TSLSPContext *ctx, TSNode body
             if (ts_node_is_null(expr))
                 continue;
             const CBMType *t = ts_eval_expr_type(ctx, expr);
-            if (t && !cbm_type_is_unknown(t))
-                return t;
+            if (t && !cbm_type_is_unknown(t)) {
+                found = t;
+                break;
+            }
             continue;
         }
         // Don't recurse into nested function bodies — their returns belong to them.
@@ -4721,9 +4763,11 @@ static const CBMType *infer_return_type_from_body(TSLSPContext *ctx, TSNode body
             strcmp(k, "arrow_function") == 0 || strcmp(k, "method_definition") == 0)
             continue;
 
-        ts_nstack_push_children(&stack, n);
+        if (!ts_walk_push_children(&stack, &cap, &top, n, inline_stack, "ts_lsp_return_walk"))
+            break; // "unknown" is the safe answer for a walk that could not finish
     }
-    return cbm_type_unknown();
+    cbm_walk_stack_release(stack, inline_stack);
+    return found;
 }
 
 // Rebuild a function's CBMRegisteredFunc signature from the AST directly. extract_defs
@@ -4737,29 +4781,33 @@ static void rebuild_signatures_from_ast(TSLSPContext *ctx, TSNode root, CBMTypeR
     if (ts_node_is_null(root) || !reg || !ctx->module_qn)
         return;
 
-    /* The stack grows. A fixed 256 slots used to be filled by the seeding loop
-     * alone on a file with that many top-level children, and every declaration
-     * past it was then skipped without a word — it kept whatever signature
-     * extract_defs had guessed. */
-    TSNodeStack stack;
-    ts_nstack_init_arena(&stack, ctx->arena, 256);
-    ts_nstack_push_children(&stack, root);
+    // Seeded with every top-level child, so a file with more than 256 of them
+    // needs the growing stack (see TS_WALK_STACK_INLINE). If it cannot grow, the
+    // walk stops and the declarations not yet reached keep extract_defs' signature.
+    TSNode inline_stack[TS_WALK_STACK_INLINE];
+    TSNode *stack = inline_stack;
+    int cap = TS_WALK_STACK_INLINE;
+    int top = 0;
+    bool walking =
+        ts_walk_push_children(&stack, &cap, &top, root, inline_stack, "ts_lsp_rebuild_signatures");
 
-    while (stack.count > 0) {
-        TSNode n = ts_nstack_pop(&stack);
+    while (walking && top > 0) {
+        TSNode n = stack[--top];
         if (ts_node_is_null(n))
             continue;
         const char *k = ts_node_type(n);
 
         // Recurse into export_statement and class bodies.
         if (strcmp(k, "export_statement") == 0 || strcmp(k, "class_body") == 0) {
-            ts_nstack_push_children(&stack, n);
+            walking = ts_walk_push_children(&stack, &cap, &top, n, inline_stack,
+                                            "ts_lsp_rebuild_signatures");
             continue;
         }
         if (strcmp(k, "class_declaration") == 0) {
             TSNode body = ts_node_child_by_field_name(n, "body", TS_LSP_FIELD_LEN("body"));
             if (!ts_node_is_null(body))
-                ts_nstack_push(&stack, body);
+                walking = ts_walk_push(&stack, &cap, &top, body, inline_stack,
+                                       "ts_lsp_rebuild_signatures");
             continue;
         }
 
@@ -4889,6 +4937,7 @@ static void rebuild_signatures_from_ast(TSLSPContext *ctx, TSNode root, CBMTypeR
             break;
         }
     }
+    cbm_walk_stack_release(stack, inline_stack);
 }
 
 // Convert NAMED references to TYPE_PARAM for any function whose declaration has a
@@ -4899,29 +4948,33 @@ static void convert_signature_type_params(TSLSPContext *ctx, TSNode root, CBMTyp
         return;
 
     // Walk: function_declaration, class_declaration { method_definition }, plus exported.
-    /* The stack grows. A fixed 256 slots used to be filled by the seeding loop
-     * alone on a file with that many top-level children, and every declaration
-     * past it was then skipped without a word — it kept whatever signature
-     * extract_defs had guessed. */
-    TSNodeStack stack;
-    ts_nstack_init_arena(&stack, ctx->arena, 256);
-    ts_nstack_push_children(&stack, root);
+    // Seeded with every top-level child, so a file with more than 256 of them needs
+    // the growing stack (see TS_WALK_STACK_INLINE). If it cannot grow, the walk stops
+    // and the generics not yet reached keep their NAMED parameters.
+    TSNode inline_stack[TS_WALK_STACK_INLINE];
+    TSNode *stack = inline_stack;
+    int cap = TS_WALK_STACK_INLINE;
+    int top = 0;
+    bool walking =
+        ts_walk_push_children(&stack, &cap, &top, root, inline_stack, "ts_lsp_type_params");
 
-    while (stack.count > 0) {
-        TSNode n = ts_nstack_pop(&stack);
+    while (walking && top > 0) {
+        TSNode n = stack[--top];
         if (ts_node_is_null(n))
             continue;
         const char *k = ts_node_type(n);
 
         // Recurse into export_statement and class_body.
         if (strcmp(k, "export_statement") == 0 || strcmp(k, "class_body") == 0) {
-            ts_nstack_push_children(&stack, n);
+            walking =
+                ts_walk_push_children(&stack, &cap, &top, n, inline_stack, "ts_lsp_type_params");
             continue;
         }
         if (strcmp(k, "class_declaration") == 0) {
             TSNode body = ts_node_child_by_field_name(n, "body", TS_LSP_FIELD_LEN("body"));
             if (!ts_node_is_null(body))
-                ts_nstack_push(&stack, body);
+                walking =
+                    ts_walk_push(&stack, &cap, &top, body, inline_stack, "ts_lsp_type_params");
             continue;
         }
 
@@ -5020,6 +5073,7 @@ static void convert_signature_type_params(TSLSPContext *ctx, TSNode root, CBMTyp
             break;
         }
     }
+    cbm_walk_stack_release(stack, inline_stack);
 }
 
 // Parse a JSDoc comment block for `@param {T} name` and `@returns {T}` tags. For each
