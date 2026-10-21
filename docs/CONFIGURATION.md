@@ -105,6 +105,12 @@ has not run yet).
 > narrower: it globally controls MCP session watch registration. On the next
 > refresh or registration request, `false` removes all watches; `true` allows
 > session roots and successful explicit `index_repository` targets to register.
+> Watcher refreshes retain `mode`, `persistence`, and the resolved
+> `doc_candidates` boolean from the latest successful explicit index registered
+> for that target. This boolean can come from the request or its global setting.
+> When neither supplied a boolean, refresh uses the current setting or mode default.
+> A watcher callback also observes `auto_watch=false`: it removes all watches
+> before admitting any new refresh work.
 > When `watcher_enabled=false`,
 > `auto_watch` has no effect — there is no watcher to register with.
 >
