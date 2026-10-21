@@ -620,6 +620,31 @@ TEST(infrascan_decorator_route_metadata_rejects_malformed_values) {
     PASS();
 }
 
+/* Properties hold source text as its bytes, which need not be UTF-8: a
+ * Latin-1 docstring beside the route metadata, or a Latin-1 route path. The
+ * Route extraction emits for them must come back from the stored metadata too,
+ * as it did before the metadata was parsed. */
+TEST(infrascan_decorator_route_metadata_survives_invalid_utf8) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/cbm_infrascan_route_latin1");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "doc", "test.doc", "views.py", 1, 1,
+                                   "{\"docstring\":\"caf\xe9\",\"route_path\":\"/doc\","
+                                   "\"route_method\":\"GET\"}"),
+              0);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "GET", "test.app.caf\xe9.route.GET",
+                                   "app/caf\xe9/route.ts", 1, 1,
+                                   "{\"route_path\":\"/caf\xe9\",\"route_method\":\"GET\"}"),
+              0);
+    cbm_pipeline_create_route_nodes(gb);
+    const cbm_gbuf_node_t *doc_route = cbm_gbuf_find_by_qn(gb, "__route__GET__/doc");
+    const cbm_gbuf_node_t *dir_route = cbm_gbuf_find_by_qn(gb, "__route__GET__/caf\xe9");
+    bool both = doc_route && dir_route && strcmp(dir_route->name, "/caf\xe9") == 0 &&
+                cbm_gbuf_edge_count_by_type(gb, "HANDLES") == 2;
+    cbm_gbuf_free(gb);
+    ASSERT_TRUE(both);
+    PASS();
+}
+
 /* FD16: a route's DATA_FLOWS were built from the first 64 callers and the first 32 infra handlers
  * in edge-insertion order (parallel worker interleaving), so the flow set changed between two
  * indexes of the same tree and every caller past the 64th lost its flow. */
@@ -794,6 +819,7 @@ SUITE(infrascan) {
     RUN_TEST(infrascan_http_calls_join_matching_handler_route);
     RUN_TEST(infrascan_decorator_route_metadata_keeps_its_escapes);
     RUN_TEST(infrascan_decorator_route_metadata_rejects_malformed_values);
+    RUN_TEST(infrascan_decorator_route_metadata_survives_invalid_utf8);
     RUN_TEST(infrascan_handles_properties_hold_a_long_handler_qn);
     RUN_TEST(infrascan_route_properties_escape_the_method);
     RUN_TEST(infrascan_sveltekit_handles_properties_escape_the_handler_qn);

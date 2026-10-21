@@ -446,7 +446,9 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
         return 0;
     }
 
-    yyjson_doc *doc = yyjson_read(func->properties_json, strlen(func->properties_json), 0);
+    /* Properties hold source text as its bytes, which need not be UTF-8. */
+    yyjson_doc *doc = yyjson_read(func->properties_json, strlen(func->properties_json),
+                                  YYJSON_READ_ALLOW_INVALID_UNICODE);
     yyjson_val *root = yyjson_doc_get_root(doc);
     char path[CBM_SZ_256];
     char method[CBM_SZ_16] = "ANY";
