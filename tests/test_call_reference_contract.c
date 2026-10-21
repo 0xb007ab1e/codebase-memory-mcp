@@ -507,6 +507,77 @@ TEST(call_java_record_accessor_binds_the_record) {
     PASS();
 }
 
+/* Static imports can name both an inherited method and a field. Thread's
+ * activeCount() is external to this project, whereas Owner.activeCount is
+ * local data; an unresolved import must not turn the field into a callee. */
+static int crc_java_static_import_data_call_count(bool parallel) {
+    RFile files[52] = {{"example/Owner.java", "package example;\n"
+                                              "public class Owner extends Thread {\n"
+                                              "    public static int activeCount;\n"
+                                              "}\n"},
+                       {"example/Caller.java", "package example;\n"
+                                               "import static example.Owner.activeCount;\n"
+                                               "class Caller {\n"
+                                               "    int caller() { return activeCount(); }\n"
+                                               "}\n"}};
+    char names[50][64];
+    char sources[50][64];
+    int count = parallel ? 52 : 2;
+    for (int i = 2; i < count; i++) {
+        snprintf(names[i - 2], sizeof(names[i - 2]), "example/Pad%d.java", i);
+        snprintf(sources[i - 2], sizeof(sources[i - 2]), "package example; class Pad%d {}\n", i);
+        files[i].name = names[i - 2];
+        files[i].content = sources[i - 2];
+    }
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, files, count);
+    if (!store) {
+        return -1;
+    }
+    int fields = crc_edge_count(store, project.project, "CALLS", "caller", "Field", "activeCount");
+    int vars = crc_edge_count(store, project.project, "CALLS", "caller", "Variable", "activeCount");
+    rh_cleanup(&project, store);
+    return fields < 0 || vars < 0 ? -1 : fields + vars;
+}
+
+TEST(call_java_static_import_does_not_call_field_sequential) {
+    ASSERT_EQ(crc_java_static_import_data_call_count(false), 0);
+    PASS();
+}
+
+TEST(call_java_static_import_does_not_call_field_parallel) {
+    ASSERT_EQ(crc_java_static_import_data_call_count(true), 0);
+    PASS();
+}
+
+TEST(call_java_record_varargs_accessor_has_array_return) {
+    static const char *sources[] = {
+        "record Values(String... xs) {}\n", "record Values(String[]... xs) {}\n",
+        "record Values(int... xs) {}\n", "record Values(@Deprecated String... xs) {}\n",
+        "record Values(String... xs) { public String[] xs() { return xs; } }\n"};
+    static const char *return_types[] = {"String[]", "String[][]", "int[]", "String[]", "String[]"};
+    for (int fixture = 0; fixture < 5; fixture++) {
+        CBMFileResult *result =
+            cbm_extract_file(sources[fixture], (int)strlen(sources[fixture]), CBM_LANG_JAVA,
+                             "repro", "Values.java", 0, NULL, NULL);
+        ASSERT_NOT_NULL(result);
+        int accessors = 0;
+        bool array_return = false;
+        for (int i = 0; i < result->defs.count; i++) {
+            CBMDefinition *def = &result->defs.items[i];
+            if (strcmp(def->name, "xs") == 0 && strcmp(def->label, "Method") == 0) {
+                accessors++;
+                array_return =
+                    def->return_type && strcmp(def->return_type, return_types[fixture]) == 0;
+            }
+        }
+        cbm_free_result(result);
+        ASSERT_EQ(accessors, 1);
+        ASSERT_TRUE(array_return);
+    }
+    PASS();
+}
+
 SUITE(call_reference_contract) {
     RUN_TEST(call_reference_typescript_direct_argument_is_exact);
     RUN_TEST(call_reference_kotlin_alias_argument_is_exact);
@@ -524,4 +595,7 @@ SUITE(call_reference_contract) {
     RUN_TEST(call_reference_go_bound_method_argument_is_exact);
     RUN_TEST(call_reference_go_ambiguous_promoted_method_stays_usage);
     RUN_TEST(call_java_record_accessor_binds_the_record);
+    RUN_TEST(call_java_record_varargs_accessor_has_array_return);
+    RUN_TEST(call_java_static_import_does_not_call_field_sequential);
+    RUN_TEST(call_java_static_import_does_not_call_field_parallel);
 }
