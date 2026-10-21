@@ -26,6 +26,7 @@
 #include "../src/foundation/compat.h"
 #include "../src/pipeline/lsp_resolve.h"
 #include "lsp/ts_lsp.h"
+#include <limits.h>
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
 
@@ -3448,6 +3449,66 @@ TEST(tslsp_stress_many_classes) {
     PASS();
 }
 
+TEST(tslsp_signature_walk_keeps_first_local_registration) {
+    CBMRegisteredFunc base_funcs[] = {{.qualified_name = "test.base.only"}};
+    CBMTypeRegistry base = {.funcs = base_funcs, .func_count = 1, .read_only = true};
+    CBMRegisteredFunc funcs[] = {
+        {.qualified_name = NULL},
+        {.qualified_name = "test.main.identity"},
+        {.qualified_name = "test.main.identity"},
+        {.qualified_name = "test.main.Box.identity"},
+    };
+    CBMTypeRegistry overlay = {.funcs = funcs, .func_count = 4, .fallback = &base};
+    ASSERT_EQ(cbm_ts_lsp_test_signature_func_index(&overlay, "test.main.identity"), 1);
+    ASSERT_EQ(cbm_ts_lsp_test_signature_func_index(&overlay, "test.main.Box.identity"), 3);
+    ASSERT_EQ(cbm_ts_lsp_test_signature_func_index(&overlay, "test.base.only"), -1);
+    ASSERT_EQ(cbm_ts_lsp_test_signature_func_index(&overlay, "test.missing"), -1);
+    ASSERT_EQ(overlay.func_count, 4);
+    ASSERT_EQ(base.func_count, 1);
+    PASS();
+}
+
+TEST(tslsp_walk_pending_count_rejects_overflow) {
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(255, 300), 555);
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(INT_MAX - 1, 1), INT_MAX);
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(INT_MAX, 1), -1);
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(1, (uint32_t)INT_MAX), -1);
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(0, UINT32_MAX), -1);
+    PASS();
+}
+
+/* Count actual registry work, independent of machine speed. Both inputs exceed
+ * the old walk cap, and every declaration exercises rebuild and generic rewrite. */
+TEST(tslsp_signature_walk_lookup_scales_linearly) {
+    unsigned long work[2] = {0};
+    for (int scale = 0; scale < 2; scale++) {
+        const int count = 300 << scale;
+        const size_t capacity = (size_t)count * 160 + 512;
+        char *source = (char *)malloc(capacity);
+        ASSERT_NOT_NULL(source);
+        size_t used = 0;
+        for (int i = 0; i < count; i++) {
+            used += (size_t)snprintf(source + used, capacity - used,
+                                     "export function identity%d<T>(x: T): T { return x; }\n", i);
+        }
+        snprintf(source + used, capacity - used,
+                 "class Box { use(): void {} }\n"
+                 "function go() { const b = identity%d(new Box()); b.use(); }\n",
+                 count - 1);
+        CBMFileResult *r = extract_ts(source);
+        free(source);
+        ASSERT_NOT_NULL(r);
+        work[scale] = cbm_ts_lsp_test_signature_lookup_work();
+        ASSERT_GTE(require_resolved(r, ".go", "use"), 0);
+        cbm_free_result(r);
+    }
+    printf("  signature lookup work: 300=%lu 600=%lu\n", work[0], work[1]);
+    ASSERT_GT(work[0], 0);
+    /* Allow 25% above ideal doubling for hash-bucket distribution. */
+    ASSERT_LT(work[1], work[0] * 5 / 2);
+    PASS();
+}
+
 TEST(tslsp_stress_declarations_past_stack_cap) {
     /* 300 padding functions, then the generic pair that needs the AST walk.
      * The walk used to hold 256 nodes at most, so every top-level declaration
@@ -5261,6 +5322,9 @@ SUITE(ts_lsp) {
 
     /* Stress tests */
     RUN_TEST(tslsp_stress_many_classes);
+    RUN_TEST(tslsp_signature_walk_keeps_first_local_registration);
+    RUN_TEST(tslsp_walk_pending_count_rejects_overflow);
+    RUN_TEST(tslsp_signature_walk_lookup_scales_linearly);
     RUN_TEST(tslsp_stress_declarations_past_stack_cap);
     RUN_TEST(tslsp_stress_return_past_stack_cap);
     RUN_TEST(tslsp_stress_deep_inheritance);
