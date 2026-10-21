@@ -39,6 +39,7 @@ typedef struct {
     const char **import_alias_locals;
     const char **import_alias_exports;
     int import_alias_count;
+    size_t import_alias_capacity;
 
     // File / surrounding context.
     const char *module_qn;          // QN of this file's module

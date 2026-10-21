@@ -9341,8 +9341,30 @@ TEST(pipeline_ts_renamed_import_call_issue2297) {
         cross_file_call_has_strategy(s, project, "callsPlain", "fooUniqueQrs", "lsp_ts_import");
     bool renamed = cross_file_call_has_strategy(s, project, "callsRenamed", "fooUniqueQrs",
                                                 "lsp_import_alias");
-    bool wrapper = cross_file_call_has_strategy(s, project, "buildHealthUniqueQrs",
-                                                "buildHealthUniqueQrs", "lsp_import_alias");
+    char wrapper_qn[512];
+    char exported_qn[512];
+    snprintf(wrapper_qn, sizeof(wrapper_qn), "%s.src.wrapper.buildHealthUniqueQrs", project);
+    snprintf(exported_qn, sizeof(exported_qn), "%s.src.lib.buildHealthUniqueQrs", project);
+    cbm_node_t wrapper_node = {0};
+    cbm_node_t exported_node = {0};
+    bool wrapper = false;
+    bool recursive = false;
+    if (cbm_store_find_node_by_qn(s, project, wrapper_qn, &wrapper_node) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(s, project, exported_qn, &exported_node) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        cbm_store_find_edges_by_source_type(s, wrapper_node.id, "CALLS", &edges, &edge_count);
+        for (int i = 0; i < edge_count; i++) {
+            if (edges[i].target_id == exported_node.id && edges[i].properties_json &&
+                strstr(edges[i].properties_json, "lsp_import_alias"))
+                wrapper = true;
+            if (edges[i].target_id == wrapper_node.id)
+                recursive = true;
+        }
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_node_free_fields(&wrapper_node);
+    cbm_node_free_fields(&exported_node);
     bool renamed_class = cross_file_call_has_strategy(s, project, "viaRenamedClass",
                                                       "pingUniqueQrs", "lsp_ts_method");
 
@@ -9353,6 +9375,7 @@ TEST(pipeline_ts_renamed_import_call_issue2297) {
     ASSERT_TRUE(plain);
     ASSERT_TRUE(renamed);
     ASSERT_TRUE(wrapper);
+    ASSERT_FALSE(recursive);
     ASSERT_TRUE(renamed_class);
     PASS();
 }

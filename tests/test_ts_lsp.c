@@ -2771,6 +2771,125 @@ TEST(tslsp_crossfile_chain_through_return) {
     PASS();
 }
 
+/* The call target and its return signature must use the same exported name,
+ * even when the module also exports a function named like the local alias. */
+static int ts_renamed_import_return_chain(bool shared_registry) {
+    const char *source = "import { make as alias } from './lib';\n"
+                         "function go() { alias().read(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.go",
+         .short_name = "go",
+         .label = "Function",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.main"},
+        {.qualified_name = "test.lib.Good",
+         .short_name = "Good",
+         .label = "Class",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.lib",
+         .method_names_str = "read"},
+        {.qualified_name = "test.lib.Good.read",
+         .short_name = "read",
+         .label = "Method",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.lib",
+         .receiver_type = "test.lib.Good"},
+        {.qualified_name = "test.lib.Bad",
+         .short_name = "Bad",
+         .label = "Class",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.lib",
+         .method_names_str = "read"},
+        {.qualified_name = "test.lib.Bad.read",
+         .short_name = "read",
+         .label = "Method",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.lib",
+         .receiver_type = "test.lib.Bad"},
+        {.qualified_name = "test.lib.make",
+         .short_name = "make",
+         .label = "Function",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.lib",
+         .return_types = "test.lib.Good"},
+        {.qualified_name = "test.lib.alias",
+         .short_name = "alias",
+         .label = "Function",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.lib",
+         .return_types = "test.lib.Bad"},
+    };
+    enum { NDEFS = (int)(sizeof(defs) / sizeof(defs[0])) };
+    const char *imp_names[] = {"alias"};
+    const char *imp_qns[] = {"test.lib"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    if (shared_registry) {
+        CBMTypeRegistry *reg = cbm_ts_build_cross_registry(&arena, defs, NDEFS);
+        ASSERT_NOT_NULL(reg);
+        cbm_run_ts_lsp_cross_with_registry(&arena, source, (int)strlen(source), "test.main", false,
+                                           false, false, reg, defs, NDEFS, imp_names, imp_qns, 1,
+                                           NULL, &out);
+    } else {
+        cbm_run_ts_lsp_cross(&arena, source, (int)strlen(source), "test.main", false, false, false,
+                             defs, NDEFS, imp_names, imp_qns, 1, NULL, &out);
+    }
+    bool direct = has_exact_resolved(&out, "test.main.go", "test.lib.make", "lsp_import_alias");
+    bool good = has_exact_resolved(&out, "test.main.go", "test.lib.Good.read", "lsp_ts_method");
+    bool bad = has_exact_resolved(&out, "test.main.go", "test.lib.Bad.read", "lsp_ts_method");
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(direct);
+    ASSERT_FALSE(bad);
+    ASSERT_TRUE(good);
+    PASS();
+}
+
+TEST(tslsp_crossfile_renamed_import_return_chain) {
+    return ts_renamed_import_return_chain(false);
+}
+
+TEST(tslsp_crossfile_renamed_import_return_chain_shared) {
+    return ts_renamed_import_return_chain(true);
+}
+
+/* Keep the supplied import map at one entry: this measures the AST alias
+ * collector independently of the older import-map insertion path. */
+static size_t ts_import_alias_arena_bytes(int count) {
+    size_t capacity = (size_t)count * 48 + 64;
+    char *source = malloc(capacity);
+    if (!source)
+        return 0;
+    size_t len = (size_t)snprintf(source, capacity, "import { ");
+    for (int i = 0; i < count; i++) {
+        len += (size_t)snprintf(source + len, capacity - len, "%sf%d as a%d", i ? ", " : "", i, i);
+    }
+    len += (size_t)snprintf(source + len, capacity - len, " } from './lib';\n");
+    const char *imp_names[] = {"a0"};
+    const char *imp_qns[] = {"test.lib"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_ts_lsp_cross(&arena, source, (int)len, "test.main", false, false, false, NULL, 0,
+                         imp_names, imp_qns, 1, NULL, &out);
+    size_t bytes = cbm_arena_total(&arena);
+    cbm_arena_destroy(&arena);
+    free(source);
+    return bytes;
+}
+
+TEST(tslsp_import_alias_arena_growth) {
+    size_t small = ts_import_alias_arena_bytes(1024);
+    size_t large = ts_import_alias_arena_bytes(2048);
+    ASSERT_GT(small, 0);
+    ASSERT_GT(large, small);
+    printf(" aliases arena bytes: 1024=%zu 2048=%zu ", small, large);
+    /* Linear source/AST work plus geometric storage stays below 3x; retaining
+     * two complete arrays at every insertion grows approximately 4x. */
+    ASSERT(large < small * 3);
+    PASS();
+}
+
 TEST(tslsp_crossfile_no_def_match) {
     /* Function that imports a symbol not in the def list — should resolve safely
      * (emit unresolved, no crash). */
@@ -5236,6 +5355,9 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_scale_many_defs_no_crash_issue344);
     RUN_TEST(tslsp_crossfile_function_call);
     RUN_TEST(tslsp_crossfile_chain_through_return);
+    RUN_TEST(tslsp_crossfile_renamed_import_return_chain);
+    RUN_TEST(tslsp_crossfile_renamed_import_return_chain_shared);
+    RUN_TEST(tslsp_import_alias_arena_growth);
     RUN_TEST(tslsp_crossfile_no_def_match);
     RUN_TEST(tslsp_crossfile_renamed_import_issue2297);
     RUN_TEST(tslsp_crossfile_renamed_import_missing_export_issue2297);

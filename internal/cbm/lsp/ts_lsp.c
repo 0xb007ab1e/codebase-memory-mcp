@@ -2231,7 +2231,8 @@ static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, 
             if (!registered) {
                 const char *module_qn = ts_import_module_for_local(ctx, name, NULL);
                 if (module_qn)
-                    registered = ts_lookup_symbol_for_call(ctx, module_qn, name, args);
+                    registered = ts_lookup_symbol_for_call(ctx, module_qn,
+                                                           ts_import_export_name(ctx, name), args);
             }
             if (registered)
                 return registered->signature;
@@ -4048,22 +4049,27 @@ void ts_lsp_add_import(TSLSPContext *ctx, const char *local_name, const char *mo
 }
 
 static void ts_lsp_add_import_alias(TSLSPContext *ctx, const char *local, const char *exported) {
-    int new_count = ctx->import_alias_count + 1;
-    const char **locals =
-        (const char **)cbm_arena_alloc(ctx->arena, (size_t)new_count * sizeof(const char *));
-    const char **exports =
-        (const char **)cbm_arena_alloc(ctx->arena, (size_t)new_count * sizeof(const char *));
-    if (!locals || !exports)
-        return;
-    for (int i = 0; i < ctx->import_alias_count; i++) {
-        locals[i] = ctx->import_alias_locals[i];
-        exports[i] = ctx->import_alias_exports[i];
+    if ((size_t)ctx->import_alias_count == ctx->import_alias_capacity) {
+        /* The arena retains old arrays: grow geometrically so collecting A
+         * aliases retains O(A) pointers instead of O(A squared). */
+        size_t capacity = ctx->import_alias_capacity ? ctx->import_alias_capacity * 2 : 8;
+        const char **locals =
+            (const char **)cbm_arena_alloc(ctx->arena, capacity * sizeof(const char *));
+        const char **exports =
+            (const char **)cbm_arena_alloc(ctx->arena, capacity * sizeof(const char *));
+        if (!locals || !exports)
+            return;
+        for (int i = 0; i < ctx->import_alias_count; i++) {
+            locals[i] = ctx->import_alias_locals[i];
+            exports[i] = ctx->import_alias_exports[i];
+        }
+        ctx->import_alias_locals = locals;
+        ctx->import_alias_exports = exports;
+        ctx->import_alias_capacity = capacity;
     }
-    locals[ctx->import_alias_count] = local;
-    exports[ctx->import_alias_count] = exported;
-    ctx->import_alias_locals = locals;
-    ctx->import_alias_exports = exports;
-    ctx->import_alias_count = new_count;
+    ctx->import_alias_locals[ctx->import_alias_count] = local;
+    ctx->import_alias_exports[ctx->import_alias_count] = exported;
+    ctx->import_alias_count++;
 }
 
 /* Record each `import { foo as bar }` binding of the file (#2297). The import
