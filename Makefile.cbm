@@ -449,7 +449,7 @@ PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
 
 # Store module (new)
-STORE_SRCS = src/store/store.c src/store/architecture_projection.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
+STORE_SRCS = src/store/store.c src/store/graph_mem.c src/store/architecture_projection.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
 
 # Cypher module (new)
 CYPHER_SRCS = src/cypher/cypher.c
@@ -537,10 +537,13 @@ PIPELINE_SRCS = \
     src/pipeline/pass_compile_commands.c \
     src/pipeline/pass_infrascan.c \
     src/pipeline/pass_k8s.c \
+    src/pipeline/helm_template.c \
     src/pipeline/pass_operator.c \
     src/pipeline/pass_shell.c \
     src/pipeline/pass_terraform.c \
+    src/pipeline/pass_ansible.c \
     src/pipeline/pass_docker.c \
+    src/pipeline/pass_envjoin.c \
     src/pipeline/pass_ci.c \
     src/pipeline/pass_similarity.c \
     src/pipeline/pass_semantic_edges.c \
@@ -744,6 +747,7 @@ TEST_STORE_SRCS = \
     tests/test_store_impact.c \
     tests/test_store_scope.c \
     tests/test_store_graph_digest.c \
+    tests/test_graph_mem.c \
     tests/test_store_search.c \
     tests/test_store_arch.c \
     tests/test_architecture_projection.c \
@@ -843,7 +847,7 @@ TEST_PY_LSP_SCALE_SRCS = tests/test_py_lsp_scale.c
 
 TEST_TS_LSP_SRCS = tests/test_ts_lsp.c
 TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c
-TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c
+TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c tests/test_kotlin_typed_calls.c
 TEST_RUST_LSP_SRCS = tests/test_rust_lsp.c
 
 TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/test_lang_contract.c tests/test_edge_imports.c tests/test_edge_structural.c tests/test_lsp_resolution_probe.c tests/test_node_creation_probe.c tests/test_edge_types_probe.c tests/test_convergence_probe.c tests/test_matrix_known_classes.c tests/test_matrix_new_constructs.c tests/test_grammar_probe_a.c tests/test_grammar_probe_b.c tests/test_grammar_probe_c.c tests/test_grammar_probe_d.c tests/test_grammar_probe_e.c tests/test_grammar_probe_f.c tests/test_grammar_probe_g.c tests/test_conditional_variants.c tests/test_spawns.c
@@ -1294,6 +1298,16 @@ $(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c $(BUILD_DIR)/.build-co
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w $(MEMWASTE_VENDOR_CFLAGS) -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
 OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
+
+# The part of OBJS_VENDORED_PROD that holds no first-party code: everything but
+# prod_lsp_all.o (first-party LSP unity) and prod_preprocessor.o (first-party
+# code around vendored simplecpp). CodeQL's light PR scan builds these BEFORE
+# it starts tracing (scripts/build.sh --vendored-only), so the traced build
+# (--reuse-vendored) compiles first-party code only: the grammars alone are
+# most of the 1.3 GB of vendored C, against ~45 MB of first-party code.
+OBJS_THIRD_PARTY_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
+.PHONY: cbm-third-party
+cbm-third-party: $(OBJS_THIRD_PARTY_PROD)
 
 MAIN_SRC = src/main.c
 

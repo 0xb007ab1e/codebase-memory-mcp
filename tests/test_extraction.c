@@ -1506,6 +1506,82 @@ TEST(python_annotated_instance_fields_exported_issue1277) {
     PASS();
 }
 
+/* #1277: the import an annotated field's type comes from usually sits under
+ * `if TYPE_CHECKING:`. It is recorded, flagged annotation-only; a runtime
+ * import is not flagged; an else branch (a runtime alternative) and an
+ * ordinary `if` stay unrecorded as before. */
+static const CBMImport *py_find_import(const CBMFileResult *r, const char *local) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name && strcmp(r->imports.items[i].local_name, local) == 0)
+            return &r->imports.items[i];
+    }
+    return NULL;
+}
+
+TEST(python_type_checking_imports_flagged_issue1277) {
+    const char *src = "from typing import TYPE_CHECKING\n"
+                      "import typing\n"
+                      "if TYPE_CHECKING:\n"
+                      "    from trainer import Trainer\n"
+                      "    import contracts\n"
+                      "else:\n"
+                      "    from fallback import Runtime\n"
+                      "if typing.TYPE_CHECKING:\n"
+                      "    from engine import Engine as Eng\n"
+                      "if FLAG:\n"
+                      "    from other import Conditional\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "loop.py");
+    ASSERT_NOT_NULL(r);
+    const CBMImport *tc = py_find_import(r, "TYPE_CHECKING");
+    const CBMImport *trainer = py_find_import(r, "Trainer");
+    const CBMImport *contracts = py_find_import(r, "contracts");
+    const CBMImport *eng = py_find_import(r, "Eng");
+    ASSERT_NOT_NULL(tc);
+    ASSERT_FALSE(tc->type_checking_only);
+    ASSERT_NOT_NULL(trainer);
+    ASSERT_TRUE(trainer->type_checking_only);
+    ASSERT_NOT_NULL(contracts);
+    ASSERT_TRUE(contracts->type_checking_only);
+    ASSERT_NOT_NULL(eng);
+    ASSERT_TRUE(eng->type_checking_only);
+    ASSERT_NULL(py_find_import(r, "Runtime"));
+    ASSERT_NULL(py_find_import(r, "Conditional"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A name the alternative of an `if TYPE_CHECKING:` binds again (the airflow
+ * compat shape, usually inside try/except ImportError) is bound at runtime, so
+ * its TYPE_CHECKING import is not annotation-only: it stays unrecorded, as the
+ * runtime import itself does. A star import in an alternative may bind any
+ * name, so it covers every name of the block. */
+TEST(python_type_checking_rebound_in_else_unrecorded_issue1277) {
+    const char *src = "from typing import TYPE_CHECKING\n"
+                      "if TYPE_CHECKING:\n"
+                      "    from airflow.sdk.execution_time.secrets_masker import mask_secret\n"
+                      "    from airflow.sdk.types import OnlyTyped\n"
+                      "else:\n"
+                      "    try:\n"
+                      "        from airflow.sdk.log import mask_secret\n"
+                      "    except ImportError:\n"
+                      "        mask_secret = None\n"
+                      "if TYPE_CHECKING:\n"
+                      "    from compat.types import Starred\n"
+                      "elif SOMETHING:\n"
+                      "    from compat import *\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "hook.py");
+    ASSERT_NOT_NULL(r);
+    const CBMImport *typed = py_find_import(r, "OnlyTyped");
+    ASSERT_NOT_NULL(typed);
+    ASSERT_TRUE(typed->type_checking_only);        /* only the type checker binds it */
+    ASSERT_NULL(py_find_import(r, "mask_secret")); /* the else branch binds it at runtime */
+    ASSERT_NULL(py_find_import(r, "Starred"));     /* the elif star import may bind it */
+    ASSERT_NULL(py_find_import(r, "compat"));      /* alternatives stay unrecorded */
+    ASSERT_NOT_NULL(py_find_import(r, "TYPE_CHECKING"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(python_function) {
     CBMFileResult *r = extract(
         "def greet(name):\n    return f\"Hello {name}\"\n\ndef main():\n    greet(\"World\")\n",
@@ -3790,6 +3866,48 @@ TEST(python_imports) {
     PASS();
 }
 
+/* The module_path recorded for a local name, or NULL. */
+static const char *import_path_of(CBMFileResult *r, const char *local) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name && strcmp(r->imports.items[i].local_name, local) == 0)
+            return r->imports.items[i].module_path;
+    }
+    return NULL;
+}
+
+/* `from . import x` names the importing file's OWN package: the path is ".x",
+ * as `from .m import f` is ".m.f". Joining the all-dots module with another '.'
+ * recorded "..x" (the parent package), so the import resolved one package too
+ * high and fell to an arbitrary same-named definition (home-assistant: 7,175
+ * calls bound to another integration's function). */
+TEST(python_package_relative_import_paths) {
+    CBMFileResult *r = extract("from . import async_register\n"
+                               "from .. import shared\n"
+                               "from . import local_fn as lf\n"
+                               "from .helpers import helper_fn\n"
+                               "from pkg.db import get_row\n",
+                               CBM_LANG_PYTHON, "t", "comp/web/sub/mod.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *own = import_path_of(r, "async_register");
+    const char *parent = import_path_of(r, "shared");
+    const char *aliased = import_path_of(r, "lf");
+    const char *member = import_path_of(r, "helper_fn");
+    const char *absolute = import_path_of(r, "get_row");
+    ASSERT_NOT_NULL(own);
+    ASSERT_NOT_NULL(parent);
+    ASSERT_NOT_NULL(aliased);
+    ASSERT_NOT_NULL(member);
+    ASSERT_NOT_NULL(absolute);
+    ASSERT_STR_EQ(own, ".async_register");
+    ASSERT_STR_EQ(parent, "..shared");
+    ASSERT_STR_EQ(aliased, ".local_fn");
+    ASSERT_STR_EQ(member, ".helpers.helper_fn"); /* control: unchanged */
+    ASSERT_STR_EQ(absolute, "pkg.db.get_row");   /* control: unchanged */
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(js_imports) {
     CBMFileResult *r = extract("import React from 'react';\nimport { useState } from "
                                "'react';\nconst fs = require('fs');\n",
@@ -4719,6 +4837,298 @@ TEST(python_init_nested_module_qn) {
     ASSERT_NOT_NULL(r->module_qn);
     /* Must contain __init__ to not collide with Folder QN */
     ASSERT_NOT_NULL(strstr(r->module_qn, "__init__"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── #1548: Python defs nested in a function body ─────────────────── */
+
+/* How many defs carry exactly this QN. */
+static int pyn_def_count(const CBMFileResult *r, const char *qn) {
+    int n = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *q = r->defs.items[i].qualified_name;
+        if (q && strcmp(q, qn) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* The one def with this QN, or NULL when there is none (or more than one). */
+static const CBMDefinition *pyn_def(const CBMFileResult *r, const char *qn) {
+    if (pyn_def_count(r, qn) != 1) {
+        return NULL;
+    }
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *q = r->defs.items[i].qualified_name;
+        if (q && strcmp(q, qn) == 0) {
+            return &r->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+/* Calls of `callee` whose enclosing function is exactly `caller_qn`. */
+static int pyn_calls(const CBMFileResult *r, const char *callee, const char *caller_qn) {
+    int n = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, callee) == 0 && c->enclosing_func_qn &&
+            strcmp(c->enclosing_func_qn, caller_qn) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* No def QN is minted twice: a nested def must not also surface as a
+ * module-level one, and walking a def body must not re-extract anything. */
+static bool pyn_defs_unique(const CBMFileResult *r) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *q = r->defs.items[i].qualified_name;
+        if (q && pyn_def_count(r, q) != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The issue's reproducer: `def nested()` inside `def factory()` was never
+ * extracted. It is now a Function qualified by the def it sits in, the same
+ * QN the Python LSP gives its calls. Module-level defs, and defs in a
+ * module-level `if` block, keep their QNs. */
+TEST(extract_python_nested_def_qualified_by_enclosing_def_issue1548) {
+    CBMFileResult *r = extract("def target():\n"
+                               "    return 0\n"
+                               "\n"
+                               "\n"
+                               "def module_level():\n"
+                               "    return target()\n"
+                               "\n"
+                               "\n"
+                               "if True:\n"
+                               "    def inside_if():\n"
+                               "        return target()\n"
+                               "\n"
+                               "\n"
+                               "def factory():\n"
+                               "    def nested():\n"
+                               "        return target()\n"
+                               "    return nested\n"
+                               "\n"
+                               "\n"
+                               "def outer():\n"
+                               "    def middle():\n"
+                               "        def inner():\n"
+                               "            return target()\n"
+                               "        return inner\n"
+                               "    return middle\n",
+                               CBM_LANG_PYTHON, "t", "app.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *nested = pyn_def(r, "t.app.factory.nested");
+    ASSERT_NOT_NULL(nested);
+    ASSERT_STR_EQ(nested->label, "Function");
+    ASSERT_EQ(nested->start_line, 15);
+    ASSERT_NOT_NULL(pyn_def(r, "t.app.outer.middle"));
+    ASSERT_NOT_NULL(pyn_def(r, "t.app.outer.middle.inner"));
+    /* Never minted flat, where it would collide with a module-level name. */
+    ASSERT_EQ(pyn_def_count(r, "t.app.nested"), 0);
+    ASSERT_EQ(pyn_def_count(r, "t.app.inner"), 0);
+    /* Controls: unchanged. */
+    ASSERT_NOT_NULL(pyn_def(r, "t.app.target"));
+    ASSERT_NOT_NULL(pyn_def(r, "t.app.module_level"));
+    ASSERT_NOT_NULL(pyn_def(r, "t.app.inside_if"));
+    ASSERT_NOT_NULL(pyn_def(r, "t.app.factory"));
+    ASSERT_TRUE(pyn_defs_unique(r));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A call inside a nested def belongs to that def. It used to carry the flat
+ * `t.app.nested`, a QN no node has, so the edge was pinned on the file node:
+ * inbound traces of target() lost the caller. It is not the outer def's
+ * either. */
+TEST(extract_python_nested_def_calls_attributed_to_it_issue1548) {
+    CBMFileResult *r = extract("def target():\n"
+                               "    return 0\n"
+                               "\n"
+                               "def factory():\n"
+                               "    def nested():\n"
+                               "        return target()\n"
+                               "    return nested\n"
+                               "\n"
+                               "def outer():\n"
+                               "    def middle():\n"
+                               "        def inner():\n"
+                               "            return target()\n"
+                               "        return inner\n"
+                               "    return middle\n",
+                               CBM_LANG_PYTHON, "t", "app.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(pyn_calls(r, "target", "t.app.factory.nested"), 1);
+    ASSERT_EQ(pyn_calls(r, "target", "t.app.outer.middle.inner"), 1);
+    ASSERT_EQ(pyn_calls(r, "target", "t.app.factory"), 0);
+    ASSERT_EQ(pyn_calls(r, "target", "t.app.nested"), 0);
+    ASSERT_EQ(pyn_calls(r, "target", "t.app.inner"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The app-factory shape: route handlers are decorated defs inside
+ * create_app. Each is extracted with its QN and carries the route its
+ * decorator declares, which is what mints the Route node and its HANDLES
+ * edge (pipeline_python_app_factory_routes_issue1548 checks the graph). */
+TEST(extract_python_decorated_nested_route_handler_issue1548) {
+    CBMFileResult *r = extract("from flask import Flask\n"
+                               "\n"
+                               "def create_app():\n"
+                               "    app = Flask(__name__)\n"
+                               "\n"
+                               "    @app.route(\"/users/<uid>\")\n"
+                               "    def show_user(uid):\n"
+                               "        return render(uid)\n"
+                               "\n"
+                               "    @app.get(\"/health\")\n"
+                               "    async def health():\n"
+                               "        return render(\"ok\")\n"
+                               "\n"
+                               "    return app\n",
+                               CBM_LANG_PYTHON, "t", "web.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *show = pyn_def(r, "t.web.create_app.show_user");
+    ASSERT_NOT_NULL(show);
+    ASSERT_STR_EQ(show->route_path, "/users/<uid>");
+    ASSERT_NOT_NULL(show->decorators);
+    const CBMDefinition *health = pyn_def(r, "t.web.create_app.health");
+    ASSERT_NOT_NULL(health);
+    ASSERT_STR_EQ(health->route_path, "/health");
+    ASSERT_STR_EQ(health->route_method, "GET");
+    ASSERT_EQ(pyn_calls(r, "render", "t.web.create_app.show_user"), 1);
+    ASSERT_EQ(pyn_calls(r, "render", "t.web.create_app.health"), 1);
+    ASSERT_TRUE(pyn_defs_unique(r));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A class declared in a def is qualified by the def; its methods are Methods
+ * of it, and a call in such a method is the method's. */
+TEST(extract_python_nested_class_issue1548) {
+    CBMFileResult *r = extract("def create_app():\n"
+                               "    class Settings:\n"
+                               "        debug = False\n"
+                               "\n"
+                               "        def value(self):\n"
+                               "            return load(self)\n"
+                               "\n"
+                               "    return Settings().value()\n",
+                               CBM_LANG_PYTHON, "t", "web.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *cls = pyn_def(r, "t.web.create_app.Settings");
+    ASSERT_NOT_NULL(cls);
+    ASSERT_STR_EQ(cls->label, "Class");
+    const CBMDefinition *value = pyn_def(r, "t.web.create_app.Settings.value");
+    ASSERT_NOT_NULL(value);
+    ASSERT_STR_EQ(value->label, "Method");
+    ASSERT_STR_EQ(value->parent_class, "t.web.create_app.Settings");
+    ASSERT_EQ(pyn_calls(r, "load", "t.web.create_app.Settings.value"), 1);
+    ASSERT_EQ(pyn_def_count(r, "t.web.Settings"), 0);
+    ASSERT_TRUE(pyn_defs_unique(r));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A def nested in a method, named like the method (django's
+ * AbstractBaseUser.check_password holds a `def setter`; Tree.visit here holds
+ * a `def visit`). It used to share the method's QN, so its calls -- its
+ * recursion included -- were the method's. It is its own Function now: the
+ * recursive call and render() are its, only visit(node) is the method's, and
+ * the recursion seed flags the nested def. */
+TEST(extract_python_nested_def_named_like_its_method_issue1548) {
+    CBMFileResult *r = extract("class Tree:\n"
+                               "    def visit(self, node):\n"
+                               "        def visit(n):\n"
+                               "            if n:\n"
+                               "                visit(n.child)\n"
+                               "                render(n)\n"
+                               "\n"
+                               "        visit(node)\n",
+                               CBM_LANG_PYTHON, "t", "m.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *method = pyn_def(r, "t.m.Tree.visit");
+    ASSERT_NOT_NULL(method);
+    ASSERT_STR_EQ(method->label, "Method");
+    const CBMDefinition *nested = pyn_def(r, "t.m.Tree.visit.visit");
+    ASSERT_NOT_NULL(nested);
+    ASSERT_STR_EQ(nested->label, "Function");
+    ASSERT_EQ(nested->start_line, 3);
+    ASSERT_EQ(pyn_calls(r, "visit", "t.m.Tree.visit.visit"), 1);
+    ASSERT_EQ(pyn_calls(r, "render", "t.m.Tree.visit.visit"), 1);
+    ASSERT_EQ(pyn_calls(r, "visit", "t.m.Tree.visit"), 1);
+    ASSERT_EQ(pyn_calls(r, "render", "t.m.Tree.visit"), 0);
+    ASSERT_TRUE(nested->is_recursive);
+    ASSERT_TRUE(pyn_defs_unique(r));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Controls: a lambda and the comprehensions are expressions, not defs. They
+ * mint nothing, and the calls inside them stay the enclosing def's. */
+TEST(extract_python_lambda_and_comprehension_stay_in_enclosing_def_issue1548) {
+    CBMFileResult *r = extract("def work(items):\n"
+                               "    double = lambda x: scale(x)\n"
+                               "    squares = [scale(i) for i in items]\n"
+                               "    table = {k: scale(k) for k in items}\n"
+                               "    return double(squares), table\n",
+                               CBM_LANG_PYTHON, "t", "c.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(pyn_def(r, "t.c.work"));
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *q = r->defs.items[i].qualified_name;
+        ASSERT_FALSE(q && strncmp(q, "t.c.work.", strlen("t.c.work.")) == 0);
+    }
+    ASSERT_EQ(pyn_calls(r, "scale", "t.c.work"), 3);
+    ASSERT_TRUE(pyn_defs_unique(r));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Records other than calls take their enclosing function from the same
+ * unified-walk scope frame as the calls. The nested def's env read carries its
+ * QN; the outer def's reads, before and after the nested def, keep the outer
+ * QN once its frame is popped. */
+TEST(extract_python_nested_def_env_access_attributed_to_it_issue1548) {
+    CBMFileResult *r = extract("import os\n"
+                               "\n"
+                               "def outer():\n"
+                               "    token = os.environ[\"OUTER_TOKEN\"]\n"
+                               "\n"
+                               "    def inner():\n"
+                               "        return os.environ[\"INNER_TOKEN\"]\n"
+                               "\n"
+                               "    return inner, token, os.environ[\"OUTER_AGAIN\"]\n",
+                               CBM_LANG_PYTHON, "t", "e.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int seen = 0;
+    for (int i = 0; i < r->env_accesses.count; i++) {
+        const CBMEnvAccess *ea = &r->env_accesses.items[i];
+        ASSERT_NOT_NULL(ea->enclosing_func_qn);
+        if (strcmp(ea->env_key, "INNER_TOKEN") == 0) {
+            ASSERT_STR_EQ(ea->enclosing_func_qn, "t.e.outer.inner");
+            seen++;
+        } else {
+            ASSERT_STR_EQ(ea->enclosing_func_qn, "t.e.outer");
+            seen++;
+        }
+    }
+    ASSERT_EQ(seen, 3);
     cbm_free_result(r);
     PASS();
 }
@@ -6273,12 +6683,12 @@ TEST(extract_go_no_filename_in_module_qn) {
     ASSERT_NOT_NULL(conn);
     ASSERT_STR_EQ(conn->qualified_name, "proj.myapp.db.Conn");
 
-    /* Go method nodes keep a FLAT QN (module + name) with a separate
-     * parent_class link to the receiver type — the QN must carry the
+    /* Go method nodes carry a receiver-qualified QN (module + receiver type +
+     * name) plus the parent_class link — the QN must carry the
      * directory-based module and NOT the `.conn.` filename segment. */
     const CBMDefinition *query = find_def_by_name(r, "Query");
     ASSERT_NOT_NULL(query);
-    ASSERT_STR_EQ(query->qualified_name, "proj.myapp.db.Query");
+    ASSERT_STR_EQ(query->qualified_name, "proj.myapp.db.Conn.Query");
     ASSERT_EQ(strstr(query->qualified_name, ".conn."), NULL);
     /* The method's parent_class must match the type node QN (for DEFINES_METHOD). */
     ASSERT_NOT_NULL(query->parent_class);
@@ -6886,12 +7296,74 @@ TEST(extract_perl_method_call_flags_is_method) {
     PASS();
 }
 
-/* Languages OUTSIDE the is_method flag set (only Perl and TS/JS/TSX set it) must
- * be unaffected: a Go method call never sets is_method. */
+/* The def QN of `name` and the enclosing-function QN of the call `callee` inside
+ * it, from one extraction result. */
+static void rust_def_and_scope(const CBMFileResult *r, const char *name, const char *callee,
+                               const char **def_qn, const char **scope_qn) {
+    *def_qn = NULL;
+    *scope_qn = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && d->qualified_name && strcmp(d->name, name) == 0) {
+            *def_qn = d->qualified_name;
+        }
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, callee) == 0 && c->enclosing_func_qn &&
+            strstr(c->enclosing_func_qn, name)) {
+            *scope_qn = c->enclosing_func_qn;
+        }
+    }
+}
+
+/* F-R4: a method of a generic impl (`impl<T> Gen<T>`, `impl<'a> Life<'a>`) got a
+ * call scope that kept the generic arguments ("...Gen<T>.in_generic") while the
+ * def side strips them ("...Gen.in_generic"), so no node carried the scope and
+ * every call in the body fell back to the File node (base census: 84,331 Rust
+ * CALLS sourced from a File although inside a function, 96% of all File-sourced
+ * Rust CALLS). The def QN and the call scope must agree. */
+TEST(extract_rust_generic_impl_call_scope_matches_def) {
+    CBMFileResult *r = extract("pub struct Plain;\n"
+                               "impl Plain {\n"
+                               "    pub fn in_plain(&self) -> u32 { helper() }\n"
+                               "}\n"
+                               "pub struct Gen<T> { v: T }\n"
+                               "impl<T> Gen<T> {\n"
+                               "    pub fn in_generic(&self) -> u32 { helper() }\n"
+                               "}\n"
+                               "pub struct Life<'a> { s: &'a str }\n"
+                               "impl<'a> Life<'a> {\n"
+                               "    pub fn in_lifetime(&self) -> u32 { helper() }\n"
+                               "}\n"
+                               "pub fn helper() -> u32 { 1 }\n",
+                               CBM_LANG_RUST, "t", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    static const char *const methods[] = {"in_plain", "in_generic", "in_lifetime", NULL};
+    for (int m = 0; methods[m]; m++) {
+        const char *def_qn = NULL;
+        const char *scope_qn = NULL;
+        rust_def_and_scope(r, methods[m], "helper", &def_qn, &scope_qn);
+        ASSERT_NOT_NULL(def_qn);
+        ASSERT_NOT_NULL(scope_qn);
+        ASSERT_STR_EQ(scope_qn, def_qn);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Languages OUTSIDE the is_method flag set (Perl, Python, TS/JS/TSX and Go set
+ * it) must be unaffected: a Rust method call never sets is_method. */
 TEST(extract_flag_exempt_method_call_not_flagged_is_method) {
-    CBMFileResult *r = extract("package m\n"
-                               "func run(o Obj) { o.Commit(); helper() }\n",
-                               CBM_LANG_GO, "t", "x.go");
+    /* Rust is flag-exempt: only Perl, Python, TS/JS and Go set is_method.
+     * Guards the blast radius of the receiver-aware flags for every other
+     * language. */
+    CBMFileResult *r = extract("fn run(o: Obj) {\n"
+                               "    o.commit();\n"
+                               "    helper();\n"
+                               "}\n",
+                               CBM_LANG_RUST, "t", "x.rs");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     for (int i = 0; i < r->calls.count; i++) {
@@ -7049,6 +7521,33 @@ TEST(extract_python_bare_call_flags_locally_bound_callee) {
     PASS();
 }
 
+TEST(extract_go_selector_call_flags_is_method) {
+    /* Go selector calls are flagged so the weak-match guard can fire when the
+     * Go LSP cannot type the receiver; bare calls stay unflagged. */
+    CBMFileResult *r = extract("package m\n"
+                               "func run(o Obj) { o.Commit(); helper() }\n",
+                               CBM_LANG_GO, "t", "x.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    bool saw_selector = false;
+    bool saw_bare = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strstr(c->callee_name, "Commit") != NULL) {
+            ASSERT_TRUE(c->is_method);
+            saw_selector = true;
+        }
+        if (c->callee_name && strcmp(c->callee_name, "helper") == 0) {
+            ASSERT_FALSE(c->is_method);
+            saw_bare = true;
+        }
+    }
+    ASSERT_TRUE(saw_selector);
+    ASSERT_TRUE(saw_bare);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* The bare-call flag is DEPTH-INDEPENDENT, and the binding is UNWOUND when its
  * scope closes.
  *
@@ -7151,6 +7650,91 @@ TEST(extract_python_bare_call_flag_is_depth_independent) {
     ASSERT_EQ(flagged, 2);
     ASSERT_EQ(unflagged, 1);
     cbm_free_result(unwound);
+    PASS();
+}
+
+TEST(extract_go_method_receiver_qualified_qn) {
+    /* A Go method QN carries the receiver type (proj.pkg.Recv.method), same
+     * shape as C++ out-of-line methods and Go interface members — so two
+     * same-name methods on different receivers no longer collide in the
+     * graph upsert. Free functions keep the flat package QN. */
+    CBMFileResult *r = extract("package m\n"
+                               "type Storage struct{}\n"
+                               "type Cache struct{}\n"
+                               "func (s *Storage) Close() {}\n"
+                               "func (c Cache) Close() {}\n"
+                               "func Shutdown() {}\n",
+                               CBM_LANG_GO, "t", "x.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    bool saw_storage = false;
+    bool saw_cache = false;
+    bool saw_free = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->name || !d->qualified_name) {
+            continue;
+        }
+        if (strcmp(d->name, "Close") == 0 && strcmp(d->qualified_name, "t.Storage.Close") == 0) {
+            ASSERT_STR_EQ(d->label, "Method");
+            ASSERT_STR_EQ(d->parent_class, "t.Storage");
+            saw_storage = true;
+        }
+        if (strcmp(d->name, "Close") == 0 && strcmp(d->qualified_name, "t.Cache.Close") == 0) {
+            ASSERT_STR_EQ(d->parent_class, "t.Cache");
+            saw_cache = true;
+        }
+        if (strcmp(d->name, "Shutdown") == 0) {
+            ASSERT_STR_EQ(d->qualified_name, "t.Shutdown");
+            saw_free = true;
+        }
+    }
+    ASSERT_TRUE(saw_storage);
+    ASSERT_TRUE(saw_cache);
+    ASSERT_TRUE(saw_free);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Templ shares Go's method grammar (method_declaration with a receiver), but
+ * only Go method QNs are receiver-qualified (#1913); templ's call-scope QN
+ * stays flat. The method's def QN and the enclosing-function QN of a call
+ * inside it must agree, or the call has no source node and degrades to the
+ * File node. */
+TEST(extract_templ_method_qn_matches_call_scope) {
+    CBMFileResult *r = extract("package views\n"
+                               "\n"
+                               "type Page struct{}\n"
+                               "\n"
+                               "func (p Page) Title() string {\n"
+                               "\treturn helper()\n"
+                               "}\n"
+                               "\n"
+                               "func helper() string { return \"x\" }\n"
+                               "\n"
+                               "templ hello(name string) {\n"
+                               "\t<div>{ name }</div>\n"
+                               "}\n",
+                               CBM_LANG_TEMPL, "t", "x.templ");
+    ASSERT_NOT_NULL(r);
+    const char *title_qn = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && d->qualified_name && strcmp(d->name, "Title") == 0) {
+            title_qn = d->qualified_name;
+        }
+    }
+    const char *scope = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, "helper") == 0) {
+            scope = c->enclosing_func_qn;
+        }
+    }
+    ASSERT_NOT_NULL(title_qn);
+    ASSERT_NOT_NULL(scope);
+    ASSERT_STR_EQ(scope, title_qn);
+    cbm_free_result(r);
     PASS();
 }
 
@@ -11816,6 +12400,241 @@ TEST(python_namespace_facts_preserve_order_and_import_provenance) {
     PASS();
 }
 
+/* The type checker view of `if TYPE_CHECKING:` publishes its consequence (a
+ * lazy-module package: the else branch only installs the module). A name an
+ * elif/else import binds again is withdrawn by a SHADOW: its runtime source is
+ * the alternative. Both streams stay COMPLETE and valid. */
+TEST(python_namespace_facts_type_checking_alternatives) {
+    CBMFileResult *lazy = extract("from typing import TYPE_CHECKING\n"
+                                  "if TYPE_CHECKING:\n    from .lazy_mod import Lazy\n"
+                                  "else:\n    import sys\n",
+                                  CBM_LANG_PYTHON, "t", "lz/__init__.py");
+    CBMFileResult *compat = extract("from typing import TYPE_CHECKING\n"
+                                    "if TYPE_CHECKING:\n    from .types_only import Shim\n"
+                                    "else:\n    try:\n        from .runtime_impl import Shim\n"
+                                    "    except ImportError:\n        Shim = None\n",
+                                    CBM_LANG_PYTHON, "t", "cmp/__init__.py");
+    bool ok = lazy && compat && lazy->py_namespace.status == CBM_PY_NS_COMPLETE &&
+              compat->py_namespace.status == CBM_PY_NS_COMPLETE &&
+              cbm_py_namespace_facts_valid(&lazy->py_namespace) &&
+              cbm_py_namespace_facts_valid(&compat->py_namespace) &&
+              lazy->py_namespace.count == 3 && compat->py_namespace.count == 3;
+    if (ok) {
+        const CBMPyNamespaceFact *l = lazy->py_namespace.items;
+        const CBMPyNamespaceFact *c = compat->py_namespace.items;
+        ok = l[1].kind == CBM_PY_NS_IMPORT_NAME && strcmp(l[1].local_name, "Lazy") == 0 &&
+             l[2].kind == CBM_PY_NS_SHADOW && strcmp(l[2].local_name, "sys") == 0 &&
+             c[1].kind == CBM_PY_NS_IMPORT_NAME && strcmp(c[1].local_name, "Shim") == 0 &&
+             c[2].kind == CBM_PY_NS_SHADOW && strcmp(c[2].local_name, "Shim") == 0;
+    }
+    if (lazy)
+        cbm_free_result(lazy);
+    if (compat)
+        cbm_free_result(compat);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* A string-literal statement (a module, class or attribute docstring) has no
+ * effect, and `from __future__ import x` binds x like any from-import. Neither
+ * may withdraw the names bound before it: sqlalchemy's sql/expression.py lost
+ * its 149 re-exports to `nullsfirst = nulls_first` followed by a triple-quoted
+ * docstring. An f-string with a replacement field can run code
+ * (__format__ / __str__) and stays an effect. */
+static bool py_facts_any_unknown(const CBMFileResult *r, CBMPyNamespaceUnknownReason reason) {
+    for (int i = 0; r && i < r->py_namespace.count; i++) {
+        if (r->py_namespace.items[i].kind == CBM_PY_NS_UNKNOWN &&
+            r->py_namespace.items[i].reason == reason)
+            return true;
+    }
+    return false;
+}
+
+TEST(python_namespace_facts_string_statements_and_future_imports) {
+    static const char source[] = "\"\"\"Module docstring.\"\"\"\n"
+                                 "from __future__ import annotations\n"
+                                 "from __future__ import (division as div, generator_stop)\n"
+                                 "from .impl import a\n"
+                                 "\"\"\"A triple-quoted string after an import.\"\"\"\n"
+                                 "'''Single-quoted triple.'''\n"
+                                 "r\"raw \\d\"\n"
+                                 "b\"bytes\"\n"
+                                 "rb'raw bytes'\n"
+                                 "u\"unicode\"\n"
+                                 "\"implicit\" 'concatenation'\n"
+                                 "f\"no replacement field {{escaped}}\"\n"
+                                 "from .impl import b\n"
+                                 "class Documented:\n"
+                                 "    \"\"\"Class docstring.\"\"\"\n"
+                                 "    def method(self):\n"
+                                 "        pass\n"
+                                 "x = a\n"
+                                 "\"\"\"Attribute docstring.\"\"\"\n";
+    CBMFileResult *r = extract(source, CBM_LANG_PYTHON, "t", "pkg/__init__.py");
+    bool ok = r && !r->has_error && r->py_namespace.status == CBM_PY_NS_COMPLETE &&
+              cbm_py_namespace_facts_valid(&r->py_namespace) && r->py_namespace.count == 7;
+    if (ok) {
+        const CBMPyNamespaceFact *f = r->py_namespace.items;
+        ok = f[0].kind == CBM_PY_NS_IMPORT_NAME && strcmp(f[0].module_name, "__future__") == 0 &&
+             f[0].relative_level == 0 && strcmp(f[0].member_name, "annotations") == 0 &&
+             strcmp(f[0].local_name, "annotations") == 0 && f[1].kind == CBM_PY_NS_IMPORT_NAME &&
+             strcmp(f[1].member_name, "division") == 0 && strcmp(f[1].local_name, "div") == 0 &&
+             f[2].kind == CBM_PY_NS_IMPORT_NAME && strcmp(f[2].local_name, "generator_stop") == 0 &&
+             f[3].kind == CBM_PY_NS_IMPORT_NAME && strcmp(f[3].local_name, "a") == 0 &&
+             f[4].kind == CBM_PY_NS_IMPORT_NAME && strcmp(f[4].local_name, "b") == 0 &&
+             f[5].kind == CBM_PY_NS_OWN_DEF && f[5].def_kind == CBM_PY_NS_DEF_CLASS &&
+             strcmp(f[5].local_name, "Documented") == 0 && f[6].kind == CBM_PY_NS_SHADOW &&
+             strcmp(f[6].local_name, "x") == 0;
+    }
+    if (!ok && r) {
+        for (int i = 0; i < r->py_namespace.count; i++) {
+            const CBMPyNamespaceFact *f = &r->py_namespace.items[i];
+            printf("  string/future fact %d: kind %d reason %d name %s\n", i, (int)f->kind,
+                   (int)f->reason, f->local_name ? f->local_name : "-");
+        }
+    }
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(ok); /* RED while a docstring is an effect and __future__ is unsupported */
+
+    /* Controls: each stays a namespace barrier. */
+    static const struct {
+        const char *name;
+        const char *source;
+        CBMPyNamespaceUnknownReason reason;
+    } barriers[] = {
+        {"f-string field", "from .impl import a\nf\"{a}\"\n", CBM_PY_NS_REASON_EFFECT},
+        {"concatenated f-string field", "from .impl import a\n\"x\" f\"{a!r}\"\n",
+         CBM_PY_NS_REASON_EFFECT},
+        {"call", "from .impl import a\nprint(a)\n", CBM_PY_NS_REASON_EFFECT},
+        /* Python rejects it, and so does the grammar: the whole file is unknown */
+        {"star from __future__", "from .impl import a\nfrom __future__ import *\n",
+         CBM_PY_NS_REASON_PARSE},
+    };
+    for (size_t i = 0; i < sizeof(barriers) / sizeof(barriers[0]); i++) {
+        r = extract(barriers[i].source, CBM_LANG_PYTHON, "t", "pkg/__init__.py");
+        ok = r && r->py_namespace.status == CBM_PY_NS_COMPLETE &&
+             cbm_py_namespace_facts_valid(&r->py_namespace) &&
+             py_facts_any_unknown(r, barriers[i].reason);
+        if (!ok)
+            printf("  control '%s' is no namespace barrier\n", barriers[i].name);
+        if (r)
+            cbm_free_result(r);
+        ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
+/* A top-level call of a same-module function is a namespace effect, unless the
+ * callee provably cannot rebind the caller's names: sqlalchemy's
+ * `sql/__init__.py` ends with `__go(locals())`. Every submodule its body
+ * imports becomes a package attribute, so those names are shadowed at the
+ * call; everything else of the namespace survives. */
+static bool py_facts_has_effect(const CBMFileResult *r) {
+    for (int i = 0; r && i < r->py_namespace.count; i++) {
+        if (r->py_namespace.items[i].kind == CBM_PY_NS_UNKNOWN &&
+            r->py_namespace.items[i].reason == CBM_PY_NS_REASON_EFFECT)
+            return true;
+    }
+    return false;
+}
+
+static int py_facts_count_kind(const CBMFileResult *r, CBMPyNamespaceFactKind kind) {
+    int n = 0;
+    for (int i = 0; r && i < r->py_namespace.count; i++)
+        n += r->py_namespace.items[i].kind == kind;
+    return n;
+}
+
+static bool py_facts_valid_complete(const CBMFileResult *r) {
+    return r && !r->has_error && r->py_namespace.status == CBM_PY_NS_COMPLETE &&
+           cbm_py_namespace_facts_valid(&r->py_namespace);
+}
+
+TEST(python_namespace_facts_init_call_allowlist) {
+    static const char go[] = "from typing import TYPE_CHECKING, Any\n"
+                             "from .impl import base\n"
+                             "from .elements import cast\n"
+                             "def __go(lcls: Any) -> None:\n"
+                             "    from .. import util as _sa_util\n"
+                             "    from . import base\n"
+                             "    from . import coercions, elements as _el\n"
+                             "    if not TYPE_CHECKING:\n"
+                             "        base.coercions = _el.coercions = coercions\n"
+                             "    from .annotation import _prepare_annotations\n"
+                             "    _prepare_annotations(cast, cast)\n"
+                             "    _sa_util.preloaded.import_prefix(\"sqlalchemy.sql\")\n"
+                             "\n"
+                             "__go(locals())\n";
+    CBMFileResult *r = extract(go, CBM_LANG_PYTHON, "t", "sql/__init__.py");
+    bool ok = py_facts_valid_complete(r) && !py_facts_has_effect(r) && r->py_namespace.count == 9;
+    if (ok) {
+        const CBMPyNamespaceFact *f = r->py_namespace.items;
+        static const char *const shadowed[] = {"base", "coercions", "elements", "annotation"};
+        ok = f[2].kind == CBM_PY_NS_IMPORT_NAME && strcmp(f[2].local_name, "base") == 0 &&
+             f[4].kind == CBM_PY_NS_OWN_DEF && strcmp(f[4].local_name, "__go") == 0;
+        for (int i = 0; ok && i < 4; i++) {
+            ok = f[5 + i].kind == CBM_PY_NS_SHADOW && f[5 + i].local_name &&
+                 strcmp(f[5 + i].local_name, shadowed[i]) == 0;
+        }
+    }
+    if (!ok && r) {
+        for (int i = 0; i < r->py_namespace.count; i++) {
+            const CBMPyNamespaceFact *f = &r->py_namespace.items[i];
+            printf("  __go fact %d: kind %d reason %d name %s\n", i, (int)f->kind, (int)f->reason,
+                   f->local_name ? f->local_name : "-");
+        }
+    }
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(ok); /* RED while every top-level call withdraws the namespace */
+
+    /* A plain module is no package: the body's imports set attributes of its
+     * parent package, never of the module itself. */
+    r = extract("def __go(lcls):\n    from . import base\n\n__go(locals())\n", CBM_LANG_PYTHON, "t",
+                "sql/mod.py");
+    ok = py_facts_valid_complete(r) && !py_facts_has_effect(r) &&
+         py_facts_count_kind(r, CBM_PY_NS_SHADOW) == 0;
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(ok);
+
+    /* Each of these can rebind a name of the caller's namespace (or is not
+     * provably a same-module function): the call stays a whole-namespace
+     * effect. */
+    static const char *const effects[][2] = {
+        {"param", "def __go(lcls):\n    lcls['base'] = 1\n\n__go(locals())\n"},
+        {"global", "def __go(lcls):\n    global base\n    base = 1\n\n__go(locals())\n"},
+        {"nested global", "def __go(lcls):\n    def inner():\n        global base\n"
+                          "        base = 1\n    inner()\n\n__go(locals())\n"},
+        {"globals()", "def __go(lcls):\n    globals()['base'] = 1\n\n__go(locals())\n"},
+        {"sys.modules", "def __go(lcls):\n    import sys\n    sys.modules[__name__].base = 1\n"
+                        "\n__go(locals())\n"},
+        {"imported callee", "from .setup import __go\n__go(locals())\n"},
+        {"own package name", "def __go(lcls):\n    from .. import sql\n    sql.base = 1\n"
+                             "\n__go(locals())\n"},
+        {"same-module helper", "def helper():\n    pass\n\ndef __go(lcls):\n    helper()\n"
+                               "\n__go(locals())\n"},
+        {"rebound callee", "def __go(lcls):\n    pass\n\n__go = other\n__go(locals())\n"},
+        {"call before def", "__go(locals())\n\ndef __go(lcls):\n    pass\n"},
+        {"argument effect", "def __go(lcls):\n    pass\n\n__go(make())\n"},
+        {"rebound locals", "def locals():\n    return {}\n\ndef __go(lcls):\n    pass\n"
+                           "\n__go(locals())\n"},
+    };
+    for (size_t i = 0; i < sizeof(effects) / sizeof(effects[0]); i++) {
+        char src[512];
+        snprintf(src, sizeof(src), "from .impl import base\n%s", effects[i][1]);
+        r = extract(src, CBM_LANG_PYTHON, "t", "sql/__init__.py");
+        ok = py_facts_valid_complete(r) && py_facts_has_effect(r);
+        if (!ok)
+            printf("  control '%s' is no namespace effect\n", effects[i][0]);
+        if (r)
+            cbm_free_result(r);
+        ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
 TEST(python_namespace_facts_distinguish_all_operations_and_unknowns) {
     static const char source[] = "__all__ = ['old']; __all__ = []\n"
                                  "__all__ = dynamic\n"
@@ -12163,7 +12982,7 @@ TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects) {
                                  "__all__ = ['escaped\\n']\n";
     CBMFileResult *r = extract(source, CBM_LANG_PYTHON, "t", "main.py");
     bool ok = r && !r->has_error && !r->parse_incomplete &&
-              r->py_namespace.status == CBM_PY_NS_COMPLETE && r->py_namespace.count == 14 &&
+              r->py_namespace.status == CBM_PY_NS_COMPLETE && r->py_namespace.count == 13 &&
               cbm_py_namespace_facts_valid(&r->py_namespace) && has_def(r, "Function", "later") &&
               has_def(r, "Class", "HasDescriptor");
     if (ok) {
@@ -12179,8 +12998,10 @@ TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects) {
              strcmp(f[7].local_name, "__all__") == 0 && f[8].kind == CBM_PY_NS_UNKNOWN &&
              f[9].kind == CBM_PY_NS_SHADOW && strcmp(f[9].local_name, "values") == 0 &&
              f[10].kind == CBM_PY_NS_UNKNOWN && f[11].kind == CBM_PY_NS_SHADOW &&
-             f[11].reason == CBM_PY_NS_REASON_UNPROVEN_CLASS && f[12].kind == CBM_PY_NS_UNKNOWN &&
-             f[13].kind == CBM_PY_NS_ALL_UNKNOWN;
+             f[11].reason == CBM_PY_NS_REASON_UNPROVEN_CLASS &&
+             /* a string with an escape evaluates nothing: no effect, but no
+              * literal export name either */
+             f[12].kind == CBM_PY_NS_ALL_UNKNOWN;
     }
     if (r)
         cbm_free_result(r);
@@ -12202,6 +13023,9 @@ SUITE(extraction) {
     RUN_TEST(python_namespace_facts_distinguish_all_operations_and_unknowns);
     RUN_TEST(python_namespace_facts_unknown_effects_and_body_stability);
     RUN_TEST(python_namespace_facts_parse_errors_are_complete_unknown);
+    RUN_TEST(python_namespace_facts_type_checking_alternatives);
+    RUN_TEST(python_namespace_facts_string_statements_and_future_imports);
+    RUN_TEST(python_namespace_facts_init_call_allowlist);
     RUN_TEST(python_namespace_facts_capture_and_copy_fail_atomically);
     RUN_TEST(python_namespace_facts_validation_rejects_partial_and_unknown_schema);
     RUN_TEST(python_namespace_facts_compact_spill_and_copy_keep_owned_payload);
@@ -12220,10 +13044,14 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_config_string_not_a_callee);
     RUN_TEST(extract_perl_builtin_call_is_function_not_method);
     RUN_TEST(extract_perl_method_call_flags_is_method);
+    RUN_TEST(extract_rust_generic_impl_call_scope_matches_def);
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
     RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
     RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
+    RUN_TEST(extract_go_selector_call_flags_is_method);
+    RUN_TEST(extract_go_method_receiver_qualified_qn);
+    RUN_TEST(extract_templ_method_qn_matches_call_scope);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);
@@ -12333,6 +13161,8 @@ SUITE(extraction) {
     RUN_TEST(python_function);
     RUN_TEST(python_class);
     RUN_TEST(python_annotated_instance_fields_exported_issue1277);
+    RUN_TEST(python_type_checking_imports_flagged_issue1277);
+    RUN_TEST(python_type_checking_rebound_in_else_unrecorded_issue1277);
     RUN_TEST(js_function);
     RUN_TEST(js_class);
     RUN_TEST(ts_function);
@@ -12497,6 +13327,7 @@ SUITE(extraction) {
     RUN_TEST(python_iris_invokeClassMethod);
     RUN_TEST(go_calls);
     RUN_TEST(python_imports);
+    RUN_TEST(python_package_relative_import_paths);
     RUN_TEST(js_imports);
     RUN_TEST(go_imports);
     RUN_TEST(go_cgo_pseudo_import_dropped);
@@ -12551,6 +13382,13 @@ SUITE(extraction) {
     /* __init__.py / index.ts Module QN collision regression */
     RUN_TEST(python_init_module_qn_not_collide_with_folder);
     RUN_TEST(python_init_nested_module_qn);
+    RUN_TEST(extract_python_nested_def_qualified_by_enclosing_def_issue1548);
+    RUN_TEST(extract_python_nested_def_calls_attributed_to_it_issue1548);
+    RUN_TEST(extract_python_decorated_nested_route_handler_issue1548);
+    RUN_TEST(extract_python_nested_class_issue1548);
+    RUN_TEST(extract_python_nested_def_named_like_its_method_issue1548);
+    RUN_TEST(extract_python_lambda_and_comprehension_stay_in_enclosing_def_issue1548);
+    RUN_TEST(extract_python_nested_def_env_access_attributed_to_it_issue1548);
     RUN_TEST(js_index_module_qn_not_collide_with_folder);
     RUN_TEST(python_regular_module_qn_unchanged);
     RUN_TEST(extract_java_method_annotations_issue382);
