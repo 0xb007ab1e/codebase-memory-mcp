@@ -3433,7 +3433,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                                    rc->project_name, rel)) ||
             cbm_suppress_external_import_shadow(call->callee_name, res.strategy, &result->imports,
                                                 imp_keys, imp_count, cbm_pipeline_get_pkgmap(),
-                                                cbm_pipeline_get_nsmap());
+                                                cbm_pipeline_get_nsmap()) ||
+            /* MUST match pass_calls.c exactly. */
+            (lang == CBM_LANG_PHP && cbm_suppress_weak_member_match(true, true, res.strategy) &&
+             cbm_pipeline_php_receiver_type_unindexed(&result->resolved_calls, call, rc->registry));
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve

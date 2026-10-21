@@ -1170,7 +1170,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                                ctx->gbuf, ctx->project_name, rel)) ||
         cbm_suppress_external_import_shadow(call->callee_name, res.strategy, imports, imp_keys,
                                             imp_count, cbm_pipeline_get_pkgmap(),
-                                            cbm_pipeline_get_nsmap());
+                                            cbm_pipeline_get_nsmap()) ||
+        /* MUST match pass_parallel.c exactly. */
+        (lang == CBM_LANG_PHP && cbm_suppress_weak_member_match(true, true, res.strategy) &&
+         cbm_pipeline_php_receiver_type_unindexed(lsp_calls, call, ctx->registry));
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
