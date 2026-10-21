@@ -9590,7 +9590,19 @@ static bool record_declares_accessor(CBMExtractCtx *ctx, TSNode node, const char
         }
         /* Same name, no parameters — that is the accessor. */
         TSNode params = ts_node_child_by_field_name(member, TS_FIELD("parameters"));
-        if (ts_node_is_null(params) || ts_node_named_child_count(params) == 0) {
+        if (ts_node_is_null(params)) {
+            return true;
+        }
+        /* Comments are named extras, not parameters. */
+        bool has_parameters = false;
+        uint32_t pc = ts_node_named_child_count(params);
+        for (uint32_t pi = 0; pi < pc; pi++) {
+            if (!ts_node_is_extra(ts_node_named_child(params, pi))) {
+                has_parameters = true;
+                break;
+            }
+        }
+        if (!has_parameters) {
             return true;
         }
     }

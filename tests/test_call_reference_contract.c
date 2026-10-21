@@ -578,6 +578,74 @@ TEST(call_java_record_varargs_accessor_has_array_return) {
     PASS();
 }
 
+/* Comment extras in an otherwise empty parameter list must not create a
+ * second, implicit accessor at the record component's source location. */
+TEST(call_java_record_commented_accessor_has_only_explicit_span) {
+    static const char *sources[] = {"record Value(int x) {\n"
+                                    "    public int x(/* explanation */) {\n"
+                                    "        return x;\n"
+                                    "    }\n"
+                                    "}\n",
+                                    "record Value(int x) {\n"
+                                    "    public int x(// explanation\n"
+                                    "    ) {\n"
+                                    "        return x;\n"
+                                    "    }\n"
+                                    "}\n"};
+    static const int end_lines[] = {4, 5};
+    for (int fixture = 0; fixture < 2; fixture++) {
+        CBMFileResult *result =
+            cbm_extract_file(sources[fixture], (int)strlen(sources[fixture]), CBM_LANG_JAVA,
+                             "repro", "Value.java", 0, NULL, NULL);
+        ASSERT_NOT_NULL(result);
+        int accessors = 0;
+        int explicit_spans = 0;
+        for (int i = 0; i < result->defs.count; i++) {
+            CBMDefinition *def = &result->defs.items[i];
+            if (strcmp(def->name, "x") == 0 && strcmp(def->label, "Method") == 0) {
+                accessors++;
+                if (def->start_line == 2 && def->end_line == end_lines[fixture]) {
+                    explicit_spans++;
+                }
+            }
+        }
+        cbm_free_result(result);
+        ASSERT_EQ(accessors, 1);
+        ASSERT_EQ(explicit_spans, 1);
+    }
+    PASS();
+}
+
+TEST(call_java_record_commented_overload_keeps_implicit_accessor) {
+    static const char source[] =
+        "record Value(int x) {\n"
+        "    public int x(/* explanation */ int scale) { return x * scale; }\n"
+        "}\n";
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_JAVA, "repro",
+                                             "Value.java", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    int methods = 0;
+    int implicit_spans = 0;
+    int overload_spans = 0;
+    for (int i = 0; i < result->defs.count; i++) {
+        CBMDefinition *def = &result->defs.items[i];
+        if (strcmp(def->name, "x") == 0 && strcmp(def->label, "Method") == 0) {
+            methods++;
+            if (def->start_line == 1 && def->end_line == 1) {
+                implicit_spans++;
+            }
+            if (def->start_line == 2 && def->end_line == 2) {
+                overload_spans++;
+            }
+        }
+    }
+    cbm_free_result(result);
+    ASSERT_EQ(methods, 2);
+    ASSERT_EQ(implicit_spans, 1);
+    ASSERT_EQ(overload_spans, 1);
+    PASS();
+}
+
 SUITE(call_reference_contract) {
     RUN_TEST(call_reference_typescript_direct_argument_is_exact);
     RUN_TEST(call_reference_kotlin_alias_argument_is_exact);
@@ -596,6 +664,8 @@ SUITE(call_reference_contract) {
     RUN_TEST(call_reference_go_ambiguous_promoted_method_stays_usage);
     RUN_TEST(call_java_record_accessor_binds_the_record);
     RUN_TEST(call_java_record_varargs_accessor_has_array_return);
+    RUN_TEST(call_java_record_commented_accessor_has_only_explicit_span);
+    RUN_TEST(call_java_record_commented_overload_keeps_implicit_accessor);
     RUN_TEST(call_java_static_import_does_not_call_field_sequential);
     RUN_TEST(call_java_static_import_does_not_call_field_parallel);
 }
