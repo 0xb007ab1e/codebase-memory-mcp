@@ -8943,9 +8943,15 @@ static bool csharp_is_extension_block(TSNode node, TSNode class_node, const char
     }
     TSNode type_name = ts_node_child_by_field_name(class_node, TS_FIELD("name"));
     if (!ts_node_is_null(type_name)) {
+        const char *type_text = source + ts_node_start_byte(type_name);
         uint32_t tlen = ts_node_end_byte(type_name) - ts_node_start_byte(type_name);
-        if (tlen == kw_len &&
-            strncmp(source + ts_node_start_byte(type_name), "extension", kw_len) == 0) {
+        /* A verbatim identifier names the same type: class @extension may
+         * declare a genuine constructor spelled extension(). */
+        if (tlen > 0 && type_text[0] == '@') {
+            type_text++;
+            tlen--;
+        }
+        if (tlen == kw_len && strncmp(type_text, "extension", kw_len) == 0) {
             return false;
         }
     }
@@ -8963,11 +8969,11 @@ static void extract_csharp_extension_members(CBMExtractCtx *ctx, TSNode ext_node
     if (ts_node_is_null(body)) {
         return;
     }
-    uint32_t count = ts_node_child_count(body);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode member = ts_node_child(body, i);
-        if (ts_node_is_null(member) ||
-            strcmp(ts_node_type(member), "local_function_statement") != 0) {
+    member_iter_t it;
+    member_iter_init(&it, body, ctx->language, false);
+    TSNode member;
+    while (member_iter_next(&it, &member)) {
+        if (strcmp(ts_node_type(member), "local_function_statement") != 0) {
             continue;
         }
         TSNode name = resolve_method_name(member, ctx->language);
@@ -8976,6 +8982,7 @@ static void extract_csharp_extension_members(CBMExtractCtx *ctx, TSNode ext_node
         }
         push_method_def(ctx, member, class_node, class_qn, spec, name);
     }
+    member_iter_done(&it);
 }
 
 // Extract methods inside a class body

@@ -916,6 +916,52 @@ TEST(csharp_constructor_of_type_named_extension) {
     PASS();
 }
 
+/* Escaping a type identifier does not change its constructor's identity. */
+TEST(csharp_constructor_of_escaped_type_named_extension) {
+    const char *src = "namespace App { public class @extension { "
+                      "public extension() { int ConstructorLocal() => 1; } } }";
+    CBMFileResult *r = extract(src, CBM_LANG_CSHARP, "t", "extension.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "extension"));
+    ASSERT_FALSE(has_def(r, "Method", "ConstructorLocal"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* All conditional branches expose extension members, but method-local
+ * functions must never be promoted to members of the enclosing type. */
+TEST(csharp_extension_block_conditional_members) {
+    const char *src = "public static class TextExtensions\n"
+                      "{\n"
+                      "    extension(string text)\n"
+                      "    {\n"
+                      "#if FIRST\n"
+                      "        public int First() { int Nested() => 1; return Nested(); }\n"
+                      "#elif SECOND\n"
+                      "        public int Second() => 2;\n"
+                      "#else\n"
+                      "#if NESTED\n"
+                      "        public int Third() => 3;\n"
+                      "#else\n"
+                      "        public int Fourth() => 4;\n"
+                      "#endif\n"
+                      "#endif\n"
+                      "    }\n"
+                      "}\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CSHARP, "t", "TextExtensions.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "First"));
+    ASSERT(has_def(r, "Method", "Second"));
+    ASSERT(has_def(r, "Method", "Third"));
+    ASSERT(has_def(r, "Method", "Fourth"));
+    ASSERT_FALSE(has_def_any(r, "extension"));
+    ASSERT_FALSE(has_def(r, "Method", "Nested"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Swift --- */
 TEST(swift_class) {
     CBMFileResult *r = extract("class Vehicle {\n    var speed: Int = 0\n    func accelerate() { "
@@ -13195,6 +13241,8 @@ SUITE(extraction) {
     RUN_TEST(csharp_interface);
     RUN_TEST(csharp_extension_block_members);
     RUN_TEST(csharp_constructor_of_type_named_extension);
+    RUN_TEST(csharp_constructor_of_escaped_type_named_extension);
+    RUN_TEST(csharp_extension_block_conditional_members);
     RUN_TEST(swift_class);
     RUN_TEST(swift_protocol);
     RUN_TEST(kotlin_function);
