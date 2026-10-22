@@ -1375,6 +1375,21 @@ TEST(discover_keeps_jvm_packages_named_like_build_dirs_issue2661) {
     ASSERT_FALSE(discover_has_rel_path(files, count, "src/main/target/Out.java"));
     ASSERT_FALSE(discover_has_rel_path(files, count, "src/main/java/com/.git/H.java"));
     ASSERT_EQ(count, 3);
+    cbm_discover_free(files, count);
+
+    /* Moderate/fast mode: a package named like a fast-mode skip dir is kept
+     * below a JVM source root, while the same name at the top stays skipped. */
+    th_write_file(TH_PATH(base, "src/main/java/com/acme/integration/I.java"),
+                  "package com.acme.integration;\nclass I {}\n");
+    th_write_file(TH_PATH(base, "integration/Top.java"), "class Top {}\n");
+
+    cbm_discover_opts_t mod_opts = {.mode = CBM_MODE_MODERATE};
+    files = NULL;
+    count = 0;
+    rc = cbm_discover(base, &mod_opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "src/main/java/com/acme/integration/I.java"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "integration/Top.java"));
 
     cbm_discover_free(files, count);
     th_cleanup(base);
