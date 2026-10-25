@@ -22,6 +22,7 @@
 #include "foundation/compat.h"
 #include "foundation/platform.h"
 #include "foundation/constants.h"
+#include "foundation/json_writer.h"
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
 #include "foundation/sha256.h"
@@ -4242,7 +4243,8 @@ static bool cbm_copilot_add_hook_event(yyjson_mut_doc *doc, yyjson_mut_val *hook
 
 /* include_posttool renders the current manifest; without it the function
  * renders the previous lifecycle-only manifest, which installs up to v0.12 wrote
- * and which upgrades and uninstalls must still recognize as owned. */
+ * and which upgrades and uninstalls must still recognize as owned. The result is
+ * released with cbm_free(CBM_MEM_CLASS_OTHER, ...). */
 static char *cbm_build_copilot_hook_manifest(const char *binary_path, bool include_posttool) {
     char session_bash[CLI_BUF_8K];
     char session_powershell[CLI_BUF_8K];
@@ -4284,7 +4286,9 @@ static char *cbm_build_copilot_hook_manifest(const char *binary_path, bool inclu
                cbm_copilot_add_hook_event(doc, hooks, "PostToolUse", COPILOT_SEARCH_MATCHER,
                                           post_bash, post_powershell)) &&
               yyjson_mut_obj_add_val(doc, root, "hooks", hooks);
-    char *manifest = ok ? yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, NULL) : NULL;
+    char *manifest = ok ? yyjson_mut_write_opts(doc, YYJSON_WRITE_PRETTY,
+                                                cbm_json_writer_allocator(), NULL, NULL)
+                        : NULL;
     yyjson_mut_doc_free(doc);
     return manifest;
 }
@@ -4303,14 +4307,14 @@ static int cbm_upsert_copilot_hooks(const char *binary_path, const char *manifes
     char *manifest = cbm_build_copilot_hook_manifest(binary_path, true);
     char *previous = cbm_build_copilot_hook_manifest(binary_path, false);
     if (!manifest || !previous || !manifest_path) {
-        free(manifest);
-        free(previous);
+        cbm_free(CBM_MEM_CLASS_OTHER, manifest);
+        cbm_free(CBM_MEM_CLASS_OTHER, previous);
         return CLI_ERR;
     }
     const char *const released[] = {previous};
     int rc = cbm_text_migrate_owned_document(manifest_path, manifest, released, 1U);
-    free(manifest);
-    free(previous);
+    cbm_free(CBM_MEM_CLASS_OTHER, manifest);
+    cbm_free(CBM_MEM_CLASS_OTHER, previous);
     return rc == 0 ? CLI_OK : CLI_ERR;
 }
 
@@ -4318,14 +4322,14 @@ static int cbm_remove_copilot_hooks(const char *manifest_path, const char *binar
     char *manifest = cbm_build_copilot_hook_manifest(binary_path, true);
     char *previous = cbm_build_copilot_hook_manifest(binary_path, false);
     if (!manifest || !previous || !manifest_path) {
-        free(manifest);
-        free(previous);
+        cbm_free(CBM_MEM_CLASS_OTHER, manifest);
+        cbm_free(CBM_MEM_CLASS_OTHER, previous);
         return CLI_ERR;
     }
     const char *const released[] = {previous};
     int rc = cbm_text_remove_owned_document_any(manifest_path, manifest, released, 1U);
-    free(manifest);
-    free(previous);
+    cbm_free(CBM_MEM_CLASS_OTHER, manifest);
+    cbm_free(CBM_MEM_CLASS_OTHER, previous);
     return rc >= 0 ? CLI_OK : CLI_ERR;
 }
 

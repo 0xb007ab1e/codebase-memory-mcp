@@ -23,6 +23,7 @@
 #include <daemon/version_cohort.h>
 #include <foundation/constants.h>
 #include <foundation/log.h>
+#include <foundation/mem_core.h>
 #include <foundation/platform.h>
 #include <foundation/private_file_lock.h>
 #include <foundation/sha256.h>
@@ -12907,8 +12908,8 @@ TEST(cli_copilot_manifest_adds_posttooluse_search_hook) {
     bool previous_shape = strstr(previous, "sessionStart") && strstr(previous, "subagentStart") &&
                           !strstr(previous, "PostToolUse");
     yyjson_doc_free(doc);
-    free(current);
-    free(previous);
+    cbm_free(CBM_MEM_CLASS_OTHER, current);
+    cbm_free(CBM_MEM_CLASS_OTHER, previous);
     if (!shaped || !previous_shape)
         FAIL("Copilot manifest must add one PostToolUse search hook beside the lifecycle pair");
     PASS();
@@ -12939,8 +12940,8 @@ TEST(cli_copilot_install_upgrades_previous_manifest) {
     char *previous = cbm_build_copilot_hook_manifest_for_testing(binary, false);
     char *current = cbm_build_copilot_hook_manifest_for_testing(binary, true);
     if (!previous || !current) {
-        free(previous);
-        free(current);
+        cbm_free(CBM_MEM_CLASS_OTHER, previous);
+        cbm_free(CBM_MEM_CLASS_OTHER, current);
         test_rmdir_r(tmpdir);
         FAIL("Copilot manifest rendering failed");
     }
@@ -12967,8 +12968,8 @@ TEST(cli_copilot_install_upgrades_previous_manifest) {
 
     free(upgraded);
     free(again);
-    free(previous);
-    free(current);
+    cbm_free(CBM_MEM_CLASS_OTHER, previous);
+    cbm_free(CBM_MEM_CLASS_OTHER, current);
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     restore_test_env("COPILOT_HOME", saved_copilot);

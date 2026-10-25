@@ -283,7 +283,8 @@ bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
                                         bool case_insensitive);
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event);
 bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out, size_t out_sz);
-/* include_posttool false renders the previous lifecycle-only manifest. */
+/* include_posttool false renders the previous lifecycle-only manifest. Release
+ * the result with cbm_free(CBM_MEM_CLASS_OTHER, ...). */
 char *cbm_build_copilot_hook_manifest_for_testing(const char *binary_path, bool include_posttool);
 bool cbm_mcp_command_path_probe_safe_for_testing(const char *command, bool windows);
 void cbm_set_mcp_command_path_probe_counter_for_testing(int *counter);
