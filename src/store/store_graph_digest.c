@@ -706,7 +706,8 @@ static bool gd_table_rows(gd_context_t *g, int index, bool present) {
 
 static bool gd_stream_tables(gd_context_t *g, const bool present[GD_TABLE_COUNT]) {
     for (int i = 0; i < GD_TABLE_COUNT; i++) {
-        /* Legacy stores retain their byte-for-byte canonical stream. */
+        /* A store without the candidate table streams the same tables as
+         * version 1; only the version word differs. */
         if (i == GD_UNRESOLVED_CANDIDATES && !present[i]) {
             continue;
         }

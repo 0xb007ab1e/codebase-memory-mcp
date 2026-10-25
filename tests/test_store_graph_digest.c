@@ -38,7 +38,11 @@ static const char *const gd_inserts[] = {
     "INSERT INTO index_coverage(project,rel_path,kind,detail) VALUES(CAST(X'70' AS TEXT),CAST(X'62' AS TEXT),CAST(X'736b6970' AS TEXT),CAST(X'' AS TEXT));",
     "INSERT INTO index_coverage_meta(project,generation,index_mode,recorded_at,recording_status,ignored_files_stored,ignored_files_total,coverage_version,hash_records_complete) VALUES(CAST(X'70' AS TEXT),CAST(X'67656e' AS TEXT),CAST(X'66756c6c' AS TEXT),CAST(X'74' AS TEXT),CAST(X'636f6d706c657465' AS TEXT),-1,0,1,1);",
 };
-static const unsigned char gd_golden_sha[32] = { 0x46, 0x44, 0x71, 0x72, 0xdc, 0x9b, 0x2d, 0xa8, 0xda, 0xc8, 0x54, 0x5a, 0x56, 0x88, 0xab, 0x59, 0x1d, 0xad, 0x39, 0xe2, 0x9b, 0xe6, 0x33, 0x9c, 0x3d, 0x26, 0x49, 0x27, 0xd0, 0x94, 0xe9, 0x3e };
+/* Stream version 2: the oracle's version-1 stream (4038 framed bytes, golden
+ * 46447172dc9b2da8...) with only its version word set to 2. This fixture has
+ * no index_unresolved_candidates table and no unresolved_calls_complete
+ * column, so nothing else in its stream changes. */
+static const unsigned char gd_golden_sha[32] = { 0xd0, 0x51, 0xc4, 0x56, 0x11, 0x5c, 0xf7, 0x3c, 0x75, 0xe2, 0x89, 0xb5, 0xc3, 0x92, 0xa2, 0x56, 0xa5, 0x66, 0xe6, 0x62, 0xfd, 0x56, 0x66, 0x35, 0x05, 0xc6, 0x1e, 0xa5, 0x49, 0x7d, 0xa1, 0x30 };
 #define GD_GOLDEN_ROWS UINT64_C(17)
 #define GD_GOLDEN_BYTES UINT64_C(4038)
 
@@ -190,7 +194,7 @@ TEST(store_graph_digest_independent_canonical_golden) {
         gd_int(cbm_store_get_db(s),"SELECT length(CAST(properties AS BLOB)) FROM nodes WHERE id=-7",4) &&
         gd_int(cbm_store_get_db(s),"SELECT count(*) FROM lsp_surface WHERE typeof(ref_bloom)='blob'",2);
     bool got=setup && gd_p(s,&out); cbm_store_close(s);
-    ASSERT_TRUE(setup); ASSERT_TRUE(got); ASSERT_EQ(out.version,1);
+    ASSERT_TRUE(setup); ASSERT_TRUE(got); ASSERT_EQ(out.version,2);
     ASSERT_TRUE(out.rows==GD_GOLDEN_ROWS); ASSERT_TRUE(out.framed_bytes==GD_GOLDEN_BYTES);
     ASSERT_TRUE(memcmp(out.sha256,gd_golden_sha,32)==0); PASS();
 }
