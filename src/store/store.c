@@ -4516,6 +4516,18 @@ static void cov_json_escape(char *dst, size_t dstsz, const char *src) {
  * {kind, detail}. Queryable via query_graph(graph="missed") with zero
  * cypher-engine changes; the real project's graph gains no rows. Derived
  * data — rebuilt from the authoritative (post-prune) table contents. */
+/* Coverage kinds that never materialize in the miss graph. not_indexed_*
+ * rows are by-design exclusions, not failures. unresolved_calls rows (#2265)
+ * describe files that WERE indexed; their call evidence is reported by
+ * check_index_coverage and trace_path, and as a File row it would also
+ * replace a parse_partial row for the same path (rows arrive ordered by
+ * rel_path, kind, and the File upsert keeps the last one). */
+static bool cov_kind_outside_miss_graph(const char *kind) {
+    static const char by_design_prefix[] = "not_indexed";
+    return strncmp(kind, by_design_prefix, sizeof(by_design_prefix) - 1) == 0 ||
+           strcmp(kind, "unresolved_calls") == 0;
+}
+
 /* Fingerprint of the FAILURE rows the shadow graph derives from. When the
  * set is unchanged since the last rebuild, the wipe-and-rebuild (tens of
  * thousands of node/edge upserts probing the full-size nodes index -- a
@@ -4527,7 +4539,7 @@ static void cov_failure_fingerprint(const cbm_coverage_row_t *rows, int count,
     cbm_sha256_ctx sha;
     cbm_sha256_init(&sha);
     for (int i = 0; i < count; i++) {
-        if (!rows[i].kind || strncmp(rows[i].kind, "not_indexed", 11) == 0) {
+        if (!rows[i].kind || cov_kind_outside_miss_graph(rows[i].kind)) {
             continue;
         }
         const char *rel = rows[i].rel_path ? rows[i].rel_path : "";
@@ -4626,11 +4638,11 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
         return CBM_STORE_OK;
     }
     /* Only FAILURE rows materialize in the miss graph; a project whose only
-     * coverage rows are by-design not_indexed_* entries gets NO graph (not
-     * even a bare root node). */
+     * coverage rows are by-design not_indexed_* entries or unresolved_calls
+     * evidence gets NO graph (not even a bare root node). */
     int failure_count = 0;
     for (int i = 0; i < count; i++) {
-        if (!rows[i].kind || strncmp(rows[i].kind, "not_indexed", 11) != 0) {
+        if (!rows[i].kind || !cov_kind_outside_miss_graph(rows[i].kind)) {
             failure_count++;
         }
     }
@@ -4671,8 +4683,10 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
         }
         /* The missed graph shows FAILURES ("we did not manage") only —
          * by-design not_indexed_* rows stay out of it, so the UI's
-         * report-an-edge-case callout never fires for gitignored paths. */
-        if (rows[i].kind && strncmp(rows[i].kind, "not_indexed", 11) == 0) {
+         * report-an-edge-case callout never fires for gitignored paths, and
+         * unresolved_calls rows stay out so a parse_partial row for the same
+         * file keeps its File node. */
+        if (rows[i].kind && cov_kind_outside_miss_graph(rows[i].kind)) {
             continue;
         }
         char pathbuf[CBM_SZ_1K];

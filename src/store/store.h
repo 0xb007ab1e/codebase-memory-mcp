@@ -860,10 +860,11 @@ int cbm_store_observed_lookup(cbm_store_t *s, const char *project, const char *c
 void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta);
 
 /* Name of the derived miss-graph shadow project ("<project>::missed").
- * cbm_store_coverage_replace materializes the coverage rows as a file-
+ * cbm_store_coverage_replace materializes the coverage FAILURE rows as a file-
  * structure graph (Project → Folder → File{kind, detail}) under this project
  * name — queryable via the normal cypher path without touching the real
- * project's graph. */
+ * project's graph. By-design not_indexed_* rows and unresolved_calls evidence
+ * stay out of it. */
 void cbm_store_coverage_shadow_project(char *dst, size_t dstsz, const char *project);
 
 void cbm_store_free_coverage(cbm_coverage_row_t *rows, int count);
