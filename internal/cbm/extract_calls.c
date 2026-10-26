@@ -4559,7 +4559,8 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 if (call.first_string_arg &&
                     (call.first_string_arg[0] == '/' ||
                      (ctx->language == CBM_LANG_GO &&
-                      cbm_service_pattern_mux_split(call.first_string_arg, NULL, 0) != NULL)) &&
+                      cbm_service_pattern_mux_route_path(call.callee_name, call.first_string_arg) !=
+                          NULL)) &&
                     !(laravel_uri && php_route_action_is_string(node))) {
                     call.second_arg_name = extract_handler_arg(ctx, args);
                 }

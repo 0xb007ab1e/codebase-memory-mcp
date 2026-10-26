@@ -95,6 +95,14 @@ const char *cbm_service_pattern_route_method(const char *callee_name);
  * on the file language. */
 const char *cbm_service_pattern_mux_split(const char *pattern, char *method, size_t method_sz);
 
+/* The path of a ServeMux registration's pattern (#2537): only a callee ending
+ * ".Handle" or ".HandleFunc" registers one, and never with a URL ("://").
+ * Another route-verb call names no pattern: `store.Get("users/123")` is no
+ * host "users" + path "/123", `client.Get("https://...")` no host "https:".
+ * The split of cbm_service_pattern_mux_split for such a registration, else
+ * NULL. The grammar is Go's: callers gate on the file language. */
+const char *cbm_service_pattern_mux_route_path(const char *callee_name, const char *pattern);
+
 /* Get the broker name for an async QN (e.g., "pubsub" from a Pub/Sub QN).
  * Returns NULL if not an async pattern. */
 const char *cbm_service_pattern_broker(const char *resolved_qn);

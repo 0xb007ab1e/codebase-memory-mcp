@@ -13376,6 +13376,53 @@ TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing) {
     PASS();
 }
 
+/* Route nodes whose qualified name contains `part`. */
+static int route_nodes_containing(cbm_store_t *s, const char *project, const char *part) {
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    if (cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].qualified_name && strstr(routes[i].qualified_name, part)) {
+            matches++;
+        }
+    }
+    if (routes) {
+        cbm_store_free_nodes(routes, route_count);
+    }
+    return matches;
+}
+
+/* CALLS edges out of the function `source_name` into a Route node: the edge a
+ * route registration emits beside its Route (an HTTP client call's edge to a
+ * Route is HTTP_CALLS instead). */
+static int calls_into_route_count(cbm_store_t *s, const char *project, const char *source_name) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.label &&
+            strcmp(source.name, source_name) == 0 && strcmp(target.label, "Route") == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
 /* Issue #2537: since Go 1.22 a ServeMux pattern may name a method and a host
  * before the path ("POST /v1/payments", "GET api.example.com/v1/x"). Such a
  * registration minted no Route and no HANDLES edge, because every registration
@@ -13383,7 +13430,10 @@ TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing) {
  * written with "/v1/payments" had both. The method now comes from the pattern
  * and a host is dropped from the path, in the sequential and the parallel pass
  * alike. Only Go reads that grammar: a Python registration of "GET /py" is still
- * no route. */
+ * no route. Only a ServeMux registration (Handle / HandleFunc) is read with it:
+ * another route-verb call names no pattern and mints no Route, neither
+ * `st.Get("users/123")` on a project method (which keeps its CALLS edge) nor
+ * `c.Get("https://api.example.com/v1/x")` on a client. */
 TEST(pipeline_go_servemux_method_patterns_issue2537) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_servemux_XXXXXX");
@@ -13400,6 +13450,16 @@ TEST(pipeline_go_servemux_method_patterns_issue2537) {
                     "func getPayment(w http.ResponseWriter, r *http.Request)    {}\n"
                     "func hostOnly(w http.ResponseWriter, r *http.Request)      {}\n"
                     "func legacyList(w http.ResponseWriter, r *http.Request)    {}\n"
+                    "\n"
+                    "type Store struct{ m map[string]string }\n"
+                    "\n"
+                    "func (s *Store) Get(k string) string { return s.m[k] }\n"
+                    "\n"
+                    "func lookup(st *Store) string { return st.Get(\"users/123\") }\n"
+                    "\n"
+                    "func fetchRemote(c *http.Client) {\n"
+                    "\t_, _ = c.Get(\"https://api.example.com/v1/x\")\n"
+                    "}\n"
                     "\n"
                     "func main() {\n"
                     "\tmux := http.NewServeMux()\n"
@@ -13438,6 +13498,11 @@ TEST(pipeline_go_servemux_method_patterns_issue2537) {
     int legacy[2] = {-1, -1};
     int py_any[2] = {-1, -1};
     int py_get[2] = {-1, -1};
+    int store_calls[2] = {-1, -1};
+    int store_route[2] = {-1, -1};
+    int lookup_reg[2] = {-1, -1};
+    int remote_route[2] = {-1, -1};
+    int remote_reg[2] = {-1, -1};
     for (int mode = 0; mode < 2; mode++) {
         if (mode == 0) {
             cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
@@ -13463,6 +13528,11 @@ TEST(pipeline_go_servemux_method_patterns_issue2537) {
             legacy[mode] = handles_to_route(s, project, "legacyList", "__route__ANY__/v1/legacy");
             py_any[mode] = handles_to_route(s, project, "py_view", "__route__ANY__/py");
             py_get[mode] = handles_to_route(s, project, "py_view", "__route__GET__/py");
+            store_calls[mode] = named_edge_count(s, project, "CALLS", "lookup", "Get");
+            store_route[mode] = route_nodes_containing(s, project, "__route__GET__/123");
+            lookup_reg[mode] = calls_into_route_count(s, project, "lookup");
+            remote_route[mode] = route_nodes_containing(s, project, "//api.example.com");
+            remote_reg[mode] = calls_into_route_count(s, project, "fetchRemote");
         }
         if (s) {
             cbm_store_close(s);
@@ -13496,6 +13566,14 @@ TEST(pipeline_go_servemux_method_patterns_issue2537) {
         /* another language's "GET /py" is not read as a ServeMux pattern */
         ASSERT_EQ(py_any[mode], 0);
         ASSERT_EQ(py_get[mode], 0);
+        /* a project method named Get keeps its CALLS edge; "users/123" is no
+         * host + path */
+        ASSERT_EQ(store_calls[mode], 1);
+        ASSERT_EQ(store_route[mode], 0);
+        ASSERT_EQ(lookup_reg[mode], 0);
+        /* a client Get on a URL registers no route: "https:" is no host */
+        ASSERT_EQ(remote_route[mode], 0);
+        ASSERT_EQ(remote_reg[mode], 0);
     }
     PASS();
 }

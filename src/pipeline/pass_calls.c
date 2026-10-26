@@ -573,8 +573,9 @@ cbm_svc_kind_t cbm_pipeline_external_import_service(cbm_external_import_index_t 
 
 /* The path a route registration's first argument names: the argument itself
  * when it opens with a slash, or in Go the path of a ServeMux pattern that
- * names a method or host first ("POST /v1/x", #2537). NULL when it names no
- * path. MUST match pass_parallel.c find_route_path_in_args. */
+ * names a method or host first ("POST /v1/x", #2537; Handle / HandleFunc
+ * only). NULL when it names no path. MUST match pass_parallel.c
+ * find_route_path_in_args. */
 static const char *route_reg_path(const CBMCall *call, CBMLanguage lang) {
     const char *arg = call->first_string_arg;
     if (!arg) {
@@ -583,7 +584,7 @@ static const char *route_reg_path(const CBMCall *call, CBMLanguage lang) {
     if (arg[0] == '/') {
         return arg;
     }
-    return cbm_pipeline_mux_route_path(arg, lang);
+    return cbm_pipeline_mux_route_path(call, lang);
 }
 
 /* Handle a route registration call: create Route node + HANDLES edge.

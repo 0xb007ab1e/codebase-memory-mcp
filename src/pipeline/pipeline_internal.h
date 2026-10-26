@@ -788,11 +788,12 @@ bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *proje
 void cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool with_line);
 
 /* Go 1.22 ServeMux registrations may name a method and a host before the path
- * ("POST /v1/x", "GET api.example.com/v1/x", #2537). For a Go file, the path
- * inside such a route-registration argument; NULL for any other language and
- * for an argument that is no such pattern (a plain "/v1/x" included). The one
- * reader of that grammar behind both passes (pass_parallel.c). */
-const char *cbm_pipeline_mux_route_path(const char *arg, CBMLanguage lang);
+ * ("POST /v1/x", "GET api.example.com/v1/x", #2537). For a Go `Handle` /
+ * `HandleFunc` call, the path inside its first argument; NULL for any other
+ * language or callee (`store.Get("users/123")`), for a URL argument, and for an
+ * argument that is no such pattern (a plain "/v1/x" included). The one reader
+ * of that grammar behind both passes (pass_parallel.c). */
+const char *cbm_pipeline_mux_route_path(const CBMCall *call, CBMLanguage lang);
 
 /* The method of a route registration's Route: the verb its callee names
  * (`router.GET`), else the method its Go ServeMux pattern names

@@ -1227,6 +1227,21 @@ const char *cbm_service_pattern_mux_split(const char *pattern, char *method, siz
     return slash;
 }
 
+const char *cbm_service_pattern_mux_route_path(const char *callee_name, const char *pattern) {
+    static const char *const mux_callees[] = {".Handle", ".HandleFunc"};
+    if (!callee_name || !pattern || strstr(pattern, "://") != NULL) {
+        return NULL;
+    }
+    size_t clen = strlen(callee_name);
+    for (size_t i = 0; i < sizeof(mux_callees) / sizeof(mux_callees[0]); i++) {
+        size_t slen = strlen(mux_callees[i]);
+        if (clen >= slen && strcmp(callee_name + clen - slen, mux_callees[i]) == 0) {
+            return cbm_service_pattern_mux_split(pattern, NULL, 0);
+        }
+    }
+    return NULL;
+}
+
 const char *cbm_service_pattern_broker(const char *resolved_qn) {
     if (!resolved_qn) {
         return NULL;

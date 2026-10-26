@@ -2263,11 +2263,12 @@ static bool is_route_path_shaped(const char *val) {
     return val && val[0] == '/' && !cbm_service_pattern_is_comment_text(val);
 }
 
-const char *cbm_pipeline_mux_route_path(const char *arg, CBMLanguage lang) {
+const char *cbm_pipeline_mux_route_path(const CBMCall *call, CBMLanguage lang) {
+    const char *arg = call->first_string_arg;
     if (lang != CBM_LANG_GO || !arg || cbm_service_pattern_is_comment_text(arg)) {
         return NULL;
     }
-    return cbm_service_pattern_mux_split(arg, NULL, 0);
+    return cbm_service_pattern_mux_route_path(call->callee_name, arg);
 }
 
 const char *cbm_pipeline_route_reg_method(const CBMCall *call, CBMLanguage lang, char *buf,
@@ -2276,7 +2277,7 @@ const char *cbm_pipeline_route_reg_method(const CBMCall *call, CBMLanguage lang,
     if (method && strcmp(method, "ANY") != 0) {
         return method;
     }
-    if (cbm_pipeline_mux_route_path(call->first_string_arg, lang) &&
+    if (cbm_pipeline_mux_route_path(call, lang) &&
         cbm_service_pattern_mux_split(call->first_string_arg, buf, buf_sz) && buf[0] != '\0') {
         return buf;
     }
@@ -2291,9 +2292,9 @@ static const char *find_route_path_in_args(const CBMCall *call, const char **out
         *out_handler = call->second_arg_name;
         return call->first_string_arg;
     }
-    /* 1b. Go ServeMux pattern with a method or host before the path (#2537).
-     * MUST match pass_calls.c route_reg_path. */
-    const char *mux_path = cbm_pipeline_mux_route_path(call->first_string_arg, lang);
+    /* 1b. Go ServeMux pattern with a method or host before the path (#2537),
+     * read for Handle / HandleFunc only. MUST match pass_calls.c route_reg_path. */
+    const char *mux_path = cbm_pipeline_mux_route_path(call, lang);
     if (mux_path) {
         *out_handler = call->second_arg_name;
         return mux_path;
