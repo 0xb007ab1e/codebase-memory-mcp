@@ -1811,10 +1811,15 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
         return 0;
     }
     /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
-     * (helpers.c) — see pass_definitions.c for the per-label rationale. */
+     * (helpers.c) — see pass_definitions.c for the per-label rationale, and
+     * for the generated member registered by qualified name only. */
     if (cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name, def->label,
-                                        lang, module_prefix_len);
+        if (cbm_def_props_generated(def->extra_props)) {
+            cbm_registry_add_qn_only(ctx->registry, def->qualified_name, def->label);
+        } else {
+            cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name,
+                                            def->label, lang, module_prefix_len);
+        }
         (*reg_entries)++;
     }
     char marked[CBM_SZ_4K];

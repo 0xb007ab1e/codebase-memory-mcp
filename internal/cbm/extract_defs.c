@@ -9668,6 +9668,16 @@ static void extract_record_accessors(CBMExtractCtx *ctx, TSNode node, const char
             const char *type = cbm_node_text(a, ctype, ctx->source);
             adef.return_type = spread && type ? cbm_arena_sprintf(a, "%s[]", type) : type;
         }
+        /* The compiler writes this member and the source never spells it: its
+         * node says so, and the pipeline registers it by qualified name only,
+         * so no short-name guess can land on it. */
+        const char **kv = (const char **)cbm_arena_alloc(a, CBM_SZ_3 * sizeof(char *));
+        if (kv) {
+            kv[0] = CBM_PROP_GENERATED;
+            kv[SKIP_ONE] = "record";
+            kv[PAIR_LEN] = NULL;
+        }
+        adef.extra_props = kv;
         cbm_defs_push(&ctx->result->defs, a, adef);
     }
 }
