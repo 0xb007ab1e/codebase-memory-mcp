@@ -2899,11 +2899,22 @@ static cyp_partial_t partial_or(cyp_partial_t l, cyp_partial_t r) {
                                                               : CYP_PARTIAL_UNKNOWN;
 }
 
-/* A condition whose alias is not bound yet is UNKNOWN; a literal-only LHS
- * (func condition with no variable arg) has nothing to wait for. */
+static bool partial_alias_unbound(binding_t *b, const char *alias) {
+    return alias && !binding_get(b, alias) && !binding_get_edge(b, alias);
+}
+
+/* A condition is UNKNOWN while any alias it reads is not bound yet: its own
+ * variable, and every function argument's -- a func condition is filed under
+ * its first argument's alias, so the b in coalesce(a.x, b.name) is only seen
+ * here. A literal-only LHS has nothing to wait for. */
 static cyp_partial_t eval_condition_partial(const cbm_condition_t *c, binding_t *b) {
-    if (c->variable && !binding_get(b, c->variable) && !binding_get_edge(b, c->variable)) {
+    if (partial_alias_unbound(b, c->variable)) {
         return CYP_PARTIAL_UNKNOWN;
+    }
+    for (int i = 0; i < c->arg_count; i++) {
+        if (partial_alias_unbound(b, c->args[i].variable)) {
+            return CYP_PARTIAL_UNKNOWN;
+        }
     }
     return eval_condition(c, b) ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
 }
@@ -5359,6 +5370,34 @@ static void ret_agg_emit_row(cbm_return_clause_t *ret, ret_agg_entry_t *agg, res
     rb_add_row(rb, row);
 }
 
+/* True when every RETURN item is an aggregate, so the whole input is one group. */
+static bool ret_agg_is_ungrouped(const cbm_return_clause_t *ret) {
+    for (int ci = 0; ci < ret->count; ci++) {
+        if (!is_aggregate_func(ret->items[ci].func)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The one row an ungrouped aggregation answers when no binding reached it
+ * (#2742): count and sum are 0, collect is an empty list, and avg/min/max have
+ * no value, rendered as "" like any other null. */
+static void ret_agg_emit_empty_row(cbm_return_clause_t *ret, result_builder_t *rb) {
+    const char *row[CBM_SZ_32];
+    for (int ci = 0; ci < ret->count && ci < CBM_SZ_32; ci++) {
+        const char *func = ret->items[ci].func;
+        if (strcmp(func, "COUNT") == 0 || strcmp(func, "SUM") == 0) {
+            row[ci] = "0";
+        } else if (strcmp(func, "COLLECT") == 0) {
+            row[ci] = "[]";
+        } else {
+            row[ci] = "";
+        }
+    }
+    rb_add_row(rb, row);
+}
+
 static void ret_sink_feed_agg(ret_sink_t *s, binding_t *bindings, int bind_count) {
     cbm_return_clause_t *ret = s->ret;
     for (int bi = 0; bi < bind_count && !s->done; bi++) {
@@ -5574,6 +5613,11 @@ static void ret_sink_finish(ret_sink_t *s) {
     if (s->kind == RET_SINK_AGG) {
         for (int a = 0; a < s->agg_count; a++) {
             ret_agg_emit_row(ret, &s->aggs[a], rb);
+        }
+        /* Without grouping keys the input is a single group even when it is
+         * empty; a grouped aggregation over no rows has no group to report. */
+        if (s->agg_count == 0 && ret_agg_is_ungrouped(ret)) {
+            ret_agg_emit_empty_row(ret, rb);
         }
     }
     ret_sink_free(s);
