@@ -376,8 +376,8 @@ void cbm_log_mcp_request(const char *method, const char *tool_name, bool is_erro
     const char *status = timed_out ? "timeout" : (is_error ? "error" : "ok");
     if (tool_name && tool_name[0] != '\0') {
         cbm_log(is_error ? CBM_LOG_WARN : CBM_LOG_INFO, "mcp.request", "protocol", "jsonrpc",
-                "method", method ? method : "", "tool", tool_name, "status", status,
-                "duration_ms", duration_ms, "handler_duration_ms", handler_duration_ms,
+                "method", method ? method : "", "tool", tool_name, "status", status, "duration_ms",
+                duration_ms, "handler_duration_ms", handler_duration_ms,
                 "response_serialization_ms", response_serialization_ms, "cancelled",
                 cancelled ? "true" : "false", "timed_out", timed_out ? "true" : "false", NULL);
     } else {
