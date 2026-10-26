@@ -120,7 +120,7 @@ cbm_sem_config_t cbm_sem_get_config(void) {
         .threshold = (float)CBM_SEM_EDGE_THRESHOLD,
         .max_edges = CBM_SEM_MAX_EDGES,
     };
-    const char *thresh = getenv("CBM_SEMANTIC_THRESHOLD");
+    const char *thresh = cbm_runtime_getenv("CBM_SEMANTIC_THRESHOLD");
     if (thresh) {
         /* strtod reports errors via endptr; reject non-numeric input silently. */
         char *end = NULL;
@@ -133,7 +133,7 @@ cbm_sem_config_t cbm_sem_get_config(void) {
 }
 
 bool cbm_sem_is_enabled(void) {
-    const char *val = getenv("CBM_SEMANTIC_ENABLED");
+    const char *val = cbm_runtime_getenv("CBM_SEMANTIC_ENABLED");
     return val && val[0] == '1';
 }
 
@@ -1971,6 +1971,72 @@ float cbm_sem_doc_folder_p(cbm_sem_doc_format_t fmt, const char *doc_path) {
     bool readme = (n == sizeof("readme") - 1 && strncasecmp(base, "readme", n) == 0) ||
                   (n == sizeof("index") - 1 && strncasecmp(base, "index", n) == 0);
     return readme ? 0.867F : 0.0F;
+}
+
+cbm_sem_diag_family_t cbm_sem_diag_family(const char *format, const char *diagram_kind) {
+    static const char *const mermaid[] = {"sequence",   "class",         "er",
+                                          "c4_context", "c4_container",  "c4_component",
+                                          "c4_dynamic", "c4_deployment", "architecture"};
+    static const char *const plantuml[] = {"c4", "class", "sequence", "usecase", "component"};
+    if (!format || !format[0]) {
+        return CBM_SEM_DIAG_NONE;
+    }
+    const char *const *structural = NULL;
+    size_t n = 0;
+    if (strcmp(format, "mermaid") == 0) {
+        structural = mermaid;
+        n = sizeof(mermaid) / sizeof(mermaid[0]);
+    } else if (strcmp(format, "plantuml") == 0) {
+        structural = plantuml;
+        n = sizeof(plantuml) / sizeof(plantuml[0]);
+    } else {
+        return CBM_SEM_DIAG_GRAPH;
+    }
+    for (size_t i = 0; diagram_kind && i < n; i++) {
+        if (strcmp(diagram_kind, structural[i]) == 0) {
+            return CBM_SEM_DIAG_STRUCTURAL;
+        }
+    }
+    return CBM_SEM_DIAG_PROSE;
+}
+
+/* Markdown sections that embed a diagram, by the section's family (DIAG-C,
+ * 2026-10-11: 553 blind-judged candidates from sections of 16 held-out
+ * repositories that embed a diagram, three reading rounds; function
+ * candidates at or inside the home pooled, as both curves rose by band).
+ * A diagram section is about its candidates more often than SEM7's Markdown
+ * curve says, so its first band is stored too:
+ *   prose       0.24 / 0.28 / 0.45, local extras 11 of 40 = 0.275
+ *   structural  0.32 / 0.46 / 0.57, local extras  7 of  9 = 0.78 (every
+ *               local extra of the family; 95% interval 0.45-0.94)
+ * Graph diagrams (DOT, D2) were not found in Markdown sections: SEM7. */
+static const struct {
+    bool fitted;
+    float function[SEM_DOC_P_NBANDS];
+    float local;
+} SEM_DOC_P_MD_DIAGRAM[CBM_SEM_DIAG_COUNT] = {
+    [CBM_SEM_DIAG_PROSE] = {true, {0.0F, 0.24F, 0.28F, 0.45F}, 0.275F},
+    [CBM_SEM_DIAG_STRUCTURAL] = {true, {0.0F, 0.32F, 0.464F, 0.567F}, 0.778F},
+};
+
+float cbm_sem_doc_section_p(cbm_sem_doc_format_t fmt, cbm_sem_diag_family_t fam,
+                            cbm_sem_doc_kind_t kind, cbm_sem_doc_pos_t pos, float score) {
+    bool fitted = fmt == CBM_SEM_DOC_FMT_MARKDOWN && (int)fam > 0 && fam < CBM_SEM_DIAG_COUNT &&
+                  SEM_DOC_P_MD_DIAGRAM[fam].fitted;
+    bool home = pos == CBM_SEM_DOC_POS_GLOBAL || pos == CBM_SEM_DOC_POS_LOCAL;
+    if (!fitted || !((kind == CBM_SEM_DOC_KIND_FUNCTION && home) ||
+                     (kind == CBM_SEM_DOC_KIND_LOCAL && pos == CBM_SEM_DOC_POS_LOCAL))) {
+        return cbm_sem_doc_calibrated_p(fmt, kind, pos, score);
+    }
+    size_t band = 0;
+    while (band < SEM_DOC_P_NBANDS - 1 && score >= SEM_DOC_P_CUTS[band]) {
+        band++;
+    }
+    if (band == 0) {
+        return 0.0F; /* below CBM_SEM_DOC_MIN_SCORE: never measured, nothing stored */
+    }
+    return kind == CBM_SEM_DOC_KIND_LOCAL ? SEM_DOC_P_MD_DIAGRAM[fam].local
+                                          : SEM_DOC_P_MD_DIAGRAM[fam].function[band];
 }
 
 float cbm_sem_combined_score(const cbm_sem_func_t *a, const cbm_sem_func_t *b,

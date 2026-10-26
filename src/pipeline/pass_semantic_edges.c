@@ -2904,12 +2904,39 @@ typedef struct {
     int n;
 } doc_rows_t;
 
+/* The diagram family of a section: the highest of the Diagram nodes it
+ * DEFINES (cbm_sem_diag_family), CBM_SEM_DIAG_NONE without one. */
+static cbm_sem_diag_family_t doc_section_family(const cbm_gbuf_t *gbuf,
+                                                const cbm_gbuf_node_t *sec) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int n = 0;
+    cbm_sem_diag_family_t fam = CBM_SEM_DIAG_NONE;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, sec->id, "DEFINES", &edges, &n) != 0) {
+        return fam;
+    }
+    for (int i = 0; i < n; i++) {
+        const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(gbuf, edges[i]->target_id);
+        if (!t || !t->label || strcmp(t->label, "Diagram") != 0 || !t->properties_json) {
+            continue;
+        }
+        char fmt[CBM_SZ_32];
+        char kind[CBM_SZ_32];
+        const char *f = json_str_value(t->properties_json, "format", fmt, sizeof(fmt));
+        const char *k = json_str_value(t->properties_json, "diagram_kind", kind, sizeof(kind));
+        cbm_sem_diag_family_t df = cbm_sem_diag_family(f, k);
+        if (df > fam) {
+            fam = df;
+        }
+    }
+    return fam;
+}
+
 /* Append the candidate (section -> target) when its judged p is above 0 and
  * the graph does not link the pair exactly; false: out of memory (the row at
  * rw->n may hold partial strings). */
 static bool doc_row_add(doc_rows_t *rw, const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sec,
-                        const cbm_gbuf_node_t *target, const doc_hit_t *hit,
-                        cbm_sem_doc_kind_t kind, const char *home) {
+                        cbm_sem_diag_family_t fam, const cbm_gbuf_node_t *target,
+                        const doc_hit_t *hit, cbm_sem_doc_kind_t kind, const char *home) {
     if (!target || !target->qualified_name || !sec->qualified_name) {
         return true;
     }
@@ -2917,7 +2944,7 @@ static bool doc_row_add(doc_rows_t *rw, const cbm_gbuf_t *gbuf, const cbm_gbuf_n
     cbm_sem_doc_format_t fmt = cbm_sem_doc_format(sec->file_path);
     float p = kind == CBM_SEM_DOC_KIND_FOLDER
                   ? cbm_sem_doc_folder_p(fmt, sec->file_path)
-                  : cbm_sem_doc_calibrated_p(fmt, kind, pos, hit->tfidf);
+                  : cbm_sem_doc_section_p(fmt, fam, kind, pos, hit->tfidf);
     if (p <= 0.0F || doc_pair_linked(gbuf, sec->id, target->id)) {
         return true; /* not stored for this band, kind or format; or linked exactly */
     }
@@ -2944,25 +2971,26 @@ static bool doc_section_rows(doc_rows_t *rw, const cbm_gbuf_t *gbuf, const doc_c
                              const doc_place_t *pl, int s) {
     const cbm_gbuf_node_t *sec = dc->secs[s];
     const doc_result_t *r = &dc->res[s];
+    cbm_sem_diag_family_t fam = doc_section_family(gbuf, sec);
     bool ok = true;
     for (int h = 0; ok && h < r->n + r->nlocal; h++) {
         const doc_hit_t *hit = h < r->n ? &r->hits[h] : &r->local[h - r->n];
         if (h < r->n && (hit->rank > CBM_SEM_DOC_TOP_K || hit->tfidf < CBM_SEM_DOC_MIN_SCORE)) {
             continue;
         }
-        ok =
-            doc_row_add(rw, gbuf, sec, cbm_gbuf_find_by_id(gbuf, dc->funcs[hit->func].node_id), hit,
-                        h < r->n ? CBM_SEM_DOC_KIND_FUNCTION : CBM_SEM_DOC_KIND_LOCAL, pl->home[s]);
+        ok = doc_row_add(
+            rw, gbuf, sec, fam, cbm_gbuf_find_by_id(gbuf, dc->funcs[hit->func].node_id), hit,
+            h < r->n ? CBM_SEM_DOC_KIND_FUNCTION : CBM_SEM_DOC_KIND_LOCAL, pl->home[s]);
     }
     for (int h = 0; ok && h < r->nfiles; h++) {
         const doc_file_hit_t *fh = &r->files[h];
         doc_hit_t hit = {.tfidf = fh->tfidf, .rank = fh->rank, .shared = fh->shared};
-        ok = doc_row_add(rw, gbuf, sec, dc->files->node[fh->file], &hit, CBM_SEM_DOC_KIND_FILE,
+        ok = doc_row_add(rw, gbuf, sec, fam, dc->files->node[fh->file], &hit, CBM_SEM_DOC_KIND_FILE,
                          pl->home[s]);
     }
     doc_hit_t first = {.rank = SKIP_ONE};
-    return ok && doc_row_add(rw, gbuf, sec, doc_home_folder(pl, s), &first, CBM_SEM_DOC_KIND_FOLDER,
-                             pl->home[s]);
+    return ok && doc_row_add(rw, gbuf, sec, fam, doc_home_folder(pl, s), &first,
+                             CBM_SEM_DOC_KIND_FOLDER, pl->home[s]);
 }
 
 /* The stored candidates of every section -- its best CBM_SEM_DOC_TOP_K
@@ -2999,6 +3027,12 @@ static void phase6c_doc_sections(cbm_pipeline_ctx_t *ctx, const cbm_sem_func_t *
                                  int func_count, const cbm_sem_corpus_t *corpus, int worker_count) {
     const cbm_gbuf_t *gbuf = ctx->gbuf;
     if (!corpus || func_count <= 0) {
+        return;
+    }
+    /* doc_candidates off: no scoring and no rows (the scoring grows with
+     * sections x functions; on the Linux kernel it is ~174 s of the index). */
+    if (!cbm_pipeline_doc_candidates_enabled(ctx->pipeline)) {
+        cbm_log_info("pass.semantic.doc_candidates", "skipped", "doc_candidates_off");
         return;
     }
     const cbm_gbuf_node_t **found = NULL;
@@ -3150,8 +3184,16 @@ static void phase6c_doc_sections(cbm_pipeline_ctx_t *ctx, const cbm_sem_func_t *
 }
 
 int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
-    /* Controlled by pipeline mode (moderate/full), not env var */
-    cbm_log_info("pass.start", "pass", "semantic_edges");
+    /* Controlled by pipeline mode, not env var. Full and moderate run every
+     * phase. Fast mode has no SEMANTICALLY_RELATED edges: it runs the pass
+     * only for doc -> code candidates, doc-only -- phases 1-4 (the corpus and
+     * vectors phase 6c scores against) and 6c, never the LSH + scoring of
+     * 5-6 -- and not at all with doc candidates off. */
+    bool doc_only = ctx->mode == CBM_MODE_FAST;
+    if (doc_only && !cbm_pipeline_doc_candidates_enabled(ctx->pipeline)) {
+        return 0;
+    }
+    cbm_log_info("pass.start", "pass", "semantic_edges", "doc_only", doc_only ? "true" : "false");
 
     cbm_gbuf_t *gbuf = ctx->gbuf;
     cbm_sem_config_t cfg = cbm_sem_get_config();
@@ -3220,22 +3262,25 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
 
     cbm_log_info("pass.semantic.vectors_stored", "count", itoa_log(func_count));
 
-    /* Phase 5: LSH hyperplanes → signatures → buckets. */
-    CBM_PROF_START(t_phase5);
     uint64_t *signatures = NULL;
     sem_bucket_t **band_buckets = NULL;
-    phase5_lsh_build(funcs, func_count, worker_count, &signatures, &band_buckets);
-    CBM_PROF_END_N("semantic_edges", "5_lsh_build", t_phase5, func_count);
+    int total_edges = 0;
+    if (!doc_only) {
+        /* Phase 5: LSH hyperplanes → signatures → buckets. */
+        CBM_PROF_START(t_phase5);
+        phase5_lsh_build(funcs, func_count, worker_count, &signatures, &band_buckets);
+        CBM_PROF_END_N("semantic_edges", "5_lsh_build", t_phase5, func_count);
 
-    cbm_log_info("pass.semantic.lsh_built", "functions", itoa_log(func_count), "bands",
-                 itoa_log(SEM_LSH_BANDS));
-    sem_mem_mark("5_lsh");
+        cbm_log_info("pass.semantic.lsh_built", "functions", itoa_log(func_count), "bands",
+                     itoa_log(SEM_LSH_BANDS));
+        sem_mem_mark("5_lsh");
 
-    /* Phase 6: Parallel scoring + sequential edge merge. */
-    int total_edges =
-        run_scoring_phase(gbuf, funcs, signatures, band_buckets, cfg, func_count, worker_count);
+        /* Phase 6: Parallel scoring + sequential edge merge. */
+        total_edges =
+            run_scoring_phase(gbuf, funcs, signatures, band_buckets, cfg, func_count, worker_count);
 
-    sem_mem_mark("6_score");
+        sem_mem_mark("6_score");
+    }
 
     /* Phase 6c: doc sections -> function candidates (doc_link_candidates). */
     phase6c_doc_sections(ctx, funcs, func_count, corpus, worker_count);

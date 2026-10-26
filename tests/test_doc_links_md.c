@@ -444,6 +444,55 @@ TEST(doc_links_md_incremental) {
     PASS();
 }
 
+/* #2588: a reference into a directory that was moved or renamed named a
+ * path whose directory is gone, so it counted as no reference to this
+ * repository: no edge and no row. A directory above it that the reference
+ * wrote is still there, so it is doc rot. A path none of whose directories
+ * the repository has stays no reference. */
+TEST(doc_links_md_moved_directory_issue2588) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlmd_mv_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char repo[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    th_write_file(TH_PATH(repo, "docs/notes.md"), "# Notes\n"
+                                                  "\n"
+                                                  "See `src/util/rounding.py::clamp` and "
+                                                  "[rounding](../src/util/rounding.py).\n"
+                                                  "Create `scratch/new/thing.py` first.\n");
+    th_write_file(TH_PATH(repo, "src/ledger.py"), "def balance(ledger):\n"
+                                                  "    return sum(ledger)\n");
+    th_write_file(TH_PATH(repo, "src/util/rounding.py"), "def clamp(x, lo, hi):\n"
+                                                         "    return max(lo, min(hi, x))\n");
+    char db[512];
+    char full_db[512];
+    snprintf(db, sizeof(db), "%s/inc.db", tmp);
+    snprintf(full_db, sizeof(full_db), "%s/full.db", tmp);
+    ASSERT_EQ(dm_index(repo, db, NULL), 0);
+    char props[512];
+    char reason[64];
+    ASSERT_EQ(md_edge(db, "Notes", "rounding.clamp", props, sizeof(props)), 1);
+
+    /* src/util moves to src/helpers: both references are missing, on the
+     * incremental route as in a full index */
+    th_write_file(TH_PATH(repo, "src/helpers/rounding.py"), "def clamp(x, lo, hi):\n"
+                                                            "    return max(lo, min(hi, x))\n");
+    ASSERT_EQ(th_rmtree(TH_PATH(repo, "src/util")), 0);
+    ASSERT_EQ(dm_step(repo, db, full_db, "directory moved", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
+    ASSERT_EQ(md_edge(db, "Notes", "rounding.clamp", props, sizeof(props)), 0);
+    dm_row(db, "docs/notes.md", "src/util/rounding.py::clamp", reason, sizeof(reason), NULL, 0);
+    ASSERT_STR_EQ(reason, "missing");
+    dm_row(db, "docs/notes.md", "../src/util/rounding.py", reason, sizeof(reason), NULL, 0);
+    ASSERT_STR_EQ(reason, "missing");
+
+    /* no directory of it in the repository: still no reference */
+    dm_row(db, "docs/notes.md", "scratch/new/thing.py", reason, sizeof(reason), NULL, 0);
+    ASSERT_STR_EQ(reason, "");
+
+    th_cleanup(tmp);
+    PASS();
+}
+
 /* ── ADRs ────────────────────────────────────────────────────────── */
 
 static void md_write_adrs(const char *tmp, const char *first_status) {
@@ -602,6 +651,18 @@ TEST(doc_links_md_ship_gate) {
         ASSERT_FALSE(cbm_doclink_syntax_ships(DM_HELD_FAMILIES[i]));
     }
     ASSERT_TRUE(cbm_doclink_syntax_ships(CBM_DOCLINK_MD_LINK));
+    /* the doc-comment families whose held-out tiers passed (2026-10-11) */
+    static const int passed[] = {
+        CBM_DOCLINK_GO_DOC_LINK,  CBM_DOCLINK_JAVA_LINK,    CBM_DOCLINK_JAVA_LINKPLAIN,
+        CBM_DOCLINK_JAVA_SEE,     CBM_DOCLINK_JAVA_THROWS,  CBM_DOCLINK_JAVA_VALUE,
+        CBM_DOCLINK_KT_KDOC_LINK, CBM_DOCLINK_KT_SEE,       CBM_DOCLINK_KT_THROWS,
+        CBM_DOCLINK_KT_SAMPLE,    CBM_DOCLINK_RS_INTRA_DOC, CBM_DOCLINK_RS_LINK_DEF,
+        CBM_DOCLINK_PERL_POD_L,   CBM_DOCLINK_TS_LINK,      CBM_DOCLINK_PHP_SEE,
+        CBM_DOCLINK_C_REF,        CBM_DOCLINK_C_SEE,
+    };
+    for (size_t i = 0; i < sizeof(passed) / sizeof(passed[0]); i++) {
+        ASSERT_TRUE(cbm_doclink_syntax_ships(passed[i]));
+    }
     ASSERT_TRUE(cbm_doclink_syntax_ships(CBM_DOCLINK_RST_ROLE));
     ASSERT_TRUE(cbm_doclink_syntax_ships(CBM_DOCLINK_ADOC_INCLUDE));
     ASSERT_TRUE(cbm_doclink_syntax_ships(CBM_DOCLINK_RST_LITERALINCLUDE));
@@ -854,6 +915,7 @@ SUITE(doc_links_md) {
     RUN_TEST(doc_links_md_classify_span);
     RUN_TEST(doc_links_md_resolve);
     RUN_TEST(doc_links_md_incremental);
+    RUN_TEST(doc_links_md_moved_directory_issue2588);
     RUN_TEST(doc_links_md_adr);
     RUN_TEST(doc_links_md_adr_label_choice);
     RUN_TEST(doc_links_md_adr_reported);

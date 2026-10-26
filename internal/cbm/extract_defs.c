@@ -416,6 +416,33 @@ static TSNode resolve_lean_func_name(TSNode node, TSNode name) {
     return cbm_find_child_by_kind(node, "ident");
 }
 
+// Haskell infix-form definition head (`a <+> b`, ``x `plus` y``): the defined
+// name is the operator, not the left operand that is the head's first child. A
+// backticked `infix_id` yields its inner variable (`plus`); a symbolic `operator`
+// is returned as-is and parenthesised by cbm_func_name_node_text, matching the
+// prefix form `(<+>) a b = ...` (#2440).
+static TSNode resolve_haskell_infix_head_name(TSNode head) {
+    enum { INFIX_MIN_CHILDREN = 3, INFIX_OP_IDX = 1 };
+    TSNode op = ts_node_child_by_field_name(head, TS_FIELD("operator"));
+    if (ts_node_is_null(op) && ts_node_child_count(head) >= INFIX_MIN_CHILDREN) {
+        op = ts_node_child(head, INFIX_OP_IDX);
+    }
+    if (!ts_node_is_null(op)) {
+        const char *ok = ts_node_type(op);
+        if (strcmp(ok, "operator") == 0) {
+            return op;
+        }
+        if (strcmp(ok, "infix_id") == 0) {
+            TSNode v = cbm_find_child_by_kind(op, "variable");
+            if (!ts_node_is_null(v)) {
+                return v;
+            }
+        }
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
 // Haskell: resolve function name from first named child (variable/name).
 static TSNode resolve_haskell_func_name(TSNode node) {
     if (ts_node_named_child_count(node) > 0) {
@@ -423,6 +450,9 @@ static TSNode resolve_haskell_func_name(TSNode node) {
         const char *hk = ts_node_type(head);
         if (strcmp(hk, "variable") == 0 || strcmp(hk, "name") == 0) {
             return head;
+        }
+        if (strcmp(hk, "infix") == 0) {
+            return resolve_haskell_infix_head_name(head);
         }
         if (ts_node_named_child_count(head) > 0) {
             TSNode v = ts_node_named_child(head, 0);
@@ -2327,6 +2357,7 @@ typedef struct {
     size_t name_len;
     uint32_t sb;
     uint32_t eb;
+    bool used; /* a sub's doc holds it (pod_doc_by_name): not the module's */
 } pod_sec_t;
 
 typedef struct {
@@ -2587,15 +2618,16 @@ static void pod_index_block(CBMExtractCtx *ctx, pod_index_t *ix, TSNode pod) {
             continue;
         }
         uint32_t se = pod_section_end(cmds, n, ci, pe);
-        pod_sec_t sec = {nm, nl, cmds[ci].sb, pod_trim_end(ctx->source, cmds[ci].sb, se)};
+        pod_sec_t sec = {nm, nl, cmds[ci].sb, pod_trim_end(ctx->source, cmds[ci].sb, se), false};
         pod_index_push(a, ix, &sec);
     }
 }
 
-/* The file's POD sections by name, built on the first Perl sub. */
-static const pod_index_t *pod_index(CBMExtractCtx *ctx) {
+/* The file's POD sections by name, built on the first Perl sub (or for the
+ * module doc of a file without one). */
+static pod_index_t *pod_index(CBMExtractCtx *ctx) {
     if (ctx->doc_pod_index) {
-        return (const pod_index_t *)ctx->doc_pod_index;
+        return (pod_index_t *)ctx->doc_pod_index;
     }
     pod_index_t *ix = (pod_index_t *)cbm_arena_alloc(doc_scratch(ctx), sizeof(pod_index_t));
     if (!ix) {
@@ -2623,7 +2655,7 @@ static bool pod_sec_names(const pod_sec_t *s, const char *name, size_t nl) {
 /* Every POD section whose =head / =item names the sub exactly, joined in
  * document order; NULL when none does. */
 static const char *pod_doc_by_name(CBMExtractCtx *ctx, const char *name) {
-    const pod_index_t *ix = pod_index(ctx);
+    pod_index_t *ix = pod_index(ctx);
     if (!ix || !name || !name[0]) {
         return NULL;
     }
@@ -2643,10 +2675,11 @@ static const char *pod_doc_by_name(CBMExtractCtx *ctx, const char *name) {
     }
     size_t w = 0;
     for (int i = 0; i < ix->count; i++) {
-        const pod_sec_t *s = &ix->items[i];
+        pod_sec_t *s = &ix->items[i];
         if (!pod_sec_names(s, name, nl)) {
             continue;
         }
+        s->used = true;
         if (w > 0) {
             buf[w++] = '\n';
             buf[w++] = '\n';
@@ -2656,6 +2689,137 @@ static const char *pod_doc_by_name(CBMExtractCtx *ctx, const char *name) {
     }
     buf[w] = '\0';
     return buf;
+}
+
+/* True when src[b, e) holds a paragraph that is text, or a =head / =item
+ * command: not only =cut, =pod, =over and =back lines. */
+static bool pod_run_has_text(const char *src, uint32_t b, uint32_t e) {
+    uint32_t pos = b;
+    uint32_t sb = 0;
+    uint32_t eb = 0;
+    int depth = 0;
+    while (pod_next_para(src, &pos, e, &sb, &eb)) {
+        if (src[sb] != '=' || sb + SKIP_ONE >= eb || !isalpha((unsigned char)src[sb + SKIP_ONE])) {
+            return true;
+        }
+        pod_cmd_t c = pod_classify(src, sb, eb, &depth);
+        if (c.type == POD_HEAD || c.type == POD_ITEM || c.type == POD_OTHER) {
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct {
+    CBMExtractCtx *ctx;
+    char *buf;
+    size_t w;
+    uint32_t first_line; /* source line of the first run kept, 0 before it */
+    TSNode block;
+    int next_sec; /* the first index section not yet passed: blocks go in order */
+} pod_module_t;
+
+/* Append src[b, e) of the current block to the module doc, after a blank
+ * line, unless it holds no text. */
+static void pod_module_run(pod_module_t *m, uint32_t b, uint32_t e) {
+    const char *src = m->ctx->source;
+    while (b < e) { /* leading blank lines */
+        uint32_t le = b;
+        while (le < e && src[le] != '\n') {
+            le++;
+        }
+        if (!pod_line_is_blank(src, b, le)) {
+            break;
+        }
+        b = le < e ? le + SKIP_ONE : e;
+    }
+    e = pod_trim_end(src, b, e);
+    if (b >= e || !pod_run_has_text(src, b, e)) {
+        return;
+    }
+    if (m->first_line == 0) {
+        uint32_t line = ts_node_start_point(m->block).row + SKIP_ONE;
+        for (uint32_t k = ts_node_start_byte(m->block); k < b; k++) {
+            line += src[k] == '\n' ? SKIP_ONE : 0;
+        }
+        m->first_line = line;
+    }
+    if (m->w > 0) {
+        m->buf[m->w++] = '\n';
+        m->buf[m->w++] = '\n';
+    }
+    memcpy(m->buf + m->w, src + b, e - b);
+    m->w += e - b;
+}
+
+/* Perl's module doc, for the File node: the file's POD outside the sections a
+ * sub's doc holds, so that no reference is read twice. Every POD block with
+ * those sections cut out, each remaining run as it is in the source, in
+ * document order and joined by a blank line (a sub's doc joins its sections
+ * the same way); a run of only =cut / =pod / =over / =back lines is dropped.
+ * Built after the definitions, which mark the sections they take. NULL when
+ * nothing is left. */
+static const char *doc_perl_module(CBMExtractCtx *ctx) {
+    pod_index_t *ix = pod_index(ctx);
+    if (!ix) {
+        return NULL;
+    }
+    size_t total = 0;
+    int blocks = 0;
+    TSTreeCursor cur = ts_tree_cursor_new(ctx->root);
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            TSNode ch = ts_tree_cursor_current_node(&cur);
+            if (strcmp(ts_node_type(ch), "pod") == 0) {
+                total += ts_node_end_byte(ch) - ts_node_start_byte(ch);
+                blocks++;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    if (blocks == 0) {
+        ts_tree_cursor_delete(&cur);
+        return NULL;
+    }
+    /* each block yields at most one run more than the sections it loses */
+    size_t runs = (size_t)blocks + (size_t)ix->count;
+    pod_module_t m = {.ctx = ctx};
+    m.buf = (char *)cbm_arena_alloc(ctx->arena, total + (runs * PAIR_LEN) + SKIP_ONE);
+    if (!m.buf) {
+        ts_tree_cursor_delete(&cur);
+        return NULL;
+    }
+    ts_tree_cursor_reset(&cur, ctx->root);
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            TSNode ch = ts_tree_cursor_current_node(&cur);
+            if (strcmp(ts_node_type(ch), "pod") != 0) {
+                continue;
+            }
+            m.block = ch;
+            uint32_t pb = ts_node_start_byte(ch);
+            uint32_t pe = ts_node_end_byte(ch);
+            uint32_t at = pb;
+            /* the index holds the blocks' sections in document order */
+            for (; m.next_sec < ix->count && ix->items[m.next_sec].sb < pe; m.next_sec++) {
+                const pod_sec_t *s = &ix->items[m.next_sec];
+                if (!s->used || s->sb < pb) {
+                    continue;
+                }
+                if (s->sb > at) {
+                    pod_module_run(&m, at, s->sb);
+                }
+                at = s->eb > at ? s->eb : at;
+            }
+            pod_module_run(&m, at, pe);
+        } while (ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    ts_tree_cursor_delete(&cur);
+    if (m.w == 0) {
+        return NULL;
+    }
+    m.buf[m.w] = '\0';
+    cbm_doclink_note_doc_line(ctx, m.buf, m.first_line);
+    return m.buf;
 }
 
 /* ── Doc entry points ── */
@@ -3448,6 +3612,325 @@ static const char *join_route_paths(CBMArena *a, const char *prefix, const char 
         return cbm_arena_sprintf(a, "%s/%s", prefix, path);
     }
     return cbm_arena_sprintf(a, "%s%s", prefix, path);
+}
+
+/* ── ASP.NET Core attribute routing (C#, #1041 / #1692) ──────────────────────
+ * Controllers route through attributes rather than Spring-style mapping names:
+ *   [Route("api/[controller]")] class QuotesController      -> class prefix
+ *   [HttpGet("{symbol}")]  /  [HttpPost] + [Route("x/{id}")] -> action route
+ *   [AcceptVerbs("GET", "HEAD", Route = "x")]
+ * A template is relative to the class prefix unless it starts with "/" or
+ * "~/". The [controller]/[action]/[area] tokens are replaced and constraints,
+ * defaults and optional markers reduce to the bare parameter ("{id:int}" ->
+ * "{id}"), so the result leads with '/' and canonicalizes like any other
+ * decorator route. */
+typedef struct {
+    const char *method;      /* HTTP verb of the first verb attribute */
+    const char *verb_tmpl;   /* its template (AcceptVerbs: Route = "...") */
+    const char *route_tmpl;  /* template of the first [Route] */
+    const char *action_name; /* [ActionName("x")] */
+    const char *area;        /* [Area("x")] */
+    bool has_route;          /* a [Route] attribute was seen */
+} aspnet_attrs_t;
+
+/* Attribute name without namespace qualifier or "Attribute" suffix:
+ * Microsoft.AspNetCore.Mvc.HttpGetAttribute -> HttpGet. */
+static const char *aspnet_attr_name(CBMArena *a, TSNode attr, const char *source) {
+    TSNode name_node = ts_node_child_by_field_name(attr, TS_FIELD("name"));
+    if (ts_node_is_null(name_node)) {
+        return NULL;
+    }
+    const char *name = cbm_node_text(a, name_node, source);
+    if (!name) {
+        return NULL;
+    }
+    const char *sep = strrchr(name, '.');
+    const char *colon = strrchr(name, ':');
+    if (colon > sep) {
+        sep = colon;
+    }
+    if (sep) {
+        name = sep + SKIP_CHAR;
+    }
+    static const char suffix[] = "Attribute";
+    size_t len = strlen(name);
+    size_t slen = sizeof(suffix) - SKIP_CHAR;
+    if (len > slen && strcmp(name + len - slen, suffix) == 0) {
+        return cbm_arena_strndup(a, name, len - slen);
+    }
+    return name;
+}
+
+static const char *aspnet_verb(const char *name) {
+    static const char *const verbs[][PAIR_CHARS] = {
+        {"HttpGet", "GET"},        {"HttpPost", "POST"},   {"HttpPut", "PUT"},
+        {"HttpDelete", "DELETE"},  {"HttpPatch", "PATCH"}, {"HttpHead", "HEAD"},
+        {"HttpOptions", "OPTIONS"}};
+    for (size_t i = 0; i < sizeof(verbs) / sizeof(verbs[0]); i++) {
+        if (strcmp(name, verbs[i][0]) == 0) {
+            return verbs[i][SKIP_CHAR];
+        }
+    }
+    return NULL;
+}
+
+/* Unquoted text of a C# "x" or @"x" string literal node; NULL otherwise. */
+static const char *aspnet_string_value(CBMArena *a, TSNode node, const char *source) {
+    const char *kind = ts_node_type(node);
+    bool verbatim = strcmp(kind, "verbatim_string_literal") == 0;
+    if (!verbatim && strcmp(kind, "string_literal") != 0) {
+        return NULL;
+    }
+    const char *text = cbm_node_text(a, node, source);
+    size_t open = verbatim ? PAIR_CHARS : SKIP_CHAR; /* `@"` or `"` */
+    size_t len = text ? strlen(text) : 0;
+    if (len < open + SKIP_CHAR) {
+        return NULL;
+    }
+    return cbm_arena_strndup(a, text + open, len - open - SKIP_CHAR);
+}
+
+/* The first positional string argument (key == NULL) or the string value of
+ * the named argument `key` (Route = "..."). */
+static const char *aspnet_attr_arg(CBMArena *a, TSNode attr, const char *source, const char *key) {
+    TSNode args = cbm_find_child_by_kind(attr, "attribute_argument_list");
+    if (ts_node_is_null(args)) {
+        return NULL;
+    }
+    uint32_t nc = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        uint32_t vc = ts_node_named_child_count(arg);
+        if (strcmp(ts_node_type(arg), "attribute_argument") != 0 || vc == 0) {
+            continue;
+        }
+        TSNode name = ts_node_child_by_field_name(arg, TS_FIELD("name"));
+        TSNode value = ts_node_named_child(arg, vc - SKIP_CHAR);
+        if (ts_node_is_null(name) != (key == NULL)) {
+            continue; /* positional wanted but named seen, or vice versa */
+        }
+        if (key) {
+            const char *n = cbm_node_text(a, name, source);
+            if (!n || strcmp(n, key) != 0) {
+                continue;
+            }
+        }
+        return aspnet_string_value(a, value, source);
+    }
+    return NULL;
+}
+
+/* [AcceptVerbs("get", ...)]: first verb upper-cased; letters only, since the
+ * verb lands in the Route QN and its JSON properties unescaped. */
+static const char *aspnet_accept_verb(CBMArena *a, const char *verb) {
+    enum { VERB_MAX = 7 }; /* OPTIONS */
+    size_t len = verb ? strlen(verb) : 0;
+    if (len == 0 || len > VERB_MAX) {
+        return "ANY";
+    }
+    char *up = cbm_arena_strndup(a, verb, len);
+    for (size_t i = 0; i < len; i++) {
+        if (!isalpha((unsigned char)up[i])) {
+            return "ANY";
+        }
+        up[i] = (char)toupper((unsigned char)up[i]);
+    }
+    return up;
+}
+
+static void aspnet_note_attr(CBMArena *a, TSNode attr, const char *source, aspnet_attrs_t *out) {
+    const char *name = aspnet_attr_name(a, attr, source);
+    if (!name) {
+        return;
+    }
+    const char *verb = aspnet_verb(name);
+    if (verb || strcmp(name, "AcceptVerbs") == 0) {
+        if (!out->method) {
+            out->method =
+                verb ? verb : aspnet_accept_verb(a, aspnet_attr_arg(a, attr, source, NULL));
+            out->verb_tmpl = aspnet_attr_arg(a, attr, source, verb ? NULL : "Route");
+        }
+    } else if (strcmp(name, "Route") == 0) {
+        if (!out->has_route) {
+            out->has_route = true;
+            out->route_tmpl = aspnet_attr_arg(a, attr, source, NULL);
+        }
+    } else if (strcmp(name, "ActionName") == 0) {
+        out->action_name = aspnet_attr_arg(a, attr, source, NULL);
+    } else if (strcmp(name, "Area") == 0) {
+        out->area = aspnet_attr_arg(a, attr, source, NULL);
+    }
+}
+
+static void aspnet_scan_attrs(CBMArena *a, TSNode owner, const char *source, aspnet_attrs_t *out) {
+    memset(out, 0, sizeof(*out));
+    TSNode wrappers[MAX_ATTR_WRAPPERS];
+    int wn = find_jvm_modifiers(owner, CBM_LANG_CSHARP, wrappers, MAX_ATTR_WRAPPERS);
+    for (int w = 0; w < wn; w++) {
+        uint32_t cc = ts_node_named_child_count(wrappers[w]);
+        for (uint32_t ci = 0; ci < cc; ci++) {
+            TSNode child = ts_node_named_child(wrappers[w], ci);
+            if (strcmp(ts_node_type(child), "attribute") == 0) {
+                aspnet_note_attr(a, child, source, out);
+            }
+        }
+    }
+}
+
+/* `name` minus `suffix` when it is a proper suffix (QuotesController ->
+ * Quotes, GetAsync -> Get); `name` otherwise. */
+static const char *aspnet_trim_suffix(CBMArena *a, const char *name, const char *suffix) {
+    size_t len = name ? strlen(name) : 0;
+    size_t slen = strlen(suffix);
+    if (len > slen && strcmp(name + len - slen, suffix) == 0) {
+        return cbm_arena_strndup(a, name, len - slen);
+    }
+    return name;
+}
+
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} aspnet_buf_t;
+
+static void aspnet_putc(aspnet_buf_t *b, char c) {
+    if (c == '/' && b->len > 0 && b->buf[b->len - SKIP_CHAR] == '/') {
+        return; /* "api/" + "/x" and empty token values never double a slash */
+    }
+    if (b->len + SKIP_CHAR < b->cap) {
+        b->buf[b->len++] = c;
+    }
+}
+
+static void aspnet_putn(aspnet_buf_t *b, const char *s, size_t n) {
+    for (size_t i = 0; i < n && s[i]; i++) {
+        aspnet_putc(b, s[i]);
+    }
+}
+
+/* Index just past the '}' closing the '{' at t[open] (braces nest, as in
+ * "{code:regex(^\d{{3}}$)}"); 0 when unterminated. */
+static size_t aspnet_brace_end(const char *t, size_t open) {
+    int depth = 0;
+    for (size_t j = open; t[j]; j++) {
+        if (t[j] == '{') {
+            depth++;
+        } else if (t[j] == '}' && --depth == 0) {
+            return j + SKIP_CHAR;
+        }
+    }
+    return 0;
+}
+
+/* "{id:int}", "{page=1}", "{slug?}", "{**path}" -> "{id}", "{page}", "{slug}",
+ * "{**path}": keep the catch-all stars and the parameter name. */
+static void aspnet_put_param(aspnet_buf_t *b, const char *t, size_t open, size_t end) {
+    size_t i = open + SKIP_CHAR;
+    aspnet_putc(b, '{');
+    while (i < end && t[i] == '*') {
+        aspnet_putc(b, t[i++]);
+    }
+    while (i < end && (isalnum((unsigned char)t[i]) || t[i] == '_')) {
+        aspnet_putc(b, t[i++]);
+    }
+    aspnet_putc(b, '}');
+}
+
+enum { ASPNET_TOKENS = 3 }; /* [controller], [action], [area] */
+
+/* Replacement for the [controller]/[action]/[area] token starting at t[i]
+ * (values[k] belongs to tokens[k]); NULL when t[i] starts no known token or
+ * its value is unknown, so the token is kept verbatim. */
+static const char *aspnet_token_value(const char *t, size_t i, const char *const *values,
+                                      size_t *tok_len) {
+    static const char *const tokens[ASPNET_TOKENS] = {"[controller]", "[action]", "[area]"};
+    for (size_t k = 0; k < ASPNET_TOKENS; k++) {
+        size_t n = strlen(tokens[k]);
+        if (values[k] && strncmp(t + i, tokens[k], n) == 0) {
+            *tok_len = n;
+            return values[k];
+        }
+    }
+    return NULL;
+}
+
+/* Normalize one ASP.NET route template into a '/'-led path (see the section
+ * comment above). values = {controller, action, area}. */
+static const char *aspnet_route_template(CBMArena *a, const char *t, const char *const *values) {
+    size_t extra = 0;
+    for (int k = 0; k < ASPNET_TOKENS; k++) {
+        extra += values[k] ? strlen(values[k]) : 0;
+    }
+    size_t brackets = 0;
+    for (const char *p = t; *p; p++) {
+        brackets += *p == '[';
+    }
+    aspnet_buf_t b = {0};
+    b.cap = strlen(t) + (brackets * extra) + PAIR_CHARS;
+    b.buf = (char *)cbm_arena_alloc(a, b.cap);
+    if (!b.buf) {
+        return NULL;
+    }
+    aspnet_putc(&b, '/');
+    size_t i = (t[0] == '~') ? SKIP_CHAR : 0;
+    while (t[i]) {
+        size_t tok_len = 0;
+        const char *val = (t[i] == '[') ? aspnet_token_value(t, i, values, &tok_len) : NULL;
+        size_t end = (t[i] == '{' && t[i + SKIP_CHAR] != '{') ? aspnet_brace_end(t, i) : 0;
+        if (val) {
+            aspnet_putn(&b, val, strlen(val));
+            i += tok_len;
+        } else if (end) {
+            aspnet_put_param(&b, t, i, end);
+            i = end;
+        } else if ((t[i] == '{' || t[i] == '}' || t[i] == '[' || t[i] == ']') &&
+                   t[i + SKIP_CHAR] == t[i]) {
+            aspnet_putc(&b, t[i]); /* "{{" / "[[" escapes a literal brace */
+            i += PAIR_CHARS;
+        } else {
+            aspnet_putc(&b, t[i++]);
+        }
+    }
+    if (b.len > SKIP_CHAR && b.buf[b.len - SKIP_CHAR] == '/') {
+        b.len--;
+    }
+    b.buf[b.len] = '\0';
+    return b.buf;
+}
+
+static bool aspnet_template_is_absolute(const char *t) {
+    return t[0] == '/' || (t[0] == '~' && t[SKIP_CHAR] == '/');
+}
+
+/* Route of one controller action: sets out_path and out_method when the method
+ * carries a verb attribute, [AcceptVerbs] or [Route]; clears them otherwise. */
+static void aspnet_action_route(CBMArena *a, TSNode method_node, TSNode class_node,
+                                const char *method_name, const char *source, const char **out_path,
+                                const char **out_method) {
+    *out_path = NULL;
+    *out_method = NULL;
+    aspnet_attrs_t act;
+    aspnet_scan_attrs(a, method_node, source, &act);
+    if (!act.method && !act.has_route) {
+        return;
+    }
+    aspnet_attrs_t cls;
+    aspnet_scan_attrs(a, class_node, source, &cls);
+    TSNode cname = ts_node_child_by_field_name(class_node, TS_FIELD("name"));
+    const char *ctrl = ts_node_is_null(cname) ? NULL : cbm_node_text(a, cname, source);
+    const char *values[ASPNET_TOKENS] = {
+        aspnet_trim_suffix(a, ctrl, "Controller"),
+        act.action_name ? act.action_name : aspnet_trim_suffix(a, method_name, "Async"),
+        act.area ? act.area : cls.area,
+    };
+    const char *tmpl = act.verb_tmpl ? act.verb_tmpl : act.route_tmpl;
+    const char *path = tmpl ? aspnet_route_template(a, tmpl, values) : NULL;
+    if ((!tmpl || !aspnet_template_is_absolute(tmpl)) && cls.route_tmpl) {
+        path = join_route_paths(a, aspnet_route_template(a, cls.route_tmpl, values), path);
+    }
+    *out_path = path ? path : "/";
+    *out_method = act.method ? act.method : "ANY";
 }
 
 static const char *spring_class_route_prefix(CBMArena *a, TSNode class_node, const char *source,
@@ -5319,7 +5802,7 @@ static void set_def_complexity(CBMDefinition *def, TSNode body, const CBMLangSpe
  * Walks to the parameter_declaration's `type` field, unwrapping pointer_type
  * and generic_type, and returns the type_identifier text (e.g. "OrderService").
  * Returns NULL if no type_identifier is found. */
-static char *go_receiver_type_name(CBMArena *a, TSNode recv, const char *source) {
+char *cbm_go_receiver_type_name(CBMArena *a, TSNode recv, const char *source) {
     uint32_t nc = ts_node_child_count(recv);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode child = ts_node_child(recv, i);
@@ -6275,6 +6758,107 @@ void cbm_test_declarations_finish(CBMExtractCtx *ctx) {
     }
 }
 
+static bool make_name_char(char c) {
+    return c == '_' || c == '.' || c == '-' || (c >= '0' && c <= '9') ||
+           ((c | ' ') >= 'a' && (c | ' ') <= 'z');
+}
+
+/* A `rule` node that is a target-specific variable: after the targets'
+ * colon(s) come [export|override|private|unexport]... NAME and an
+ * assignment operator (= := ::= :::= += ?= !=). */
+static bool make_rule_sets_variable(TSNode rule, const char *src) {
+    static const char *const kws[] = {"export", "override", "private", "unexport", NULL};
+    TSNode targets = cbm_find_child_by_kind(rule, "targets");
+    if (ts_node_is_null(targets)) {
+        return false;
+    }
+    uint32_t p = ts_node_end_byte(targets);
+    uint32_t end = ts_node_end_byte(rule);
+    while (p < end && (src[p] == ' ' || src[p] == '\t')) {
+        p++;
+    }
+    if (p >= end || src[p] != ':') {
+        return false;
+    }
+    while (p < end && src[p] == ':') {
+        p++;
+    }
+    for (bool kw = true; kw;) {
+        while (p < end && (src[p] == ' ' || src[p] == '\t')) {
+            p++;
+        }
+        kw = false;
+        for (int i = 0; kws[i]; i++) {
+            size_t n = strlen(kws[i]);
+            if (p + n < end && strncmp(src + p, kws[i], n) == 0 &&
+                (src[p + n] == ' ' || src[p + n] == '\t')) {
+                p += (uint32_t)n;
+                kw = true;
+                break;
+            }
+        }
+    }
+    uint32_t name = p;
+    while (p < end && make_name_char(src[p])) {
+        p++;
+    }
+    if (p == name) {
+        return false;
+    }
+    while (p < end && (src[p] == ' ' || src[p] == '\t')) {
+        p++;
+    }
+    if (p < end && src[p] == ':') {
+        while (p < end && src[p] == ':') {
+            p++;
+        }
+        return p < end && src[p] == '=';
+    }
+    return p < end && (src[p] == '=' ||
+                       (strchr("+?!", src[p]) && p + SKIP_ONE < end && src[p + SKIP_ONE] == '='));
+}
+
+/* Make: a rule names several targets (`up down: deps`), each a goal
+ * `make <target>` runs. The rule's definition carries the first target;
+ * every further one gets a definition of its own over the same rule span --
+ * without fingerprint, structural profile or body tokens, so the copies of
+ * one recipe do not read as similar code. Special (`.X`) targets and
+ * repeats stay out. */
+static void push_make_rule_targets(CBMExtractCtx *ctx, TSNode node, const CBMDefinition *first) {
+    CBMArena *a = ctx->arena;
+    TSNode targets = cbm_find_child_by_kind(node, "targets");
+    uint32_t n = ts_node_is_null(targets) ? 0 : ts_node_named_child_count(targets);
+    for (uint32_t i = SKIP_ONE; i < n; i++) {
+        char *name =
+            cbm_func_name_node_text(a, ts_node_named_child(targets, i), ctx->source, ctx->language);
+        if (!name || !name[0] || name[0] == '.' || strcmp(name, first->name) == 0) {
+            continue;
+        }
+        bool repeat = false;
+        for (uint32_t j = SKIP_ONE; j < i && !repeat; j++) {
+            char *prev = cbm_func_name_node_text(a, ts_node_named_child(targets, j), ctx->source,
+                                                 ctx->language);
+            repeat = prev && strcmp(prev, name) == 0;
+        }
+        if (repeat) {
+            continue;
+        }
+        CBMDefinition d = *first;
+        d.name = name;
+        d.qualified_name =
+            cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
+        d.is_exported = cbm_is_exported(name, ctx->language);
+        d.is_entry_point = strcmp(name, "main") == 0;
+        d.fingerprint = NULL;
+        d.fingerprint_k = 0;
+        d.structural_profile = NULL;
+        d.body_tokens = NULL;
+        if (d.qualified_name) {
+            cbm_defs_push(&ctx->result->defs, a, d);
+        }
+    }
+}
+
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
@@ -6306,6 +6890,12 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // emit a "..PHONY" segment (a "double dot") and thus a malformed QN. Skip
     // any dot-prefixed Make target.
     if (ctx->language == CBM_LANG_MAKEFILE && name[0] == '.') {
+        return;
+    }
+    // `targets: [export] VAR := value` sets a variable for those targets:
+    // no rule, so no def (else a target only ever configured there is a
+    // phantom, and a real rule of it gains the line as a variant).
+    if (ctx->language == CBM_LANG_MAKEFILE && make_rule_sets_variable(node, ctx->source)) {
         return;
     }
 
@@ -6368,14 +6958,6 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
      * proj.myapp.db.Func, not proj.myapp.db.conn.Func). Other langs unchanged. */
     def.qualified_name =
         cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, qn_name, ctx->language);
-    /* C-family platform variants (foo_win.c / foo_posix.c, src/unix/ vs
-     * src/win/): an external-linkage file-scope function takes its
-     * platform-neutral QN, so its variants are one definition. The call-scope
-     * twin in extract_unified.c applies the same rule. */
-    if (!ctx->enclosing_class_qn) {
-        def.qualified_name = cbm_platform_variant_qn(a, ctx->language, ctx->project, ctx->rel_path,
-                                                     qn_name, def.qualified_name, node);
-    }
     /* A free function declared inside a namespace (C++/C#/PHP) is qualified by
      * the namespace scope the def walk carries (enclosing_class_qn was extended
      * by is_namespace_scope_kind), so `ns::serialize` is `proj.file.ns.serialize`
@@ -6391,11 +6973,16 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
      * scope. Note the call-scope side (compute_func_qn in extract_unified.c) is
      * NOT language-gated — it qualifies whenever a scope is pushed — so this gate
      * and the scope-push rule must move together, or a call QN names a def QN that
-     * was never minted and the edge is dropped at write. */
+     * was never minted and the edge is dropped at write.
+     *
+     * Python: the only enclosing scope that reaches here is the def a nested
+     * def sits in (py_push_def_body), so `def index()` inside create_app is
+     * proj.mod.create_app.index. */
     if (ctx->enclosing_class_qn &&
         (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA ||
          ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX ||
-         ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_NIX)) {
+         ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_NIX ||
+         ctx->language == CBM_LANG_PYTHON)) {
         def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, qn_name);
     }
     def.label = "Function";
@@ -6449,12 +7036,27 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
          * (and downstream Go IMPLEMENTS/OVERRIDE) link the method to its owning
          * struct/type node.  The parent QN must match the type's node QN, which
          * is computed the same way (cbm_fqn_compute on the type name). */
-        char *recv_type = go_receiver_type_name(a, recv, ctx->source);
+        char *recv_type = cbm_go_receiver_type_name(a, recv, ctx->source);
         if (recv_type && recv_type[0]) {
             /* Must match the Go type node QN (directory-based module) so the
              * DEFINES_METHOD edge links the method to its owning type. */
             def.parent_class = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path,
                                                            recv_type, ctx->language);
+            /* Receiver-qualify the method QN (proj.pkg.Recv.method) — same
+             * shape as the C++ out-of-line path below and Go interface
+             * members. With the flat proj.pkg.method QN every same-name
+             * method in a package collided in the graph upsert: one body
+             * survived and the twins' call edges accreted onto it. The
+             * call-scope side (compute_func_qn in extract_unified.c) mirrors
+             * this formula, and go_lsp consumers read the def QN and
+             * parent_class (receiver_type) verbatim, so resolution joins
+             * stay exact. Go only: templ's Go-derived grammar reaches this
+             * branch too, but its call-scope QN (compute_func_qn) stays flat,
+             * and a def QN the calls do not share would orphan every call
+             * inside a templ method. */
+            if (ctx->language == CBM_LANG_GO && def.parent_class) {
+                def.qualified_name = cbm_arena_sprintf(a, "%s.%s", def.parent_class, name);
+            }
         }
     }
 
@@ -6472,6 +7074,16 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             def.label = "Method";
             def.parent_class = class_qn;
         }
+    }
+
+    /* C-family platform variants (foo_win.c / foo_posix.c, src/unix/ vs
+     * src/win/): an external-linkage file-scope function keeps its path QN and
+     * carries its platform-neutral QN as the key that relates its variants
+     * (the node's `variant_key`). NULL for anything scoped, static, or in a
+     * path without a platform token. */
+    if (!ctx->enclosing_class_qn) {
+        def.variant_key = cbm_platform_neutral_qn(a, ctx->language, ctx->project, ctx->rel_path,
+                                                  qn_name, def.qualified_name, node);
     }
 
     // Pony: fun/be/new (method/constructor/ffi_method) live in pony_func_types,
@@ -6557,6 +7169,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             return;
     }
     cbm_defs_push(&ctx->result->defs, a, def);
+    if (ctx->language == CBM_LANG_MAKEFILE && strcmp(ts_node_type(node), "rule") == 0) {
+        push_make_rule_targets(ctx, node, &def);
+    }
 }
 
 // --- Class definition extraction ---
@@ -6706,10 +7321,22 @@ static bool is_markdown_heading_kind(const char *kind) {
  * with nested subsections as further `section` children that own their own
  * text. Stopping at either a `section` or another heading therefore gives each
  * Section exactly its OWN body under both that shape and a flat one. The bytes
- * between are contiguous in the source, so one slice beats concatenation. */
-static const char *extract_markdown_section_body(CBMArena *a, TSNode heading, const char *source) {
+ * between are contiguous in the source, so one slice beats concatenation.
+ *
+ * A top-level diagram fence (```mermaid, plantuml, dot, d2 ...) is the one
+ * exception: the body keeps the labels its diagram parser reads, not the
+ * format's syntax. Arrows and keywords (`-->`, `participant`, `classDiagram`)
+ * name no code and crowd the prose out of the 500-byte cap, while the labels
+ * are what name the code. Judged on held-out sections that embed diagrams,
+ * labels gave more sections a correct code candidate (56 vs 42 of 147) at a
+ * higher precision (0.54 vs 0.45) than the fence as written; dropping the
+ * fence lost candidates (29). The diagram itself keeps its own nodes. */
+static const char *extract_markdown_section_body(CBMExtractCtx *ctx, TSNode heading) {
+    CBMArena *a = ctx->arena;
+    const char *source = ctx->source;
     uint32_t start = ts_node_end_byte(heading);
     uint32_t end = start;
+    int fences = 0;
     for (TSNode sib = ts_node_next_sibling(heading); !ts_node_is_null(sib);
          sib = ts_node_next_sibling(sib)) {
         const char *sk = ts_node_type(sib);
@@ -6717,11 +7344,57 @@ static const char *extract_markdown_section_body(CBMArena *a, TSNode heading, co
             break;
         }
         end = ts_node_end_byte(sib);
+        fences += cbm_diagram_fence_is_diagram(source, sib);
     }
     if (end <= start) {
         return NULL;
     }
-    return collapse_prose(a, source + start, (size_t)(end - start));
+    if (fences == 0) {
+        return collapse_prose(a, source + start, (size_t)(end - start));
+    }
+    /* The body with each diagram fence replaced by its labels. */
+    const char **labels = (const char **)cbm_arena_alloc(a, (size_t)fences * sizeof(char *));
+    if (!labels) {
+        return NULL;
+    }
+    size_t total = 0;
+    int k = 0;
+    for (TSNode sib = ts_node_next_sibling(heading); !ts_node_is_null(sib) && k < fences;
+         sib = ts_node_next_sibling(sib)) {
+        if (cbm_diagram_fence_is_diagram(source, sib)) {
+            labels[k] = cbm_diagram_fence_labels(ctx, sib);
+            total += labels[k] ? strlen(labels[k]) + SKIP_ONE : 0;
+            k++;
+        }
+    }
+    char *buf = (char *)cbm_arena_alloc(a, (size_t)(end - start) + total + SKIP_ONE);
+    if (!buf) {
+        return NULL;
+    }
+    size_t w = 0;
+    uint32_t prev = start;
+    k = 0;
+    for (TSNode sib = ts_node_next_sibling(heading); !ts_node_is_null(sib) && k < fences;
+         sib = ts_node_next_sibling(sib)) {
+        if (!cbm_diagram_fence_is_diagram(source, sib)) {
+            continue;
+        }
+        uint32_t sb = ts_node_start_byte(sib);
+        memcpy(buf + w, source + prev, sb - prev);
+        w += sb - prev;
+        if (labels[k]) {
+            size_t n = strlen(labels[k]);
+            memcpy(buf + w, labels[k], n);
+            w += n;
+            buf[w++] = ' ';
+        }
+        k++;
+        prev = ts_node_end_byte(sib);
+    }
+    memcpy(buf + w, source + prev, end - prev);
+    w += end - prev;
+    buf[w] = '\0';
+    return collapse_prose(a, buf, w);
 }
 
 /* Push a config-language definition that carries prose. push_simple_class_def
@@ -6862,6 +7535,19 @@ static char *find_ini_section_name(CBMArena *a, TSNode node, const char *source)
     return NULL;
 }
 
+// HCL: a top-level block (resource, data, module, variable, output, locals,
+// provider, terraform; Terragrunt's include, dependency, ...) sits directly in
+// the file's body. Blocks nested in one (lifecycle, dynamic, content, a
+// resource's own argument blocks) are part of it, not entities of their own.
+static bool hcl_block_is_top_level(TSNode node) {
+    TSNode body = ts_node_parent(node);
+    if (ts_node_is_null(body) || strcmp(ts_node_type(body), "body") != 0) {
+        return false;
+    }
+    TSNode file = ts_node_parent(body);
+    return !ts_node_is_null(file) && strcmp(ts_node_type(file), "config_file") == 0;
+}
+
 // HCL: extract block name from identifier child.
 static char *find_hcl_block_name(CBMArena *a, TSNode node, const char *source) {
     TSNode id = cbm_find_child_by_kind(node, "identifier");
@@ -6875,18 +7561,19 @@ static char *find_hcl_block_name(CBMArena *a, TSNode node, const char *source) {
     // Append the block's quoted labels so each block gets a distinct,
     // query-friendly name: resource "aws_instance" "web" -> resource.aws_instance.web
     // rather than every resource collapsing to the bare keyword "resource" (#337).
-    // HCL stores labels as string_lit -> template_literal children.
+    // HCL stores quoted labels as string_lit -> template_literal children and
+    // bare ones (`variable region {}`, valid HCL) as identifiers after the
+    // keyword's own -- both name the block.
     uint32_t cc = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < cc; i++) {
         TSNode ch = ts_node_named_child(node, i);
-        if (strcmp(ts_node_type(ch), "string_lit") != 0) {
-            continue;
+        char *label = NULL;
+        if (strcmp(ts_node_type(ch), "string_lit") == 0) {
+            TSNode lit = cbm_find_child_by_kind(ch, "template_literal");
+            label = ts_node_is_null(lit) ? NULL : cbm_node_text(a, lit, source);
+        } else if (strcmp(ts_node_type(ch), "identifier") == 0 && !ts_node_eq(ch, id)) {
+            label = cbm_node_text(a, ch, source);
         }
-        TSNode lit = cbm_find_child_by_kind(ch, "template_literal");
-        if (ts_node_is_null(lit)) {
-            continue;
-        }
-        char *label = cbm_node_text(a, lit, source);
         if (!label || !label[0]) {
             continue;
         }
@@ -6921,9 +7608,9 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
         // "Class"; that assertion is the inaccurate side and is flagged for review.
         label = "Section";
         // #518: index what the section SAYS, not just its title.
-        docstring = extract_markdown_section_body(a, node, ctx->source);
+        docstring = extract_markdown_section_body(ctx, node);
     } else if (ctx->language == CBM_LANG_HCL && strcmp(kind, "block") == 0) {
-        name = find_hcl_block_name(a, node, ctx->source);
+        name = hcl_block_is_top_level(node) ? find_hcl_block_name(a, node, ctx->source) : NULL;
     } else {
         return false;
     }
@@ -8124,6 +8811,10 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         def.route_path = prefix ? join_route_paths(a, prefix, def.route_path) : NULL;
         def.route_method = prefix ? def.route_method : NULL;
     }
+    if (ctx->language == CBM_LANG_CSHARP) {
+        aspnet_action_route(a, child, class_node, name, ctx->source, &def.route_path,
+                            &def.route_method);
+    }
     def.docstring = extract_docstring(ctx, child, name);
 
     if (spec->branching_node_types && spec->branching_node_types[0]) {
@@ -8232,6 +8923,68 @@ static void extract_objc_impl_methods(CBMExtractCtx *ctx, TSNode impl_node, cons
     }
 }
 
+/* True for a C# 14 extension block. The vendored tree-sitter-c-sharp has no
+ * `extension` production, so `extension(string text) { ... }` parses as a
+ * constructor_declaration named `extension` and nothing flags it: has_error
+ * stays 0. A constructor carries its own type's name, so this shape can only be
+ * a genuine constructor inside a type literally called `extension` (#2071). */
+static bool csharp_is_extension_block(TSNode node, TSNode class_node, const char *source) {
+    if (strcmp(ts_node_type(node), "constructor_declaration") != 0) {
+        return false;
+    }
+    TSNode name = resolve_method_name(node, CBM_LANG_CSHARP);
+    if (ts_node_is_null(name)) {
+        return false;
+    }
+    const size_t kw_len = sizeof("extension") - 1;
+    uint32_t len = ts_node_end_byte(name) - ts_node_start_byte(name);
+    if (len != kw_len || strncmp(source + ts_node_start_byte(name), "extension", kw_len) != 0) {
+        return false;
+    }
+    TSNode type_name = ts_node_child_by_field_name(class_node, TS_FIELD("name"));
+    if (!ts_node_is_null(type_name)) {
+        const char *type_text = source + ts_node_start_byte(type_name);
+        uint32_t tlen = ts_node_end_byte(type_name) - ts_node_start_byte(type_name);
+        /* A verbatim identifier names the same type: class @extension may
+         * declare a genuine constructor spelled extension(). */
+        if (tlen > 0 && type_text[0] == '@') {
+            type_text++;
+            tlen--;
+        }
+        if (tlen == kw_len && strncmp(type_text, "extension", kw_len) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Lift the members of a misparsed C# 14 extension block onto the enclosing
+ * type. They sit in the block the grammar took for a constructor body, which
+ * nothing recurses into, so every one of them was dropped. Methods land there
+ * as local_function_statement; a property in the block parses as ERROR and is
+ * beyond recovery without a grammar that knows the construct (#2071). */
+static void extract_csharp_extension_members(CBMExtractCtx *ctx, TSNode ext_node, TSNode class_node,
+                                             const char *class_qn, const CBMLangSpec *spec) {
+    TSNode body = cbm_find_child_by_kind(ext_node, "block");
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    member_iter_t it;
+    member_iter_init(&it, body, ctx->language, false);
+    TSNode member;
+    while (member_iter_next(&it, &member)) {
+        if (strcmp(ts_node_type(member), "local_function_statement") != 0) {
+            continue;
+        }
+        TSNode name = resolve_method_name(member, ctx->language);
+        if (ts_node_is_null(name)) {
+            continue;
+        }
+        push_method_def(ctx, member, class_node, class_qn, spec, name);
+    }
+    member_iter_done(&it);
+}
+
 // Extract methods inside a class body
 static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                   const CBMLangSpec *spec) {
@@ -8244,6 +8997,15 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
     member_iter_init(&it, body, ctx->language, false);
     TSNode child;
     while (member_iter_next(&it, &child)) {
+
+        /* C# 14 extension block: emit the members it holds as methods of the
+         * enclosing type, rather than the block itself as a constructor named
+         * `extension` with its members buried in the body (#2071). */
+        if (ctx->language == CBM_LANG_CSHARP &&
+            csharp_is_extension_block(child, class_node, ctx->source)) {
+            extract_csharp_extension_members(ctx, child, class_node, class_qn, spec);
+            continue;
+        }
 
         if (ctx->language == CBM_LANG_OBJC &&
             strcmp(ts_node_type(child), "implementation_definition") == 0) {
@@ -9961,6 +10723,31 @@ static void extract_yaml_toplevel_keys(CBMExtractCtx *ctx, TSNode root) {
     }
 }
 
+// True when the YAML document's top level holds both `apiVersion` and `kind`:
+// a Kubernetes object, whose top-level keys are its envelope.
+static bool yaml_is_k8s_object(CBMExtractCtx *ctx, TSNode root) {
+    TSNode bm = find_yaml_toplevel_mapping(root);
+    if (ts_node_is_null(bm)) {
+        return false;
+    }
+    bool api_version = false;
+    bool kind = false;
+    uint32_t n = ts_node_named_child_count(bm);
+    for (uint32_t i = 0; i < n && !(api_version && kind); i++) {
+        TSNode pair = ts_node_named_child(bm, i);
+        if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
+            continue;
+        }
+        TSNode key = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+        const char *k = ts_node_is_null(key) ? NULL : cbm_node_text(ctx->arena, key, ctx->source);
+        if (k) {
+            api_version = api_version || strcmp(k, "apiVersion") == 0;
+            kind = kind || strcmp(k, "kind") == 0;
+        }
+    }
+    return api_version && kind;
+}
+
 static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     if (!spec->variable_node_types || !spec->variable_node_types[0]) {
         return;
@@ -9972,10 +10759,37 @@ static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec
         return;
     }
 
+    // A Kubernetes object's top-level keys (apiVersion, kind, metadata, spec,
+    // status) are its envelope, which its Resource node carries; as Variables
+    // they repeated in every manifest and fed name-similarity config links.
+    if (ctx->language == CBM_LANG_YAML && yaml_is_k8s_object(ctx, root)) {
+        return;
+    }
+
     // Config languages with nested structure: use recursive walk
     if (ctx->language == CBM_LANG_YAML || ctx->language == CBM_LANG_TOML ||
         ctx->language == CBM_LANG_INI || ctx->language == CBM_LANG_JSON) {
         walk_variables_iter(ctx, root, spec);
+        return;
+    }
+
+    /* HCL: a file's own assignments -- a .tfvars file, Terragrunt's `inputs`
+     * -- sit in the top-level body, one level below the root the generic loop
+     * scans, so none was extracted. Attributes inside blocks belong to their
+     * block. */
+    if (ctx->language == CBM_LANG_HCL) {
+        TSNode body = cbm_find_child_by_kind(root, "body");
+        uint32_t n = ts_node_is_null(body) ? 0 : ts_node_named_child_count(body);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode attr = ts_node_named_child(body, i);
+            if (strcmp(ts_node_type(attr), "attribute") != 0) {
+                continue;
+            }
+            TSNode id = cbm_find_child_by_kind(attr, "identifier");
+            if (!ts_node_is_null(id)) {
+                push_var_def(ctx, cbm_node_text(ctx->arena, id, ctx->source), attr);
+            }
+        }
         return;
     }
 
@@ -11118,9 +11932,12 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_sta
                 wd_push(s, child, enclosing_qn);
             } else {
                 const char *ck = ts_node_type(child);
-                /* A nested class inside #if/#else is still nested here. */
+                /* A nested class inside #if/#else is still nested here, and so is
+                 * a decorated one (Python `@dataclass class Meta:` in a class
+                 * body): the decorated_definition wraps the class_definition. */
                 if (strcmp(ck, "field_declaration") == 0 ||
                     strcmp(ck, "template_declaration") == 0 || strcmp(ck, "declaration") == 0 ||
+                    (ctx->language == CBM_LANG_PYTHON && strcmp(ck, "decorated_definition") == 0) ||
                     cbm_kind_in_set(child, cbm_conditional_block_types(spec->language))) {
                     ts_nstack_push(&nc_stack, child);
                 }
@@ -11294,6 +12111,51 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_st
     uint32_t nc = ts_node_child_count(node);
     for (int ci = (int)nc - SKIP_CHAR; ci >= 0; ci--) {
         wd_push(s, ts_node_child(node, (uint32_t)ci), new_enclosing);
+    }
+}
+
+/* Python: a def's body is a scope of its own, and a `def` or `class` statement
+ * in it is a definition like any other -- closures, decorator wrappers, the
+ * route handlers of an app factory (`@app.route` inside create_app), local
+ * classes. Walk the body with the def's QN as the enclosing scope, so a nested
+ * def is qualified by the def it sits in: proj.mod.create_app.index. That is
+ * the QN the Python LSP already gives the calls inside it (py_process_function)
+ * and the one the call-scope walk computes (extract_unified.c
+ * py_nearest_scope_qn). Only the body is walked: parameters,
+ * annotations and decorators hold expressions, never statements. A lambda or
+ * a comprehension holds no statements either, so neither becomes a def. */
+static void py_push_def_body(wd_stack_t *s, TSNode def_node, const char *def_qn) {
+    TSNode body = ts_node_child_by_field_name(def_node, TS_FIELD("body"));
+    if (def_qn && !ts_node_is_null(body)) {
+        wd_push(s, body, def_qn);
+    }
+}
+
+/* Python methods are extracted by extract_class_methods, not by the walk, so
+ * their bodies are pushed here, under the QN push_method_def gave the method
+ * (class_qn.name), in source order. */
+static void py_push_method_bodies(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
+                                  wd_stack_t *s) {
+    TSNode body = find_class_member_body(class_node, ctx->language);
+    if (ts_node_is_null(body) || !class_qn) {
+        return;
+    }
+    for (int i = (int)ts_node_named_child_count(body) - SKIP_CHAR; i >= 0; i--) {
+        TSNode method = ts_node_named_child(body, (uint32_t)i);
+        if (strcmp(ts_node_type(method), "decorated_definition") == 0) {
+            method = ts_node_child_by_field_name(method, TS_FIELD("definition"));
+        }
+        if (ts_node_is_null(method) || strcmp(ts_node_type(method), "function_definition") != 0) {
+            continue;
+        }
+        TSNode name_node = resolve_method_name(method, ctx->language);
+        char *name =
+            ts_node_is_null(name_node)
+                ? NULL
+                : cbm_func_name_node_text(ctx->arena, name_node, ctx->source, ctx->language);
+        if (name && name[0]) {
+            py_push_def_body(s, method, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, name));
+        }
     }
 }
 
@@ -11841,6 +12703,16 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         }
         if (cbm_kind_in_set(node, spec->function_node_types)) {
             if (!is_template_class_node(node, ctx->language)) {
+                if (ctx->language == CBM_LANG_PYTHON) {
+                    int defs_before = ctx->result->defs.count;
+                    extract_func_def(ctx, node, spec);
+                    if (ctx->result->defs.count > defs_before) {
+                        py_push_def_body(&s, node,
+                                         ctx->result->defs.items[ctx->result->defs.count - SKIP_ONE]
+                                             .qualified_name);
+                    }
+                    continue;
+                }
                 extract_func_def(ctx, node, spec);
                 // Most languages stop here. JS/TS (and Wolfram) descend into the
                 // function body so NESTED named definitions are also captured —
@@ -11898,6 +12770,9 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             extract_class_def(ctx, node, spec);
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
             push_class_body_children(node, spec, &s, new_enclosing, ctx);
+            if (ctx->language == CBM_LANG_PYTHON && new_enclosing != frame.enclosing_class_qn) {
+                py_push_method_bodies(ctx, node, new_enclosing, &s);
+            }
             continue;
         }
 
@@ -12065,6 +12940,10 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     ctx->result->module_doc = extract_module_doc(ctx);
 
     cbm_extract_definitions_without_module(ctx);
+    if (ctx->language == CBM_LANG_PERL) {
+        /* after the subs: the POD sections they hold are not the module's */
+        ctx->result->module_doc = doc_perl_module(ctx);
+    }
 
     if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
         ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {

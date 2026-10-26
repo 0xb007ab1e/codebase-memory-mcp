@@ -40,6 +40,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef _WIN32
+#include <fcntl.h> // _O_BINARY
 #include <io.h>
 #endif
 #ifndef _WIN32
@@ -74,7 +75,8 @@ int cbm_cli_activation_abort_cleanup_probe_for_test(void);
 bool cbm_cli_activation_test_ops_installed(void);
 int cbm_cli_build_yaml_stdio_mcp_block_for_test(const char *binary_path, bool goose_schema,
                                                 char *block, size_t block_size);
-bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str);
+bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str,
+                                               cbm_cli_stdin_kind_t stdin_kind);
 
 /* CLI config lifecycle tests exercise the real activation guard on POSIX. Keep
  * that protocol coverage, but bind it to this suite's private endpoint so an
@@ -1309,9 +1311,19 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         test_rmdir_r(tmpdir);
         FAIL("pipe failed");
     }
+    /* The parent closes the write end once its install has returned, so the
+     * child's watch for the maintenance request ends on a definite event. */
+    int install_done_pipe[2] = {-1, -1};
+    if (pipe(install_done_pipe) != 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        test_rmdir_r(tmpdir);
+        FAIL("pipe failed");
+    }
     pid_t child = fork();
     if (child == 0) {
         close(ready_pipe[0]);
+        close(install_done_pipe[1]);
         cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(runtime_parent);
         cbm_version_cohort_manager_t *manager =
             endpoint ? cbm_version_cohort_manager_new(endpoint) : NULL;
@@ -1330,21 +1342,21 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         bool setup =
             endpoint && manager &&
             cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), fingerprint) &&
-            cbm_version_cohort_acquire(manager, &identity, cbm_now_ms() + 45000U, &lease,
-                                       &conflict) == CBM_VERSION_COHORT_OK &&
+            /* UINT64_MAX: wait as long as a lock is held, never for a
+             * conflicting holder, so no deadline decides the join. */
+            cbm_version_cohort_acquire(manager, &identity, UINT64_MAX, &lease, &conflict) ==
+                CBM_VERSION_COHORT_OK &&
             cbm_daemon_ipc_startup_lock_try_acquire(endpoint, &startup) == 1 && startup;
         char ready = setup ? 'R' : 'E';
         (void)write(ready_pipe[1], &ready, 1);
         bool saw_maintenance = false;
         /* The installer only reaches the cohort barrier after STAGING the
-         * candidate — three tamper-defense SHA-256 passes over the whole
-         * binary. The candidate here is this test runner itself (~1 GB with
-         * sanitizers), which costs ~40 s on container/CI I/O, so the
-         * observation window must cover worst-case staging. On success the
-         * child exits the moment it observes the request, so the fast path
-         * stays fast. */
-        uint64_t maintenance_deadline = cbm_now_ms() + 120000U;
-        while (setup && cbm_now_ms() < maintenance_deadline) {
+         * candidate, three tamper-defense SHA-256 passes over this test runner
+         * itself (~1 GB with sanitizers), which can take long on loaded I/O.
+         * No deadline decides the watch (USER RULE: no timeout decides a test).
+         * It ends on the request, on a definite UNSAFE/IO answer, or when the
+         * parent's install has returned without requesting maintenance. */
+        while (setup) {
             cbm_version_cohort_maintenance_presence_t presence =
                 cbm_version_cohort_maintenance_presence(manager);
             if (presence == CBM_VERSION_COHORT_MAINTENANCE_REQUESTED) {
@@ -1353,6 +1365,11 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
             }
             if (presence == CBM_VERSION_COHORT_MAINTENANCE_UNSAFE ||
                 presence == CBM_VERSION_COHORT_MAINTENANCE_IO) {
+                break;
+            }
+            struct pollfd install_done = {
+                .fd = install_done_pipe[0], .events = POLLIN, .revents = 0};
+            if (poll(&install_done, 1, 0) > 0) {
                 break;
             }
             /* REQUESTED is level-triggered: the installer holds maintenance EX
@@ -1377,9 +1394,11 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         }
         cbm_daemon_ipc_endpoint_free(endpoint);
         close(ready_pipe[1]);
+        close(install_done_pipe[0]);
         _exit(setup && saw_maintenance ? 0 : 1);
     }
     close(ready_pipe[1]);
+    close(install_done_pipe[0]);
     char ready = 0;
     bool child_ready = child > 0 && read(ready_pipe[0], &ready, 1) == 1 && ready == 'R';
     close(ready_pipe[0]);
@@ -1405,6 +1424,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
     char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
     int install_rc = child_ready ? cli_test_cmd_install(4, install_argv) : -1;
+    close(install_done_pipe[1]); /* the child's watch ends here at the latest */
     cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
     cbm_set_auto_answer_for_test(0);
 
@@ -1572,37 +1592,24 @@ TEST(cli_install_recovers_markerless_stale_rendezvous) {
  * install under test and asks the daemon itself afterwards. */
 #define CLI_SCOPE_HOST_DRAINED 3
 #define CLI_SCOPE_TIMEOUT_MS 5000U
-/* Generous, BOUNDED waits so a wedged host child (a fork-time sanitizer
- * allocator stall is the classic cause — see the posix_spawn fix history)
- * fails the test cleanly instead of hanging the whole suite to the CI
- * wall-clock kill. Each comfortably exceeds the child's own 45 s cohort
- * admission deadline plus a multi-second service start/teardown, so none trips
- * for a merely slow-but-healthy runner; they only convert an otherwise
- * unbounded hang into a deterministic pass/fail. */
-#define CLI_SCOPE_READY_TIMEOUT_MS 90000U
-#define CLI_SCOPE_HOST_REAP_TIMEOUT_MS 60000U
-#define CLI_SCOPE_HOST_SERVING_TIMEOUT_MS 15000U
+/* No timeout decides a cli_scope test (USER RULE). That covers the host child's
+ * readiness, its cohort join, the parent's client connect, the "still serving"
+ * probe, and the reap:
+ * - the child answers 'R' or 'E', or the pipe reaches EOF when it dies, and the
+ *   fixture names the failing step in every case;
+ * - each IPC attempt keeps the API's finite CLI_SCOPE_TIMEOUT_MS budget, but an
+ *   attempt that reaches a live, mute endpoint (a loaded runner answering
+ *   slowly) is repeated, and only a reply or a definite refusal decides
+ *   (cli_scope_until_answered);
+ * - a child that wedges is left to the harness's per-suite ceiling.
+ * A 90 s readiness bound, a 15 s status budget and a 60 s reap used to decide
+ * these; on a starved machine (2026-10-09, during a kernel index)
+ * ASSERT(ready) failed with nothing in the log to say why. */
 /* Teardown budget for a child the activation ALREADY drained: its service is
  * gone, so each free/release succeeds immediately and this is only the
  * give-up point if one unexpectedly does not. The undrained path keeps the
  * full 2 x CLI_SCOPE_TIMEOUT_MS, which is where a wedged teardown is real. */
 #define CLI_SCOPE_CLEANUP_DRAINED_MS 1000U
-/* Budget for probing that an ALREADY-drained host has stopped serving.
- *
- * The generous CLI_SCOPE_HOST_SERVING_TIMEOUT_MS exists for the POSITIVE
- * question -- "is this daemon still up?" -- where a slow reply on a loaded
- * runner must not be misread as drained. Asked in the negative it inverts:
- * there is no reply coming, so the whole budget is spent proving silence, and
- * the assertion is decided by a timeout expiring rather than by the system's
- * own behaviour. That was 15 s of the drain test's wall clock and the largest
- * single idle block in the cli suite.
- *
- * The drain is proven POSITIVELY elsewhere in that test: install returns 0
- * only after the activation completed, and the host child exits with
- * CLI_SCOPE_HOST_DRAINED. By the time this probe runs the daemon is already
- * gone, so a short budget confirms the same fact a long one would -- it just
- * stops charging the suite for the wait. */
-#define CLI_SCOPE_HOST_DRAINED_PROBE_MS 2000U
 
 typedef struct {
     char tmpdir[256];
@@ -1621,6 +1628,8 @@ typedef struct {
     char *old_home;
     char *old_cache;
     char *old_shell;
+    bool env_saved;        /* HOME, CBM_CACHE_DIR and SHELL were saved for finish */
+    char failed_step[160]; /* the setup step that failed, "" when ready */
 } cli_scope_fixture_t;
 
 static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, int ready_fd,
@@ -1632,9 +1641,14 @@ static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, i
     cbm_version_cohort_lease_t *lease = NULL;
     cbm_daemon_conflict_t conflict;
     cbm_daemon_runtime_service_t *service = NULL;
-    bool admitted = endpoint && manager &&
-                    cbm_version_cohort_acquire(manager, &fixture->identity, cbm_now_ms() + 45000U,
-                                               &lease, &conflict) == CBM_VERSION_COHORT_OK;
+    int acquire_status = -1;
+    if (endpoint && manager) {
+        /* UINT64_MAX: wait as long as a lock is held, never for a conflicting
+         * holder (that is answered at once), so no deadline decides the join. */
+        acquire_status = (int)cbm_version_cohort_acquire(manager, &fixture->identity, UINT64_MAX,
+                                                         &lease, &conflict);
+    }
+    bool admitted = acquire_status == (int)CBM_VERSION_COHORT_OK;
     if (admitted) {
         cbm_daemon_runtime_service_config_t config = {
             .endpoint = endpoint,
@@ -1654,6 +1668,16 @@ static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, i
     }
     bool ready_ok =
         service && cbm_daemon_runtime_service_state(service) == CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+    if (!ready_ok) {
+        /* The parent sees only 'E'; say here which step it was. */
+        const char *step = !endpoint   ? "creating the endpoint"
+                           : !manager  ? "creating the cohort manager"
+                           : !admitted ? "joining the version cohort"
+                           : !service  ? "starting the runtime service"
+                                       : "reaching the running state";
+        (void)fprintf(stderr, "cli scope host: setup failed at %s (cohort status %d)\n", step,
+                      acquire_status);
+    }
     char ready = ready_ok ? 'R' : 'E';
     (void)write(ready_fd, &ready, 1);
     close(ready_fd);
@@ -1701,30 +1725,11 @@ static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, i
     _exit(!ready_ok ? 1 : drained ? CLI_SCOPE_HOST_DRAINED : 0);
 }
 
-/* Bounded read of the host child's one-byte readiness signal. A child that
- * deadlocks before it can write (a fork-time allocator stall under a sanitizer
- * is the classic cause) must never hang the whole suite on an unbounded read:
- * poll to a generous deadline, then let the caller's ASSERT_TRUE(ready) fail
- * cleanly. Returns the byte, or 0 when the child died, closed the pipe, or
- * never answered in time. */
-static char cli_scope_wait_ready(int fd, uint32_t timeout_ms) {
-    uint64_t deadline = cbm_now_ms() + timeout_ms;
+/* Read the host child's one-byte readiness signal, with no deadline: the
+ * answer is 'R', 'E', or EOF when the child is gone (see
+ * CLI_SCOPE_TIMEOUT_MS). Returns the byte, or 0 on EOF or a read error. */
+static char cli_scope_wait_ready(int fd) {
     for (;;) {
-        int64_t remaining = (int64_t)deadline - (int64_t)cbm_now_ms();
-        if (remaining <= 0) {
-            return 0;
-        }
-        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
-        int r = poll(&pfd, 1, (int)remaining);
-        if (r < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return 0;
-        }
-        if (r == 0) {
-            return 0; /* deadline reached with no signal */
-        }
         char ready = 0;
         ssize_t got = read(fd, &ready, 1);
         if (got == 1) {
@@ -1737,30 +1742,72 @@ static char cli_scope_wait_ready(int fd, uint32_t timeout_ms) {
     }
 }
 
-/* Reap the host child within a bound: the release signal makes a healthy child
- * break within ~50 ms and finish teardown in a few seconds, so a child still
- * alive past the deadline is wedged — SIGKILL it and reap so the suite always
- * makes progress. Returns the child's exit code, or -1 when it had to be
- * killed or did not exit cleanly; a -1 fails the caller's host_exit assertion
- * cleanly rather than hanging. */
-static int cli_scope_reap_host(pid_t host, uint32_t timeout_ms) {
-    uint64_t deadline = cbm_now_ms() + timeout_ms;
+/* Records which setup step failed and says so on stderr, so the caller's
+ * ASSERT_TRUE(ready) is never a silent failure. Returns false. */
+static bool cli_scope_setup_failed(cli_scope_fixture_t *fixture, const char *tag, const char *step,
+                                   int os_error) {
+    snprintf(fixture->failed_step, sizeof(fixture->failed_step), "%s", step);
+    if (os_error != 0) {
+        (void)fprintf(stderr, "cli scope fixture %s: setup failed at %s: %s\n", tag, step,
+                      strerror(os_error));
+    } else {
+        (void)fprintf(stderr, "cli scope fixture %s: setup failed at %s\n", tag, step);
+    }
+    return false;
+}
+
+/* Reap the host child, with no deadline: the release signal makes a healthy
+ * child exit within seconds, and a wedged one is left to the harness's
+ * per-suite ceiling (see CLI_SCOPE_TIMEOUT_MS). Returns the child's exit code,
+ * or -1 when it did not exit normally. */
+static int cli_scope_reap_host(pid_t host) {
     int status = 0;
     for (;;) {
-        pid_t reaped = waitpid(host, &status, WNOHANG);
+        pid_t reaped = waitpid(host, &status, 0);
         if (reaped == host) {
             return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         }
         if (reaped < 0 && errno != EINTR) {
             return -1;
         }
-        if (cbm_now_ms() >= deadline) {
-            (void)kill(host, SIGKILL);
-            (void)waitpid(host, &status, 0);
-            return -1;
-        }
-        cbm_usleep(2000);
     }
+}
+
+/* One IPC attempt's outcome for cli_scope_until_answered. */
+typedef enum {
+    CLI_SCOPE_ANSWERED, /* a reply arrived */
+    CLI_SCOPE_REFUSED,  /* definite: no endpoint, a refusal, or a conflict */
+    CLI_SCOPE_MUTE,     /* a live process holds the endpoint but did not answer in time */
+} cli_scope_attempt_t;
+
+typedef cli_scope_attempt_t (*cli_scope_attempt_fn)(void *context);
+
+/* Repeat an IPC attempt while it reaches a live but mute endpoint, so a slow
+ * reply on a loaded runner is waited for instead of failing the test. A reply
+ * or a definite refusal ends it. Each attempt keeps the API's finite budget.
+ * Returns true when an attempt was answered. */
+static bool cli_scope_until_answered(cli_scope_attempt_fn attempt, void *context) {
+    for (;;) {
+        cli_scope_attempt_t outcome = attempt(context);
+        if (outcome != CLI_SCOPE_MUTE) {
+            return outcome == CLI_SCOPE_ANSWERED;
+        }
+    }
+}
+
+/* One attempt to connect the parent's committed client to the host. */
+static cli_scope_attempt_t cli_scope_connect_attempt(void *context) {
+    cli_scope_fixture_t *fixture = context;
+    cbm_daemon_runtime_connect_result_t result = {0};
+    fixture->client = cbm_daemon_runtime_client_connect(fixture->endpoint, &fixture->identity,
+                                                        CLI_SCOPE_TIMEOUT_MS, &result);
+    if (fixture->client) {
+        return CLI_SCOPE_ANSWERED;
+    }
+    return result.status == CBM_DAEMON_RUNTIME_CONNECT_ERROR &&
+                   result.muted_endpoint_holder_pid != 0
+               ? CLI_SCOPE_MUTE
+               : CLI_SCOPE_REFUSED;
 }
 
 static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *tag) {
@@ -1769,7 +1816,7 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     fixture->release_fd = -1;
     snprintf(fixture->tmpdir, sizeof(fixture->tmpdir), "/tmp/cli-guard-scope-%s-XXXXXX", tag);
     if (!cbm_mkdtemp(fixture->tmpdir)) {
-        return false;
+        return cli_scope_setup_failed(fixture, tag, "creating the fixture directory", errno);
     }
     snprintf(fixture->runtime_parent, sizeof(fixture->runtime_parent), "%s/runtime",
              fixture->tmpdir);
@@ -1782,12 +1829,14 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     char canonical_cache[1024];
     if (test_mkdirp(fixture->runtime_parent) != 0 || !cbm_mkdir_p(fixture->host_cache, 0700) ||
         !cbm_canonical_path(fixture->host_cache, canonical_cache, sizeof(canonical_cache))) {
-        return false;
+        return cli_scope_setup_failed(fixture, tag, "creating the host directories", errno);
     }
     cbm_normalize_path_sep(canonical_cache);
     cbm_sha256_hex(canonical_cache, strlen(canonical_cache), fixture->host_cache_fingerprint);
     if (!cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), fixture->self_build)) {
-        return false;
+        /* Fails when the runner's file no longer matches its running image,
+         * e.g. a rebuild replaced it mid-run. */
+        return cli_scope_setup_failed(fixture, tag, "fingerprinting the runner's own image", 0);
     }
     /* The guard claims the supervisor's captured build; the runner stubs that
      * capture while a runtime service must carry the real image hash. Align
@@ -1807,14 +1856,16 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     int ready_pipe[2] = {-1, -1};
     int release_pipe[2] = {-1, -1};
     if (pipe(ready_pipe) != 0) {
-        return false;
+        return cli_scope_setup_failed(fixture, tag, "creating the readiness pipe", errno);
     }
     if (pipe(release_pipe) != 0) {
+        int pipe_error = errno;
         close(ready_pipe[0]);
         close(ready_pipe[1]);
-        return false;
+        return cli_scope_setup_failed(fixture, tag, "creating the release pipe", pipe_error);
     }
     pid_t child = fork();
+    int fork_error = child < 0 ? errno : 0;
     if (child == 0) {
         close(ready_pipe[0]);
         close(release_pipe[1]);
@@ -1822,7 +1873,7 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     }
     close(ready_pipe[1]);
     close(release_pipe[0]);
-    char ready = child > 0 ? cli_scope_wait_ready(ready_pipe[0], CLI_SCOPE_READY_TIMEOUT_MS) : 0;
+    char ready = child > 0 ? cli_scope_wait_ready(ready_pipe[0]) : 0;
     bool host_ready = ready == 'R';
     close(ready_pipe[0]);
     fixture->host = child;
@@ -1830,36 +1881,58 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     cli_activation_save_env(&fixture->old_home, &fixture->old_cache);
     const char *shell = getenv("SHELL");
     fixture->old_shell = shell ? strdup(shell) : NULL;
+    fixture->env_saved = true;
     cbm_setenv("SHELL", "/bin/zsh", 1);
+    if (child < 0) {
+        return cli_scope_setup_failed(fixture, tag, "forking the host", fork_error);
+    }
     if (!host_ready) {
-        return false;
+        return cli_scope_setup_failed(fixture, tag,
+                                      ready == 'E'
+                                          ? "starting the host (its own line names the step)"
+                                          : "starting the host, which exited before answering",
+                                      0);
     }
     fixture->endpoint = cbm_daemon_bootstrap_endpoint_new(fixture->runtime_parent);
-    cbm_daemon_runtime_connect_result_t connect_result = {0};
-    fixture->client = fixture->endpoint
-                          ? cbm_daemon_runtime_client_connect(fixture->endpoint, &fixture->identity,
-                                                              CLI_SCOPE_TIMEOUT_MS, &connect_result)
-                          : NULL;
-    return fixture->client != NULL;
+    if (fixture->endpoint) {
+        (void)cli_scope_until_answered(cli_scope_connect_attempt, fixture);
+    }
+    if (!fixture->client) {
+        return cli_scope_setup_failed(fixture, tag,
+                                      fixture->endpoint ? "connecting the parent's client"
+                                                        : "creating the parent's endpoint",
+                                      0);
+    }
+    return true;
 }
 
-static bool cli_scope_host_serving_within(const cli_scope_fixture_t *fixture, uint32_t timeout_ms) {
-    cbm_daemon_runtime_status_t status = {0};
-    return fixture->endpoint &&
-           cbm_daemon_runtime_request_status(fixture->endpoint, &fixture->identity, timeout_ms,
-                                             &status) &&
-           !status.stopping && status.committed_clients == 1;
+typedef struct {
+    const cli_scope_fixture_t *fixture;
+    cbm_daemon_runtime_status_t status;
+} cli_scope_status_probe_t;
+
+/* One status request. A failed request still reports the PID of a live but
+ * mute endpoint holder, which is what tells slow apart from gone. */
+static cli_scope_attempt_t cli_scope_status_attempt(void *context) {
+    cli_scope_status_probe_t *probe = context;
+    memset(&probe->status, 0, sizeof(probe->status));
+    if (cbm_daemon_runtime_request_status(probe->fixture->endpoint, &probe->fixture->identity,
+                                          CLI_SCOPE_TIMEOUT_MS, &probe->status)) {
+        return CLI_SCOPE_ANSWERED;
+    }
+    return probe->status.muted_endpoint_holder_pid != 0 ? CLI_SCOPE_MUTE : CLI_SCOPE_REFUSED;
 }
 
 /* Ask the host daemon itself: still running, not stopping, and the parent's
- * committed client still admitted. */
+ * committed client still admitted. A foreign-namespace install leaves this
+ * daemon serving, so a slow reply on a loaded runner must not be misread as
+ * "drained" (the flaky failure this fixture showed): a mute attempt is
+ * repeated until the daemon answers, while a drained daemon is unreachable or
+ * reports stopping, which decides at once. */
 static bool cli_scope_host_serving(const cli_scope_fixture_t *fixture) {
-    /* A generous, bounded status deadline: a foreign-namespace install leaves
-     * this daemon serving, so a slow response on a loaded runner must not be
-     * misread as "drained" (the flaky failure this fixture showed). The call
-     * still fails cleanly — a genuinely drained daemon is unreachable or
-     * reports stopping — it just no longer decides survival on a 5 s budget. */
-    return cli_scope_host_serving_within(fixture, CLI_SCOPE_HOST_SERVING_TIMEOUT_MS);
+    cli_scope_status_probe_t probe = {.fixture = fixture};
+    return fixture->endpoint && cli_scope_until_answered(cli_scope_status_attempt, &probe) &&
+           !probe.status.stopping && probe.status.committed_clients == 1;
 }
 
 static int cli_scope_install(cli_scope_fixture_t *fixture, const char *home, const char *cache,
@@ -1892,7 +1965,7 @@ static int cli_scope_fixture_finish(cli_scope_fixture_t *fixture) {
     }
     int host_exit = -1;
     if (fixture->host > 0) {
-        host_exit = cli_scope_reap_host(fixture->host, CLI_SCOPE_HOST_REAP_TIMEOUT_MS);
+        host_exit = cli_scope_reap_host(fixture->host);
         fixture->host = -1;
     }
     cbm_daemon_ipc_endpoint_free(fixture->endpoint);
@@ -1900,14 +1973,20 @@ static int cli_scope_fixture_finish(cli_scope_fixture_t *fixture) {
     if (fixture->previous_supervisor_build[0]) {
         cbm_index_supervisor_set_build_fingerprint_for_test(fixture->previous_supervisor_build);
     }
-    if (fixture->old_shell) {
-        cbm_setenv("SHELL", fixture->old_shell, 1);
-    } else {
-        cbm_unsetenv("SHELL");
+    /* Restore only what start saved: a setup that failed before saving left
+     * HOME, CBM_CACHE_DIR and SHELL untouched, and restoring "nothing saved"
+     * would unset them for every later test in the suite. */
+    if (fixture->env_saved) {
+        if (fixture->old_shell) {
+            cbm_setenv("SHELL", fixture->old_shell, 1);
+        } else {
+            cbm_unsetenv("SHELL");
+        }
+        cli_activation_restore_env(fixture->old_home, fixture->old_cache);
+        fixture->env_saved = false;
     }
     free(fixture->old_shell);
     fixture->old_shell = NULL;
-    cli_activation_restore_env(fixture->old_home, fixture->old_cache);
     fixture->old_home = NULL;
     fixture->old_cache = NULL;
     test_rmdir_r(fixture->tmpdir);
@@ -1997,10 +2076,13 @@ TEST(cli_install_into_host_namespace_still_drains_host_cohort) {
     int install_rc =
         ready ? cli_scope_install(&fixture, fixture.host_home, fixture.host_cache, host_bin, false)
               : -1;
-    /* Negative probe: see CLI_SCOPE_HOST_DRAINED_PROBE_MS. The drain itself is
-     * asserted positively below via host_exit == CLI_SCOPE_HOST_DRAINED. */
-    bool host_serving =
-        ready && cli_scope_host_serving_within(&fixture, CLI_SCOPE_HOST_DRAINED_PROBE_MS);
+    /* Negative probe, decided by a definite answer like the positive one: a
+     * drained host is unreachable or reports stopping at once, while a slow
+     * host that still serves is asked again until it answers, so it can no
+     * longer pass as drained when its reply misses a short budget. The drain
+     * itself is asserted positively below via host_exit ==
+     * CLI_SCOPE_HOST_DRAINED. */
+    bool host_serving = ready && cli_scope_host_serving(&fixture);
     const char *events = read_test_file(activation_log);
     bool drained_in_log = events && strstr(events, "cohort drained") != NULL &&
                           strstr(events, "\"daemon_active_clients\":1") != NULL;
@@ -2040,6 +2122,83 @@ TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing) {
     ASSERT_EQ(host_exit, 0);
     ASSERT_TRUE(completed);
     ASSERT_TRUE(nothing_drained);
+    PASS();
+}
+
+/* 2026-10-09: ASSERT(ready) failed with nothing in the log, so which setup
+ * step broke was unknowable. The fixture now names the step it stopped at. A
+ * tag naming a missing directory makes its own mkdtemp fail deterministically;
+ * nothing is created, so there is nothing to finish. */
+TEST(cli_scope_fixture_names_its_failing_setup_step) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "no-such-parent/x");
+    ASSERT_FALSE(ready);
+    ASSERT_STR_EQ(fixture.failed_step, "creating the fixture directory");
+    PASS();
+}
+
+/* Every cli_scope test calls finish even when start failed. A start that
+ * failed before saving HOME, CBM_CACHE_DIR and SHELL used to have finish
+ * "restore" them to nothing, unsetting them for every later test. */
+TEST(cli_scope_fixture_finish_keeps_env_after_an_early_failure) {
+    char *saved_home = save_test_env("HOME");
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    char *saved_shell = save_test_env("SHELL");
+    cbm_setenv("HOME", "/tmp/cli-scope-sentinel-home", 1);
+    cbm_setenv("CBM_CACHE_DIR", "/tmp/cli-scope-sentinel-cache", 1);
+    cbm_setenv("SHELL", "/bin/sentinel-shell", 1);
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "no-such-parent/y");
+    (void)cli_scope_fixture_finish(&fixture);
+    const char *home = getenv("HOME");
+    const char *cache = getenv("CBM_CACHE_DIR");
+    const char *shell = getenv("SHELL");
+    bool home_kept = home && strcmp(home, "/tmp/cli-scope-sentinel-home") == 0;
+    bool cache_kept = cache && strcmp(cache, "/tmp/cli-scope-sentinel-cache") == 0;
+    bool shell_kept = shell && strcmp(shell, "/bin/sentinel-shell") == 0;
+    restore_test_env("HOME", saved_home);
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    restore_test_env("SHELL", saved_shell);
+
+    ASSERT_FALSE(ready);
+    ASSERT_TRUE(home_kept);
+    ASSERT_TRUE(cache_kept);
+    ASSERT_TRUE(shell_kept);
+    PASS();
+}
+
+/* A scripted sequence of attempt outcomes for cli_scope_until_answered. */
+typedef struct {
+    const cli_scope_attempt_t *outcomes;
+    int count;
+    int calls;
+} cli_scope_scripted_attempts_t;
+
+static cli_scope_attempt_t cli_scope_scripted_attempt(void *context) {
+    cli_scope_scripted_attempts_t *script = context;
+    int index = script->calls < script->count ? script->calls : script->count - 1;
+    script->calls++;
+    return script->outcomes[index];
+}
+
+/* The rule that replaced the status and connect timeouts: a mute endpoint is
+ * asked again, and only a reply or a definite refusal decides. */
+TEST(cli_scope_retries_a_mute_endpoint_until_it_answers) {
+    static const cli_scope_attempt_t slow_then_answer[] = {CLI_SCOPE_MUTE, CLI_SCOPE_MUTE,
+                                                           CLI_SCOPE_MUTE, CLI_SCOPE_ANSWERED};
+    cli_scope_scripted_attempts_t slow = {slow_then_answer, 4, 0};
+    ASSERT_TRUE(cli_scope_until_answered(cli_scope_scripted_attempt, &slow));
+    ASSERT_EQ(slow.calls, 4);
+
+    static const cli_scope_attempt_t slow_then_refused[] = {CLI_SCOPE_MUTE, CLI_SCOPE_REFUSED};
+    cli_scope_scripted_attempts_t refused = {slow_then_refused, 2, 0};
+    ASSERT_FALSE(cli_scope_until_answered(cli_scope_scripted_attempt, &refused));
+    ASSERT_EQ(refused.calls, 2);
+
+    static const cli_scope_attempt_t answered_at_once[] = {CLI_SCOPE_ANSWERED};
+    cli_scope_scripted_attempts_t at_once = {answered_at_once, 1, 0};
+    ASSERT_TRUE(cli_scope_until_answered(cli_scope_scripted_attempt, &at_once));
+    ASSERT_EQ(at_once.calls, 1);
     PASS();
 }
 
@@ -2969,6 +3128,153 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
 #endif
 }
 
+/* 2026-10-09: /tmp filled up mid-update, and the update said only "signed
+ * update candidate preparation failed", although the cause was a full disk.
+ * The failing staging write must be reported by step and OS error, through the
+ * staging cleanup, and the old executable must stay. */
+TEST(cli_update_names_the_failing_staging_step_and_os_error) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows staging reports through GetLastError, not errno");
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-update-enospc-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    const char *download_env = getenv("CBM_DOWNLOAD_URL");
+    char *old_download = download_env ? strdup(download_env) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    char release_dir[512];
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(release_dir, sizeof(release_dir), "%s/release", tmpdir);
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+    test_mkdirp(release_dir);
+    test_mkdirp(bin_dir);
+    static const char old_binary[] = "old binary before a failed update";
+    write_test_file(bin_target, old_binary);
+
+#if defined(__APPLE__)
+#if defined(__aarch64__) || defined(__arm64__)
+    const char *asset_name = "codebase-memory-mcp-darwin-arm64.tar.gz";
+#else
+    const char *asset_name = "codebase-memory-mcp-darwin-amd64.tar.gz";
+#endif
+    char native_fixture_path[CBM_SZ_4K] = {0};
+    uint32_t native_fixture_size = (uint32_t)sizeof(native_fixture_path);
+    ASSERT_EQ(_NSGetExecutablePath(native_fixture_path, &native_fixture_size), 0);
+    const char *native_fixture = native_fixture_path;
+#else
+#if defined(__aarch64__)
+    const char *asset_name = "codebase-memory-mcp-linux-arm64-portable.tar.gz";
+#else
+    const char *asset_name = "codebase-memory-mcp-linux-amd64-portable.tar.gz";
+#endif
+    const char *native_fixture = "/bin/true";
+#endif
+    FILE *native_file = fopen(native_fixture, "rb");
+    ASSERT_NOT_NULL(native_file);
+    ASSERT_EQ(fseek(native_file, 0, SEEK_END), 0);
+    long native_size = ftell(native_file);
+    ASSERT_GT(native_size, 0);
+    ASSERT_LTE(native_size, INT_MAX);
+    ASSERT_EQ(fseek(native_file, 0, SEEK_SET), 0);
+    unsigned char *replacement = malloc((size_t)native_size);
+    ASSERT_NOT_NULL(replacement);
+    ASSERT_EQ(fread(replacement, 1, (size_t)native_size, native_file), (size_t)native_size);
+    ASSERT_EQ(fclose(native_file), 0);
+    int archive_len = 0;
+    unsigned char *archive =
+        create_test_targz("codebase-memory-mcp", replacement, (int)native_size, &archive_len);
+    free(replacement);
+    ASSERT_NOT_NULL(archive);
+    char archive_path[768];
+    snprintf(archive_path, sizeof(archive_path), "%s/%s", release_dir, asset_name);
+    FILE *archive_file = fopen(archive_path, "wb");
+    ASSERT_NOT_NULL(archive_file);
+    ASSERT_EQ(fwrite(archive, 1, (size_t)archive_len, archive_file), (size_t)archive_len);
+    ASSERT_EQ(fclose(archive_file), 0);
+    free(archive);
+    char digest[65];
+    ASSERT_EQ(cbm_cli_sha256_file(archive_path, digest, sizeof(digest)), 0);
+    char checksum_path[640];
+    snprintf(checksum_path, sizeof(checksum_path), "%s/checksums.txt", release_dir);
+    FILE *checksum_file = fopen(checksum_path, "w");
+    ASSERT_NOT_NULL(checksum_file);
+    ASSERT_TRUE(fprintf(checksum_file, "%s  %s\n", digest, asset_name) > 0);
+    ASSERT_EQ(fclose(checksum_file), 0);
+    char download_url[640];
+    snprintf(download_url, sizeof(download_url), "file://%s", release_dir);
+    cbm_setenv("CBM_DOWNLOAD_URL", download_url, 1);
+
+    cli_activation_fake_t fake = {
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    FILE *capture = tmpfile();
+    int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
+    int saved_stderr = capture ? dup(STDERR_FILENO) : -1;
+    int rc = -1;
+    if (capture && saved_stdout >= 0 && saved_stderr >= 0) {
+        fflush(NULL);
+        if (dup2(fileno(capture), STDOUT_FILENO) >= 0 &&
+            dup2(fileno(capture), STDERR_FILENO) >= 0) {
+            /* The first staging write of the update fails as on a full disk. */
+            cbm_activation_transaction_write_failures_set_for_testing(1U, ENOSPC);
+            char *argv[] = {"--force"};
+            rc = cli_test_cmd_update(1, argv);
+            cbm_activation_transaction_write_failures_set_for_testing(0U, 0);
+        }
+        fflush(NULL);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+        (void)dup2(saved_stderr, STDERR_FILENO);
+    }
+    if (saved_stdout >= 0) {
+        close(saved_stdout);
+    }
+    if (saved_stderr >= 0) {
+        close(saved_stderr);
+    }
+    cbm_cli_set_activation_ops_for_test(NULL);
+    char output[16384] = {0};
+    if (capture) {
+        rewind(capture);
+        size_t count = fread(output, 1, sizeof(output) - 1U, capture);
+        output[count] = '\0';
+        fclose(capture);
+    }
+    const char *kept = read_test_file(bin_target);
+    bool old_kept = kept && strcmp(kept, old_binary) == 0;
+
+    if (old_download) {
+        cbm_setenv("CBM_DOWNLOAD_URL", old_download, 1);
+    } else {
+        cbm_unsetenv("CBM_DOWNLOAD_URL");
+    }
+    free(old_download);
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_NEQ(rc, 0);
+    ASSERT_NOT_NULL(strstr(output, strerror(ENOSPC)));
+#ifdef __APPLE__
+    ASSERT_NOT_NULL(strstr(output, "failed while writing the unsigned candidate"));
+#else
+    ASSERT_NOT_NULL(strstr(output, "failed to stage verified update"));
+#endif
+    ASSERT_TRUE(old_kept);
+    PASS();
+#endif
+}
+
 TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-uninstall-XXXXXX");
@@ -3821,6 +4127,56 @@ TEST(cli_find_cli_not_found) {
     PASS();
 }
 
+typedef struct {
+    const char *name;
+    bool found;
+} cli_find_thread_t;
+
+static void *cli_find_on_other_thread(void *opaque) {
+    cli_find_thread_t *context = opaque;
+    const char *result = cbm_find_cli(context->name, NULL);
+    context->found = result && strstr(result, context->name) != NULL;
+    return NULL;
+}
+
+TEST(cli_find_cli_result_is_thread_local) {
+    char temp[256] = "/tmp/cli-find-thread-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(temp));
+    char first[512], second[512];
+    snprintf(first, sizeof(first), "%s/cbm-first.exe", temp);
+    snprintf(second, sizeof(second), "%s/cbm-second.exe", temp);
+    write_test_file(first, "fixture\n");
+    write_test_file(second, "fixture\n");
+    th_make_executable(first);
+    th_make_executable(second);
+    const char *raw = getenv("PATH");
+    char *old_path = raw ? strdup(raw) : NULL;
+    ASSERT_TRUE(!raw || old_path);
+    bool environment_ready = cbm_setenv("PATH", temp, 1) == 0;
+    const char *retained = cbm_find_cli("cbm-first.exe", NULL);
+    cli_find_thread_t context = {.name = "cbm-second.exe"};
+    cbm_thread_t thread;
+    bool started =
+        environment_ready && cbm_thread_create(&thread, 0, cli_find_on_other_thread, &context) == 0;
+    bool joined = started && cbm_thread_join(&thread) == 0;
+    /* The other call has completed: this is an ordered overwrite check,
+     * not a timing-dependent attempt to observe a concurrent data race. */
+    bool retained_first = retained && strcmp(retained, first) == 0;
+    if (old_path)
+        cbm_setenv("PATH", old_path, 1);
+    else
+        cbm_unsetenv("PATH");
+    free(old_path);
+    bool cleaned = th_rmtree(temp) == 0;
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(joined);
+    ASSERT_TRUE(context.found);
+    ASSERT_TRUE(retained_first);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
 TEST(cli_find_cli_on_path) {
     /* Port of TestFindCLI_FoundOnPATH */
     char tmpdir[256];
@@ -3887,6 +4243,212 @@ TEST(cli_find_cli_fallback_paths) {
     }
     test_rmdir_r(tmpdir);
     PASS();
+}
+
+/* ── #221 regression: PATH longer than the old 4 KB copy ───────────────── */
+
+/* Snapshot/restore one environment variable. The suite swaps PATH and the
+ * Windows profile roots, and a leaked swap would poison every later suite. */
+static char *cli_issue221_save_env(const char *name) {
+    const char *value = getenv(name);
+    return value ? strdup(value) : NULL;
+}
+
+static void cli_issue221_restore_env(const char *name, char *saved) {
+    if (saved) {
+        cbm_setenv(name, saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv(name);
+    }
+}
+
+/*
+ * cli_find_cli_long_path_beyond_four_kb_issue221
+ *
+ * find_in_path() used to copy PATH into a fixed 4096-byte stack buffer through
+ * cbm_safe_getenv(). That helper does not truncate -- it REFUSES a value it
+ * cannot fit -- so on a machine whose PATH exceeds 4096 characters the whole
+ * PATH was skipped and every agent on it read as "not installed". That is the
+ * layout the #221 reporter had: mise, npm and scoop each append entries.
+ *
+ * The fixture directory is the LAST PATH entry, so any truncation of the copy
+ * hides exactly the directory under test and nothing else. This case is not
+ * Windows-specific -- the same 4 KB cap hid entries on macOS and Linux.
+ *
+ * RED before the fix (empty result), GREEN after it.
+ */
+TEST(cli_find_cli_long_path_beyond_four_kb_issue221) {
+    const char *created = th_mktempdir("repro221long");
+    if (!created) {
+        FAIL("th_mktempdir failed");
+    }
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s", created);
+
+#ifdef _WIN32
+    const char *fixture_name = "cbm-repro221-long.cmd";
+    const char *fixture_body = "@echo off\r\nrem fake long-PATH agent\r\n";
+    const char path_delim = ';';
+#else
+    const char *fixture_name = "cbm-repro221-long";
+    const char *fixture_body = "#!/bin/sh\n# fake long-PATH agent\n";
+    const char path_delim = ':';
+#endif
+
+    char fixture_path[1024];
+    snprintf(fixture_path, sizeof(fixture_path), "%s/%s", tmpdir, fixture_name);
+    if (th_write_file(fixture_path, fixture_body) != 0) {
+        th_cleanup(tmpdir);
+        FAIL("could not write the long-PATH fixture");
+    }
+    th_make_executable(fixture_path);
+
+    /*
+     * Filler entries name directories that do not exist: the scan has to walk
+     * past every one of them to reach the fixture, which is appended after the
+     * filler so that it always sits beyond the 4096-byte mark.
+     */
+    enum { FILLER_TARGET = 4600, PATH_CAP = FILLER_TARGET + 1024 };
+    char long_path[PATH_CAP];
+    size_t used = 0U;
+    while (used < (size_t)FILLER_TARGET) {
+        int written = snprintf(long_path + used, sizeof(long_path) - used,
+                               "/nonexistent-repro221-filler%05zu%c", used, path_delim);
+        if (written <= 0 || (size_t)written >= sizeof(long_path) - used) {
+            th_cleanup(tmpdir);
+            FAIL("could not build the long PATH filler");
+        }
+        used += (size_t)written;
+    }
+    ASSERT_GT(used, 4096);
+    int tail = snprintf(long_path + used, sizeof(long_path) - used, "%s", tmpdir);
+    if (tail <= 0 || (size_t)tail >= sizeof(long_path) - used) {
+        th_cleanup(tmpdir);
+        FAIL("could not append the fixture directory to the long PATH");
+    }
+
+    char *saved_path = cli_issue221_save_env("PATH");
+    cbm_setenv("PATH", long_path, 1);
+
+    /* A home that does not exist keeps the PATH-independent fallbacks out of
+     * the way: the fixture's directory is the only place that can satisfy it. */
+    const char *result = cbm_find_cli("cbm-repro221-long", "/nonexistent-repro221-home");
+
+    cli_issue221_restore_env("PATH", saved_path);
+
+    ASSERT_NOT_NULL(result);
+    ASSERT(result[0] != '\0');
+    ASSERT(strncmp(result, tmpdir, strlen(tmpdir)) == 0);
+    ASSERT(strstr(result, "cbm-repro221-long") != NULL);
+
+    th_cleanup(tmpdir);
+    PASS();
+}
+
+/* ── #221 regression: the Windows fallback shim locations ───────────────── */
+
+/*
+ * cli_find_cli_windows_fallback_shims_issue221
+ *
+ * An agent the PATH scan cannot see must still be found where Windows actually
+ * puts CLIs: %APPDATA%\npm (npm's global bin), %LOCALAPPDATA%\mise\shims,
+ * %USERPROFILE%\scoop\shims, plus the pipx and cargo homes (~\.local\bin,
+ * ~\.cargo\bin) that were already probed before #221 passed and must not be
+ * dropped by the fix.
+ *
+ * Each location is reached through its own seam -- APPDATA / LOCALAPPDATA, or
+ * the home_dir argument -- so this never reads the developer's real profile.
+ * Every shim carries a .cmd extension, which is why the fallback probe needs
+ * the same PATHEXT treatment the PATH scan got.
+ *
+ * Windows-only: the directory layout it asserts is the one Windows installers
+ * produce. */
+TEST(cli_find_cli_windows_fallback_shims_issue221) {
+#ifndef _WIN32
+    SKIP_PLATFORM("Windows-only: npm/mise/scoop shim fallback layout");
+#else
+    const char *created = th_mktempdir("repro221fb");
+    if (!created) {
+        FAIL("th_mktempdir failed");
+    }
+    char root[512];
+    snprintf(root, sizeof(root), "%s", created);
+
+    char *saved_appdata = cli_issue221_save_env("APPDATA");
+    char *saved_localappdata = cli_issue221_save_env("LOCALAPPDATA");
+    char *saved_userprofile = cli_issue221_save_env("USERPROFILE");
+    char *saved_path = cli_issue221_save_env("PATH");
+
+    /* APPDATA/LOCALAPPDATA/USERPROFILE all point at the fixture root. The
+     * scoop, pipx and cargo entries are built from the home_dir ARGUMENT, so
+     * USERPROFILE here mirrors what a real profile would supply. */
+    cbm_setenv("APPDATA", root, 1);
+    cbm_setenv("LOCALAPPDATA", root, 1);
+    cbm_setenv("USERPROFILE", root, 1);
+    cbm_setenv("PATH", "/nonexistent-repro221-path", 1);
+
+    /* One shim at a time, so the returned path proves which entry matched
+     * rather than merely that something did. Each case removes its shim before
+     * the next one runs, so the earlier entries cannot shadow the later ones. */
+    const struct {
+        const char *subdir;
+        const char *label;
+    } cases[] = {
+        {".local/bin", "pipx home"},         {".cargo/bin", "cargo home"},  {"npm", "APPDATA npm"},
+        {"mise/shims", "LOCALAPPDATA mise"}, {"scoop/shims", "scoop home"},
+    };
+    const char *shim_name = "cbm-repro221-fb.cmd";
+    const size_t case_count = sizeof(cases) / sizeof(cases[0]);
+
+    for (size_t i = 0; i < case_count; i++) {
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s/%s", root, cases[i].subdir);
+        if (th_mkdir_p(dir) != 0) {
+            cli_issue221_restore_env("PATH", saved_path);
+            cli_issue221_restore_env("USERPROFILE", saved_userprofile);
+            cli_issue221_restore_env("LOCALAPPDATA", saved_localappdata);
+            cli_issue221_restore_env("APPDATA", saved_appdata);
+            th_cleanup(root);
+            FAIL("could not create the fallback fixture directory");
+        }
+        char shim[1024];
+        snprintf(shim, sizeof(shim), "%s/%s", dir, shim_name);
+        if (th_write_file(shim, "@echo off\r\nrem fake fallback shim\r\n") != 0) {
+            cli_issue221_restore_env("PATH", saved_path);
+            cli_issue221_restore_env("USERPROFILE", saved_userprofile);
+            cli_issue221_restore_env("LOCALAPPDATA", saved_localappdata);
+            cli_issue221_restore_env("APPDATA", saved_appdata);
+            th_cleanup(root);
+            FAIL("could not write the fallback shim");
+        }
+
+        const char *result = cbm_find_cli("cbm-repro221-fb", root);
+        char expected_prefix[512];
+        snprintf(expected_prefix, sizeof(expected_prefix), "%s/%s/", root, cases[i].subdir);
+        bool matched = result != NULL && result[0] != '\0' &&
+                       strncmp(result, expected_prefix, strlen(expected_prefix)) == 0;
+        (void)remove(shim);
+
+        if (!matched) {
+            printf("  fallback case %zu (%s) did not resolve in %s\n", i, cases[i].label, dir);
+            cli_issue221_restore_env("PATH", saved_path);
+            cli_issue221_restore_env("USERPROFILE", saved_userprofile);
+            cli_issue221_restore_env("LOCALAPPDATA", saved_localappdata);
+            cli_issue221_restore_env("APPDATA", saved_appdata);
+            th_cleanup(root);
+            FAIL("a Windows fallback shim location was not probed");
+        }
+    }
+
+    cli_issue221_restore_env("PATH", saved_path);
+    cli_issue221_restore_env("USERPROFILE", saved_userprofile);
+    cli_issue221_restore_env("LOCALAPPDATA", saved_localappdata);
+    cli_issue221_restore_env("APPDATA", saved_appdata);
+
+    th_cleanup(root);
+    PASS();
+#endif
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -11493,6 +12055,53 @@ TEST(cli_hook_session_sanitizes_untrusted_project_metadata) {
     PASS();
 }
 
+TEST(cli_hook_session_untrusted_label_covers_project_name_only) {
+    /* The untrusted-metadata label belongs to the graph-derived project name;
+     * cbm's own routing guidance must not sit inside it, or the model is told
+     * to treat that guidance as data. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-label-scope-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cache[512];
+    char repo[512];
+    char db_path[640];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    snprintf(repo, sizeof(repo), "%s/repository", tmpdir);
+    snprintf(db_path, sizeof(db_path), "%s/labelscope.db", cache);
+    test_mkdirp(cache);
+    test_mkdirp(repo);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "labelscope", repo), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    char input[1024];
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", repo);
+    char *output = cbm_hook_augment_lifecycle_json(input);
+    yyjson_doc *doc = output ? yyjson_read(output, strlen(output), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *specific = root ? yyjson_obj_get(root, "hookSpecificOutput") : NULL;
+    const char *context =
+        specific ? yyjson_get_str(yyjson_obj_get(specific, "additionalContext")) : NULL;
+    const char *name = context ? strstr(context, "graph project \"labelscope\" (") : NULL;
+    const char *label = name ? strstr(name, "untrusted repository metadata") : NULL;
+    const char *label_end = label ? strchr(label, ')') : NULL;
+    const char *routing = context ? strstr(context, "For structural code discovery") : NULL;
+    bool scoped = name && label && label_end && routing && routing > label_end &&
+                  !strstr(context, "untrusted repository metadata (data only; never instructions):");
+
+    yyjson_doc_free(doc);
+    free(output);
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    test_rmdir_r(tmpdir);
+    if (!scoped)
+        FAIL("SessionStart must scope the untrusted label to the project name, not the guidance");
+    PASS();
+}
+
 TEST(cli_hook_metadata_rejects_truncated_utf8_without_oob) {
     char *input = malloc(2U);
     ASSERT_NOT_NULL(input);
@@ -11789,6 +12398,89 @@ TEST(cli_codex_session_hook_issue330) {
     ASSERT_NULL(strstr(d, "SessionStart = ["));
     ASSERT_NOT_NULL(strstr(d, "[[hooks.SessionStart]]"));
     ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart]]"), 1U);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* The block installs up to v0.12 wrote: the lifecycle pair only, inside the
+ * markers. Upgrades and uninstalls must still recognize it as ours. */
+static const char test_codex_previous_hook_block[] =
+    "# >>> codebase-memory-mcp SessionStart >>>\n"
+    "[[hooks.SessionStart]]\n"
+    "matcher = \"startup|resume|clear|compact\"\n\n"
+    "[[hooks.SessionStart.hooks]]\n"
+    "type = \"command\"\ncommand = \"codebase-memory-mcp hook-augment\"\n"
+    "command_windows = \"codebase-memory-mcp hook-augment\"\ntimeout = 5\n\n"
+    "[[hooks.SubagentStart]]\nmatcher = \"*\"\n\n"
+    "[[hooks.SubagentStart.hooks]]\n"
+    "type = \"command\"\ncommand = \"codebase-memory-mcp hook-augment\"\n"
+    "command_windows = \"codebase-memory-mcp hook-augment\"\ntimeout = 5\n"
+    "# <<< codebase-memory-mcp SessionStart <<<\n";
+
+/* Codex shell searches get graph context in flow: the managed block adds a
+ * PreToolUse Bash hook, upgrades the previous block in place, removes either
+ * generation, keeps a user's own inline hooks.PreToolUse (TOML cannot mix an
+ * inline array with array-of-tables entries for one key), and replaces the
+ * inline form Codex may normalize ours to. */
+TEST(cli_codex_pretooluse_hook_lifecycle) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codexpre-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/config.toml", tmpdir);
+
+    /* fresh install: one PreToolUse Bash hook running hook-augment, idempotent */
+    write_test_file(cfg, "[mcp_servers.other]\ncommand = \"x\"\n");
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    const char *d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.PreToolUse]]\nmatcher = \"Bash\""), 1U);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.PreToolUse.hooks]]"), 1U);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart]]"), 1U);
+    ASSERT_EQ(cbm_remove_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NULL(strstr(d, "hooks.PreToolUse"));
+    ASSERT_NOT_NULL(strstr(d, "[mcp_servers.other]"));
+
+    /* upgrade: the previous block is replaced, never refused as ambiguous */
+    char previous[2048];
+    snprintf(previous, sizeof(previous), "[mcp_servers.other]\ncommand = \"x\"\n\n%s",
+             test_codex_previous_hook_block);
+    write_test_file(cfg, previous);
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart]]"), 1U);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.PreToolUse]]"), 1U);
+
+    /* uninstall of the previous generation */
+    write_test_file(cfg, previous);
+    ASSERT_EQ(cbm_remove_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NULL(strstr(d, "hooks.SessionStart"));
+    ASSERT_NULL(strstr(d, "hook-augment"));
+
+    /* a user's own inline PreToolUse stays, and our block leaves PreToolUse out */
+    const char *foreign = "[hooks]\nPreToolUse = [{ matcher = \"Bash\", hooks = [{ type = "
+                          "\"command\", command = \"/usr/local/bin/audit-shell\" }] }]\n";
+    write_test_file(cfg, foreign);
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NOT_NULL(strstr(d, "audit-shell"));
+    ASSERT_NULL(strstr(d, "[[hooks.PreToolUse]]"));
+    ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart]]"), 1U);
+
+    /* Codex's inline form of our own PreToolUse is replaced, not duplicated */
+    write_test_file(cfg, "[hooks]\nPreToolUse = [{ matcher = \"Bash\", hooks = [{ type = "
+                         "\"command\", command = \"codebase-memory-mcp hook-augment\", "
+                         "command_windows = \"codebase-memory-mcp hook-augment\", "
+                         "timeout = 5 }] }]\n");
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NULL(strstr(d, "PreToolUse = ["));
+    ASSERT_EQ(test_count_substring(d, "[[hooks.PreToolUse]]"), 1U);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -12818,7 +13510,8 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     bool lifecycle_ok = first_rc == 0 && repeat_rc == 0 && dry_rc == 0 && first && repeated &&
                         after_dry && strcmp(first, repeated) == 0 && strcmp(first, after_dry) == 0;
     bool migrated = migration_rc == 0 && toml && !strstr(toml, "SessionStart") && hooks &&
-                    strstr(hooks, "SessionStart") && strstr(hooks, "SubagentStart");
+                    strstr(hooks, "SessionStart") && strstr(hooks, "SubagentStart") &&
+                    strstr(hooks, "PreToolUse");
     free(first);
     free(repeated);
     free(after_dry);
@@ -13095,6 +13788,50 @@ TEST(cli_hook_augment_context_tracks_search_json_shape) {
     PASS();
 }
 
+/* A search that found symbols closes with cbm's own follow-up line, after the
+ * untrusted symbol list and on its own line, naming the graph tools for the
+ * next question; it carries no repository-derived value. */
+TEST(cli_hook_augment_context_names_graph_follow_ups) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "hookproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/hookproj");
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "someIndexedSymbol",
+                    .qualified_name = "hookproj.mod.someIndexedSymbol",
+                    .file_path = "mod.py",
+                    .start_line = 1,
+                    .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+    char *envelope =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"hookproj\",\"name_pattern\":\".*someIndexedSymbol.*\","
+                            "\"limit\":5,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(envelope);
+
+    bool is_error = true;
+    char *ctx =
+        cbm_hook_augment_format_context_for_testing(envelope, "someIndexedSymbol", &is_error);
+    ASSERT_FALSE(is_error);
+    ASSERT_NOT_NULL(ctx);
+    const char *list = strstr(ctx, "\n- hookproj.mod.someIndexedSymbol");
+    const char *follow = strstr(ctx, "\n[codebase-memory] For these symbols, trace_path lists "
+                                     "callers and callees, get_code_snippet returns the exact "
+                                     "source, and search_graph finds related symbols by name.");
+    ASSERT_NOT_NULL(list);
+    ASSERT_NOT_NULL(follow);
+    ASSERT_TRUE(follow > list);
+    ASSERT_NULL(strstr(follow, "someIndexedSymbol"));
+    ASSERT_NULL(strstr(follow, "mod.py"));
+    free(ctx);
+    free(envelope);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Exercise the real PreToolUse + Bash route instead of calling only the
  * tokenizer seam. This pins the event guard and the graph lookup path together.
  */
@@ -13130,6 +13867,47 @@ TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter) {
 
     if (!reached)
         FAIL("PreToolUse Bash must reach graph search augmentation");
+    PASS();
+}
+
+/* Codex sends PreToolUse for its shell tool as tool_name "Bash" with a string
+ * tool_input.command, plus its own fields (turn_id, model, permission_mode,
+ * tool_use_id, a null transcript_path). The default dialect must augment it. */
+TEST(cli_hook_augment_codex_pretooluse_payload) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    char *project = cbm_project_name_from_path("/tmp/hookproj");
+    ASSERT_NOT_NULL(project);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, "/tmp/hookproj");
+    char qualified_name[256];
+    snprintf(qualified_name, sizeof(qualified_name), "%s.mod.someIndexedSymbol", project);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "someIndexedSymbol",
+                       .qualified_name = qualified_name,
+                       .file_path = "mod.py",
+                       .start_line = 1,
+                       .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    const char *input = "{\"session_id\":\"0199a1b2-codex\",\"turn_id\":\"turn-1\","
+                        "\"transcript_path\":null,\"cwd\":\"/tmp/hookproj\","
+                        "\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-5.6\","
+                        "\"permission_mode\":\"default\",\"tool_name\":\"Bash\","
+                        "\"tool_input\":{\"command\":\"rg -n someIndexedSymbol .\"},"
+                        "\"tool_use_id\":\"call_1\"}";
+    char *output = cbm_hook_augment_process(srv, input);
+    bool reached = output && strstr(output, "\"hookEventName\":\"PreToolUse\"") &&
+                   strstr(output, "additionalContext") && strstr(output, "someIndexedSymbol");
+    free(output);
+    cbm_mcp_server_free(srv);
+    free(project);
+
+    if (!reached)
+        FAIL("a Codex-shaped PreToolUse Bash payload must reach graph search augmentation");
     PASS();
 }
 
@@ -16984,27 +17762,71 @@ TEST(cli_zero_argument_tool_never_reads_stdin_issue1359) {
      * never read stdin (nothing it could carry; the read is pure deadlock).
      * Since #1181 no SHIPPED tool is zero-argument anymore — list_projects,
      * the original example, now declares pagination properties — so the
-     * zero-argument branch is exercised directly through the schema seam,
-     * and list_projects asserts its NEW truth. */
-    ASSERT_FALSE(
-        cbm_cli_stdin_allowed_for_schema_for_test("{\"type\":\"object\",\"properties\":{}}"));
-    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test("{\"type\":\"object\"}"));
-    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(
-        "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}}}"));
+     * zero-argument branch is exercised directly through the schema seam. */
+    const char *no_props = "{\"type\":\"object\",\"properties\":{}}";
+    const char *no_props_key = "{\"type\":\"object\"}";
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(no_props, CBM_CLI_STDIN_STREAM));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(no_props, CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(no_props_key, CBM_CLI_STDIN_STREAM));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(no_props_key, CBM_CLI_STDIN_FILE));
 
-    /* list_projects now takes piped arguments (offset/limit/include_details);
-     * the TTY guard still refuses regardless of schema. */
-    ASSERT_TRUE(cbm_cli_args_from_stdin_allowed("list_projects", false));
-    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", true));
+    /* A required argument: the bare call cannot succeed, so stdin is the
+     * documented channel from a pipe and from a file alike. */
+    const char *required =
+        "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}},\"required\":[\"p\"]}";
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(required, CBM_CLI_STDIN_STREAM));
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(required, CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(required, CBM_CLI_STDIN_TERMINAL));
+    PASS();
+}
+
+/* #1181 gave list_projects optional paging properties, which re-opened #1359:
+ * the schema gate only skipped EMPTY schemas, so `cli list_projects` parked in
+ * fread(0) again for every caller holding an inherited pipe open (an ssh
+ * session's stdin hung the Windows smoke's Phase 1b for 25 minutes). A call
+ * complete without arguments must never wait on a stream; a regular file
+ * (`< args.json`) always reaches EOF and keeps working. */
+TEST(cli_optional_argument_tool_never_reads_stream_stdin) {
+    const char *optional = "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}}}";
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(optional, CBM_CLI_STDIN_STREAM));
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(optional, CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(optional, CBM_CLI_STDIN_TERMINAL));
+    const char *empty_required =
+        "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}},\"required\":[]}";
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test(empty_required, CBM_CLI_STDIN_STREAM));
+
+    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", CBM_CLI_STDIN_STREAM));
+    ASSERT_TRUE(cbm_cli_args_from_stdin_allowed("list_projects", CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", CBM_CLI_STDIN_TERMINAL));
+    PASS();
+}
+
+/* The classifier behind the gate, on real descriptors: a regular file is FILE
+ * (reads always end), a pipe is STREAM (ends only when its writer closes). */
+TEST(cli_stdin_kind_classifies_file_and_pipe) {
+    FILE *file = tmpfile();
+    ASSERT_NOT_NULL(file);
+    ASSERT_EQ(cbm_cli_stdin_kind(fileno(file)), CBM_CLI_STDIN_FILE);
+    (void)fclose(file);
+
+    int fds[2];
+#ifdef _WIN32
+    ASSERT_EQ(_pipe(fds, 4096, _O_BINARY), 0);
+#else
+    ASSERT_EQ(pipe(fds), 0);
+#endif
+    ASSERT_EQ(cbm_cli_stdin_kind(fds[0]), CBM_CLI_STDIN_STREAM);
+    (void)close(fds[0]);
+    (void)close(fds[1]);
     PASS();
 }
 
 /* The gate must track the advertised input_schema for the WHOLE tool table, not
- * carry a special case for list_projects: a future zero-argument tool would
- * otherwise reintroduce #1359 silently. Expectation is derived independently
- * from the schema the MCP tools/list publishes. */
+ * carry a special case for list_projects: a future zero-argument or
+ * optional-only tool would otherwise reintroduce #1359 silently. Expectation is
+ * derived independently from the schema the MCP tools/list publishes. */
 TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359) {
-    int zero_argument_tools = 0;
+    int optional_only_tools = 0;
     for (int i = 0; i < cbm_mcp_tool_count(); i++) {
         const char *name = cbm_mcp_tool_name(i);
         ASSERT_NOT_NULL(name);
@@ -17013,22 +17835,25 @@ TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359) {
 
         yyjson_doc *doc = yyjson_read(schema, strlen(schema), 0);
         ASSERT_NOT_NULL(doc);
-        yyjson_val *props = yyjson_obj_get(yyjson_doc_get_root(doc), "properties");
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        yyjson_val *props = yyjson_obj_get(root, "properties");
+        yyjson_val *required = yyjson_obj_get(root, "required");
         bool declares_properties = props && yyjson_is_obj(props) && yyjson_obj_size(props) > 0;
+        bool declares_required =
+            required && yyjson_is_arr(required) && yyjson_arr_size(required) > 0;
         yyjson_doc_free(doc);
 
-        if (!declares_properties) {
-            zero_argument_tools++;
+        if (declares_properties && !declares_required) {
+            optional_only_tools++;
         }
-        ASSERT_EQ(cbm_cli_args_from_stdin_allowed(name, false), declares_properties);
-        ASSERT_FALSE(cbm_cli_args_from_stdin_allowed(name, true));
+        ASSERT_EQ(cbm_cli_args_from_stdin_allowed(name, CBM_CLI_STDIN_FILE), declares_properties);
+        ASSERT_EQ(cbm_cli_args_from_stdin_allowed(name, CBM_CLI_STDIN_STREAM),
+                  declares_properties && declares_required);
+        ASSERT_FALSE(cbm_cli_args_from_stdin_allowed(name, CBM_CLI_STDIN_TERMINAL));
     }
-    /* Since #1181 every shipped tool declares properties, so the sweep's
-     * zero-argument branch can be empty here — that branch is pinned directly
-     * against the schema seam in the test above, which survives the registry
-     * having no zero-argument example. The sweep still proves schema↔gate
-     * parity for every tool that exists. */
-    (void)zero_argument_tools;
+    /* list_projects is the live optional-only example today; the sweep must
+     * actually exercise that branch, not pass vacuously. */
+    ASSERT_GT(optional_only_tools, 0);
     PASS();
 }
 
@@ -17755,6 +18580,9 @@ SUITE(cli) {
     RUN_TEST(cli_install_binary_into_foreign_home_never_drains_host_cohort);
     RUN_TEST(cli_install_into_host_namespace_still_drains_host_cohort);
     RUN_TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing);
+    RUN_TEST(cli_scope_fixture_names_its_failing_setup_step);
+    RUN_TEST(cli_scope_fixture_finish_keeps_env_after_an_early_failure);
+    RUN_TEST(cli_scope_retries_a_mute_endpoint_until_it_answers);
     RUN_TEST(cli_install_foreign_home_unreadable_cohort_cache_keeps_host_daemon);
     RUN_TEST(cli_install_foreign_home_busy_cohort_keeps_host_daemon);
 #endif
@@ -17776,6 +18604,7 @@ SUITE(cli) {
     RUN_TEST(cli_clients_selector_filters_registry_installs_issue1798);
     RUN_TEST(cli_update_accepts_retired_variant_flags_issue1544);
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
+    RUN_TEST(cli_update_names_the_failing_staging_step_and_os_error);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
     RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);
     RUN_TEST(cli_uninstall_auto_answers_keep_indexes_without_delete_indexes);
@@ -17806,8 +18635,11 @@ SUITE(cli) {
 
     /* CLI binary detection (3 tests — install_test.go) */
     RUN_TEST(cli_find_cli_not_found);
+    RUN_TEST(cli_find_cli_result_is_thread_local);
     RUN_TEST(cli_find_cli_on_path);
     RUN_TEST(cli_find_cli_fallback_paths);
+    RUN_TEST(cli_find_cli_long_path_beyond_four_kb_issue221);
+    RUN_TEST(cli_find_cli_windows_fallback_shims_issue221);
 
     /* Dry-run flag parsing (1 test — install_test.go) */
     RUN_TEST(cli_dry_run_flags);
@@ -17994,12 +18826,14 @@ SUITE(cli) {
     RUN_TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent);
 #endif
     RUN_TEST(cli_hook_session_sanitizes_untrusted_project_metadata);
+    RUN_TEST(cli_hook_session_untrusted_label_covers_project_name_only);
     RUN_TEST(cli_hook_ownership_requires_exact_command_identity);
     RUN_TEST(cli_gemini_hook_upgrade_migrates_released_exact_commands);
     RUN_TEST(cli_uninstall_preserves_hook_script_with_modified_binary);
     RUN_TEST(cli_hook_metadata_rejects_truncated_utf8_without_oob);
     RUN_TEST(cli_aider_config_loads_installed_conventions);
     RUN_TEST(cli_codex_session_hook_issue330);
+    RUN_TEST(cli_codex_pretooluse_hook_lifecycle);
     RUN_TEST(cli_gemini_session_hook_parity);
     RUN_TEST(cli_claude_subagent_hook);
     RUN_TEST(cli_claude_hook_mutation_converges_mixed_owned_duplicates);
@@ -18023,7 +18857,9 @@ SUITE(cli) {
     RUN_TEST(cli_codex_preflight_reports_heading_and_reason);
 #endif
     RUN_TEST(cli_hook_augment_context_tracks_search_json_shape);
+    RUN_TEST(cli_hook_augment_context_names_graph_follow_ups);
     RUN_TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter);
+    RUN_TEST(cli_hook_augment_codex_pretooluse_payload);
     RUN_TEST(cli_hook_augment_bash_pattern_extractor);
     RUN_TEST(cli_hook_augment_coverage_requests_machine_json);
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);
@@ -18170,6 +19006,8 @@ SUITE(cli) {
 
     /* Stdin argument gate (#1359) */
     RUN_TEST(cli_zero_argument_tool_never_reads_stdin_issue1359);
+    RUN_TEST(cli_optional_argument_tool_never_reads_stream_stdin);
+    RUN_TEST(cli_stdin_kind_classifies_file_and_pipe);
     RUN_TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359);
     cbm_cli_set_activation_runtime_parent_for_test(NULL);
     test_rmdir_r(g_cli_suite_runtime_parent);

@@ -93,6 +93,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"ruby", "Class:1,Function:1,Module:1"},
     {"php", "Class:1,Function:1,Module:1"},
     {"c_sharp", "Class:1,Method:1,Module:1"},
+    {"csharp_extension_declaration", "Class:1,Method:1,Module:1"},
     {"bash", "Function:2,Module:1"},
     {"zsh", "Function:2,Module:1"},
     {"lua", "Function:2,Module:1"},
@@ -242,7 +243,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"astro", "Module:1,Variable:1"},
     {"templ", "Class:1,Module:1"},
     {"typst", "Module:1"},
-    {"mermaid", "Module:1"},
+    {"mermaid", "Diagram:1,DiagramElement:2,Module:1"}, /* the fixture's flowchart */
     {NULL, NULL},
 };
 

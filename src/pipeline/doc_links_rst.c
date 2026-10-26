@@ -1685,6 +1685,11 @@ static void rr_resolve(const void *index, void *state, int run_file, const CBMDo
         cbm_doclink_md_resolver.resolve(x->md, NULL, run_file, link, graph, out);
         return;
     }
+    if (cbm_doclink_md_twin(link->syntax) != CBM_DOCLINK_NONE) { /* a diagram's link, an
+                                                                  * API's operationId */
+        cbm_doclink_md_resolver.resolve(x->md, NULL, run_file, link, graph, out);
+        return;
+    }
     if (link->syntax == CBM_DOCLINK_RST_CODE_PATH || link->syntax == CBM_DOCLINK_RST_CODE_NAME) {
         CBMDocLink md = *link;
         md.syntax = link->syntax == CBM_DOCLINK_RST_CODE_PATH ? CBM_DOCLINK_MD_CODE_PATH

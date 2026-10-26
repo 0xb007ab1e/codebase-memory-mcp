@@ -162,10 +162,14 @@ static const lang_name_entry_t LANG_NAME_TABLE[] = {
     {"chialisp", CBM_LANG_CHIALISP},
     {"pdf", CBM_LANG_PDF},
     {"asciidoc", CBM_LANG_ASCIIDOC},
+    {"diagram", CBM_LANG_DIAGRAM},
+    {"openapi", CBM_LANG_OPENAPI},
     {"lean", CBM_LANG_LEAN},
     {"form", CBM_LANG_FORM},
     {"magma", CBM_LANG_MAGMA},
     {"wolfram", CBM_LANG_WOLFRAM},
+    {"jinja2", CBM_LANG_JINJA2},
+    {"jinja", CBM_LANG_JINJA2},
 };
 
 #define LANG_NAME_TABLE_SIZE (sizeof(LANG_NAME_TABLE) / sizeof(LANG_NAME_TABLE[0]))

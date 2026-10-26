@@ -16,16 +16,18 @@
  * document wrote the path.
  *
  * Unresolved:
- *   missing    the path is not in the graph, but its directory is: the
- *              document names something that is not there (doc rot)
+ *   missing    the path is not in the graph, but its directory is, or a
+ *              directory above it that the reference wrote is: the document
+ *              names something that is not there (doc rot; a moved or
+ *              renamed directory)
  *   ambiguous  a file name alone that is not next to the document but exists
  *              elsewhere in the repository: the document does not say which
  * Not a reference to this repository at all (LOCAL: no edge, no row): a link
  * back into the same document; a path that is neither indexed nor of a type
  * the indexer reads (an image, an archive, an extensionless page); a path
- * whose directory is not in the repository either (a file a tutorial asks
- * the reader to create, a system path, a path above the root); and, in a
- * code span, a rooted single segment without a file extension, which is a
+ * none of whose directories is in the repository either (a file a tutorial
+ * asks the reader to create, a system path, a path above the root); and, in
+ * a code span, a rooted single segment without a file extension, which is a
  * URL route (`/docs`, `/health`), not the directory of that name.
  */
 #include "pipeline/doc_links.h"
@@ -110,8 +112,9 @@ static const char *mdr_base(const char *path) {
 static bool mdr_code_file(const char *path) {
     CBMLanguage lang = cbm_language_for_filename(mdr_base(path));
     return lang != CBM_LANG_COUNT && lang != CBM_LANG_MARKDOWN && lang != CBM_LANG_RST &&
-           lang != CBM_LANG_ASCIIDOC && lang != CBM_LANG_PDF && lang != CBM_LANG_HTML &&
-           lang != CBM_LANG_CSS && lang != CBM_LANG_SCSS && !cbm_has_config_extension(path);
+           lang != CBM_LANG_ASCIIDOC && lang != CBM_LANG_PDF && lang != CBM_LANG_DIAGRAM &&
+           lang != CBM_LANG_OPENAPI && lang != CBM_LANG_HTML && lang != CBM_LANG_CSS &&
+           lang != CBM_LANG_SCSS && !cbm_has_config_extension(path);
 }
 
 /* The stems of a package directory's index file. */
@@ -407,6 +410,25 @@ static const cbm_gbuf_node_t *mdr_folder(const mdr_index_t *x, const cbm_gbuf_t 
     return path[0] ? (const cbm_gbuf_node_t *)cbm_ht_get(x->folders, path) : NULL;
 }
 
+/* Whether a directory above `path` that the reference itself wrote, one
+ * longer than the `base_len` bytes it was read from, is a Folder. */
+static bool mdr_written_ancestor(const mdr_index_t *x, const cbm_gbuf_t *graph, const char *path,
+                                 size_t base_len) {
+    char dir[MDR_PATH_CAP];
+    size_t n = strlen(path);
+    if (n >= sizeof(dir)) {
+        return false;
+    }
+    memcpy(dir, path, n + SKIP_ONE);
+    for (char *s = strrchr(dir, '/'); s && (size_t)(s - dir) > base_len; s = strrchr(dir, '/')) {
+        *s = '\0';
+        if (mdr_folder(x, graph, dir)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool mdr_code_label(const char *label) {
     for (size_t i = 0; label && MDR_CODE_LABELS[i]; i++) {
         if (strcmp(label, MDR_CODE_LABELS[i]) == 0) {
@@ -658,6 +680,35 @@ static void mdr_edge(cbm_doclink_outcome_t *out, const cbm_gbuf_node_t *target, 
     out->exact = true;
     out->target_first = first;
     out->target_last = last;
+}
+
+/* A bare OpenAPI operationId (`getUser`): the one function or method of the
+ * repository with exactly that name, outside the tests; several are
+ * ambiguous, none is missing. (A dotted one, Connexion's, reads as a
+ * qualified code name.) */
+static void mdr_resolve_unique_callable(const cbm_gbuf_t *graph, const char *name,
+                                        cbm_doclink_outcome_t *out) {
+    const cbm_gbuf_node_t **nodes = NULL;
+    int n = 0;
+    const cbm_gbuf_node_t *hit = NULL;
+    int hits = 0;
+    if (cbm_gbuf_find_by_name(graph, name, &nodes, &n) == 0) {
+        for (int i = 0; i < n; i++) {
+            const char *l = nodes[i]->label;
+            if (l && (strcmp(l, "Function") == 0 || strcmp(l, "Method") == 0) &&
+                !(nodes[i]->file_path && mdr_test_path(nodes[i]->file_path))) {
+                hit = nodes[i];
+                hits++;
+            }
+        }
+    }
+    if (hits == 1) {
+        mdr_edge(out, hit, 0, 0);
+        out->exact = false; /* unique by name, not named in full */
+        return;
+    }
+    out->kind = CBM_DOCLINK_UNRESOLVED;
+    out->reason = hits > 1 ? CBM_DOCLINK_REASON_AMBIGUOUS : CBM_DOCLINK_REASON_MISSING;
 }
 
 enum { MDR_MAX_PIECES = 80 }; /* a code span is at most 150 bytes */
@@ -1096,8 +1147,19 @@ static void mdr_resolve_path(const mdr_index_t *x, const cbm_gbuf_t *graph, cons
     char tries[MDR_TRIES][MDR_PATH_CAP];
     int nt = 0;
     int attempted = 0;
+    size_t base_len[MDR_TRIES]; /* the directory each try reads from, before what p wrote */
     if (!rooted) {
         attempted++;
+        char lead[MDR_PATH_CAP]; /* p's leading `./` and `../` segments */
+        char base[MDR_PATH_CAP];
+        size_t ll = 0;
+        while (ll < sizeof(lead) - PAIR_LEN - 1 && (strncmp(p + ll, "./", PAIR_LEN) == 0 ||
+                                                    strncmp(p + ll, "../", PAIR_LEN + 1) == 0)) {
+            ll += p[ll + 1] == '/' ? PAIR_LEN : PAIR_LEN + 1;
+        }
+        memcpy(lead, p, ll);
+        lead[ll] = '\0';
+        base_len[nt] = mdr_join(doc_dir, lead, base, sizeof(base)) ? strlen(base) : 0;
         nt += mdr_join(doc_dir, p, tries[nt], MDR_PATH_CAP);
     }
     if (!relative && !r->name_only) {
@@ -1107,7 +1169,7 @@ static void mdr_resolve_path(const mdr_index_t *x, const cbm_gbuf_t *graph, cons
             q++;
         }
         if (mdr_join("", q, tries[nt], MDR_PATH_CAP) && (nt == 0 || strcmp(tries[0], tries[nt]))) {
-            nt++;
+            base_len[nt++] = 0;
         }
     }
     for (int i = 0; i < nt; i++) {
@@ -1144,7 +1206,8 @@ static void mdr_resolve_path(const mdr_index_t *x, const cbm_gbuf_t *graph, cons
         return;
     }
     /* doc rot when the reference points into the repository: its directory is
-     * there (a bare name in a link: the document's own directory) */
+     * there (a bare name in a link: the document's own directory), or a
+     * directory above it that the reference wrote is (one moved or renamed) */
     for (int i = 0; i < nt; i++) {
         char parent[MDR_PATH_CAP];
         const char *ps = strrchr(tries[i], '/');
@@ -1152,6 +1215,10 @@ static void mdr_resolve_path(const mdr_index_t *x, const cbm_gbuf_t *graph, cons
         memcpy(parent, tries[i], pl);
         parent[pl] = '\0';
         if (pl > 0 && mdr_folder(x, graph, parent) && (strchr(p, '/') || r->link)) {
+            out->reason = CBM_DOCLINK_REASON_MISSING;
+            return;
+        }
+        if (pl > 0 && strchr(p, '/') && mdr_written_ancestor(x, graph, tries[i], base_len[i])) {
             out->reason = CBM_DOCLINK_REASON_MISSING;
             return;
         }
@@ -1286,7 +1353,13 @@ static void mdr_resolve(const void *index, void *state, int run_file, const CBMD
     }
     char buf[MDR_PATH_CAP];
     mdr_ref_t r = {0};
-    switch (link->syntax) {
+    if (link->syntax == CBM_DOCLINK_OPENAPI_OPERATION_ID && !strchr(link->raw, '.')) {
+        mdr_resolve_unique_callable(graph, link->raw, out);
+        return;
+    }
+    /* a diagram's link reads as a link, an operationId as a code name */
+    int twin = cbm_doclink_md_twin(link->syntax);
+    switch (twin != CBM_DOCLINK_NONE ? twin : link->syntax) {
     case CBM_DOCLINK_MD_SUPERSEDES:
     case CBM_DOCLINK_MD_SUPERSEDES_PROSE:
         mdr_resolve_adr(x, graph, doc, link->raw, out);
@@ -1586,8 +1659,10 @@ bool cbm_doclink_md_test_path(const char *path) {
 }
 
 const cbm_doclink_resolver_t cbm_doclink_md_resolver = {
-    .langs = {CBM_LANG_MARKDOWN},
-    .lang_count = 1,
+    /* + the links of diagram files and the operationIds of API documents */
+    .langs = {CBM_LANG_MARKDOWN, CBM_LANG_MERMAID, CBM_LANG_DIAGRAM, CBM_LANG_OPENAPI,
+              CBM_LANG_JSON},
+    .lang_count = 5,
     .scope_tag = NULL,
     .build = mdr_build,
     .destroy = mdr_destroy,

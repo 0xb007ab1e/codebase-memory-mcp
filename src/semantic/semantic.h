@@ -319,6 +319,28 @@ float cbm_sem_doc_calibrated_p(cbm_sem_doc_format_t fmt, cbm_sem_doc_kind_t kind
  * stored. */
 float cbm_sem_doc_folder_p(cbm_sem_doc_format_t fmt, const char *doc_path);
 
+/* The kind family of a diagram a section embeds, by its format and
+ * diagram_kind: structural (Mermaid sequence, class, ER, C4 and architecture;
+ * PlantUML C4, class, sequence, use-case and component), prose (any other
+ * Mermaid or PlantUML diagram) or graph (any other format). A section's family
+ * is the highest any of its diagrams has, in this order. */
+typedef enum {
+    CBM_SEM_DIAG_NONE = 0,
+    CBM_SEM_DIAG_GRAPH,
+    CBM_SEM_DIAG_PROSE,
+    CBM_SEM_DIAG_STRUCTURAL,
+    CBM_SEM_DIAG_COUNT,
+} cbm_sem_diag_family_t;
+cbm_sem_diag_family_t cbm_sem_diag_family(const char *format, const char *diagram_kind);
+
+/* cbm_sem_doc_calibrated_p for a section that embeds diagrams of family fam:
+ * a Markdown section of a family with its own judged curve takes that curve
+ * for function candidates at or inside the home and for local extras; every
+ * other candidate, and every section of another family, as
+ * cbm_sem_doc_calibrated_p. */
+float cbm_sem_doc_section_p(cbm_sem_doc_format_t fmt, cbm_sem_diag_family_t fam,
+                            cbm_sem_doc_kind_t kind, cbm_sem_doc_pos_t pos, float score);
+
 /* p as stored and shown: two decimals, half up (0.225 -> 0.23, 0.325 ->
  * 0.33; the epsilon absorbs the float representation of a judged x.xx5). */
 double cbm_sem_p_2dp(float p);

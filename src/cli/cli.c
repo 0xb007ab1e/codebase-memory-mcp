@@ -14,6 +14,7 @@
 #include "cli/config_toml_edit.h"
 #include "ui/config.h"
 #include "cli/config_yaml_edit.h"
+#include "cli/runtime_settings.h"
 #include "daemon/bootstrap.h"
 #include "daemon/ipc.h"
 #include "daemon/runtime.h"
@@ -22,6 +23,7 @@
 #include "foundation/platform.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/sha256.h"
 #include "foundation/str_util.h"
 #include "cli/client_adapter.h"
@@ -1124,40 +1126,54 @@ static bool is_executable(const char *path) {
 #endif
 }
 
+/* Windows ships CLIs as extension-bearing shims -- .cmd from npm, .ps1 from
+ * mise, .exe from scoop -- so a bare-name probe never matches there. One
+ * definition serves both the PATH scan and the fallback-directory probe (#221). */
+#ifdef _WIN32
+static const char *const WIN_EXEC_EXTS[] = {".exe", ".cmd", ".bat", ".ps1", NULL};
+#endif
+
 /* Search for an executable named `name` in the PATH environment variable.
- * Returns the full path in `out` (max out_sz) if found, else empty string. */
+ * Returns the full path in `out` (max out_sz) if found, else empty string.
+ *
+ * The PATH copy is sized to the REAL value, not to a fixed 4 KB stack buffer.
+ * That buffer was the first root cause of #221: a Windows dev machine's PATH
+ * routinely runs past 4096 characters, and cbm_safe_getenv() REFUSES a value it
+ * cannot fit rather than truncating it -- so find_in_path() returned false
+ * before looking at a single directory, and opencode (installed through
+ * mise/npm/scoop and present on PATH) read as "not installed". The same 4 KB
+ * cap hid entries on macOS/Linux too; the fix is not Windows-specific. */
 static bool find_in_path(const char *name, char *out, size_t out_sz) {
-    char path_copy[CLI_BUF_4K];
-    if (!cbm_safe_getenv("PATH", path_copy, sizeof(path_copy), NULL)) {
+    char *path_copy = cbm_env_dup("PATH");
+    if (!path_copy) {
         return false;
     }
-    char *saveptr;
+
+    /* One exit. PATH is a full live copy of the environment, the scan has
+     * several ways to stop, and the previous shape returned straight out of the
+     * loop -- which is exactly what leaked a PATH-sized allocation per call. */
+    bool found = false;
+    char *saveptr = NULL;
     char *dir = strtok_r(path_copy, PATH_DELIM, &saveptr);
-    while (dir) {
+    while (dir != NULL && !found) {
         snprintf(out, out_sz, "%s/%s", dir, name);
-        if (is_executable(out)) {
-            return true;
-        }
+        found = is_executable(out);
 #ifdef _WIN32
-        /* On Windows executables carry an extension (PATHEXT). A CLI like
-         * opencode is often installed as a .cmd / .ps1 / .exe shim (e.g. via
-         * mise or npm), so the bare-name probe above misses it (#221). Try the
-         * common executable extensions before moving to the next PATH entry. */
-        static const char *const win_exts[] = {".exe", ".cmd", ".bat", ".ps1", NULL};
-        for (int i = 0; win_exts[i]; i++) {
-            snprintf(out, out_sz, "%s/%s%s", dir, name, win_exts[i]);
-            if (is_executable(out)) {
-                return true;
-            }
+        /* PATHEXT variants for THIS entry, before moving to the next one. */
+        for (int i = 0; !found && WIN_EXEC_EXTS[i] != NULL; i++) {
+            snprintf(out, out_sz, "%s/%s%s", dir, name, WIN_EXEC_EXTS[i]);
+            found = is_executable(out);
         }
 #endif
         dir = strtok_r(NULL, PATH_DELIM, &saveptr);
     }
-    return false;
+
+    cbm_free(CBM_MEM_CLASS_OTHER, path_copy);
+    return found;
 }
 
 const char *cbm_find_cli(const char *name, const char *home_dir) {
-    static char buf[CLI_BUF_512];
+    static CBM_TLS char buf[CLI_BUF_512];
     if (!name || !name[0]) {
         return "";
     }
@@ -1167,22 +1183,66 @@ const char *cbm_find_cli(const char *name, const char *home_dir) {
     if (!home_dir || !home_dir[0]) {
         return "";
     }
+    /* PATH-independent fallbacks, tried in order. Every home-derived entry is
+     * built from the `home_dir` ARGUMENT and not from cbm_get_home_dir(): a
+     * dry-run scan or a test passes a synthetic home and must not be shown the
+     * host's agents. `/` separators are fine on Windows -- the wide-safe file
+     * layer accepts them, and the rest of this file already composes paths so. */
     enum { NUM_PATHS = 5 };
     char paths[NUM_PATHS][CLI_BUF_512];
-    snprintf(paths[0], sizeof(paths[0]), "/usr/local/bin/%s", name);
-    snprintf(paths[1], sizeof(paths[1]), "%s/.npm/bin/%s", home_dir, name);
-    snprintf(paths[2], sizeof(paths[2]), "%s/.local/bin/%s", home_dir, name);
-    snprintf(paths[3], sizeof(paths[3]), "%s/.cargo/bin/%s", home_dir, name);
-#ifdef __APPLE__
-    snprintf(paths[4], sizeof(paths[4]), "/opt/homebrew/bin/%s", name);
+    memset(paths, 0, sizeof(paths));
+    int n = 0;
+#ifdef _WIN32
+    /* Locations that were already probed on Windows before #221 and are real
+     * there: pipx installs into ~/.local/bin and cargo into ~/.cargo/bin, so
+     * replacing the list rather than extending it would make pipx- and
+     * cargo-installed agents disappear. */
+    snprintf(paths[n++], sizeof(paths[0]), "%s/.local/bin/%s", home_dir, name);
+    snprintf(paths[n++], sizeof(paths[0]), "%s/.cargo/bin/%s", home_dir, name);
+    /* Windows-shaped locations (issue #221, second root cause): npm puts its
+     * global bin under %APPDATA%\npm, and mise and scoop expose shims under
+     * %LOCALAPPDATA%\mise\shims and %USERPROFILE%\scoop\shims. Each is read
+     * through its own environment seam, so the list stays testable. */
+    const char *appdata = cbm_app_config_dir();
+    if (appdata) {
+        snprintf(paths[n++], sizeof(paths[0]), "%s/npm/%s", appdata, name);
+    }
+    const char *localapp = cbm_app_local_dir();
+    if (localapp) {
+        snprintf(paths[n++], sizeof(paths[0]), "%s/mise/shims/%s", localapp, name);
+    }
+    snprintf(paths[n++], sizeof(paths[0]), "%s/scoop/shims/%s", home_dir, name);
 #else
-    paths[4][0] = '\0';
+    snprintf(paths[n++], sizeof(paths[0]), "/usr/local/bin/%s", name);
+    snprintf(paths[n++], sizeof(paths[0]), "%s/.npm/bin/%s", home_dir, name);
+    snprintf(paths[n++], sizeof(paths[0]), "%s/.local/bin/%s", home_dir, name);
+    snprintf(paths[n++], sizeof(paths[0]), "%s/.cargo/bin/%s", home_dir, name);
+#ifdef __APPLE__
+    snprintf(paths[n++], sizeof(paths[0]), "/opt/homebrew/bin/%s", name);
 #endif
-    for (int i = 0; i < NUM_RETRIES; i++) {
-        if (paths[i][0] && is_executable(paths[i])) {
+#endif
+    /* NUM_PATHS, not NUM_RETRIES: both are 5 today, so the old bound only
+     * looked right by coincidence -- what the loop means is the list length. */
+    for (int i = 0; i < NUM_PATHS; i++) {
+        if (!paths[i][0]) {
+            continue;
+        }
+        if (is_executable(paths[i])) {
             snprintf(buf, sizeof(buf), "%s", paths[i]);
             return buf;
         }
+#ifdef _WIN32
+        /* The npm/mise/scoop shims carry an extension, so every fallback
+         * directory needs the same PATHEXT probe the PATH scan got. */
+        for (int e = 0; WIN_EXEC_EXTS[e] != NULL; e++) {
+            char extpath[CLI_BUF_512];
+            snprintf(extpath, sizeof(extpath), "%s%s", paths[i], WIN_EXEC_EXTS[e]);
+            if (is_executable(extpath)) {
+                snprintf(buf, sizeof(buf), "%s", extpath);
+                return buf;
+            }
+        }
+#endif
     }
     return "";
 }
@@ -1567,7 +1627,10 @@ static const char skill_content[] =
     "CALLS, HTTP_CALLS, ASYNC_CALLS, SPAWNS, DATA_FLOWS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
     "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CALL_REFERENCE, CONFIGURES, REFERENCES_FILE,\n"
     "MENTIONS (doc comment -> referenced code), FILE_CHANGES_WITH, SIMILAR_TO,\n"
-    "SEMANTICALLY_RELATED, CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE\n"
+    "SEMANTICALLY_RELATED, CONTAINS_FILE, CONTAINS_FOLDER,\n"
+    "INFRA_MAPS (K8s Service -> selected workloads), DEPENDS_ON (chart / manifest -> dependency),\n"
+    "DEPLOYS (what puts manifests / charts on a cluster -> what it puts there),\n"
+    "CONNECTS_TO (workload / compose service -> the Service its environment addresses)\n"
     "\n"
     "## Cypher Examples (for query_graph)\n"
     "```\n"
@@ -4049,13 +4112,14 @@ static int cbm_reconcile_codex_hooks_command_detailed(const char *config_path, c
                                                       const char *command_windows,
                                                       cbm_toml_codex_hook_action_t action,
                                                       bool check_only,
-                                                      cbm_toml_codex_hook_failure_t *failure) {
+                                                      cbm_toml_codex_hook_failure_t *failure,
+                                                      int *pretool_written) {
     if (!config_path || !command || !command_windows) {
         return CLI_ERR;
     }
-    return cbm_toml_reconcile_codex_hooks_detailed(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END,
-                                                   command, command_windows, action,
-                                                   check_only ? 1 : 0, failure) == 0
+    return cbm_toml_reconcile_codex_hooks_detailed(
+               config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END, command, command_windows, action,
+               check_only ? 1 : 0, failure, pretool_written) == 0
                ? CLI_OK
                : CLI_ERR;
 }
@@ -4063,7 +4127,7 @@ static int cbm_reconcile_codex_hooks_command(const char *config_path, const char
                                              const char *command_windows,
                                              cbm_toml_codex_hook_action_t action, bool check_only) {
     return cbm_reconcile_codex_hooks_command_detailed(config_path, command, command_windows, action,
-                                                      check_only, NULL);
+                                                      check_only, NULL, NULL);
 }
 static int cbm_upsert_codex_hooks_command(const char *config_path, const char *command,
                                           const char *command_windows) {
@@ -6505,6 +6569,35 @@ static int cbm_remove_paired_lifecycle_hooks_json(const char *settings_path,
     return session_result == CLI_OK && subagent_result == CLI_OK ? CLI_OK : CLI_ERR;
 }
 
+/* Codex names its shell tool Bash and passes {"command": "..."} as tool_input,
+ * the payload hook-augment already augments for Claude Code. Only the entry whose
+ * command is exactly ours is touched; the user's own PreToolUse hooks stay. */
+static int cbm_upsert_codex_pretool_hooks_json(const char *settings_path, const char *command,
+                                               const char *command_windows) {
+    return upsert_hooks_json((hooks_upsert_args_t){
+        .settings_path = settings_path,
+        .hook_event = "PreToolUse",
+        .matcher_str = "Bash",
+        .command_str = command,
+        .command_windows = command_windows,
+        .timeout_value = CMM_HOOK_TIMEOUT_SEC,
+        .match_command_exact = command,
+    });
+}
+
+static int cbm_remove_codex_pretool_hooks_json(const char *settings_path,
+                                               const char *canonical_command) {
+    if (!canonical_command) {
+        return CLI_ERR;
+    }
+    return remove_hooks_json((hooks_remove_args_t){
+        .settings_path = settings_path,
+        .hook_event = "PreToolUse",
+        .matcher_str = "Bash",
+        .match_command_exact = canonical_command,
+    });
+}
+
 static int cbm_remove_qwen_lifecycle_hooks(const char *settings_path, const char *binary_path,
                                            bool windows) {
     char command[CLI_BUF_8K];
@@ -7406,6 +7499,9 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
         }
         return NULL;
     }
+    /* Another process mid-commit is waited out; failing here failed every
+     * settings write behind it, the daemon's UI save included. */
+    cbm_runtime_settings_wait_for_writers(db);
 
     /* Create table if not exists */
     const char *sql = "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)";
@@ -7460,18 +7556,29 @@ const char *cbm_config_get(cbm_config_t *cfg, const char *key, const char *defau
     return result;
 }
 
-bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val) {
+bool cbm_config_get_bool_set(cbm_config_t *cfg, const char *key, bool *value) {
     const char *val = cbm_config_get(cfg, key, NULL);
     if (!val) {
-        return default_val;
-    }
-    if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcmp(val, "on") == 0) {
-        return true;
-    }
-    if (strcmp(val, "false") == 0 || strcmp(val, "0") == 0 || strcmp(val, "off") == 0) {
         return false;
     }
-    return default_val;
+    bool parsed;
+    if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcmp(val, "on") == 0) {
+        parsed = true;
+    } else if (strcmp(val, "false") == 0 || strcmp(val, "0") == 0 || strcmp(val, "off") == 0) {
+        parsed = false;
+    } else {
+        return false;
+    }
+    if (value) {
+        *value = parsed;
+    }
+    return true;
+}
+
+bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val) {
+    bool value = default_val;
+    (void)cbm_config_get_bool_set(cfg, key, &value);
+    return value;
 }
 
 int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val) {
@@ -7573,6 +7680,9 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_AUTO_INDEX, "false", "Enable auto-indexing on MCP session start"},
     {CBM_CONFIG_AUTO_INDEX_LIMIT, "50000", "Max files for auto-indexing new projects"},
     {CBM_CONFIG_AUTO_WATCH, "true", "Register background git watcher on session connect"},
+    /* Unset: the index mode decides (cbm_pipeline_doc_candidates_enabled). */
+    {CBM_CONFIG_DOC_CANDIDATES, "auto",
+     "Doc-code candidates: auto = on for full, off for moderate/fast; true/false forces"},
     {CBM_CONFIG_WATCHER_ENABLED, "true",
      "Run the background watcher thread (auto-reindex); false to disable"},
     {CBM_CONFIG_WATCH_NON_GIT, "false",
@@ -9724,7 +9834,7 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         cbm_toml_codex_hook_failure_t preflight_failure = CBM_TOML_CODEX_HOOK_FAILURE_NONE;
         int preflight_result = commands_ok ? cbm_reconcile_codex_hooks_command_detailed(
                                                  cp, command, command_windows, preflight_action,
-                                                 true, &preflight_failure)
+                                                 true, &preflight_failure, NULL)
                                            : CLI_ERR;
         if (preflight_result != CLI_OK) {
             if (!g_install_plan) {
@@ -9767,19 +9877,29 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
             plan_record("Codex CLI", "hook", hook_target);
         } else {
             bool hook_ok = true;
+            int pretool_written = 1;
             if (!dry_run && use_hooks_json) {
                 hook_ok =
                     cbm_upsert_paired_lifecycle_hooks_json(hooks_json, command, command_windows,
                                                            NULL, CMM_HOOK_TIMEOUT_SEC) == CLI_OK &&
+                    cbm_upsert_codex_pretool_hooks_json(hooks_json, command, command_windows) ==
+                        CLI_OK &&
                     cbm_reconcile_codex_hooks_command(cp, command, command_windows,
                                                       CBM_TOML_CODEX_HOOK_REMOVE, false) == CLI_OK;
             } else if (!dry_run) {
-                hook_ok = cbm_upsert_codex_hooks_command(cp, command, command_windows) == CLI_OK;
+                hook_ok = cbm_reconcile_codex_hooks_command_detailed(
+                              cp, command, command_windows, CBM_TOML_CODEX_HOOK_UPSERT, false, NULL,
+                              &pretool_written) == CLI_OK;
             }
             if (!hook_ok) {
                 record_agent_config_error(false, "Codex CLI", "hook_install", hook_target);
             } else {
-                printf("  hooks: SessionStart + SubagentStart (dynamic graph context)\n");
+                printf(pretool_written
+                           ? "  hooks: SessionStart + SubagentStart + PreToolUse Bash (dynamic "
+                             "graph context)\n"
+                           : "  hooks: SessionStart + SubagentStart (dynamic graph context); "
+                             "PreToolUse skipped: config.toml already has an inline "
+                             "hooks.PreToolUse\n");
                 printf("  note: non-managed hooks require /hooks trust; definition changes "
                        "require re-trust\n");
             }
@@ -12205,10 +12325,10 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
                                                        installed_binary, hook_command_windows,
                                                        sizeof(hook_command_windows)) == CLI_OK;
         cbm_toml_codex_hook_failure_t preflight_failure = CBM_TOML_CODEX_HOOK_FAILURE_NONE;
-        bool hook_preflight_ok =
-            hook_commands_ok && cbm_reconcile_codex_hooks_command_detailed(
-                                    cp, hook_command, hook_command_windows,
-                                    CBM_TOML_CODEX_HOOK_REMOVE, true, &preflight_failure) == CLI_OK;
+        bool hook_preflight_ok = hook_commands_ok && cbm_reconcile_codex_hooks_command_detailed(
+                                                         cp, hook_command, hook_command_windows,
+                                                         CBM_TOML_CODEX_HOOK_REMOVE, true,
+                                                         &preflight_failure, NULL) == CLI_OK;
         if (!hook_preflight_ok) {
             printf("Codex CLI:\n");
             fflush(stdout);
@@ -12243,7 +12363,8 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
             snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
             if (cbm_file_exists(hooks_json) &&
                 (!hook_command_ok ||
-                 cbm_remove_paired_lifecycle_hooks_json(hooks_json, hook_command) != CLI_OK)) {
+                 cbm_remove_paired_lifecycle_hooks_json(hooks_json, hook_command) != CLI_OK ||
+                 cbm_remove_codex_pretool_hooks_json(hooks_json, hook_command) != CLI_OK)) {
                 record_agent_config_error(true, "Codex CLI", "json_hook_uninstall", hooks_json);
             }
         }
@@ -13202,6 +13323,45 @@ static int cli_update_activate_binary(void *opaque) {
     return CLI_OK;
 }
 
+#ifdef __APPLE__
+/* The first step of the signed-candidate preparation that failed. One boolean
+ * used to cover all of them, so a full disk read exactly like a broken
+ * codesign: "candidate preparation failed", and nothing else. */
+typedef struct {
+    const char *step;
+    int os_error;       /* errno left by an OS-level step; 0 when none applies */
+    const char *detail; /* the reason when no OS error applies, or NULL */
+} cli_update_prep_failure_t;
+
+/* Records the first failing step. An OS-level step keeps the errno it left; a
+ * step that succeeds clears errno so the next one starts clean. Returns ok, so
+ * the steps chain with &&. */
+static bool cli_update_prep_step(bool ok, const char *step, bool os_level, const char *detail,
+                                 cli_update_prep_failure_t *failure) {
+    if (ok) {
+        errno = 0;
+        return true;
+    }
+    if (!failure->step) {
+        failure->step = step;
+        failure->os_error = os_level ? errno : 0;
+        failure->detail = detail;
+    }
+    return false;
+}
+
+static void cli_update_prep_report(const cli_update_prep_failure_t *failure) {
+    const char *step = failure->step ? failure->step : "an unrecorded step";
+    const char *reason = failure->os_error != 0 ? strerror(failure->os_error) : failure->detail;
+    if (reason) {
+        (void)fprintf(stderr, "error: signed update candidate preparation failed while %s: %s\n",
+                      step, reason);
+    } else {
+        (void)fprintf(stderr, "error: signed update candidate preparation failed while %s\n", step);
+    }
+}
+#endif
+
 static int extract_and_install_binary(extract_install_args_t args) {
     const char *tmp_archive = args.tmp_archive;
     const char *ext = args.ext;
@@ -13259,42 +13419,79 @@ static int extract_and_install_binary(extract_install_args_t args) {
 #ifdef __APPLE__
     /* codesign replaces the signed file on current macOS releases. Publish and
      * sign a disposable private copy first, then stage the resulting immutable
-     * bytes into the final transaction. */
+     * bytes into the final transaction. Every step records why it failed, so a
+     * full disk is reported as one and not as a signing failure. */
+    cli_update_prep_failure_t failure = {0};
     char prepared_dir[CLI_BUF_1K];
     char prepared_candidate[CLI_BUF_1K];
     int prepared_dir_length =
         snprintf(prepared_dir, sizeof(prepared_dir), "%s/cbm-update-sign-XXXXXX", cbm_tmpdir());
-    bool prepared = prepared_dir_length > 0 && (size_t)prepared_dir_length < sizeof(prepared_dir) &&
-                    cbm_mkdtemp(prepared_dir) != NULL;
+    errno = 0;
+    bool prepared = cli_update_prep_step(prepared_dir_length > 0 &&
+                                             (size_t)prepared_dir_length < sizeof(prepared_dir) &&
+                                             cbm_mkdtemp(prepared_dir) != NULL,
+                                         "creating its private directory", true, NULL, &failure);
     int prepared_candidate_length = prepared
                                         ? snprintf(prepared_candidate, sizeof(prepared_candidate),
                                                    "%s/codebase-memory-mcp", prepared_dir)
                                         : CLI_ERR;
-    prepared = prepared && prepared_candidate_length > 0 &&
-               (size_t)prepared_candidate_length < sizeof(prepared_candidate);
+    prepared = prepared && cli_update_prep_step(prepared_candidate_length > 0 &&
+                                                    (size_t)prepared_candidate_length <
+                                                        sizeof(prepared_candidate),
+                                                "naming the candidate file", false, NULL, &failure);
     cbm_activation_transaction_t *preparation = NULL;
     stage_status = prepared ? cbm_activation_transaction_stage_bytes(prepared_candidate, bin_data,
                                                                      (size_t)bin_len, &preparation)
                             : CBM_ACTIVATION_TRANSACTION_IO;
+    prepared = prepared &&
+               cli_update_prep_step(
+                   stage_status == CBM_ACTIVATION_TRANSACTION_OK && preparation,
+                   "writing the unsigned candidate", stage_status == CBM_ACTIVATION_TRANSACTION_IO,
+                   cbm_activation_transaction_status_message(stage_status), &failure);
     free(bin_data);
     cli_binary_validator_t unsigned_validator = {{0}};
-    prepared = stage_status == CBM_ACTIVATION_TRANSACTION_OK && preparation &&
-               cli_activation_transaction_expected_build(preparation, &unsigned_validator) &&
-               cli_activation_transaction_commit_validated(preparation, &unsigned_validator,
-                                                           CLI_OCTAL_PERM) == CLI_OK &&
-               cli_activation_transaction_finalize_close(&preparation) == CLI_OK &&
-               cbm_macos_adhoc_sign(prepared_candidate) == CLI_OK &&
-               cbm_daemon_build_fingerprint_file(prepared_candidate, validator.fingerprint);
+    prepared = prepared &&
+               cli_update_prep_step(
+                   cli_activation_transaction_expected_build(preparation, &unsigned_validator),
+                   "fingerprinting the unsigned candidate", true, NULL, &failure) &&
+               cli_update_prep_step(cli_activation_transaction_commit_validated(
+                                        preparation, &unsigned_validator, CLI_OCTAL_PERM) == CLI_OK,
+                                    "publishing the unsigned candidate", false, NULL, &failure) &&
+               cli_update_prep_step(
+                   cli_activation_transaction_finalize_close(&preparation) == CLI_OK,
+                   "closing the unsigned candidate's transaction", false, NULL, &failure) &&
+               cli_update_prep_step(cbm_macos_adhoc_sign(prepared_candidate) == CLI_OK,
+                                    "signing the candidate ad hoc", false, NULL, &failure) &&
+               cli_update_prep_step(
+                   cbm_daemon_build_fingerprint_file(prepared_candidate, validator.fingerprint),
+                   "fingerprinting the signed candidate", true, NULL, &failure);
     const char *prepared_argv[] = {prepared_candidate, "--version", NULL};
-    prepared = prepared && cbm_exec_no_shell(prepared_argv) == CLI_OK;
+    int version_rc = prepared ? cbm_exec_no_shell(prepared_argv) : CLI_OK;
+    char version_detail[80];
+    if (version_rc == CBM_NOT_FOUND) {
+        snprintf(version_detail, sizeof(version_detail), "it could not run or was killed");
+    } else {
+        snprintf(version_detail, sizeof(version_detail), "--version exited with status %d",
+                 version_rc);
+    }
+    prepared =
+        prepared && cli_update_prep_step(version_rc == CLI_OK, "running the signed candidate",
+                                         false, version_detail, &failure);
     if (prepared) {
         stage_status = cbm_activation_transaction_stage_file(bin_dest, prepared_candidate,
                                                              &binary_transaction);
         cli_binary_validator_t staged_validator = {{0}};
         prepared =
-            stage_status == CBM_ACTIVATION_TRANSACTION_OK && binary_transaction &&
-            cli_activation_transaction_expected_build(binary_transaction, &staged_validator) &&
-            strcmp(staged_validator.fingerprint, validator.fingerprint) == 0;
+            cli_update_prep_step(
+                stage_status == CBM_ACTIVATION_TRANSACTION_OK && binary_transaction,
+                "staging the signed candidate", stage_status == CBM_ACTIVATION_TRANSACTION_IO,
+                cbm_activation_transaction_status_message(stage_status), &failure) &&
+            cli_update_prep_step(
+                cli_activation_transaction_expected_build(binary_transaction, &staged_validator),
+                "fingerprinting the staged candidate", true, NULL, &failure) &&
+            cli_update_prep_step(strcmp(staged_validator.fingerprint, validator.fingerprint) == 0,
+                                 "comparing the staged and signed candidates", false,
+                                 "their fingerprints differ", &failure);
         if (prepared) {
             validator = staged_validator;
         }
@@ -13308,18 +13505,35 @@ static int extract_and_install_binary(extract_install_args_t args) {
         (void)cbm_rmdir(prepared_dir);
     }
     if (!prepared) {
-        (void)fprintf(stderr, "error: signed update candidate preparation failed\n");
+        cli_update_prep_report(&failure);
         (void)cli_activation_transaction_abort(&binary_transaction);
         return CLI_TRUE;
     }
 #else
+    errno = 0;
     stage_status = cbm_activation_transaction_stage_bytes(bin_dest, bin_data, (size_t)bin_len,
                                                           &binary_transaction);
+    /* POSIX only: Windows staging reports through GetLastError, not errno. */
+#ifdef _WIN32
+    int stage_error = 0;
+#else
+    int stage_error = stage_status == CBM_ACTIVATION_TRANSACTION_IO ? errno : 0;
+#endif
     free(bin_data);
-    if (stage_status != CBM_ACTIVATION_TRANSACTION_OK || !binary_transaction ||
-        !cli_activation_transaction_expected_build(binary_transaction, &validator)) {
-        (void)fprintf(stderr, "error: failed to stage verified update: %s\n",
-                      cbm_activation_transaction_status_message(stage_status));
+    if (stage_status != CBM_ACTIVATION_TRANSACTION_OK || !binary_transaction) {
+        if (stage_error != 0) {
+            (void)fprintf(stderr, "error: failed to stage verified update: %s: %s\n",
+                          cbm_activation_transaction_status_message(stage_status),
+                          strerror(stage_error));
+        } else {
+            (void)fprintf(stderr, "error: failed to stage verified update: %s\n",
+                          cbm_activation_transaction_status_message(stage_status));
+        }
+        (void)cli_activation_transaction_abort(&binary_transaction);
+        return CLI_TRUE;
+    }
+    if (!cli_activation_transaction_expected_build(binary_transaction, &validator)) {
+        (void)fprintf(stderr, "error: failed to fingerprint the staged update\n");
         (void)cli_activation_transaction_abort(&binary_transaction);
         return CLI_TRUE;
     }
@@ -13980,13 +14194,29 @@ static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *
     yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), vv);
 }
 
-static bool cli_stdin_allowed_for_schema(const char *schema_str);
+static bool cli_stdin_allowed_for_schema(const char *schema_str, cbm_cli_stdin_kind_t stdin_kind);
 
-bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty) {
+cbm_cli_stdin_kind_t cbm_cli_stdin_kind(int fd) {
+#ifdef _WIN32
+    bool terminal = _isatty(fd) != 0;
+#else
+    bool terminal = isatty(fd) != 0;
+#endif
+    if (terminal) {
+        return CBM_CLI_STDIN_TERMINAL;
+    }
+    struct stat state;
+    if (fstat(fd, &state) == 0 && S_ISREG(state.st_mode)) {
+        return CBM_CLI_STDIN_FILE;
+    }
+    return CBM_CLI_STDIN_STREAM;
+}
+
+bool cbm_cli_args_from_stdin_allowed(const char *tool_name, cbm_cli_stdin_kind_t stdin_kind) {
     /* An interactive run has nothing piped to read: consulting the terminal
      * would just sit waiting for the user to type JSON. Unchanged by #1359 —
      * this is why the hang was only ever reachable from automation. */
-    if (stdin_is_tty) {
+    if (stdin_kind == CBM_CLI_STDIN_TERMINAL) {
         return false;
     }
 
@@ -13997,12 +14227,9 @@ bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty) {
      * parent must call child.stdin.end() explicitly, which almost nobody does
      * for a command they are not writing to. fd 0 then stays open with no
      * writer and the read never returns; the reporter's shell script was still
-     * parked in fread(0) fourteen minutes later. For a tool whose input_schema
-     * declares no properties (list_projects) stdin cannot carry anything the
-     * tool would accept, so that read is pure deadlock with nothing to gain:
-     * never start it, and let the caller fall through to `{}` exactly as an
-     * interactive run already did. Tools that DO declare properties keep the
-     * documented `echo '<json>' | cli <tool>` channel untouched. */
+     * parked in fread(0) fourteen minutes later. A call that is complete
+     * without arguments must therefore never wait on such a stream: see
+     * cli_stdin_allowed_for_schema for which schemas that covers. */
     const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
     if (!schema_str) {
         /* Unknown tool: dispatch rejects it by name and no stdin content can
@@ -14010,35 +14237,50 @@ bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty) {
         return false;
     }
 
-    return cli_stdin_allowed_for_schema(schema_str);
+    return cli_stdin_allowed_for_schema(schema_str, stdin_kind);
 }
 
-/* Schema→decision core of the stdin gate, split out so the zero-argument
- * branch stays TESTED even when no shipped tool is zero-argument anymore:
- * #1181 gave list_projects pagination parameters, retiring the last
- * empty-properties schema, and the #1359 regression tests had leaned on it
- * as their live example. The product contract is unchanged — a schema that
- * declares no properties means stdin has nothing to carry and the read is
- * pure deadlock; the tests now exercise this path directly. */
-static bool cli_stdin_allowed_for_schema(const char *schema_str) {
+/* Schema→decision core of the stdin gate, split out so every schema shape
+ * stays TESTED whatever the shipped tool table holds.
+ *   no properties   -> never: stdin cannot carry anything the tool accepts.
+ *   optional only   -> a regular file only. The bare call is already complete
+ *                      with `{}`, so blocking on a stream for optional extras
+ *                      is the #1359 deadlock again — #1181 gave list_projects
+ *                      paging properties and re-opened exactly that hang for
+ *                      every caller that leaves an inherited pipe open (ssh,
+ *                      Node spawn). A `< args.json` file always reaches EOF.
+ *   any required    -> file or stream: the bare call cannot succeed anyway, so
+ *                      the documented `echo '<json>' | cli <tool>` channel is
+ *                      the only way this invocation can carry its arguments. */
+static bool cli_stdin_allowed_for_schema(const char *schema_str, cbm_cli_stdin_kind_t stdin_kind) {
+    if (stdin_kind == CBM_CLI_STDIN_TERMINAL) {
+        return false;
+    }
     yyjson_doc *schema_doc = yyjson_read(schema_str, strlen(schema_str), 0);
     if (!schema_doc) {
         /* The schemas are compile-time constants, so a parse failure means a
          * malformed literal rather than caller input. Keep the documented stdin
          * channel rather than silently narrowing it on a schema we could not
-         * read — the gate must only ever fire on positive evidence that the
-         * tool takes no arguments. */
+         * read — the gate must only ever fire on positive evidence about the
+         * tool's arguments. */
         return true;
     }
-    yyjson_val *props = yyjson_obj_get(yyjson_doc_get_root(schema_doc), "properties");
+    yyjson_val *root = yyjson_doc_get_root(schema_doc);
+    yyjson_val *props = yyjson_obj_get(root, "properties");
+    yyjson_val *required = yyjson_obj_get(root, "required");
     bool accepts_arguments = props && yyjson_is_obj(props) && yyjson_obj_size(props) > 0;
+    bool requires_arguments = required && yyjson_is_arr(required) && yyjson_arr_size(required) > 0;
     yyjson_doc_free(schema_doc);
-    return accepts_arguments;
+    if (!accepts_arguments) {
+        return false;
+    }
+    return requires_arguments || stdin_kind == CBM_CLI_STDIN_FILE;
 }
 
 #ifdef CBM_CLI_ENABLE_TEST_API
-bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str) {
-    return cli_stdin_allowed_for_schema(schema_str);
+bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str,
+                                               cbm_cli_stdin_kind_t stdin_kind) {
+    return cli_stdin_allowed_for_schema(schema_str, stdin_kind);
 }
 #endif
 
