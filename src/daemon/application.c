@@ -564,7 +564,8 @@ static bool application_watches_disabled_locked(cbm_daemon_application_t *applic
     return true;
 }
 
-static void application_release_session_watch_locked(cbm_daemon_application_session_t *session) {
+static void application_release_session_watch_locked(cbm_daemon_application_session_t *session,
+                                                     bool session_ending) {
     application_watch_job_unsubscribe_session_locked(session, NULL);
 
     /*
@@ -575,9 +576,14 @@ static void application_release_session_watch_locked(cbm_daemon_application_sess
      *
      * Non-permanent applications retain the historical session-scoped
      * lifecycle and remove the physical watch after the final subscriber.
-     * Project deletion/pruning and daemon shutdown remove persistent watches
-     * through their dedicated lifecycle paths.
+     * A release decided by workspace policy (session_ending false: the
+     * session's root is no longer allowed) is not a disconnect and removes
+     * the watch in both modes. Daemon shutdown and auto_watch=false remove
+     * persistent watches through their own paths; a deleted project's watch
+     * ends at its next watcher callback
+     * (application_permanent_watch_orphaned_locked).
      */
+    bool daemon_keeps_watch = session_ending && session->application->permanent;
     while (session->watches) {
         application_watch_membership_t *membership = session->watches;
         cbm_daemon_application_watch_t *watch = membership->watch;
@@ -585,7 +591,7 @@ static void application_release_session_watch_locked(cbm_daemon_application_sess
         cbm_free(CBM_MEM_CLASS_OTHER, membership);
         if (watch->subscribers > 0) {
             watch->subscribers--;
-            if (!session->application->permanent && watch->subscribers == 0) {
+            if (!daemon_keeps_watch && watch->subscribers == 0) {
                 application_remove_watch_locked(session->application, watch);
             }
         }
@@ -733,7 +739,7 @@ static void application_refresh_watch_locked(cbm_daemon_application_session_t *s
         return;
     }
     if (!application_session_workspace_allowed(session, "watch")) {
-        application_release_session_watch_locked(session);
+        application_release_session_watch_locked(session, false);
         return;
     }
     application_register_watch_locked(session, cbm_mcp_server_session_project(session->mcp),
@@ -3661,7 +3667,7 @@ static void application_session_cancel(void *context,
             reap_update || (session->background_eligible && application->update_thread_started &&
                             application->update_owners == 0);
         application_index_watch_unsubscribe_locked(session, NULL);
-        application_release_session_watch_locked(session);
+        application_release_session_watch_locked(session, true);
         bool final_live_session = newly_cancelled;
         for (cbm_daemon_application_session_t *other = application->sessions;
              final_live_session && other; other = other->next) {
@@ -3721,7 +3727,7 @@ static void application_session_close(void *context,
         reap_update || (session->background_eligible && application->update_thread_started &&
                         application->update_owners == 0);
     application_index_watch_unsubscribe_locked(session, NULL);
-    application_release_session_watch_locked(session);
+    application_release_session_watch_locked(session, true);
     cbm_mutex_unlock(&application->mutex);
     application_auto_index_cancel_join(application, join_auto_index);
     application_jobs_reap_completed(application);

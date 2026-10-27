@@ -2820,6 +2820,122 @@ TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls) {
     PASS();
 }
 
+/* Under `daemon start` a session that ENDS leaves its watch to the daemon, but
+ * a workspace-policy release is not a disconnect: once the session's root is
+ * no longer allowed (here its approval is revoked), the next request's
+ * refresh must still end the watch in a permanent generation too. */
+TEST(daemon_application_permanent_workspace_release_still_ends_watch) {
+    app_env_backup_t cache_environment;
+    app_env_backup_t home_environment;
+    bool environments_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR") &&
+                              app_env_backup_capture(&home_environment, "HOME");
+    char sensitive_raw[APP_TEST_PATH_CAP];
+    char cache_raw[APP_TEST_PATH_CAP];
+    (void)snprintf(sensitive_raw, sizeof(sensitive_raw),
+                   "%s/cbm-app-permanent-release-home-XXXXXX", cbm_tmpdir());
+    (void)snprintf(cache_raw, sizeof(cache_raw), "%s/cbm-app-permanent-release-cache-XXXXXX",
+                   cbm_tmpdir());
+    bool dirs_ok = cbm_mkdtemp(sensitive_raw) != NULL && cbm_mkdtemp(cache_raw) != NULL;
+    char sensitive[APP_TEST_PATH_CAP] = {0};
+    char cache[APP_TEST_PATH_CAP] = {0};
+    bool canonical = dirs_ok && cbm_canonical_path(sensitive_raw, sensitive, sizeof(sensitive)) &&
+                     cbm_canonical_path(cache_raw, cache, sizeof(cache));
+    bool environments_set = environments_saved && canonical &&
+                            cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                            cbm_setenv("HOME", sensitive, 1) == 0;
+    cbm_config_t *stored_config = environments_set ? cbm_config_open(cache) : NULL;
+    bool config_ready = stored_config &&
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "false") == 0 &&
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "true") == 0;
+    char *project = canonical ? cbm_project_name_from_path(sensitive) : NULL;
+    char db_path[APP_TEST_PATH_CAP] = {0};
+    if (project) {
+        (void)snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    }
+    bool db_ready = config_ready && project && app_test_create_empty_file(db_path);
+    /* The root is $HOME, so only an explicit sensitive approval allows it. */
+    char grant_error[APP_TEST_PATH_CAP];
+    bool approved = db_ready && cbm_workspace_grant_add(cache, sensitive, sensitive, true,
+                                                        grant_error, sizeof(grant_error));
+    char grant_path[APP_TEST_PATH_CAP] = {0};
+    bool grant_path_ok =
+        approved && cbm_workspace_grant_path(cache, grant_path, sizeof(grant_path));
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, app_test_index_noop, NULL);
+    cbm_daemon_application_config_t config = {
+        .watcher = watcher,
+        .config = stored_config,
+    };
+    cbm_daemon_application_t *application =
+        grant_path_ok && watcher ? cbm_daemon_application_new(&config) : NULL;
+    if (application) {
+        cbm_daemon_application_set_permanent(application, true);
+    }
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session =
+        application ? app_test_open(&callbacks, 4036) : NULL;
+
+    bool initialized = app_test_initialize_profile(&callbacks, session, sensitive,
+                                                   CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
+    int watch_while_approved = watcher ? cbm_watcher_watch_count(watcher) : -1;
+
+    /* Revoke the approval. Every request ends with a synchronous watch
+     * refresh, so one ping is the point where the policy is re-read. */
+    bool revoked = initialized && cbm_unlink(grant_path) == 0;
+    uint8_t *ping = NULL;
+    uint32_t ping_length = 0;
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    bool pinged = revoked &&
+                  app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_MCP,
+                                        "{\"jsonrpc\":\"2.0\",\"id\":4136,\"method\":\"ping\"}",
+                                        &ping, &ping_length) &&
+                  app_test_request(&callbacks, session, ping, ping_length, &response,
+                                   &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    free(ping);
+    int watch_after_revoke = watcher ? cbm_watcher_watch_count(watcher) : -1;
+
+    if (session) {
+        callbacks.session_cancel(callbacks.context, session);
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    if (watcher) {
+        cbm_watcher_stop(watcher);
+        cbm_watcher_free(watcher);
+    }
+    cbm_store_close(store);
+    cbm_config_close(stored_config);
+    free(project);
+    (void)th_rmtree(sensitive);
+    (void)th_rmtree(cache);
+    bool cache_restored = app_env_backup_restore(&cache_environment);
+    bool home_restored = app_env_backup_restore(&home_environment);
+
+    ASSERT_TRUE(environments_saved);
+    ASSERT_TRUE(dirs_ok);
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(environments_set);
+    ASSERT_TRUE(config_ready);
+    ASSERT_TRUE(db_ready);
+    ASSERT_TRUE(approved);
+    ASSERT_TRUE(grant_path_ok);
+    ASSERT_TRUE(initialized);
+    ASSERT_EQ(watch_while_approved, 1);
+    ASSERT_TRUE(revoked);
+    ASSERT_TRUE(pinged);
+    /* A policy release, not a disconnect: the permanent watch ends as well. */
+    ASSERT_EQ(watch_after_revoke, 0);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(cache_restored);
+    ASSERT_TRUE(home_restored);
+    PASS();
+}
+
 TEST(daemon_application_programmatic_index_injects_resource_policy) {
     char *root = th_mktempdir("cbm_app_policy_root");
     char *cache = th_mktempdir("cbm_app_policy_cache");
@@ -7904,6 +8020,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
     RUN_TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls);
     RUN_TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls);
+    RUN_TEST(daemon_application_permanent_workspace_release_still_ends_watch);
     RUN_TEST(daemon_application_ui_index_accepts_non_ascii_directory);
     RUN_TEST(daemon_application_index_args_compare_repo_path_separator_equivalently);
     RUN_TEST(daemon_application_async_index_returns_before_completion_and_status_polls);
