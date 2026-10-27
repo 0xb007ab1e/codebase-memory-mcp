@@ -17379,26 +17379,39 @@ TEST(pipeline_python_nested_def_local_after_incremental_issue1548) {
  * spells the accessor: the import's symbol-name fallback must not bind it
  * there (no IMPORTS edge), or `new Vector()` in `make` would follow the import
  * onto the accessor (elasticsearch: `import javax.crypto.spec.PBEKeySpec`
- * bound a record's `spec()`). */
+ * bound a record's `spec()`). `stat` calls, and `refs` passes, the JDK's
+ * Objects.nonNull: no project callable is its target, and Seen's accessor --
+ * the only project callable called nonNull -- must not be taken for it on its
+ * leaf name alone (elasticsearch: `Objects.nonNull(x)` and
+ * `filter(Objects::nonNull)` bound a test record's nonNull()). */
 static const char jgen_point_java[] =
     "package com.example;\n"
     "public record Point(double x, double y, double z) {\n"
     "    public double z() { return z; }\n"
     "    public double norm() { return Math.sqrt(x * x + y * y + z * z); }\n"
     "}\n";
+static const char jgen_seen_java[] = "package com.example;\n"
+                                     "record Seen(boolean nonNull) {}\n";
 static const char jgen_spring_java[] = "package com.example;\n"
                                        "public final class Spring {\n"
                                        "    private double x;\n"
                                        "    public void put(double v) { this.x = v; }\n"
                                        "}\n";
-static const char jgen_caller_java[] = "package com.example;\n"
-                                       "import org.external.y.Vector;\n"
-                                       "public final class Caller {\n"
-                                       "    public double near(Point p) { return p.y(); }\n"
-                                       "    public double far(Vector v) { return v.y(); }\n"
-                                       "    public double data(Vector v) { return v.x(); }\n"
-                                       "    public Object make() { return new Vector(); }\n"
-                                       "}\n";
+static const char jgen_caller_java[] =
+    "package com.example;\n"
+    "import java.util.List;\n"
+    "import java.util.Objects;\n"
+    "import org.external.y.Vector;\n"
+    "public final class Caller {\n"
+    "    public double near(Point p) { return p.y(); }\n"
+    "    public double far(Vector v) { return v.y(); }\n"
+    "    public double data(Vector v) { return v.x(); }\n"
+    "    public Object make() { return new Vector(); }\n"
+    "    public boolean stat(Object o) { return Objects.nonNull(o); }\n"
+    "    public long refs(List<Object> xs) {\n"
+    "        return xs.stream().filter(Objects::nonNull).count();\n"
+    "    }\n"
+    "}\n";
 
 /* The id of the one `label` node called `name` in `file_path`; 0 when there is
  * none or more than one. `generated` (optional) receives whether its
@@ -17487,6 +17500,8 @@ static int jgen_check(cbm_store_t *s, const char *project) {
     bool gen_y = false;
     bool gen_z = true;
     bool gen_norm = true;
+    bool gen_nn = false;
+    int64_t acc_nn = jgen_node(s, project, "nonNull", "Method", "Seen.java", &gen_nn);
     int64_t acc_x = jgen_node(s, project, "x", "Method", "Point.java", &gen_x);
     int64_t acc_y = jgen_node(s, project, "y", "Method", "Point.java", &gen_y);
     int64_t own_z = jgen_node(s, project, "z", "Method", "Point.java", &gen_z);
@@ -17495,11 +17510,14 @@ static int jgen_check(cbm_store_t *s, const char *project) {
     int64_t far = jgen_node(s, project, "far", "Method", "Caller.java", NULL);
     int64_t data = jgen_node(s, project, "data", "Method", "Caller.java", NULL);
     int64_t make = jgen_node(s, project, "make", "Method", "Caller.java", NULL);
-    JGEN_EXPECT(acc_x > 0 && acc_y > 0 && own_z > 0 && norm > 0);
-    JGEN_EXPECT(near > 0 && far > 0 && data > 0 && make > 0);
+    int64_t stat = jgen_node(s, project, "stat", "Method", "Caller.java", NULL);
+    int64_t refs = jgen_node(s, project, "refs", "Method", "Caller.java", NULL);
+    JGEN_EXPECT(acc_x > 0 && acc_y > 0 && own_z > 0 && norm > 0 && acc_nn > 0);
+    JGEN_EXPECT(near > 0 && far > 0 && data > 0 && make > 0 && stat > 0 && refs > 0);
     /* The compiler's members are marked; the hand-written ones are not. */
     JGEN_EXPECT(gen_x);
     JGEN_EXPECT(gen_y);
+    JGEN_EXPECT(gen_nn);
     JGEN_EXPECT(!gen_z);
     JGEN_EXPECT(!gen_norm);
     /* Bound by qualified name through the receiver's type ... */
@@ -17512,12 +17530,17 @@ static int jgen_check(cbm_store_t *s, const char *project) {
     /* No import names a generated member, so nothing follows one onto it. */
     JGEN_EXPECT(jgen_edges_into(s, acc_y, "IMPORTS") == 0);
     JGEN_EXPECT(jgen_calls(s, make, 0, "y") == 0);
+    /* The JDK's Objects.nonNull is not Seen's accessor, called or referenced. */
+    JGEN_EXPECT(jgen_calls(s, stat, acc_nn, NULL) == 0);
+    JGEN_EXPECT(jgen_edges_into(s, acc_nn, "CALL_REFERENCE") == 0);
+    JGEN_EXPECT(jgen_edges_into(s, acc_nn, "USAGE") == 0);
     return failed;
 }
 #undef JGEN_EXPECT
 
 static int jgen_write_fixture(const char *tmp) {
     write_temp_file(tmp, "Point.java", jgen_point_java);
+    write_temp_file(tmp, "Seen.java", jgen_seen_java);
     write_temp_file(tmp, "Spring.java", jgen_spring_java);
     write_temp_file(tmp, "Caller.java", jgen_caller_java);
     return 0;
