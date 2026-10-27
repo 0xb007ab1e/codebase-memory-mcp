@@ -1243,6 +1243,7 @@ TEST(client_adapter_pi_wraps_result_and_honors_abort) {
     ASSERT_NOT_NULL(
         strstr(js, "[{ type: 'text', text: JSON.stringify(result ?? null, null, 2) }]"));
     ASSERT_NOT_NULL(strstr(js, "signal?.addEventListener('abort', onAbort, { once: true })"));
+    ASSERT_NOT_NULL(strstr(js, "if (!child.killed) child.kill();"));
     free(js);
     PASS();
 }
