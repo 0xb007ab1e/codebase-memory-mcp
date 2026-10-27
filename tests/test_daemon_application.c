@@ -4687,6 +4687,151 @@ TEST(daemon_application_permanent_watch_survives_disconnect_and_indexes_without_
     PASS();
 }
 
+/* A permanent daemon keeps a project watched after its last session closes.
+ * delete_project from another session or the CLI removes the project's DB but
+ * owns no watch, so the watch itself must notice: a later change must end the
+ * orphaned watch, never re-create the deleted index. */
+TEST(daemon_application_permanent_watch_ends_when_project_db_is_deleted) {
+    app_watch_race_fixture_t fixture;
+    bool fixture_ready = app_watch_race_fixture_init(&fixture, 48);
+    if (fixture_ready) {
+        cbm_daemon_application_set_permanent(fixture.application, true);
+        /* Should a job be admitted, it completes at once: the verdict is
+         * read from the start counter, never from a timeout. */
+        atomic_store(&fixture.fake.allow_completion, true);
+    }
+    if (fixture.session) {
+        fixture.callbacks.session_cancel(fixture.callbacks.context, fixture.session);
+        fixture.callbacks.session_close(fixture.callbacks.context, fixture.session);
+        fixture.session = NULL;
+    }
+    int watch_after_close = fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+    bool db_removed = fixture_ready && cbm_unlink(fixture.db_path) == 0;
+    int result = db_removed ? cbm_daemon_application_watcher_index(fixture.project, fixture.root,
+                                                                   fixture.application)
+                            : -2;
+    int starts = fixture_ready ? atomic_load(&fixture.fake.starts) : -1;
+    int watch_after_index = fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+    bool cleaned = app_watch_race_fixture_finish(&fixture);
+
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_EQ(watch_after_close, 1);
+    ASSERT_TRUE(db_removed);
+    /* A harmless skip: nothing admitted, the deleted index stays deleted. */
+    ASSERT_EQ(result, 1);
+    ASSERT_EQ(starts, 0);
+    /* The orphaned physical watch is torn down. */
+    ASSERT_EQ(watch_after_index, 0);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
+/* The second watcher callback either joins the running job (its retained
+ * ownership is the job's second subscriber) or returns. Both states latch, so
+ * whichever happens decides the wait; the deadline only catches "neither". */
+static bool app_wait_for_watcher_join_or_return(cbm_daemon_application_t *application,
+                                                const char *project, atomic_bool *returned) {
+    uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
+    while (cbm_now_ms() < deadline) {
+        if (cbm_daemon_application_job_subscribers(application, project) == 2 ||
+            atomic_load(returned)) {
+            return true;
+        }
+        cbm_usleep(1000);
+    }
+    return false;
+}
+
+/* A full reindex unlinks the project's DB while it rebuilds it, so a missing
+ * DB alone does not mean the project was deleted. While the permanent watch's
+ * own job runs, a second change in its root must join that job and keep the
+ * watch; once the job ends, both callbacks hand their ownership back. */
+TEST(daemon_application_permanent_watch_kept_while_its_reindex_runs) {
+    app_watch_race_fixture_t fixture;
+    bool fixture_ready = app_watch_race_fixture_init(&fixture, 49);
+    if (fixture_ready) {
+        cbm_daemon_application_set_permanent(fixture.application, true);
+    }
+    if (fixture.session) {
+        fixture.callbacks.session_cancel(fixture.callbacks.context, fixture.session);
+        fixture.callbacks.session_close(fixture.callbacks.context, fixture.session);
+        fixture.session = NULL;
+    }
+    int watch_after_close = fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    app_watcher_index_thread_t first = {
+        .application = fixture.application,
+        .project = fixture.project,
+        .root = fixture.root,
+        .pause_before_subscribe = false,
+        .result = -1,
+    };
+    atomic_init(&first.ready, false);
+    atomic_init(&first.proceed, true);
+    atomic_init(&first.done, false);
+    app_watcher_index_thread_t second = {
+        .application = fixture.application,
+        .project = fixture.project,
+        .root = fixture.root,
+        .pause_before_subscribe = false,
+        .result = -1,
+    };
+    atomic_init(&second.ready, false);
+    atomic_init(&second.proceed, true);
+    atomic_init(&second.done, false);
+
+    /* The fake worker keeps the first job running until allow_completion. */
+    cbm_thread_t first_thread;
+    bool first_started = fixture_ready && watch_after_close == 1 &&
+                         cbm_thread_create(&first_thread, 0, app_watcher_index_thread, &first) == 0;
+    bool job_running = first_started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    bool db_removed = job_running && cbm_unlink(fixture.db_path) == 0;
+    cbm_thread_t second_thread;
+    bool second_started =
+        db_removed && cbm_thread_create(&second_thread, 0, app_watcher_index_thread, &second) == 0;
+    bool settled = second_started && app_wait_for_watcher_join_or_return(
+                                         fixture.application, fixture.project, &second.done);
+    size_t subscribers_while_running =
+        fixture_ready ? cbm_daemon_application_job_subscribers(fixture.application, fixture.project)
+                      : 0;
+    bool second_returned_while_running = atomic_load(&second.done);
+    int watch_while_running = fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    if (fixture_ready) {
+        atomic_store(&fixture.fake.allow_completion, true);
+    }
+    bool first_joined = first_started && app_wait_for_atomic_bool(&first.done, true) &&
+                        cbm_thread_join(&first_thread) == 0;
+    bool second_joined = second_started && app_wait_for_atomic_bool(&second.done, true) &&
+                         cbm_thread_join(&second_thread) == 0;
+    int starts = fixture_ready ? atomic_load(&fixture.fake.starts) : -1;
+    size_t subscribers_after =
+        fixture_ready ? cbm_daemon_application_job_subscribers(fixture.application, fixture.project)
+                      : SIZE_MAX;
+    int watch_after = fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+    bool cleaned = app_watch_race_fixture_finish(&fixture);
+
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_EQ(watch_after_close, 1);
+    ASSERT_TRUE(job_running);
+    ASSERT_TRUE(db_removed);
+    ASSERT_TRUE(settled);
+    /* The second change joined the running job instead of ending the watch. */
+    ASSERT_EQ(subscribers_while_running, 2);
+    ASSERT_FALSE(second_returned_while_running);
+    ASSERT_EQ(watch_while_running, 1);
+    ASSERT_TRUE(first_joined);
+    ASSERT_TRUE(second_joined);
+    ASSERT_EQ(first.result, 0);
+    ASSERT_EQ(second.result, 0);
+    ASSERT_EQ(starts, 1);
+    /* Each callback released the ownership it retained at admission. */
+    ASSERT_EQ(subscribers_after, 0);
+    ASSERT_EQ(watch_after, 1);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
 TEST(daemon_application_late_watcher_session_owns_active_watcher_job) {
     app_watch_race_fixture_t fixture;
     bool fixture_ready = app_watch_race_fixture_init(&fixture, 45);
@@ -7793,6 +7938,8 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_final_cancel_drains_admitted_watcher_job);
     RUN_TEST(daemon_application_watcher_job_follows_exact_live_watch_owners);
     RUN_TEST(daemon_application_permanent_watch_survives_disconnect_and_indexes_without_session);
+    RUN_TEST(daemon_application_permanent_watch_ends_when_project_db_is_deleted);
+    RUN_TEST(daemon_application_permanent_watch_kept_while_its_reindex_runs);
     RUN_TEST(daemon_application_late_watcher_session_owns_active_watcher_job);
     RUN_TEST(daemon_application_watch_roots_match_windows_separators_only);
     RUN_TEST(daemon_application_async_completion_disables_all_watches);

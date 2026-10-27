@@ -4268,6 +4268,21 @@ static void application_watch_encode_index_args_locked(const cbm_daemon_applicat
     *args = encoded ? yyjson_mut_write(document, 0, NULL) : NULL;
 }
 
+/* Under `daemon start` a watch outlives its last session, so delete_project
+ * from another session or the CLI can remove the project's DB while nothing
+ * owns the watch any more: daemon MCP sessions carry no watcher pointer and
+ * never unwatch it. Re-indexing such an orphan would resurrect the deleted
+ * project. A full reindex also unlinks the DB while it rebuilds it, so a
+ * missing DB means "deleted" only while no job for the project is running.
+ * Caller holds application->mutex. */
+static bool application_permanent_watch_orphaned_locked(cbm_daemon_application_t *application,
+                                                        const cbm_daemon_application_watch_t *watch,
+                                                        const char *project_key) {
+    return application->permanent && watch->subscribers == 0 &&
+           !application_find_active_job_locked(application, project_key) &&
+           !application_regular_db_exists(watch->project);
+}
+
 static cbm_daemon_application_job_t *application_background_index_admit(
     cbm_daemon_application_t *application, const char *project_name, const char *canonical_root,
     const char *project_key, yyjson_mut_doc *document, yyjson_mut_val *root, char **args,
@@ -4281,6 +4296,12 @@ static cbm_daemon_application_job_t *application_background_index_admit(
     }
     cbm_daemon_application_watch_t *watch =
         require_live_watch ? application_find_watch_locked(application, project_name) : NULL;
+    if (watch && application_permanent_watch_orphaned_locked(application, watch, project_key)) {
+        /* End the orphan the way a session refresh ends a deleted project's
+         * watch; the callback below becomes a harmless skip. */
+        application_remove_watch_locked(application, watch);
+        watch = NULL;
+    }
     bool watch_live = !require_live_watch ||
                       (watch && application_watch_root_matches(watch->root, canonical_root) &&
                        (watch->subscribers > 0 || application->permanent));
