@@ -604,6 +604,68 @@ TEST(doc_links_md_incremental) {
     PASS();
 }
 
+/* #2587 incremental == full: whether a `path::member` row is missing depends
+ * on the member file's text, and the row leads to that file by no edge. A
+ * body edit that writes the name (no definition added) turns the row into a
+ * file edge, one that drops it turns the edge back into the row; a same-named
+ * group that shrinks to one turns an ambiguous row into an edge. */
+TEST(doc_links_md_member_missing_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlmd_inc_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char repo[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    th_write_file(TH_PATH(repo, "docs/helpers.md"), "# Helpers\n\nSee `src/tools.py::helper2`.\n");
+    th_write_file(TH_PATH(repo, "docs/areas.md"), "# Areas\n\nSee `src/shapes.py::area`.\n");
+    th_write_file(TH_PATH(repo, "src/tools.py"), "def helper():\n"
+                                                 "    return 1\n");
+    th_write_file(TH_PATH(repo, "src/shapes.py"), "class Circle:\n"
+                                                  "    def area(self):\n"
+                                                  "        return 3\n"
+                                                  "\n"
+                                                  "\n"
+                                                  "class Square:\n"
+                                                  "    def area(self):\n"
+                                                  "        return 4\n");
+    char db[512];
+    char full_db[512];
+    snprintf(db, sizeof(db), "%s/inc.db", tmp);
+    snprintf(full_db, sizeof(full_db), "%s/full.db", tmp);
+    ASSERT_EQ(dm_index(repo, db, NULL), 0);
+    char reason[64];
+    dm_row(db, "docs/helpers.md", "src/tools.py::helper2", reason, sizeof(reason), NULL, 0);
+    ASSERT_STR_EQ(reason, "missing");
+    dm_row(db, "docs/areas.md", "src/shapes.py::area", reason, sizeof(reason), NULL, 0);
+    ASSERT_STR_EQ(reason, "ambiguous");
+
+    /* the body writes the name, no definition added: the row becomes an edge */
+    th_write_file(TH_PATH(repo, "src/tools.py"), "def helper():\n"
+                                                 "    return 1  # helper2 follows\n");
+    ASSERT_EQ(dm_step(repo, db, full_db, "member written", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
+              0);
+    ASSERT_EQ(md_file_edges(db, "Helpers", "src/tools.py"), 1);
+    /* and drops it again: missing again */
+    th_write_file(TH_PATH(repo, "src/tools.py"), "def helper():\n"
+                                                 "    return 1\n");
+    ASSERT_EQ(dm_step(repo, db, full_db, "member dropped", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
+              0);
+    dm_row(db, "docs/helpers.md", "src/tools.py::helper2", reason, sizeof(reason), NULL, 0);
+    ASSERT_STR_EQ(reason, "missing");
+    /* one of two `area` methods goes, the name stays: the one left binds */
+    th_write_file(TH_PATH(repo, "src/shapes.py"), "class Circle:\n"
+                                                  "    pass\n"
+                                                  "\n"
+                                                  "\n"
+                                                  "class Square:\n"
+                                                  "    def area(self):\n"
+                                                  "        return 4\n");
+    ASSERT_EQ(dm_step(repo, db, full_db, "group shrinks", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    char props[512];
+    ASSERT_EQ(md_edge(db, "Areas", "Square.area", props, sizeof(props)), 1);
+    th_cleanup(tmp);
+    PASS();
+}
+
 /* ── ADRs ────────────────────────────────────────────────────────── */
 
 static void md_write_adrs(const char *tmp, const char *first_status) {
@@ -1028,6 +1090,7 @@ SUITE(doc_links_md) {
     RUN_TEST(doc_links_md_member_not_defined_issue2587);
     RUN_TEST(doc_links_md_member_written_issue2587);
     RUN_TEST(doc_links_md_incremental);
+    RUN_TEST(doc_links_md_member_missing_incremental);
     RUN_TEST(doc_links_md_adr);
     RUN_TEST(doc_links_md_adr_label_choice);
     RUN_TEST(doc_links_md_adr_reported);
