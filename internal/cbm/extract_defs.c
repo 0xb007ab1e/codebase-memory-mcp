@@ -7069,14 +7069,13 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
      * above the function — the QN is node identity, and a line suffix would
      * churn nodes on every unrelated insertion. Nothing ever joins on the
      * plain QN — calling init explicitly is illegal in Go — and the
-     * call-scope side (compute_func_qn in extract_unified.c) computes the
-     * same cbm_go_init_ordinal so init-body calls keep their attribution. */
+     * call-scope side (compute_func_qn in extract_unified.c) and the Go LSP
+     * (process_function in lsp/go_lsp.c) name it through the same
+     * cbm_go_init_qn, so init-body calls keep their attribution. */
     if (ctx->language == CBM_LANG_GO && strcmp(def.label, "Function") == 0 &&
         strcmp(name, "init") == 0) {
-        const char *base = strrchr(ctx->rel_path, '/');
-        base = base ? base + 1 : ctx->rel_path;
-        def.qualified_name = cbm_arena_sprintf(a, "%s#%s:%d", def.qualified_name, base,
-                                               cbm_go_init_ordinal(node, ctx->source));
+        def.qualified_name =
+            cbm_go_init_qn(a, def.qualified_name, ctx->rel_path, node, ctx->source);
     }
 
     // C++/CUDA: out-of-line method definition (`Foo::bar` in a .cc/.cpp). The
