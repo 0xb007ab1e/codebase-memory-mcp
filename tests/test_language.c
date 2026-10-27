@@ -386,6 +386,14 @@ TEST(lang_ext_hcl2) {
     ASSERT_EQ(cbm_language_for_extension(".hcl"), CBM_LANG_HCL);
     PASS();
 }
+/* OpenTofu's own configuration files and Terraform/OpenTofu variable files
+ * are HCL too; neither was indexed (cloud-foundation-fabric: 104 .tofu,
+ * 208 .tfvars). */
+TEST(lang_ext_tofu_tfvars) {
+    ASSERT_EQ(cbm_language_for_extension(".tofu"), CBM_LANG_HCL);
+    ASSERT_EQ(cbm_language_for_extension(".tfvars"), CBM_LANG_HCL);
+    PASS();
+}
 TEST(lang_ext_sql) {
     ASSERT_EQ(cbm_language_for_extension(".sql"), CBM_LANG_SQL);
     PASS();
@@ -492,6 +500,15 @@ TEST(lang_ext_vert) {
     ASSERT_EQ(cbm_language_for_extension(".vert"), CBM_LANG_GLSL);
     PASS();
 }
+/* Compute, geometry and tessellation stages are GLSL too (glslang naming). */
+TEST(lang_ext_glsl_other_stages) {
+    ASSERT_EQ(cbm_language_for_extension(".comp"), CBM_LANG_GLSL);
+    ASSERT_EQ(cbm_language_for_extension(".geom"), CBM_LANG_GLSL);
+    ASSERT_EQ(cbm_language_for_extension(".tesc"), CBM_LANG_GLSL);
+    ASSERT_EQ(cbm_language_for_extension(".tese"), CBM_LANG_GLSL);
+    PASS();
+}
+
 TEST(lang_ext_frag) {
     ASSERT_EQ(cbm_language_for_extension(".frag"), CBM_LANG_GLSL);
     PASS();
@@ -539,6 +556,39 @@ TEST(lang_fn_cmake) {
 }
 TEST(lang_fn_dockerfile) {
     ASSERT_EQ(cbm_language_for_filename("Dockerfile"), CBM_LANG_DOCKERFILE);
+    PASS();
+}
+/* Build files named for a variant; a template or ignore file of one is not. */
+TEST(lang_fn_dockerfile_variants) {
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile.debug"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile.multiarch"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile-test"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile_base"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Containerfile"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Containerfile.arm64"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("pipeline.Dockerfile"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile.j2"), CBM_LANG_JINJA2);
+    ASSERT_NEQ(cbm_language_for_filename("Dockerfile.dockerignore"), CBM_LANG_DOCKERFILE);
+    ASSERT_NEQ(cbm_language_for_filename("Dockerfile."), CBM_LANG_DOCKERFILE);
+    ASSERT_NEQ(cbm_language_for_filename("Dockerfiles"), CBM_LANG_DOCKERFILE);
+    PASS();
+}
+/* A name shorter than "Dockerfile" / "Containerfile" is read no further than
+ * its end: each name sits in a heap block of exactly its size, so a sanitizer
+ * sees the overread the variant check once made (GCC ASan, doc-link code
+ * asking for the language of `a.go`). */
+TEST(lang_fn_short_names_read_in_bounds) {
+    static const char *const NAMES[] = {"a",    "a.go",       "go.mod", "Dock",
+                                        "Dockerf", "Containe", "x.yaml"};
+    for (size_t i = 0; i < sizeof(NAMES) / sizeof(NAMES[0]); i++) {
+        size_t n = strlen(NAMES[i]) + 1;
+        char *exact = malloc(n);
+        ASSERT_NOT_NULL(exact);
+        memcpy(exact, NAMES[i], n);
+        CBMLanguage lang = cbm_language_for_filename(exact);
+        free(exact);
+        ASSERT_NEQ(lang, CBM_LANG_DOCKERFILE);
+    }
     PASS();
 }
 TEST(lang_fn_meson_build) {
@@ -1588,6 +1638,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_toml);
     RUN_TEST(lang_ext_hcl);
     RUN_TEST(lang_ext_hcl2);
+    RUN_TEST(lang_ext_tofu_tfvars);
     RUN_TEST(lang_ext_sql);
     RUN_TEST(lang_ext_dockerfile);
     RUN_TEST(lang_ext_json);
@@ -1612,6 +1663,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_glsl);
     RUN_TEST(lang_ext_vert);
     RUN_TEST(lang_ext_frag);
+    RUN_TEST(lang_ext_glsl_other_stages);
     RUN_TEST(lang_ext_ini);
     RUN_TEST(lang_ext_cfg);
     RUN_TEST(lang_ext_conf);
@@ -1626,6 +1678,8 @@ SUITE(language) {
     RUN_TEST(lang_fn_makefile_lower);
     RUN_TEST(lang_fn_cmake);
     RUN_TEST(lang_fn_dockerfile);
+    RUN_TEST(lang_fn_dockerfile_variants);
+    RUN_TEST(lang_fn_short_names_read_in_bounds);
     RUN_TEST(lang_fn_meson_build);
     RUN_TEST(lang_fn_meson_opts);
     RUN_TEST(lang_fn_meson_opts_txt);

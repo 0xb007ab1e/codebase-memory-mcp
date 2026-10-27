@@ -310,6 +310,12 @@ bash "$ROOT/tests/test_smoke_fixture_contract.sh"
 echo "=== Step 0i: parallel suite scheduler contract ==="
 bash "$ROOT/tests/test_parallel_harness_contract.sh"
 
+# Step 0i2: a red suite's summary must show the sanitizer report and the test
+# that was running, not only "FAIL" lines and a shadow-byte legend. Drives the
+# real summary functions with fabricated suite logs, so it runs everywhere.
+echo "=== Step 0i2: suite failure-report contract ==="
+bash "$ROOT/tests/test_failure_report_contract.sh"
+
 echo "=== Step 0j: venue parity contract (one harness, every venue) ==="
 bash "$ROOT/tests/test_venue_parity_contract.sh"
 
@@ -377,6 +383,8 @@ bash "$ROOT/tests/test_setup_scripts_contract.sh"
 # every September 2026 PR push and real failure against it.
 echo "=== Step 0z: PR lane selector contract ==="
 bash "$ROOT/tests/test_select_lanes.sh"
+echo "=== Step 0z1: CodeQL retraces affected prebuilt objects ==="
+bash "$ROOT/tests/test_codeql_retrace.sh"
 echo "=== Step 0z2: lane selector history replay ==="
 bash "$ROOT/scripts/test-impact/replay-selector.sh"
 echo "=== Step 0z3: lane-aware aggregate gates (ci-ok, shard union) ==="

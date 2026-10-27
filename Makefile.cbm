@@ -366,6 +366,7 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_imports.c \
     $(CBM_DIR)/extract_usages.c \
     $(CBM_DIR)/extract_unified.c \
+    $(CBM_DIR)/extract_url_fold.c \
     $(CBM_DIR)/extract_semantic.c \
     $(CBM_DIR)/extract_type_refs.c \
     $(CBM_DIR)/extract_type_assigns.c \
@@ -448,13 +449,13 @@ PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
 
 # Store module (new)
-STORE_SRCS = src/store/store.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
+STORE_SRCS = src/store/store.c src/store/graph_mem.c src/store/architecture_projection.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
 
 # Cypher module (new)
 CYPHER_SRCS = src/cypher/cypher.c
 
 # MCP server module (new)
-MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c \
+MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c src/mcp/architecture_jobs.c \
 	src/mcp/test_impact.c src/mcp/test_impact_diff.c src/mcp/test_impact_classify.c src/mcp/test_impact_source.c src/mcp/test_impact_seed.c src/mcp/test_impact_engine.c src/mcp/test_impact_engine_snapshot.c src/mcp/test_impact_engine_reach.c src/mcp/test_impact_engine_artifact.c src/mcp/test_impact_cli.c src/mcp/test_impact_artifact.c src/mcp/test_impact_changes.c src/mcp/test_impact_origins.c src/mcp/test_impact_coverage.c src/mcp/test_impact_config.c src/mcp/test_impact_select.c src/mcp/test_impact_policy.c src/mcp/test_impact_git.c src/mcp/test_impact_inventory.c src/mcp/test_impact_inventory_input.c src/mcp/test_impact_tree.c src/mcp/test_impact_tree_audit.c src/mcp/test_impact_tree_read.c src/mcp/test_impact_tree_batch.c src/mcp/test_impact_tree_digest.c src/mcp/test_impact_tree_names.c src/mcp/test_impact_tree_plan.c src/mcp/test_impact_tree_posix.c src/mcp/test_impact_tree_posix_acl.c src/mcp/test_impact_tree_posix_io.c src/mcp/test_impact_tree_util.c src/mcp/test_impact_tree_windows.c src/mcp/test_impact_tree_windows_acl.c src/mcp/test_impact_tree_windows_io.c \
 	src/mcp/test_impact_result.c src/mcp/test_impact_result_json.c src/mcp/test_impact_result_project.c src/mcp/test_impact_result_receipt.c src/mcp/test_impact_result_rows.c src/mcp/test_impact_result_util.c src/mcp/test_impact_result_validate.c src/mcp/test_impact_result_wire.c
 
@@ -533,10 +534,17 @@ PIPELINE_SRCS = \
     src/pipeline/doc_links_msbuild.c \
     src/pipeline/pass_route_nodes.c \
     src/pipeline/pass_enrichment.c \
-    src/pipeline/pass_envscan.c \
     src/pipeline/pass_compile_commands.c \
     src/pipeline/pass_infrascan.c \
     src/pipeline/pass_k8s.c \
+    src/pipeline/helm_template.c \
+    src/pipeline/pass_operator.c \
+    src/pipeline/pass_shell.c \
+    src/pipeline/pass_terraform.c \
+    src/pipeline/pass_ansible.c \
+    src/pipeline/pass_docker.c \
+    src/pipeline/pass_envjoin.c \
+    src/pipeline/pass_ci.c \
     src/pipeline/pass_similarity.c \
     src/pipeline/pass_semantic_edges.c \
     src/pipeline/pass_complexity.c \
@@ -565,7 +573,7 @@ WATCHER_SRCS = src/watcher/watcher.c
 GIT_SRCS = src/git/git_context.c
 
 # CLI module (new)
-CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c src/cli/client_adapter.c \
+CLI_SRCS = src/cli/cli.c src/cli/runtime_settings.c src/cli/progress_sink.c src/cli/hook_augment.c src/cli/client_adapter.c \
 	src/cli/agent_clients.c src/cli/agent_profiles.c \
 	src/cli/config_json_like.c src/cli/config_toml_edit.c src/cli/config_yaml_edit.c \
 	src/cli/config_text_edit.c src/cli/config_edit_path.c src/cli/activation_transaction.c
@@ -574,7 +582,16 @@ CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c src/cli/
 UI_SRCS = \
     src/ui/config.c \
     src/ui/http_server.c \
+    src/ui/activity.c \
+    src/ui/atlas_repository.c \
     src/ui/layout3d.c \
+    src/ui/layout_regions.c \
+    src/ui/atlas_api.c \
+    src/ui/atlas_flows.c \
+    src/ui/atlas_handout.c \
+    src/ui/atlas_why.c \
+    src/ui/atlas_metrics.c \
+    src/ui/atlas_impact.c \
     src/ui/httpd.c \
     src/ui/embedded_stub.c
 
@@ -730,8 +747,10 @@ TEST_STORE_SRCS = \
     tests/test_store_impact.c \
     tests/test_store_scope.c \
     tests/test_store_graph_digest.c \
+    tests/test_graph_mem.c \
     tests/test_store_search.c \
     tests/test_store_arch.c \
+    tests/test_architecture_projection.c \
     tests/test_store_bulk.c \
     tests/test_store_pragmas.c \
     tests/test_store_checkpoint.c \
@@ -828,7 +847,7 @@ TEST_PY_LSP_SCALE_SRCS = tests/test_py_lsp_scale.c
 
 TEST_TS_LSP_SRCS = tests/test_ts_lsp.c
 TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c
-TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c
+TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c tests/test_kotlin_typed_calls.c
 TEST_RUST_LSP_SRCS = tests/test_rust_lsp.c
 
 TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/test_lang_contract.c tests/test_edge_imports.c tests/test_edge_structural.c tests/test_lsp_resolution_probe.c tests/test_node_creation_probe.c tests/test_edge_types_probe.c tests/test_convergence_probe.c tests/test_matrix_known_classes.c tests/test_matrix_new_constructs.c tests/test_grammar_probe_a.c tests/test_grammar_probe_b.c tests/test_grammar_probe_c.c tests/test_grammar_probe_d.c tests/test_grammar_probe_e.c tests/test_grammar_probe_f.c tests/test_grammar_probe_g.c tests/test_conditional_variants.c tests/test_spawns.c
@@ -836,7 +855,7 @@ TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/
 TEST_TRACES_SRCS = tests/test_traces.c
 
 
-TEST_CLI_SRCS = tests/test_cli.c tests/test_agent_clients.c tests/test_agent_profiles.c \
+TEST_CLI_SRCS = tests/test_cli.c tests/test_runtime_settings.c tests/test_agent_clients.c tests/test_agent_profiles.c \
 	tests/test_config_json_like.c \
 	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c \
 	tests/test_activation_transaction.c
@@ -982,7 +1001,7 @@ $(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(PROJE
 	$(CC) $(CFLAGS_TEST) -o $@ $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(LDFLAGS_TEST)
 
 test-foundation: $(BUILD_DIR)/test-foundation
-	cd $(CURDIR) && $(BUILD_DIR)/test-foundation
+	cd "$(CURDIR)" && $(BUILD_DIR)/test-foundation
 
 # ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
 
@@ -1141,13 +1160,13 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 		$(LDFLAGS_TEST)
 
 test: $(BUILD_DIR)/test-runner
-	cd $(CURDIR) && $(BUILD_DIR)/test-runner
+	cd "$(CURDIR)" && $(BUILD_DIR)/test-runner
 
 # Parallel variant: every suite as its own process; identical gate quality
 # (see the ZERO-LOSS CONTRACT in scripts/run-tests-parallel.sh — union guard
 # against --list-suites + aggregated pass/fail/skip totals).
 test-par: $(BUILD_DIR)/test-runner
-	cd $(CURDIR) && bash scripts/run-tests-parallel.sh $(BUILD_DIR)/test-runner
+	cd "$(CURDIR)" && bash scripts/run-tests-parallel.sh $(BUILD_DIR)/test-runner
 
 # Focused native development is intentionally a separate, explicit target so
 # an inherited TEST_SUITES value cannot silently narrow the gating test target.
@@ -1155,7 +1174,7 @@ TEST_SUITES ?=
 test-focused: $(BUILD_DIR)/test-runner
 	@test -n "$(strip $(TEST_SUITES))" || \
 		(echo "TEST_SUITES is required for test-focused"; exit 2)
-	cd $(CURDIR) && $(BUILD_DIR)/test-runner $(TEST_SUITES)
+	cd "$(CURDIR)" && $(BUILD_DIR)/test-runner $(TEST_SUITES)
 
 # ── Cumulative bug-reproduction runner (RED board by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
@@ -1280,6 +1299,16 @@ $(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c $(BUILD_DIR)/.build-co
 
 OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
 
+# The part of OBJS_VENDORED_PROD that holds no first-party code: everything but
+# prod_lsp_all.o (first-party LSP unity) and prod_preprocessor.o (first-party
+# code around vendored simplecpp). CodeQL's light PR scan builds these BEFORE
+# it starts tracing (scripts/build.sh --vendored-only), so the traced build
+# (--reuse-vendored) compiles first-party code only: the grammars alone are
+# most of the 1.3 GB of vendored C, against ~45 MB of first-party code.
+OBJS_THIRD_PARTY_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
+.PHONY: cbm-third-party
+cbm-third-party: $(OBJS_THIRD_PARTY_PROD)
+
 MAIN_SRC = src/main.c
 
 # Rebuild when the build CONFIGURATION changes, not only when sources do. The
@@ -1327,8 +1356,11 @@ PROD_SRCS_WITH_ASSETS = $(subst src/ui/embedded_stub.c,src/ui/embedded_assets.c,
 # Embedded asset object files (generated by embed script)
 EMBED_OBJS = $(wildcard $(BUILD_DIR)/embedded/embed_*.o)
 
+# PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: the UI's dev dependencies include
+# playwright for its local browser proofs; a plain `npm ci` would otherwise
+# download browsers, which no build or gate needs.
 frontend:
-	cd graph-ui && npm ci && npm run build
+	cd graph-ui && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci && npm run build
 
 embed: frontend
 	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
@@ -1354,6 +1386,7 @@ LLVM_BIN := $(shell brew --prefix llvm 2>/dev/null)/bin
 CLANG_TIDY ?= $(shell [ -x "$(LLVM_BIN)/clang-tidy" ] && echo "$(LLVM_BIN)/clang-tidy" || echo clang-tidy)
 CLANG_FORMAT ?= $(shell [ -x "$(LLVM_BIN)/clang-format" ] && echo "$(LLVM_BIN)/clang-format" || echo clang-format)
 CPPCHECK ?= cppcheck
+CPPCHECK_JOBS ?= 2
 
 # macOS SDK sysroot (needed for Homebrew LLVM to find system headers)
 SYSROOT = $(shell xcrun --show-sdk-path 2>/dev/null)
@@ -1378,10 +1411,16 @@ lint-tidy:
 lint-tidy-diff:
 	@scripts/lint-tidy-diff.sh "$(CLANG_TIDY)" $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
 
-# cppcheck: complementary analysis (config in .cppcheck)
+# cppcheck: complementary analysis (config in .cppcheck). A build directory
+# retains whole-program analysis with parallel workers; each run owns its state.
 lint-cppcheck:
 	@echo "=== cppcheck ==="
-	@$(CPPCHECK) --enable=warning,style,performance,portability \
+	@set -e; \
+		cppcheck_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/cbm-cppcheck.XXXXXX"); \
+		trap 'status=$$?; rm -rf "$$cppcheck_dir" || :; exit "$$status"' EXIT; \
+		trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+		$(CPPCHECK) -j$(CPPCHECK_JOBS) --cppcheck-build-dir="$$cppcheck_dir" \
+		--enable=warning,style,performance,portability \
 		--std=c11 --language=c \
 		--suppressions-list=.cppcheck \
 		--error-exitcode=1 \
@@ -1588,8 +1627,12 @@ fuzz:
 	$(MAKE) -f Makefile.cbm build/fuzz/cbm-fuzz BUILD_DIR=build/fuzz \
 		CC=$(FUZZ_CC) CXX=$(FUZZ_CXX) SANITIZE="$(FUZZ_SANITIZE)"
 
+# -fsanitize-link-c++-runtime: the link runs through the C driver, which on
+# Linux leaves out UBSan's C++ runtime, but the C++ objects (preprocessor,
+# simplecpp) carry -fsanitize=vptr checks that need it
+# (__ubsan_vptr_type_cache, __ubsan_handle_dynamic_type_cache_miss).
 $(BUILD_DIR)/cbm-fuzz: $(FUZZ_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -fsanitize=fuzzer -o $@ \
+	$(CC) $(CFLAGS_TEST) -fsanitize=fuzzer -fsanitize-link-c++-runtime -o $@ \
 		$(FUZZ_SRC) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \

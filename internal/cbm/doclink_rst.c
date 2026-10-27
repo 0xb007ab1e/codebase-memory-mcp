@@ -1764,7 +1764,11 @@ void cbm_doclink_rst_scan_file(CBMExtractCtx *ctx) {
         ctx->result->doc_links.failed = true;
         return;
     }
-    qsort(d.toks, (size_t)d.ntoks, sizeof(*d.toks), rst_tok_cmp);
+    /* d.toks stays NULL until the first token: qsort's base is nonnull even
+     * for zero elements (glibc attribute; UBSan on Linux amd64, 2026-10-13). */
+    if (d.ntoks > 1) {
+        qsort(d.toks, (size_t)d.ntoks, sizeof(*d.toks), rst_tok_cmp);
+    }
     for (int i = 0; i < d.ntoks; i++) {
         const rst_tok_t *t = &d.toks[i];
         const rst_title_t *sec = rst_section_of(&d, t->line);
