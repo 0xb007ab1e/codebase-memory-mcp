@@ -18059,14 +18059,14 @@ static int jgen_check(cbm_store_t *s, const char *project) {
     int64_t acc_y = jgen_node(s, project, "y", "Method", "Point.java", &gen_y);
     int64_t own_z = jgen_node(s, project, "z", "Method", "Point.java", &gen_z);
     int64_t norm = jgen_node(s, project, "norm", "Method", "Point.java", &gen_norm);
-    int64_t near = jgen_node(s, project, "near", "Method", "Caller.java", NULL);
-    int64_t far = jgen_node(s, project, "far", "Method", "Caller.java", NULL);
+    int64_t near_m = jgen_node(s, project, "near", "Method", "Caller.java", NULL);
+    int64_t far_m = jgen_node(s, project, "far", "Method", "Caller.java", NULL);
     int64_t data = jgen_node(s, project, "data", "Method", "Caller.java", NULL);
     int64_t make = jgen_node(s, project, "make", "Method", "Caller.java", NULL);
     int64_t stat = jgen_node(s, project, "stat", "Method", "Caller.java", NULL);
     int64_t refs = jgen_node(s, project, "refs", "Method", "Caller.java", NULL);
     JGEN_EXPECT(acc_x > 0 && acc_y > 0 && own_z > 0 && norm > 0 && acc_nn > 0);
-    JGEN_EXPECT(near > 0 && far > 0 && data > 0 && make > 0 && stat > 0 && refs > 0);
+    JGEN_EXPECT(near_m > 0 && far_m > 0 && data > 0 && make > 0 && stat > 0 && refs > 0);
     /* The compiler's members are marked; the hand-written ones are not. */
     JGEN_EXPECT(gen_x);
     JGEN_EXPECT(gen_y);
@@ -18074,10 +18074,10 @@ static int jgen_check(cbm_store_t *s, const char *project) {
     JGEN_EXPECT(!gen_z);
     JGEN_EXPECT(!gen_norm);
     /* Bound by qualified name through the receiver's type ... */
-    JGEN_EXPECT(jgen_calls(s, near, acc_y, NULL) == 1);
+    JGEN_EXPECT(jgen_calls(s, near_m, acc_y, NULL) == 1);
     /* ... and never by a short-name guess. */
-    JGEN_EXPECT(jgen_calls(s, far, acc_y, NULL) == 0);
-    JGEN_EXPECT(jgen_calls(s, far, 0, "y") == 0);
+    JGEN_EXPECT(jgen_calls(s, far_m, acc_y, NULL) == 0);
+    JGEN_EXPECT(jgen_calls(s, far_m, 0, "y") == 0);
     /* Neither the accessor nor Spring's field `x`. */
     JGEN_EXPECT(jgen_calls(s, data, 0, "x") == 0);
     /* No import names a generated member, so nothing follows one onto it. */
