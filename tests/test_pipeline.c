@@ -17374,7 +17374,12 @@ TEST(pipeline_python_nested_def_local_after_incremental_issue1548) {
  * name registry is its only route to Point.y. `data` calls x(), whose other
  * spelling is Spring's private field: neither the accessor (a name guess) nor
  * the field (a Java call never names data) is its target. The record's
- * hand-written z() and norm() are source members: no `generated` mark. */
+ * hand-written z() and norm() are source members: no `generated` mark.
+ * `org.external.y.Vector` is not in the project, and its package segment `y`
+ * spells the accessor: the import's symbol-name fallback must not bind it
+ * there (no IMPORTS edge), or `new Vector()` in `make` would follow the import
+ * onto the accessor (elasticsearch: `import javax.crypto.spec.PBEKeySpec`
+ * bound a record's `spec()`). */
 static const char jgen_point_java[] =
     "package com.example;\n"
     "public record Point(double x, double y, double z) {\n"
@@ -17387,11 +17392,12 @@ static const char jgen_spring_java[] = "package com.example;\n"
                                        "    public void put(double v) { this.x = v; }\n"
                                        "}\n";
 static const char jgen_caller_java[] = "package com.example;\n"
-                                       "import org.external.Vector;\n"
+                                       "import org.external.y.Vector;\n"
                                        "public final class Caller {\n"
                                        "    public double near(Point p) { return p.y(); }\n"
                                        "    public double far(Vector v) { return v.y(); }\n"
                                        "    public double data(Vector v) { return v.x(); }\n"
+                                       "    public Object make() { return new Vector(); }\n"
                                        "}\n";
 
 /* The id of the one `label` node called `name` in `file_path`; 0 when there is
@@ -17451,6 +17457,19 @@ static int jgen_calls(cbm_store_t *s, int64_t source_id, int64_t target_id,
     return n;
 }
 
+/* Edges of `type` into `target_id`. */
+static int jgen_edges_into(cbm_store_t *s, int64_t target_id, const char *type) {
+    cbm_edge_t *edges = NULL;
+    int ec = 0;
+    if (cbm_store_find_edges_by_target_type(s, target_id, type, &edges, &ec) != CBM_STORE_OK) {
+        return -1;
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, ec);
+    }
+    return ec;
+}
+
 /* One fact of jgen_check: reported, counted, and the check goes on, so a run
  * shows every fact that does not hold. */
 #define JGEN_EXPECT(cond)                                            \
@@ -17475,8 +17494,9 @@ static int jgen_check(cbm_store_t *s, const char *project) {
     int64_t near = jgen_node(s, project, "near", "Method", "Caller.java", NULL);
     int64_t far = jgen_node(s, project, "far", "Method", "Caller.java", NULL);
     int64_t data = jgen_node(s, project, "data", "Method", "Caller.java", NULL);
+    int64_t make = jgen_node(s, project, "make", "Method", "Caller.java", NULL);
     JGEN_EXPECT(acc_x > 0 && acc_y > 0 && own_z > 0 && norm > 0);
-    JGEN_EXPECT(near > 0 && far > 0 && data > 0);
+    JGEN_EXPECT(near > 0 && far > 0 && data > 0 && make > 0);
     /* The compiler's members are marked; the hand-written ones are not. */
     JGEN_EXPECT(gen_x);
     JGEN_EXPECT(gen_y);
@@ -17489,6 +17509,9 @@ static int jgen_check(cbm_store_t *s, const char *project) {
     JGEN_EXPECT(jgen_calls(s, far, 0, "y") == 0);
     /* Neither the accessor nor Spring's field `x`. */
     JGEN_EXPECT(jgen_calls(s, data, 0, "x") == 0);
+    /* No import names a generated member, so nothing follows one onto it. */
+    JGEN_EXPECT(jgen_edges_into(s, acc_y, "IMPORTS") == 0);
+    JGEN_EXPECT(jgen_calls(s, make, 0, "y") == 0);
     return failed;
 }
 #undef JGEN_EXPECT
