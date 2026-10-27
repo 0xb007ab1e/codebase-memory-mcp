@@ -824,7 +824,9 @@ static const char *application_watch_strategy_name(cbm_watcher_strategy_t strate
 
 /* index_status watch visibility (#2167). The physical watcher is the truth for
  * "watched"; session roots and successful explicit targets stay watched while
- * at least one owning MCP session remains open. Takes the
+ * at least one owning MCP session remains open (under `daemon start`, also
+ * after the last one closes, until the daemon stops, the project is deleted,
+ * its root disappears, or auto_watch is switched off). Takes the
  * application mutex and the watcher lock one after the other, never nested. */
 static void application_watch_status(void *context, const char *project,
                                      cbm_mcp_watch_status_t *out) {
