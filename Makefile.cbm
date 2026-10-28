@@ -646,6 +646,18 @@ ifneq ($(filter yes,$(IS_MINGW) $(IS_LINUX)),)
 MIMALLOC_OVERRIDE_DEFINE := -DMI_MALLOC_OVERRIDE=1
 GLOBAL_OVERRIDE_DEFINE := -DCBM_MEM_GLOBAL_OVERRIDE=1
 endif
+# MI_MINGW_UCRT64: since 3.5.3, mimalloc treats a MinGW build as having a
+# process-attach hook only when this is defined (src/prim/windows/prim.c);
+# upstream's CMake sets it, this Makefile must too. Without it src/prim/prim.c
+# also compiles its constructor, so _mi_auto_process_init runs twice (that
+# constructor plus the CRT TLS callback) and the second options flush writes a
+# stray newline to stderr before main: a blank first line on every run, which
+# failed smoke-win's one-line --version check. Every MinGW toolchain we build
+# with (MSYS2 CLANG64/CLANGARM64) is UCRT. 3.3.2 had no such condition.
+MIMALLOC_WIN_DEFINE :=
+ifeq ($(IS_MINGW),yes)
+MIMALLOC_WIN_DEFINE := -DMI_MINGW_UCRT64=1
+endif
 # MI_DEBUG=0: the production allocator is mimalloc's RELEASE build. Its header
 # defaults to MI_DEBUG=2 unless NDEBUG is defined, and nothing here defined it,
 # so every shipped binary up to v0.11.0 ran mimalloc's debug build: internal
@@ -663,11 +675,11 @@ MIMALLOC_CFLAGS = -std=c11 -O2 -w \
                   -Ivendored/mimalloc/include \
                   -Ivendored/mimalloc/src \
                   -DMI_OVERRIDE=1 -DMI_DEBUG=0 -DMI_PROFILE=0 \
-                  $(MIMALLOC_OVERRIDE_DEFINE)
+                  $(MIMALLOC_OVERRIDE_DEFINE) $(MIMALLOC_WIN_DEFINE)
 MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
                        -Ivendored/mimalloc/include \
                        -Ivendored/mimalloc/src \
-                       -DMI_OVERRIDE=0
+                       -DMI_OVERRIDE=0 $(MIMALLOC_WIN_DEFINE)
 
 # sqlite3 (vendored amalgamation — compiled ourselves for ASan instrumentation)
 # SQLITE_ENABLE_FTS5: enables the FTS5 full-text search extension used by the
