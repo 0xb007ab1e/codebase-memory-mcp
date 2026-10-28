@@ -770,6 +770,259 @@ TEST(pipeline_adr_survives_full_reindex) {
     PASS();
 }
 
+static int pipeline_unresolved_review_case(int padding, bool spill) {
+    char tmp[256] = "/tmp/cbm_unresolved_review_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db[512], path[512];
+    const char *names[] = {"cliente.js", "servicio.js", "ayudante.js",
+                           "directo.js", "missing.js",  "route.js"};
+    const char *sources[] = {
+        "export function crearCliente() { function buscar(id) { return id; } return { buscar }; "
+        "}\n",
+        "export function crearServicio({ cliente }) {\n"
+        "  function procesar(id) {\n"
+        "    cliente.buscar(id); return cliente.buscar(id + 1);\n"
+        "  }\n  return { procesar };\n}\n",
+        "export function ayudante(id) { return id; }\n",
+        "import { ayudante } from './ayudante.js';\n"
+        "export function usarDirecto(id) { ayudante(id); return ayudante(id + 1); }\n",
+        "import { absent } from './ayudante.js';\n"
+        "export function missing(id) { return absent(id); }\n",
+        "export function setup({ app }) { app.get('/x', handler); }\n"
+        "function handler() { return 1; }\n"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", tmp, names[i]);
+        FILE *f = fopen(path, "w");
+        ASSERT_NOT_NULL(f);
+        fputs(sources[i], f);
+        fclose(f);
+    }
+    for (int i = 0; i < padding; i++) {
+        snprintf(path, sizeof(path), "%s/pad%d.js", tmp, i);
+        FILE *f = fopen(path, "w");
+        ASSERT_NOT_NULL(f);
+        fprintf(f, "export function pad%d() { return %d; }\n", i, i);
+        fclose(f);
+    }
+    snprintf(db, sizeof(db), "%s/index.db", tmp);
+    if (spill)
+        cbm_setenv("CBM_MEM_SPILL", "1", 1);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    if (spill)
+        cbm_unsetenv("CBM_MEM_SPILL");
+    ASSERT_EQ(rc, 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    cbm_store_t *st = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(st);
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "directo.js", &rows, &count), CBM_STORE_OK);
+    for (int i = 0; i < count; i++)
+        ASSERT_FALSE(strcmp(rows[i].kind, "unresolved_calls") == 0);
+    cbm_store_free_coverage(rows, count);
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "route.js", &rows, &count), CBM_STORE_OK);
+    for (int i = 0; i < count; i++)
+        ASSERT_FALSE(strcmp(rows[i].kind, "unresolved_calls") == 0);
+    cbm_store_free_coverage(rows, count);
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "servicio.js", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    yyjson_doc *doc = yyjson_read(rows[0].detail, strlen(rows[0].detail), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *sites = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_arr_size(sites), 2);
+    for (size_t i = 0; i < 2; i++) {
+        yyjson_val *site = yyjson_arr_get(sites, i);
+        const char *caller = yyjson_get_str(yyjson_obj_get(site, "caller"));
+        ASSERT_NOT_NULL(caller);
+        ASSERT_NOT_NULL(strstr(caller, ".procesar"));
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(site, "line")), 3);
+        ASSERT_NOT_NULL(yyjson_get_str(yyjson_obj_get(site, "candidate")));
+    }
+    yyjson_doc_free(doc);
+    cbm_store_free_coverage(rows, count);
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "missing.js", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    doc = yyjson_read(rows[0].detail, strlen(rows[0].detail), 0);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_EQ(yyjson_arr_size(yyjson_doc_get_root(doc)), 1);
+    yyjson_doc_free(doc);
+    cbm_store_free_coverage(rows, count);
+    cbm_store_close(st);
+    rm_rf(tmp);
+    PASS();
+}
+
+/* A noisy semantic resolver must retain an explicit bounded-coverage marker,
+ * including when a single reason would exceed the entire detail budget. */
+TEST(pipeline_unresolved_capture_bounds_count_and_json_bytes) {
+    char tmp[256] = "/tmp/cbm_unresolved_cap_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db[512];
+    snprintf(db, sizeof(db), "%s/index.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    CBMResolvedCall *sites = calloc(1001, sizeof(*sites));
+    ASSERT_NOT_NULL(sites);
+    for (int i = 0; i < 1001; i++) {
+        sites[i] = (CBMResolvedCall){.kind = CBM_RESOLVED_INVOCATION,
+                                     .caller_qn = "cap.run",
+                                     .callee_qn = "missing",
+                                     .strategy = "lsp_unresolved",
+                                     .site_start_byte = (uint32_t)i * 2,
+                                     .site_end_byte = (uint32_t)i * 2 + 1};
+    }
+    CBMFileResult result = {.resolved_calls = {.items = sites, .count = 1001}};
+    cbm_pipeline_record_unresolved_calls(p, "many.js", &result, NULL);
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    bool complete = false;
+    cbm_pipeline_get_unresolved_calls(p, &rows, &count, &complete);
+    ASSERT_TRUE(complete);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strlen(rows[0].detail) <= 128 * 1024);
+    yyjson_doc *doc = yyjson_read(rows[0].detail, strlen(rows[0].detail), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *array = yyjson_doc_get_root(doc);
+    ASSERT_TRUE(yyjson_arr_size(array) <= 1001);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(yyjson_arr_get_last(array), "truncated")));
+    yyjson_doc_free(doc);
+
+    char *reason = malloc(200000);
+    ASSERT_NOT_NULL(reason);
+    memset(reason, '"', 199999);
+    reason[199999] = '\0';
+    sites[0].reason = reason;
+    result.resolved_calls.count = 1;
+    cbm_pipeline_record_unresolved_calls(p, "huge.js", &result, NULL);
+    cbm_pipeline_get_unresolved_calls(p, &rows, &count, &complete);
+    ASSERT_TRUE(complete);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(strlen(rows[1].detail) <= 128 * 1024);
+    doc = yyjson_read(rows[1].detail, strlen(rows[1].detail), 0);
+    ASSERT_NOT_NULL(doc);
+    array = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_arr_size(array), 1);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(yyjson_arr_get_last(array), "truncated")));
+    yyjson_doc_free(doc);
+    free(reason);
+    free(sites);
+    cbm_pipeline_free(p);
+    rm_rf(tmp);
+    PASS();
+}
+
+TEST(pipeline_unresolved_review_sequential) {
+    return pipeline_unresolved_review_case(0, false);
+}
+TEST(pipeline_unresolved_review_parallel) {
+    return pipeline_unresolved_review_case(55, false);
+}
+TEST(pipeline_unresolved_review_spill) {
+    return pipeline_unresolved_review_case(55, true);
+}
+
+TEST(pipeline_records_unresolved_injected_call_sites) {
+    char tmp[256] = "/tmp/cbm_unresolved_calls_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db_path[512], path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    snprintf(path, sizeof(path), "%s/cliente.js", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("export function crearCliente() { function buscar(id) { return id; } "
+          "return { buscar }; }\n",
+          f);
+    fclose(f);
+    snprintf(path, sizeof(path), "%s/servicio.js", tmp);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("export function crearServicio({ cliente }) {\n"
+          "  function procesar(id) { return cliente.buscar(id); }\n"
+          "  return { procesar };\n}\n",
+          f);
+    fclose(f);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "servicio.js", &rows, &count), CBM_STORE_OK);
+    bool found = false;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(rows[i].kind, "unresolved_calls") == 0 && strstr(rows[i].detail, "buscar") &&
+            strstr(rows[i].detail, "method_not_in_registry")) {
+            found = true;
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_store_free_coverage(rows, count);
+    cbm_store_close(st);
+
+    /* Reindexing another file must retain this file's diagnostic. */
+    snprintf(path, sizeof(path), "%s/cliente.js", tmp);
+    f = fopen(path, "a");
+    ASSERT_NOT_NULL(f);
+    fputs("\n// unrelated edit\n", f);
+    fclose(f);
+    p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "servicio.js", &rows, &count), CBM_STORE_OK);
+    found = false;
+    for (int i = 0; i < count; i++) {
+        found |= strcmp(rows[i].kind, "unresolved_calls") == 0;
+    }
+    ASSERT_TRUE(found);
+    cbm_store_free_coverage(rows, count);
+    cbm_store_close(st);
+
+    /* The edited file must lose its old diagnostic on the next generation. */
+    snprintf(path, sizeof(path), "%s/servicio.js", tmp);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs(
+        "export function crearServicio({ cliente }) { return { procesar(id) { return id; } }; }\n",
+        f);
+    fclose(f);
+    p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "servicio.js", &rows, &count), CBM_STORE_OK);
+    for (int i = 0; i < count; i++) {
+        ASSERT_FALSE(strcmp(rows[i].kind, "unresolved_calls") == 0);
+    }
+    cbm_store_free_coverage(rows, count);
+    cbm_store_close(st);
+    rm_rf(tmp);
+    PASS();
+}
+
 TEST(pipeline_structure_edges) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -1693,7 +1946,8 @@ TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
     }
-    write_temp_file(g_tmpdir, "infra/main.tf", "module \"net\" {\n  source = \"./modules/net\"\n}\n");
+    write_temp_file(g_tmpdir, "infra/main.tf",
+                    "module \"net\" {\n  source = \"./modules/net\"\n}\n");
     write_temp_file(g_tmpdir, "infra/outputs.tf",
                     "output \"net_vpc\" {\n  value = module.net.vpc_id\n}\n");
     write_temp_file(g_tmpdir, "infra/modules/net/main.tf",
@@ -3850,8 +4104,9 @@ TEST(incremental_shell_deploy_edit_keeps_its_edges) {
     }
     write_temp_file(tmp, "manifests/app.yaml",
                     "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\n");
-    write_temp_file(tmp, "hack/deploy.sh",
-                    "#!/bin/sh\ncd \"$(dirname \"$0\")/..\"\nkubectl apply -f manifests/app.yaml\n");
+    write_temp_file(
+        tmp, "hack/deploy.sh",
+        "#!/bin/sh\ncd \"$(dirname \"$0\")/..\"\nkubectl apply -f manifests/app.yaml\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/shinc.db", tmp);
     static const char deploys[] = "SELECT COUNT(*) FROM edges WHERE type='DEPLOYS'";
@@ -3905,8 +4160,7 @@ static int incremental_spawner_delete(bool legacy, cbm_incremental_route_t *rout
     snprintf(path, sizeof(path), "%s/hack/a.sh", tmp);
     (void)remove(path);
     if (!legacy) {
-        *after_script =
-            k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
+        *after_script = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
         *route = cbm_pipeline_incremental_test_last_route();
     }
     snprintf(path, sizeof(path), "%s/app.py", tmp);
@@ -4152,7 +4406,8 @@ static char *incremental_env_edit(bool legacy, bool dockerfile, cbm_incremental_
         return NULL;
     }
     write_temp_file(tmp, "Dockerfile",
-                    dockerfile ? "FROM alpine:3.20\nENV OLD_D=1\n" : "FROM alpine:3.20\nENV KEEP_D=1\n");
+                    dockerfile ? "FROM alpine:3.20\nENV OLD_D=1\n"
+                               : "FROM alpine:3.20\nENV KEEP_D=1\n");
     write_temp_file(tmp, "compose.yaml",
                     "services:\n  web:\n    image: acme/web\n    environment:\n      OLD_C: x\n");
     write_temp_file(tmp, "compose.other.yaml",
@@ -5375,8 +5630,9 @@ static char *incremental_docker_build_keep(bool legacy, cbm_incremental_route_t 
         return NULL;
     }
     write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n");
-    write_temp_file(tmp, "build.sh",
-                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\ndocker build -t ghcr.io/acme/svc:1 svc\n");
+    write_temp_file(
+        tmp, "build.sh",
+        "#!/bin/sh\ncd \"$(dirname \"$0\")\"\ndocker build -t ghcr.io/acme/svc:1 svc\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/dockerbuild.db", tmp);
     static const char builds[] =
@@ -5427,10 +5683,12 @@ TEST(incremental_second_build_declarer_keeps_the_edge) {
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_twodecl_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n");
-    write_temp_file(tmp, "a.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
-                                 "docker build -t ghcr.io/acme/svc:1 svc\n");
-    write_temp_file(tmp, "b.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
-                                 "docker build -t ghcr.io/acme/svc:2 svc\n");
+    write_temp_file(tmp, "a.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+                    "docker build -t ghcr.io/acme/svc:1 svc\n");
+    write_temp_file(tmp, "b.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+                    "docker build -t ghcr.io/acme/svc:2 svc\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/twodecl.db", tmp);
     static const char builds[] =
@@ -5921,6 +6179,76 @@ TEST(pipeline_closure_repair_removed_def_drops_dependent_edge) {
     PASS();
 }
 
+/* #2276: the closure/delta route clones the previous generation's db file
+ * byte-for-byte and patches only nodes/edges/hashes/surfaces, so a reindex
+ * that keeps the same project name but a DIFFERENT repo_path (an artifact
+ * moved or reused from another checkout) leaves the `projects` row's
+ * root_path/indexed_at pinned to whichever directory the last FULL rebuild
+ * ran from, so every later root_path-keyed read then resolves files against
+ * a directory this run never touched. */
+TEST(pipeline_incremental_root_path_refreshed_across_directories) {
+    char dir_a[256];
+    char dir_b[256];
+    snprintf(dir_a, sizeof(dir_a), "/tmp/cbm_rootpath_a_XXXXXX");
+    snprintf(dir_b, sizeof(dir_b), "/tmp/cbm_rootpath_b_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir_a));
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir_b));
+    closure_probe_repo(dir_a);
+    closure_probe_repo(dir_b);
+    /* Body edit only, same exported names: the shape the closure route
+     * repairs without falling back to a full rebuild (mirrors
+     * pipeline_closure_repair_body_edit_converges_with_fresh_full above). */
+    write_temp_file(dir_b, "lib.ts",
+                    "export function closureProbeHelper(x: number): string {\n"
+                    "  const doubled = x + x;\n"
+                    "  return String(doubled);\n"
+                    "}\n");
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/rootpath.db", dir_a);
+    static const char *project = "rootpath-probe";
+
+    cbm_pipeline_t *first = cbm_pipeline_new(dir_a, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(first);
+    ASSERT_TRUE(cbm_pipeline_set_project_name(first, project));
+    ASSERT_EQ(cbm_pipeline_run(first), 0);
+    cbm_pipeline_free(first);
+
+    /* Reindex the SAME project name from dir_b: a valid existing generation
+     * exists, so this routes through the incremental path, not a first-time
+     * full build. */
+    cbm_pipeline_t *second = cbm_pipeline_new(dir_b, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(second);
+    ASSERT_TRUE(cbm_pipeline_set_project_name(second, project));
+    ASSERT_EQ(cbm_pipeline_run(second), 0);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(second);
+    /* The bug is specific to the closure/delta route; confirm we actually
+     * exercised it rather than a silent fall-back to a full rebuild, which
+     * would pass even with the fix reverted. */
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+
+    /* cbm_pipeline_repo_path()/cbm_store_upsert_project() never call
+     * realpath(): the stored root_path is whatever was passed to
+     * cbm_pipeline_new(), verbatim, on both the full-rebuild path and this
+     * one. Compare against dir_b directly, not a canonicalized form, or
+     * this assertion only holds on a platform where /tmp is not itself a
+     * symlink (it resolves to /private/tmp on macOS). */
+    cbm_project_t info = {0};
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_get_project(store, project, &info), CBM_STORE_OK);
+    ASSERT_STR_EQ(info.root_path, dir_b);
+    free((char *)info.name);
+    free((char *)info.indexed_at);
+    free((char *)info.root_path);
+    cbm_store_close(store);
+
+    th_rmtree(dir_a);
+    th_rmtree(dir_b);
+    PASS();
+}
+
 TEST(pipeline_closure_repair_added_name_declines_to_full) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_added_XXXXXX");
@@ -6000,10 +6328,12 @@ static void stem_repo(const char *tmp, int fillers) {
     write_temp_file(tmp, "rs/foo.rs", "pub mod bar;\npub fn top() {}\n");
     write_temp_file(tmp, "rs/foo/bar.rs", "pub fn inner() {}\n");
     write_temp_file(tmp, "c/foo.h", "int foo_add(int a, int b);\n");
-    write_temp_file(tmp, "c/foo.c", "#include \"foo.h\"\nint foo_add(int a, int b) { return a + b; }\n");
+    write_temp_file(tmp, "c/foo.c",
+                    "#include \"foo.h\"\nint foo_add(int a, int b) { return a + b; }\n");
     write_temp_file(tmp, "c/foo/x.c", "int foo_x(void) { return 1; }\n");
     write_temp_file(tmp, "ts/foo.test.ts", "export function stemProbeA(): number { return 1; }\n");
-    write_temp_file(tmp, "ts/foo/test/a.ts", "export function stemProbeB(): number { return 2; }\n");
+    write_temp_file(tmp, "ts/foo/test/a.ts",
+                    "export function stemProbeB(): number { return 2; }\n");
     write_temp_file(tmp, "go.mod", "module example.com/stem\n\ngo 1.21\n");
     write_temp_file(tmp, "goapi/api.sh", "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
     write_temp_file(tmp, "goapi/api/server.go", "package api\n\nfunc Serve() {}\n");
@@ -6056,7 +6386,8 @@ TEST(pipeline_stem_folder_collision_keeps_both_nodes) {
          "C stem pair Module"},
         {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.c.foo/'",
          "c/foo/ Folder marked"},
-        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.ts.foo.test' AND "
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.ts.foo.test' "
+         "AND "
          "file_path='ts/foo.test.ts'",
          "dotted foo.test.ts Module"},
         {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.ts.foo.test/'",
@@ -6235,8 +6566,9 @@ TEST(incremental_env_join_repair_keeps_unchanged_pairs) {
                     "              value: prod\n");
     write_temp_file(tmp, "compose.yaml",
                     "services:\n  web:\n    image: acme/web:1\n    build: ./web\n");
-    write_temp_file(tmp, "web/Dockerfile",
-                    "FROM node:20\nCOPY src ./src\nCOPY lib ./lib\nCMD [\"node\", \"src/server.js\"]\n");
+    write_temp_file(
+        tmp, "web/Dockerfile",
+        "FROM node:20\nCOPY src ./src\nCOPY lib ./lib\nCMD [\"node\", \"src/server.js\"]\n");
     write_temp_file(tmp, "web/src/server.js",
                     "const port = process.env.PORT;\nconst mode = process.env.MODE;\n");
     write_temp_file(tmp, "web/lib/conf.js", "module.exports = process.env.MODE;\n");
@@ -6246,9 +6578,9 @@ TEST(incremental_env_join_repair_keeps_unchanged_pairs) {
     snprintf(db, sizeof(db), "%s/envjoin.db", tmp);
     static const char joins[] = "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
                                 "WHERE e.type='CONFIGURES' AND s.label='EnvVar'";
-#define ENVJOIN_PAIR(key, file)                                                                    \
-    "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "               \
-    "t.id=e.target_id WHERE e.type='CONFIGURES' AND s.label='EnvVar' AND s.qualified_name LIKE "   \
+#define ENVJOIN_PAIR(key, file)                                                                  \
+    "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "             \
+    "t.id=e.target_id WHERE e.type='CONFIGURES' AND s.label='EnvVar' AND s.qualified_name LIKE " \
     "'%#env/web/" key "' AND t.file_path='" file "'"
     static const char mode_server[] = ENVJOIN_PAIR("MODE", "web/src/server.js");
     static const char mode_conf[] = ENVJOIN_PAIR("MODE", "web/lib/conf.js");
@@ -7771,12 +8103,87 @@ TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation
     PASS();
 }
 
+static void fail_unresolved_capture_before_publication(void *userdata) {
+    cbm_pipeline_mark_unresolved_capture_failed(userdata);
+    cbm_pipeline_add_file_error(userdata, "generation.py", "1-1", "parse_partial");
+}
+
+TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds) {
+    char tmp[256] = "/tmp/cbm_capture_metadata_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def GeneralCoverage():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *first = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(first);
+    cbm_pipeline_incremental_test_before_final_manifest_once(
+        fail_unresolved_capture_before_publication, first);
+    ASSERT_EQ(cbm_pipeline_run(first), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(first));
+    cbm_pipeline_free(first);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &meta), CBM_STORE_OK);
+    ASSERT_STR_EQ(meta.recording_status, "complete");
+    ASSERT_FALSE(meta.unresolved_calls_complete);
+    cbm_coverage_row_t *rows = NULL;
+    int row_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(store, project, "generation.py", &rows, &row_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(row_count, 1);
+    ASSERT_STR_EQ(rows[0].kind, "parse_partial");
+    cbm_store_free_coverage(rows, row_count);
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_store_close(store);
+    /* A partial repair cannot fill an omitted signal for unchanged files. */
+    write_temp_file(tmp, "changed.py", "def NewCoverage():\n    return 2\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_incremental_test_force_legacy_partial_once();
+    cbm_pipeline_t *partial = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(partial);
+    ASSERT_EQ(cbm_pipeline_run(partial), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    cbm_pipeline_free(partial);
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &meta), CBM_STORE_OK);
+    ASSERT_STR_EQ(meta.recording_status, "complete");
+    ASSERT_FALSE(meta.unresolved_calls_complete);
+    cbm_store_coverage_meta_clear(&meta);
+    rows = NULL;
+    row_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(store, project, "generation.py", &rows, &row_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(row_count, 1);
+    ASSERT_STR_EQ(rows[0].kind, "parse_partial");
+    cbm_store_free_coverage(rows, row_count);
+    cbm_store_close(store);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *repair = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(repair);
+    ASSERT_EQ(cbm_pipeline_run(repair), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    cbm_pipeline_free(repair);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *unchanged = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(unchanged);
+    ASSERT_EQ(cbm_pipeline_run(unchanged), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_NOOP);
+    cbm_pipeline_free(unchanged);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Metadata participates in exact-input compatibility. Old coverage schema or
  * an upgrade to a more comprehensive discovery/index mode must force a
  * complete replacement even when every semantic-input byte is unchanged; the
  * replacement must write current metadata so the next identical run is a
  * true no-op. Cheaper requests retain fuller published coverage separately. */
-TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
+static int pipeline_exact_inputs_migrate_metadata_and_mode(int legacy_version) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_manifest_metadata_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
@@ -7808,7 +8215,7 @@ TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
     cbm_coverage_meta_t current_meta = {0};
     ASSERT_EQ(cbm_store_coverage_meta_get(metadata_store, project, &current_meta), CBM_STORE_OK);
     cbm_coverage_meta_t legacy_meta = current_meta;
-    legacy_meta.coverage_version = 1;
+    legacy_meta.coverage_version = legacy_version;
     ASSERT_EQ(cbm_store_coverage_replace_ex(metadata_store, project, coverage_rows, coverage_count,
                                             &legacy_meta),
               CBM_STORE_OK);
@@ -7873,6 +8280,21 @@ TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
     ASSERT_STR_EQ(full_mode, "full");
     ASSERT_EQ(exact_full_route, CBM_INCREMENTAL_ROUTE_NOOP);
     PASS();
+}
+
+TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
+    return pipeline_exact_inputs_migrate_metadata_and_mode(1);
+}
+
+/* Published branch version 8 predates language doc links and diagrams.
+ * Unchanged inputs still need a rebuild, followed by an exact no-op. */
+TEST(pipeline_semantic_version_8_index_is_rebuilt_once) {
+    return pipeline_exact_inputs_migrate_metadata_and_mode(8);
+}
+
+/* Published version 10 predates Python lexical-scope call resolution. */
+TEST(pipeline_semantic_version_10_index_is_rebuilt_once) {
+    return pipeline_exact_inputs_migrate_metadata_and_mode(10);
 }
 
 typedef struct {
@@ -8466,6 +8888,45 @@ TEST(pipeline_semantic_manifest_rejects_non_directory_root) {
     ASSERT_EQ(manifest_count, 0);
     PASS();
 }
+
+#ifndef _WIN32
+/* A nested directory the process cannot open (permission-denied) must not
+ * abort the whole manifest walk: it has no control files to contribute, so
+ * it is skipped, and control files in sibling directories still get found.
+ * Root-not-a-directory (above) is a different, still fail-closed case. */
+TEST(pipeline_semantic_manifest_skips_unreadable_subdirectory) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_manifest_locked_dir_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "readable.py", "def Readable():\n    return 1\n");
+    write_temp_file(tmp, "locked/secret.txt", "should never be opened\n");
+    write_temp_file(tmp, "sibling/.gitignore", "*.log\n");
+
+    char locked_path[512];
+    snprintf(locked_path, sizeof(locked_path), "%s/locked", tmp);
+    ASSERT_EQ(chmod(locked_path, 0), 0);
+
+    cbm_file_hash_t *manifest = NULL;
+    int manifest_count = -1;
+    int rc = cbm_pipeline_build_semantic_manifest("manifest-skip-locked", tmp, NULL, 0, NULL, 0,
+                                                  NULL, NULL, &manifest, &manifest_count);
+
+    bool found_sibling_gitignore = false;
+    for (int i = 0; i < manifest_count; i++) {
+        if (manifest[i].rel_path && strcmp(manifest[i].rel_path, "sibling/.gitignore") == 0) {
+            found_sibling_gitignore = true;
+        }
+    }
+
+    chmod(locked_path, 0755);
+    cbm_pipeline_free_semantic_manifest(manifest, manifest_count > 0 ? manifest_count : 0);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(found_sibling_gitignore);
+    PASS();
+}
+#endif /* !_WIN32 */
 
 /* A fully validated staged graph must be able to recover from a definitely
  * non-SQLite destination without deleting evidence or overwriting an earlier
@@ -9655,6 +10116,163 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* #606: a receiver typed as an unindexed (vendor/) class must not weakly bind a
+ * same-named project method. */
+static void write_php_receiver_fixture(const char *tmp) {
+    write_temp_file(tmp, "src/Item.php",
+                    "<?php\n"
+                    "namespace App;\n"
+                    "\n"
+                    "class Item\n"
+                    "{\n"
+                    "    public function getUid(): int\n"
+                    "    {\n"
+                    "        return 1;\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/Domain/Repository.php",
+                    "<?php\n"
+                    "namespace App\\Domain;\n"
+                    "\n"
+                    "use App\\Item;\n"
+                    "use Vendor\\Storage\\File;\n"
+                    "\n"
+                    "class Repository\n"
+                    "{\n"
+                    "    public function findItem(): Item\n"
+                    "    {\n"
+                    "        return new Item();\n"
+                    "    }\n"
+                    "\n"
+                    "    public function findFile(): File\n"
+                    "    {\n"
+                    "        return new File();\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/Listener.php",
+                    "<?php\n"
+                    "namespace App;\n"
+                    "\n"
+                    "use Vendor\\Storage\\File;\n"
+                    "use function sprintf;\n"
+                    "\n"
+                    "class Listener\n"
+                    "{\n"
+                    "    public function vendorCall(File $file): int\n"
+                    "    {\n"
+                    "        return $file->getUid();\n"
+                    "    }\n"
+                    "\n"
+                    "    public function selfCall(): int\n"
+                    "    {\n"
+                    "        return $this->localHelper();\n"
+                    "    }\n"
+                    "\n"
+                    "    private function localHelper(): int\n"
+                    "    {\n"
+                    "        return 1;\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/ChainListener.php",
+                    "<?php\n"
+                    "namespace App;\n"
+                    "\n"
+                    "use App\\Domain\\Repository;\n"
+                    "\n"
+                    "class ChainListener\n"
+                    "{\n"
+                    "    public function chainedVendorCall(Repository $repository): int\n"
+                    "    {\n"
+                    "        return $repository->findFile()->getUid();\n"
+                    "    }\n"
+                    "\n"
+                    "    public function projectCall(Repository $repository): Item\n"
+                    "    {\n"
+                    "        return $repository->findItem();\n"
+                    "    }\n"
+                    "}\n");
+}
+
+/* Fewer than 50 files exercises pass_calls.c. */
+TEST(pipeline_php_receiver_suppresses_weak_method_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_php_recv_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_php_receiver_fixture(tmp);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/php_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_GTE(fixture_node_count(s, project, "src/Item.php", "getUid", "Method"), 1);
+    ASSERT_FALSE(cross_file_call_exists(s, project, "vendorCall", "getUid"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "chainedVendorCall", "getUid"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "projectCall", "findItem"));
+    ASSERT_GTE(named_edge_count(s, project, "CALLS", "selfCall", "localHelper"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* >= 50 files forces pass_parallel.c. */
+TEST(pipeline_php_receiver_parallel_suppresses_weak_method_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_php_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_php_receiver_fixture(tmp);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/Filler%d.php", i);
+        snprintf(body, sizeof(body), "<?php\nfunction filler%d(): int\n{\n    return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/php_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_GTE(fixture_node_count(s, project, "src/Item.php", "getUid", "Method"), 1);
+    ASSERT_FALSE(cross_file_call_exists(s, project, "vendorCall", "getUid"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "chainedVendorCall", "getUid"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "projectCall", "findItem"));
+    ASSERT_GTE(named_edge_count(s, project, "CALLS", "selfCall", "localHelper"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
     th_rmtree(tmp);
     PASS();
 }
@@ -10998,9 +11616,9 @@ TEST(pipeline_c_call_reaches_header_function_beside_field) {
 
     /* Both namesakes must exist for the probe to mean anything. */
     ASSERT_GTE(fixture_node_count(s, project, "include/linux/mm.h", "put_page", "Function"), 1);
-    ASSERT_GTE(fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page",
-                                  "Field"),
-               1);
+    ASSERT_GTE(
+        fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page", "Field"),
+        1);
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Function"), 1);
     /* A bare C call never names the struct member. */
@@ -11034,9 +11652,9 @@ TEST(pipeline_c_call_reaches_header_function_beside_field_parallel) {
     ASSERT_NOT_NULL(s);
 
     ASSERT_GTE(fixture_node_count(s, project, "include/linux/mm.h", "put_page", "Function"), 1);
-    ASSERT_GTE(fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page",
-                                  "Field"),
-               1);
+    ASSERT_GTE(
+        fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page", "Field"),
+        1);
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Field"), 0);
@@ -11588,6 +12206,486 @@ static int count_nodes_named(cbm_store_t *s, const char *project, const char *na
  * (axios.get, api.patch on a renamed-axios instance, supertest request(app).get).
  * The regex false edge must stay suppressed in parallel too. CBM_WORKERS forces
  * >1 worker so the parallel path is taken regardless of the host core count. */
+/* #1355: padding count for write_external_import_shadow_fixture, deliberately
+ * well past MIN_FILES_FOR_PARALLEL (=50, a private #define in
+ * src/pipeline/pipeline.c — not exposed to tests, so this cannot be a
+ * static_assert against it) rather than sitting right at the threshold. The
+ * margin, not the exact value, is what the test depends on: a modest bump to
+ * the real threshold must not silently drop this fixture back onto the
+ * sequential-only path and leave the parallel resolver unexercised. Same
+ * pattern as ET_PARALLEL_PAD / CP_PARALLEL_PAD in test_edge_types_probe.c /
+ * test_convergence_probe.c. */
+enum { EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD = 64 };
+
+/* #1355: write the shared external-import-shadow fixture into `dir`.
+ * `pad_files` filler modules push the run over MIN_FILES_FOR_PARALLEL so the
+ * same tree can be indexed by both resolvers. */
+static void write_external_import_shadow_fixture(const char *dir, int pad_files) {
+    /* The lone project symbols named eq/sql — ordinary local helpers. */
+    write_temp_file(dir, "src/text-utils.ts",
+                    "export function eq(a: string, b: string): boolean {\n"
+                    "  return a.trim() === b.trim();\n"
+                    "}\n"
+                    "export function sql(chunk: string): string {\n"
+                    "  return chunk.replace(/\\s+/g, ' ');\n"
+                    "}\n"
+                    "export function normalize(s: string): string {\n"
+                    "  return s.trim().toLowerCase();\n"
+                    "}\n");
+    /* `eq` and `sql` come from an external package that is not in the tree, so
+     * the registry falls through to a project-wide same-name guess. These are
+     * the fabricated edges. `normalize` is imported relatively from the SAME
+     * file the guess would have picked — it must survive. */
+    write_temp_file(dir, "src/queries.ts",
+                    "import { eq, sql } from 'drizzle-orm';\n"
+                    "import { normalize } from './text-utils';\n"
+                    "export function buildQuery(id: string): unknown {\n"
+                    "  return [eq({ id }, id), sql('select 1'), normalize(id)];\n"
+                    "}\n");
+    /* No import of `eq` at all: nothing in the caller's source contradicts the
+     * guess, so the pre-existing fallback keeps its edge. */
+    write_temp_file(dir, "src/no-import.ts",
+                    "export function callsWithoutImport(a: string, b: string): boolean {\n"
+                    "  return eq(a, b);\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/pad_%02d.ts", i);
+        snprintf(body, sizeof(body), "export function shadowPad%02d(): number { return %d; }\n", i,
+                 i);
+        write_temp_file(dir, name, body);
+    }
+}
+
+/* #1355: assert the guard's whole contract against one indexed store. */
+static int assert_external_import_shadow_contract(const char *dir, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", dir, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return 1;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return 2;
+    }
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_pipeline_free(p);
+        return 3;
+    }
+    int rc = 0;
+    /* (1) the reported bug: an externally-imported name must not bind to the
+     * local homonym (RED before the fix, on both resolvers). */
+    if (cross_file_call_exists(s, project, "buildQuery", "eq")) {
+        rc = 4;
+    }
+    if (rc == 0 && cross_file_call_exists(s, project, "buildQuery", "sql")) {
+        rc = 5;
+    }
+    /* (2) the relative import to the very same file still resolves. */
+    if (rc == 0 && !cross_file_call_exists(s, project, "buildQuery", "normalize")) {
+        rc = 6;
+    }
+    /* (3) a bare call the caller never imports keeps its pre-existing edge. */
+    if (rc == 0 && !cross_file_call_exists(s, project, "callsWithoutImport", "eq")) {
+        rc = 7;
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ext_import_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    /* Enough files that CBM_WORKERS can take the fused-parallel path; the same
+     * tree is then indexed by each resolver in turn, because the guard lives at
+     * two independent emit sites (pass_calls.c and pass_parallel.c). */
+    write_external_import_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
+
+    /* getenv() returns a pointer into the process environment that must be
+     * treated as read-only; strdup() below only ever reads through it. */
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int sequential = assert_external_import_shadow_contract(tmp, "shadow-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel = assert_external_import_shadow_contract(tmp, "shadow-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential, 0);
+    ASSERT_EQ(parallel, 0);
+    PASS();
+}
+
+/* #1355 / #1732: the same tree, but the bare specifier now names a WORKSPACE
+ * package that the repository itself ships. `main` deliberately points at a
+ * build artifact that is not checked in — the shape every real monorepo has,
+ * and the reason an entry-file lookup cannot answer this question. */
+static void write_workspace_shadow_fixture(const char *dir, int pad_files) {
+    /* One directory level only: write_temp_file's mkdir is documented as
+     * "simple version, one level", and a deeper path fails silently — which
+     * makes the fixture look healthy while the file never lands. */
+    write_temp_file(dir, "lib/package.json",
+                    "{\n  \"name\": \"@fixture/lib\",\n  \"main\": \"./dist/index.js\"\n}\n");
+    write_temp_file(dir, "lib/index.ts",
+                    "export function wsEq(a: string, b: string): boolean {\n"
+                    "  return a === b;\n"
+                    "}\n");
+    write_temp_file(dir, "app/package.json", "{\n  \"name\": \"@fixture/app\"\n}\n");
+    /* The lone project symbol named wsSpec — an ordinary local helper that a
+     * project-wide guess would happily bind an external `wsSpec` to. */
+    write_temp_file(dir, "app/spec-helpers.ts",
+                    "export function wsSpec(label: string): string {\n"
+                    "  return label;\n"
+                    "}\n");
+    write_temp_file(dir, "app/query.ts",
+                    "import { wsEq } from '@fixture/lib';\n"
+                    "import { wsSpec } from 'vitest';\n"
+                    "export function wsBuild(id: string): unknown {\n"
+                    "  return [wsEq(id, id), wsSpec('case')];\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "app/pad_%02d.ts", i);
+        snprintf(body, sizeof(body), "export function wsPad%02d(): number { return %d; }\n", i, i);
+        write_temp_file(dir, name, body);
+    }
+}
+
+static int assert_workspace_shadow_contract(const char *dir, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", dir, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return 1;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return 2;
+    }
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_pipeline_free(p);
+        return 3;
+    }
+    int rc = 0;
+    /* (1) the workspace sibling: the tree declares @fixture/lib, so the bare
+     * specifier is in-project and the fallback keeps its chance. RED without
+     * the package-map check — this is the 1377-edge class measured on
+     * drizzle-team/drizzle-orm. */
+    if (!cross_file_call_exists(s, project, "wsBuild", "wsEq")) {
+        rc = 4;
+    }
+    /* (2) a genuine third-party package in the very same file is still cut:
+     * the check must not disarm the guard wholesale. */
+    if (rc == 0 && cross_file_call_exists(s, project, "wsBuild", "wsSpec")) {
+        rc = 5;
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_external_import_shadow_keeps_workspace_sibling_issue1355) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ws_import_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_workspace_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int sequential = assert_workspace_shadow_contract(tmp, "ws-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel = assert_workspace_shadow_contract(tmp, "ws-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential, 0);
+    ASSERT_EQ(parallel, 0);
+    PASS();
+}
+
+/* #1355: the same tree once more, in a package-path language. A Kotlin/Java
+ * specifier is a dotted package path whether the package is the project's own
+ * or a dependency, so specifier shape decides nothing and the package map only
+ * knows manifest artifact names. The tree's own `package` declarations are the
+ * evidence, and the pipeline already collects them (the namespace map the
+ * import passes build). `assertEquals` is imported twice — from the project's
+ * package and from kotlin.test — exactly as JetBrains/Exposed writes it, which
+ * is what leaves the import map without a key and hands the call to the
+ * project-wide guess. */
+static void write_declared_package_shadow_fixture(const char *dir, int pad_files) {
+    /* One directory level only — write_temp_file's mkdir does not recurse, and
+     * a deeper path fails silently. The package path lives in the `package`
+     * declaration, not in the directory layout, which is the whole point. */
+    write_temp_file(dir, "util/Assert.kt",
+                    "package com.example.util\n"
+                    "\n"
+                    "fun pkgEq(a: String, b: String): Boolean {\n"
+                    "    return a == b\n"
+                    "}\n");
+    /* The lone project symbol named pkgSpec, in a third package so the guess
+     * that reaches it is a project-wide one and not a same-module hit. */
+    write_temp_file(dir, "spec/SpecHelpers.kt",
+                    "package com.example.spec\n"
+                    "\n"
+                    "fun pkgSpec(label: String): Boolean {\n"
+                    "    return label.isNotEmpty()\n"
+                    "}\n");
+    write_temp_file(dir, "app/Query.kt",
+                    "package com.example.app\n"
+                    "\n"
+                    "import com.example.util.pkgEq\n"
+                    "import kotlin.test.pkgEq\n"
+                    "import kotlin.test.pkgSpec\n"
+                    "import org.junit.pkgSpec\n"
+                    "\n"
+                    "fun pkgBuild(id: String): Boolean {\n"
+                    "    return pkgEq(id, id) && pkgSpec(id)\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "app/Pad%02d.kt", i);
+        snprintf(body, sizeof(body),
+                 "package com.example.app\n\nfun pkgPad%02d(): Int {\n    return %d\n}\n", i, i);
+        write_temp_file(dir, name, body);
+    }
+}
+
+static int assert_declared_package_shadow_contract(const char *dir, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", dir, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return 1;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return 2;
+    }
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_pipeline_free(p);
+        return 3;
+    }
+    int rc = 0;
+    /* The package the tree declares: `com.example.util` is in-project, so the
+     * call keeps its edge. RED without the declared-package check — this is the
+     * 426-edge class measured on JetBrains/Exposed.
+     *
+     * The matching negative — an undeclared package is still cut — is asserted
+     * where it can be reached on BOTH resolvers: directly on the predicate in
+     * test_registry.c (external_import_shadow_declared_package_kept, including
+     * `java.net.URL`), and end-to-end in the route fixture below. The
+     * sequential resolver builds its own import map straight from the
+     * extraction records, without the ambiguity check its parallel twin
+     * applies, so a doubly-imported Kotlin name resolves by `import_map` there
+     * and never reaches this guard at all — asserting the negative here would
+     * assert that quirk, not this contract. */
+    if (!cross_file_call_exists(s, project, "pkgBuild", "pkgEq")) {
+        rc = 4;
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_external_import_shadow_keeps_declared_package_issue1355) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_pkg_import_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_declared_package_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int sequential = assert_declared_package_shadow_contract(tmp, "pkg-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel = assert_declared_package_shadow_contract(tmp, "pkg-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential, 0);
+    ASSERT_EQ(parallel, 0);
+    PASS();
+}
+
+/* #1355: the guard must suppress ONLY the plain-CALLS fall-through, never the
+ * route/HTTP/CONFIG classification that runs inside the emitters. A bare call
+ * bound by a package import is exactly the shape a route registration takes
+ * when the router is a dependency, and dropping it before classification costs
+ * the Route node and every HANDLES edge downstream of it. Same reasoning, and
+ * the same drop_plain_call seam, as the #592/#606 member guard. */
+static void write_route_shadow_fixture(const char *dir, int pad_files) {
+    /* The project symbols the guess would bind to. The file name puts "express"
+     * in their qualified names, which is what makes the resolved QN classify as
+     * a route registration — the same substring match main uses on real trees. */
+    write_temp_file(dir, "app/express-routes.ts",
+                    "export function regGet(path: string, handler: unknown): string {\n"
+                    "  return path;\n"
+                    "}\n"
+                    "export function regSpec(label: string): string {\n"
+                    "  return label;\n"
+                    "}\n");
+    /* Both names come from a package outside the tree. `regGet` carries a
+     * path-shaped first argument, so it is a route registration; `regSpec` is
+     * an ordinary fabricated edge and must still go. */
+    write_temp_file(dir, "app/server.ts",
+                    "import { regGet, regSpec } from 'vendor-router';\n"
+                    "export function boot(): string {\n"
+                    "  return regGet('/orders', () => 'ok') + regSpec('case');\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "app/pad_%02d.ts", i);
+        snprintf(body, sizeof(body), "export function routePad%02d(): number { return %d; }\n", i,
+                 i);
+        write_temp_file(dir, name, body);
+    }
+}
+
+static int assert_route_shadow_contract(const char *dir, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", dir, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return 1;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return 2;
+    }
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_pipeline_free(p);
+        return 3;
+    }
+    int rc = 0;
+    /* (1) the Route node survives the guard. RED when the guard returns before
+     * the emitter: main mints __route__ANY__/orders here and the published
+     * guard lost it, together with every HANDLES edge that hangs off it. */
+    if (count_nodes_named(s, project, "/orders") < 1) {
+        rc = 4;
+    }
+    /* (2) the fabricated plain-CALLS edge in the same file is still removed, so
+     * (1) cannot pass by the guard having been disarmed. */
+    if (rc == 0 && cross_file_call_exists(s, project, "boot", "regSpec")) {
+        rc = 5;
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_external_import_shadow_keeps_route_registration_issue1355) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_route_import_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_route_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int sequential = assert_route_shadow_contract(tmp, "route-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel = assert_route_shadow_contract(tmp, "route-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential, 0);
+    ASSERT_EQ(parallel, 0);
+    PASS();
+}
+
 TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_tsjs_par_XXXXXX");
@@ -13031,6 +14129,40 @@ TEST(pipeline_native_fetch_classified_as_http_calls) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_native_fetch_template_base_url_makes_route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fetch_template_base_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/api.ts",
+                    "const BASE_URL = \"http://payments:8080\";\n"
+                    "export async function createPayment(body: unknown) {\n"
+                    "  return fetch(`${BASE_URL}/v1/payments`, { method: 'POST', body });\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/fetch_template_base.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    int http_call_count = cbm_store_count_edges_by_type(s, project, "HTTP_CALLS");
+    int matching_route_count =
+        http_calls_to_route(s, project, "createPayment", "/v1/payments");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    ASSERT_EQ(http_call_count, 1);
+    ASSERT_EQ(matching_route_count, 1);
     PASS();
 }
 
@@ -15225,8 +16357,8 @@ static int python_init_scope_pipeline_case(bool parallel, const char *failure_st
                              : body);
     }
     if (written && cross_walk_stage) {
-        written = python_module_write_fixture_file(root, "memo_def.py",
-                                                    "class S:\n    def m(self):\n        return 1\n");
+        written = python_module_write_fixture_file(
+            root, "memo_def.py", "class S:\n    def m(self):\n        return 1\n");
     }
     if (written && !failure_stage) {
         written = python_module_write_fixture_file(root, "plain.py", body) &&
@@ -15291,8 +16423,10 @@ static int python_init_scope_pipeline_case(bool parallel, const char *failure_st
         correct = project &&
                   cbm_store_find_nodes_by_label(store, project, "File", &files, &file_count) ==
                       CBM_STORE_OK &&
-                  file_count ==
-                      (cross_walk_stage ? 2 : failure_stage ? 1 : 5) + (parallel ? 52 : 0);
+                  file_count == (cross_walk_stage ? 2
+                                 : failure_stage  ? 1
+                                                  : 5) +
+                                    (parallel ? 52 : 0);
         cbm_store_free_nodes(files, file_count);
         if (project && !failure_stage) {
             const char *modules[] = {"plain", "pkg"};
@@ -17306,14 +18440,13 @@ static int pyn_assert_shadowing(cbm_store_t *s, const char *project) {
         snprintf(local_def, sizeof(local_def), "%s.uses_local.helper", files[f]);
         snprintf(module_caller, sizeof(module_caller), "%s.uses_module", files[f]);
         snprintf(module_def, sizeof(module_def), "%s.helper", files[f]);
-        ASSERT_TRUE(
-            pyn_edge_with(s, project, local_caller, local_def, "CALLS", local_strategy[f]));
+        ASSERT_TRUE(pyn_edge_with(s, project, local_caller, local_def, "CALLS", local_strategy[f]));
         ASSERT_FALSE(pyn_edge(s, project, local_caller, module_def, "CALLS"));
         ASSERT_TRUE(pyn_edge(s, project, module_caller, module_def, "CALLS"));
         ASSERT_FALSE(pyn_edge(s, project, module_caller, local_def, "CALLS"));
     }
-    ASSERT_TRUE(pyn_edge_with(s, project, "sa.uses_decorated", "sa.uses_decorated.helper",
-                              "CALLS", "\"strategy\":\"lexical_scope\""));
+    ASSERT_TRUE(pyn_edge_with(s, project, "sa.uses_decorated", "sa.uses_decorated.helper", "CALLS",
+                              "\"strategy\":\"lexical_scope\""));
     ASSERT_FALSE(pyn_edge(s, project, "sa.uses_decorated", "sa.helper", "CALLS"));
     return 0;
 }
@@ -17626,9 +18759,8 @@ static int pyn_run_init_collision(int fillers) {
             const char *project = cbm_pipeline_project_name(p);
             imports[run] = pyn_edge(s, project, "tests.test_app.py.__file__",
                                     "src.rowpkg.layout.Layout", "IMPORTS");
-            calls[run] =
-                pyn_edge(s, project, "tests.test_app.test_build", "src.rowpkg.layout.Layout",
-                         "CALLS");
+            calls[run] = pyn_edge(s, project, "tests.test_app.test_build",
+                                  "src.rowpkg.layout.Layout", "CALLS");
             method[run] = pyn_edge(s, project, "tests.test_app.test_build",
                                    "src.rowpkg.layout.Layout.create", "CALLS");
             cbm_store_close(s);
@@ -18635,13 +19767,11 @@ TEST(pipeline_cpp_overloads_are_listed_as_variants_c1) {
     PASS();
 }
 
-/* CBM_SEMANTIC_INDEX_VERSION 4: the C-family node identities changed (macro QNs end
- * in "#macro", unscoped enumerators are flat, typedef names are nodes). An index
- * written at version 3 holds the old QNs for every file that did not change, and an
- * unchanged repository is otherwise a no-op, so the version is what makes the new
- * binary rebuild it. The stored index is put back to the version-3 state by hand
- * (metadata and the old macro QN); the run after that must replace it in full. */
-TEST(pipeline_semantic_version_3_index_is_rebuilt_in_full_c1) {
+/* The C-family node identities changed (macro QNs end in "#macro", unscoped
+ * enumerators are flat, typedef names are nodes). Main's version 3 and this
+ * branch's version 5 both hold the old QNs for unchanged files. Restore that
+ * legacy metadata and macro QN by hand; an unchanged repository must rebuild. */
+static int pipeline_legacy_c_identity_index_is_rebuilt(int legacy_version) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_c1_version_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
@@ -18657,7 +19787,7 @@ TEST(pipeline_semantic_version_3_index_is_rebuilt_in_full_c1) {
     snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(first));
     cbm_pipeline_free(first);
 
-    /* Put the published index back to what version 3 wrote. */
+    /* Put the published index back to what the legacy version wrote. */
     cbm_store_t *store = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(store);
     char label[64];
@@ -18670,7 +19800,7 @@ TEST(pipeline_semantic_version_3_index_is_rebuilt_in_full_c1) {
     cbm_coverage_meta_t meta = {0};
     ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &meta), CBM_STORE_OK);
     cbm_coverage_meta_t old_meta = meta;
-    old_meta.coverage_version = 3;
+    old_meta.coverage_version = legacy_version;
     ASSERT_EQ(
         cbm_store_coverage_replace_ex(store, project, coverage_rows, coverage_count, &old_meta),
         CBM_STORE_OK);
@@ -18713,8 +19843,16 @@ TEST(pipeline_semantic_version_3_index_is_rebuilt_in_full_c1) {
     ASSERT_EQ(stored_version, CBM_SEMANTIC_INDEX_VERSION);
     ASSERT_TRUE(fenced_after);
     ASSERT_FALSE(plain_after);
-    ASSERT_GTE(CBM_SEMANTIC_INDEX_VERSION, 4);
+    ASSERT_GT(CBM_SEMANTIC_INDEX_VERSION, legacy_version);
     PASS();
+}
+
+TEST(pipeline_semantic_version_3_index_is_rebuilt_in_full_c1) {
+    return pipeline_legacy_c_identity_index_is_rebuilt(3);
+}
+
+TEST(pipeline_semantic_version_5_index_is_rebuilt_in_full_c1) {
+    return pipeline_legacy_c_identity_index_is_rebuilt(5);
 }
 
 /* `#include <linux/device.h>` from arch/x/bugs.c: two headers end with the
@@ -27475,6 +28613,11 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
     RUN_TEST(pipeline_export_error_snapshot_on_artifact_failure);
+    RUN_TEST(pipeline_records_unresolved_injected_call_sites);
+    RUN_TEST(pipeline_unresolved_review_sequential);
+    RUN_TEST(pipeline_unresolved_capture_bounds_count_and_json_bytes);
+    RUN_TEST(pipeline_unresolved_review_parallel);
+    RUN_TEST(pipeline_unresolved_review_spill);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);
@@ -27522,6 +28665,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354);
     RUN_TEST(pipeline_ts_param_property_injection_issue514);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_php_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_php_receiver_parallel_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_keeps_specific_unique_name_member_call);
     RUN_TEST(pipeline_html_embedded_member_call_stays_unbound);
     RUN_TEST(pipeline_go_method_caller_keeps_lsp_join);
@@ -27552,6 +28697,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
+    RUN_TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355);
+    RUN_TEST(pipeline_external_import_shadow_keeps_workspace_sibling_issue1355);
+    RUN_TEST(pipeline_external_import_shadow_keeps_declared_package_issue1355);
+    RUN_TEST(pipeline_external_import_shadow_keeps_route_registration_issue1355);
     RUN_TEST(pipeline_python_package_relative_imports);
     RUN_TEST(pipeline_python_package_relative_imports_parallel);
     RUN_TEST(pipeline_python_from_import_bare_call_issue1237);
@@ -27563,6 +28712,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_ts_config_object_url_http_calls_issue2235);
     RUN_TEST(pipeline_arg_url_rejects_document_file_paths);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
+    RUN_TEST(pipeline_native_fetch_template_base_url_makes_route);
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
     RUN_TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing);
@@ -27612,6 +28762,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_c_variants_on_sequential_and_parallel_paths_c1);
     RUN_TEST(pipeline_cpp_overloads_are_listed_as_variants_c1);
     RUN_TEST(pipeline_semantic_version_3_index_is_rebuilt_in_full_c1);
+    RUN_TEST(pipeline_semantic_version_5_index_is_rebuilt_in_full_c1);
     RUN_TEST(pipeline_python_app_factory_routes_issue1548);
     RUN_TEST(pipeline_python_nested_def_is_function_local_issue1548);
     RUN_TEST(pipeline_python_local_classes_stay_in_their_def_issue1548);
@@ -27934,6 +29085,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_dbt_jinja_lineage);
     RUN_TEST(pipeline_parallel_manifest_is_byte_stable_above_threshold);
     RUN_TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full);
+    RUN_TEST(pipeline_incremental_root_path_refreshed_across_directories);
     RUN_TEST(pipeline_closure_repair_removed_def_drops_dependent_edge);
     RUN_TEST(pipeline_closure_repair_added_name_declines_to_full);
     RUN_TEST(pipeline_closure_repair_new_file_declines_to_full);
@@ -27959,6 +29111,9 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode);
+    RUN_TEST(pipeline_semantic_version_8_index_is_rebuilt_once);
+    RUN_TEST(pipeline_semantic_version_10_index_is_rebuilt_once);
+    RUN_TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds);
     RUN_TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex);
     RUN_TEST(pipeline_full_cancel_after_predump_preserves_previous_generation);
     RUN_TEST(pipeline_full_cancel_after_destination_prepare_preserves_previous_generation);
@@ -27967,6 +29122,9 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_incremental_successful_publication_preserves_adr);
     RUN_TEST(pipeline_full_adr_capture_failure_preserves_previous_generation);
     RUN_TEST(pipeline_semantic_manifest_rejects_non_directory_root);
+#ifndef _WIN32
+    RUN_TEST(pipeline_semantic_manifest_skips_unreadable_subdirectory);
+#endif
     RUN_TEST(pipeline_full_reindex_quarantines_corrupt_destination_without_overwrite);
     RUN_TEST(pipeline_full_reindex_replaces_legacy_schema_without_quarantine);
 #endif

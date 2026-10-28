@@ -148,38 +148,36 @@ static void append_typebox_type(adapter_sb_t *sb, yyjson_val *val, const char *d
 
     if (type_str && strcmp(type_str, "string") == 0 && enum_val && yyjson_is_arr(enum_val) &&
         yyjson_arr_size(enum_val) > 0) {
-        sb_append(sb, "Type.Union([");
         size_t enum_idx = 0;
         size_t enum_max = yyjson_arr_size(enum_val);
-        bool first_enum = true;
+        size_t valid_count = 0;
         for (enum_idx = 0; enum_idx < enum_max; enum_idx++) {
-            yyjson_val *enum_item = yyjson_arr_get(enum_val, enum_idx);
-            const char *enum_str = yyjson_get_str(enum_item);
-            if (!enum_str) {
-                continue;
+            if (yyjson_get_str(yyjson_arr_get(enum_val, enum_idx))) {
+                valid_count++;
             }
-            if (!first_enum) {
-                sb_append(sb, ", ");
-            }
-            first_enum = false;
-            sb_append(sb, "Type.Literal(");
-            sb_append_js_string(sb, enum_str);
-            sb_append(sb, ")");
         }
-        if (first_enum) {
-            sb_append(sb, "Type.String()");
-        } else {
+        if (valid_count > 0) {
+            sb_append(sb, "Type.String({ enum: [");
+            bool first_enum = true;
+            for (enum_idx = 0; enum_idx < enum_max; enum_idx++) {
+                const char *enum_str = yyjson_get_str(yyjson_arr_get(enum_val, enum_idx));
+                if (!enum_str) {
+                    continue;
+                }
+                if (!first_enum) {
+                    sb_append(sb, ", ");
+                }
+                first_enum = false;
+                sb_append_js_string(sb, enum_str);
+            }
             sb_append(sb, "]");
             if (include_description && description) {
-                sb_append(sb, ", { description: ");
+                sb_append(sb, ", description: ");
                 sb_append_js_string(sb, description);
-                sb_append(sb, " }");
             }
-            sb_append(sb, ")");
+            sb_append(sb, " })");
             return;
         }
-        sb_append(sb, ")");
-        return;
     }
 
     const char *typebox_name = "Any";
@@ -435,29 +433,51 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
     sb_append(&sb, "import { spawn } from 'node:child_process';\n\n");
     sb_append(&sb, "const BIN = '");
     sb_append(&sb, bin);
-    sb_append(&sb, "';\n\n");
+    sb_append(&sb, "';\n"
+                   "const AUGMENT_TIMEOUT_MS = 10000;\n\n");
 
     /* hook-augment requires hook_event_name; its default dialect accepts
      * Grep/Glob under PreToolUse, Read under PostToolUse, and the
      * SessionStart lifecycle event — and emits the Claude JSON envelope, so
      * the plugin unwraps additionalContext instead of pasting raw JSON into
-     * the tool output. Every failure path resolves to '' (fail open). */
+     * the tool output. Every failure path resolves to '' (fail open) —
+     * including a child that never exits: augment() is awaited inline in
+     * tool.execute.after, so a hung hook-augment would stall every
+     * grep/glob/read completion. The timer SIGKILLs the child and resolves
+     * ''; the promise keeps the first resolution, so the kill-triggered
+     * 'close' event cannot override it. Stream errors (EPIPE on a write
+     * still buffered when the child dies, spawn ENOENT) fire on child.stdin,
+     * not on the child, and would crash the host as an unhandled 'error'
+     * event — hence the stdin listener and the guarded end(). */
     sb_append(&sb, "function augment(payload) {\n"
                    "  return new Promise((resolve) => {\n"
                    "    const child = spawn(BIN, ['hook-augment'], {\n"
                    "      stdio: ['pipe', 'pipe', 'ignore'],\n"
                    "      env: { ...process.env, CBM_LOG_LEVEL: 'error' },\n"
                    "    });\n"
+                   "    // Stream errors fire on the stream, not the child.\n"
+                   "    child.stdin.on('error', () => {});\n"
+                   "    const timer = setTimeout(() => {\n"
+                   "      child.kill('SIGKILL');\n"
+                   "      child.stdout.destroy();\n"
+                   "      resolve('');\n"
+                   "    }, AUGMENT_TIMEOUT_MS);\n"
                    "    let out = '';\n"
                    "    child.stdout.on('data', (d) => (out += d.toString()));\n"
-                   "    child.on('error', () => resolve(''));\n"
+                   "    child.on('error', () => {\n"
+                   "      clearTimeout(timer);\n"
+                   "      resolve('');\n"
+                   "    });\n"
                    "    child.on('close', () => {\n"
+                   "      clearTimeout(timer);\n"
                    "      try {\n"
                    "        const ctx = JSON.parse(out)?.hookSpecificOutput?.additionalContext;\n"
                    "        resolve(typeof ctx === 'string' ? ctx : '');\n"
                    "      } catch { resolve(''); }\n"
                    "    });\n"
-                   "    child.stdin.end(JSON.stringify(payload));\n"
+                   "    try {\n"
+                   "      child.stdin.end(JSON.stringify(payload));\n"
+                   "    } catch { resolve(''); }\n"
                    "  });\n"
                    "}\n\n");
 

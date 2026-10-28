@@ -1177,6 +1177,10 @@ TEST(client_adapter_pi_emits_parameters_and_execute) {
     /* TypeBox parameters schema is embedded with Type.Object syntax. */
     ASSERT_NOT_NULL(strstr(js, "Type.Object("));
     ASSERT_NOT_NULL(strstr(js, "Type.String("));
+    /* #2787: String enums must use Type.String({ enum: [...] }) without anyOf/const */
+    ASSERT_NOT_NULL(strstr(js, "Type.String({ enum: ["));
+    ASSERT_NULL(strstr(js, "Type.Union([Type.Literal"));
+    ASSERT_NULL(strstr(js, "Type.Literal("));
     /* A numeric registry property must remain numeric in the generated schema. */
     ASSERT_NOT_NULL(strstr(js, "depth: Type.Optional(Type.Integer("));
     /* TypeBox import should be present. */
@@ -1240,6 +1244,23 @@ TEST(client_adapter_pi_wraps_result_and_honors_abort) {
         strstr(js, "[{ type: 'text', text: JSON.stringify(result ?? null, null, 2) }]"));
     ASSERT_NOT_NULL(strstr(js, "signal?.addEventListener('abort', onAbort, { once: true })"));
     ASSERT_NOT_NULL(strstr(js, "if (!child.killed) child.kill();"));
+    free(js);
+    PASS();
+}
+
+/* #2787: Pi extension must emit string enums as Type.String({ enum: [...] })
+ * rather than Type.Union([Type.Literal(...)]) which TypeBox serializes as
+ * anyOf/const, breaking Gemini / Antigravity function declaration validation. */
+TEST(client_adapter_pi_emits_string_enum_issue2787) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NULL(strstr(js, "Type.Union([Type.Literal"));
+    ASSERT_NULL(strstr(js, "Type.Literal("));
+    ASSERT_NOT_NULL(strstr(js, "Type.String({ enum: ["));
+    ASSERT_NOT_NULL(strstr(js, "'full'"));
+    ASSERT_NOT_NULL(strstr(js, "'moderate'"));
+    ASSERT_NOT_NULL(strstr(js, "'fast'"));
+    ASSERT_NOT_NULL(strstr(js, "'cross-repo-intelligence'"));
     free(js);
     PASS();
 }
@@ -1338,6 +1359,30 @@ TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
     PASS();
 }
 
+/* augment() is awaited inline inside 'tool.execute.after', so a hook-augment
+ * that never exits would stall every grep/glob/read completion in the host
+ * session until the agent is restarted. The generated plugin must bound the
+ * wait: SIGKILL the child after AUGMENT_TIMEOUT_MS and resolve with '' (fail
+ * open). The promise keeps the first resolution, so the kill-triggered
+ * 'close' event arriving late cannot smuggle in partial output. Stream
+ * errors fire on child.stdin, not the child — the emitted listener and the
+ * guarded end() keep a failed write (EPIPE, ENOENT) from crashing the host
+ * as an unhandled 'error' event (reproduced under Bun 1.4 with a >64KB
+ * payload and a non-reading child). */
+TEST(client_adapter_opencode_bounds_a_hung_hook_augment_child) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "const AUGMENT_TIMEOUT_MS = 10000;"));
+    ASSERT_NOT_NULL(strstr(js, "const timer = setTimeout("));
+    ASSERT_NOT_NULL(strstr(js, "child.kill('SIGKILL');"));
+    /* error and close must both stop the timer once they own the outcome. */
+    ASSERT_NOT_NULL(strstr(js, "clearTimeout(timer);"));
+    /* stream-level failures must not escape as unhandled 'error' events. */
+    ASSERT_NOT_NULL(strstr(js, "child.stdin.on('error', () => {});"));
+    free(js);
+    PASS();
+}
+
 /* Empty/NULL inputs must not produce a module at all. */
 TEST(client_adapter_rejects_missing_binary_path) {
     ASSERT_NULL(cbm_client_adapter_pi(NULL));
@@ -1381,9 +1426,11 @@ SUITE(agent_clients) {
     RUN_TEST(client_adapter_pi_emits_parameters_and_execute);
     RUN_TEST(client_adapter_pi_sends_arguments_over_stdin_issue1834);
     RUN_TEST(client_adapter_pi_wraps_result_and_honors_abort);
+    RUN_TEST(client_adapter_pi_emits_string_enum_issue2787);
     RUN_TEST(client_adapter_escapes_windows_paths_and_quotes);
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
     RUN_TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction);
     RUN_TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077);
+    RUN_TEST(client_adapter_opencode_bounds_a_hung_hook_augment_child);
     RUN_TEST(client_adapter_rejects_missing_binary_path);
 }
