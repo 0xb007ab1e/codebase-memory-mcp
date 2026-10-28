@@ -608,7 +608,11 @@ TEST(doc_links_md_incremental) {
  * on the member file's text, and the row leads to that file by no edge. A
  * body edit that writes the name (no definition added) turns the row into a
  * file edge, one that drops it turns the edge back into the row; a same-named
- * group that shrinks to one turns an ambiguous row into an edge. */
+ * group that shrinks to one turns an ambiguous row into an edge. The group is
+ * Ruby: a Python file whose surface changes takes the full route (the Python
+ * namespace admission), and a language with a doc-link scope (Rust, Go, ...)
+ * reports the lost method as a removed name, so neither reaches the rule for
+ * ambiguous member rows. */
 TEST(doc_links_md_member_missing_incremental) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlmd_inc_XXXXXX");
@@ -616,17 +620,20 @@ TEST(doc_links_md_member_missing_incremental) {
     char repo[512];
     snprintf(repo, sizeof(repo), "%s/repo", tmp);
     th_write_file(TH_PATH(repo, "docs/helpers.md"), "# Helpers\n\nSee `src/tools.py::helper2`.\n");
-    th_write_file(TH_PATH(repo, "docs/areas.md"), "# Areas\n\nSee `src/shapes.py::area`.\n");
+    th_write_file(TH_PATH(repo, "docs/areas.md"), "# Areas\n\nSee `src/shapes.rb::area`.\n");
     th_write_file(TH_PATH(repo, "src/tools.py"), "def helper():\n"
                                                  "    return 1\n");
-    th_write_file(TH_PATH(repo, "src/shapes.py"), "class Circle:\n"
-                                                  "    def area(self):\n"
-                                                  "        return 3\n"
+    th_write_file(TH_PATH(repo, "src/shapes.rb"), "class Circle\n"
+                                                  "  def area\n"
+                                                  "    3\n"
+                                                  "  end\n"
+                                                  "end\n"
                                                   "\n"
-                                                  "\n"
-                                                  "class Square:\n"
-                                                  "    def area(self):\n"
-                                                  "        return 4\n");
+                                                  "class Square\n"
+                                                  "  def area\n"
+                                                  "    4\n"
+                                                  "  end\n"
+                                                  "end\n");
     char db[512];
     char full_db[512];
     snprintf(db, sizeof(db), "%s/inc.db", tmp);
@@ -635,7 +642,7 @@ TEST(doc_links_md_member_missing_incremental) {
     char reason[64];
     dm_row(db, "docs/helpers.md", "src/tools.py::helper2", reason, sizeof(reason), NULL, 0);
     ASSERT_STR_EQ(reason, "missing");
-    dm_row(db, "docs/areas.md", "src/shapes.py::area", reason, sizeof(reason), NULL, 0);
+    dm_row(db, "docs/areas.md", "src/shapes.rb::area", reason, sizeof(reason), NULL, 0);
     ASSERT_STR_EQ(reason, "ambiguous");
 
     /* the body writes the name, no definition added: the row becomes an edge */
@@ -652,13 +659,14 @@ TEST(doc_links_md_member_missing_incremental) {
     dm_row(db, "docs/helpers.md", "src/tools.py::helper2", reason, sizeof(reason), NULL, 0);
     ASSERT_STR_EQ(reason, "missing");
     /* one of two `area` methods goes, the name stays: the one left binds */
-    th_write_file(TH_PATH(repo, "src/shapes.py"), "class Circle:\n"
-                                                  "    pass\n"
+    th_write_file(TH_PATH(repo, "src/shapes.rb"), "class Circle\n"
+                                                  "end\n"
                                                   "\n"
-                                                  "\n"
-                                                  "class Square:\n"
-                                                  "    def area(self):\n"
-                                                  "        return 4\n");
+                                                  "class Square\n"
+                                                  "  def area\n"
+                                                  "    4\n"
+                                                  "  end\n"
+                                                  "end\n");
     ASSERT_EQ(dm_step(repo, db, full_db, "group shrinks", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
     char props[512];
     ASSERT_EQ(md_edge(db, "Areas", "Square.area", props, sizeof(props)), 1);
