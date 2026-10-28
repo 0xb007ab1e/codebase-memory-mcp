@@ -1019,6 +1019,10 @@ TEST(pipeline_records_unresolved_injected_call_sites) {
     }
     cbm_store_free_coverage(rows, count);
     cbm_store_close(st);
+    rm_rf(tmp);
+    PASS();
+}
+
 /* An ADR written from a test hook BETWEEN the start of a reindex and its
  * publication survives — the write lands in the "<db>.adr.db" sidecar, which the
  * graph-DB rebuild never touches (round-2 review item 7a, full route). */
