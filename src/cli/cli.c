@@ -11335,8 +11335,7 @@ static int cli_install_activate(void *opaque) {
             prev = activation->bin_target;
         }
         agent_config_rc = cbm_install_agent_configs_with_previous(
-            activation->home, config_binary, prev, activation->force,
-            activation->dry_run);
+            activation->home, config_binary, prev, activation->force, activation->dry_run);
     }
     if (agent_config_rc != CLI_OK) {
         cli_activation_transaction_finalize_committed_or_fail_stop(
