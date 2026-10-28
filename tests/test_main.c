@@ -2148,10 +2148,14 @@ static void tf_msan_mi_output(const char *msg, void *arg) {
     /* Registering replays mimalloc's delayed-output buffer into the handler.
      * Its constructor already wrote all of that to stderr before main, so the
      * replay would only repeat it behind a stray newline: skip it. */
-    if (!tf_msan_mi_output_live || !msg || !msg[0]) {
+    if (!tf_msan_mi_output_live || !msg) {
         return;
     }
+    /* Mark the text initialized before reading even its first byte. */
     __msan_unpoison_string(msg);
+    if (!msg[0]) {
+        return;
+    }
     (void)fputs(msg, stderr);
 }
 #endif
