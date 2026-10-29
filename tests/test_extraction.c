@@ -7,6 +7,7 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "foundation/platform.h"
 #include "foundation/constants.h"     /* CBM_SZ_* */
 #include "preprocessor.h"             /* cbm_export_macro_candidates (#1989) */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
@@ -852,6 +853,57 @@ TEST(ruby_module) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def_any(r, "Greetable"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A Ruby `Const.new` call is rewritten to name the CONSTANT, not the method:
+ * the constructor body lives in `initialize`, so the call should link the class
+ * like every other language's `new T()`. The rewrite fired only for bare
+ * `constant` receivers, so a scope-resolved receiver kept the whole call text
+ * as its callee ("Admin::User.new"), which resolves to nothing and cannot join
+ * the Ruby LSP's constructor rows, whose callee is the class QN.
+ *
+ * Both spellings must land on the bare constant path; a retained ".new" suffix
+ * is the bug's signature. */
+TEST(ruby_constructor_callee_is_constant_path) {
+    CBMFileResult *r = extract("module Admin\n  class User\n  end\nend\n"
+                               "class Widget\nend\n"
+                               "class Maker\n"
+                               "  def build\n"
+                               "    Admin::User.new\n"
+                               "    Widget.new\n"
+                               "  end\n"
+                               "end\n",
+                               CBM_LANG_RUBY, "t", "maker.rb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int scoped = 0, bare = 0, kept_new = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *callee = r->calls.items[i].callee_name;
+        if (strcmp(callee, "Admin::User") == 0)
+            scoped = 1;
+        if (strcmp(callee, "Widget") == 0)
+            bare = 1;
+        /* Either failure mode: the method name survived on its own, or the
+         * whole `Recv.new` expression did. */
+        size_t n = strlen(callee);
+        if (strcmp(callee, "new") == 0 || (n >= 4 && strcmp(callee + n - 4, ".new") == 0))
+            kept_new = 1;
+    }
+    if (!scoped || !bare || kept_new) {
+        printf("  ruby callees (%d):\n", r->calls.count);
+        for (int i = 0; i < r->calls.count; i++)
+            printf("    '%s'\n", r->calls.items[i].callee_name);
+    }
+    /* Scope-resolved receiver reduces to the constant path; its bare leaf is
+     * what resolution joins on. */
+    ASSERT(scoped);
+    /* Bare receiver: pre-existing behaviour, guarded against regression. */
+    ASSERT(bare);
+    ASSERT_FALSE(kept_new);
+
     cbm_free_result(r);
     PASS();
 }
@@ -13373,7 +13425,42 @@ TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects) {
     PASS();
 }
 
+#ifdef _WIN32
+/* The supervisor sets this path through cbm_setenv. Exercise the actual
+ * journal writer, which must read it as UTF-8 before calling cbm_fopen. */
+TEST(extraction_marker_round_trips_non_ascii_environment_path) {
+    char dir[512] = "/tmp/cbm-marker-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    char marker[640];
+    snprintf(marker, sizeof(marker), "%s/marker-\xce\x94-\xe4\xb8\x81.log", dir);
+    char saved[4096];
+    const char *previous = cbm_safe_getenv("CBM_INDEX_MARKER_FILE", saved, sizeof(saved), NULL);
+    ASSERT_EQ(cbm_setenv("CBM_INDEX_MARKER_FILE", marker, 1), 0);
+    cbm_index_mark_start("synthetic.cpp");
+    cbm_index_mark_done("synthetic.cpp");
+    if (previous) {
+        (void)cbm_setenv("CBM_INDEX_MARKER_FILE", saved, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_INDEX_MARKER_FILE");
+    }
+    FILE *file = cbm_fopen(marker, "rb");
+    char contents[128] = {0};
+    if (file) {
+        (void)fread(contents, 1, sizeof(contents) - 1, file);
+        (void)fclose(file);
+    }
+    (void)cbm_unlink(marker);
+    (void)cbm_rmdir(dir);
+    ASSERT_NOT_NULL(file);
+    ASSERT_STR_EQ(contents, "S synthetic.cpp\nD synthetic.cpp\n");
+    PASS();
+}
+#endif
+
 SUITE(extraction) {
+#ifdef _WIN32
+    RUN_TEST(extraction_marker_round_trips_non_ascii_environment_path);
+#endif
     RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
     RUN_TEST(extract_spill_round_trip_keeps_every_field);
@@ -13491,6 +13578,7 @@ SUITE(extraction) {
     RUN_TEST(php_function);
     RUN_TEST(ruby_class);
     RUN_TEST(ruby_module);
+    RUN_TEST(ruby_constructor_callee_is_constant_path);
     RUN_TEST(csharp_class);
     RUN_TEST(csharp_interface);
     RUN_TEST(csharp_extension_block_members);
