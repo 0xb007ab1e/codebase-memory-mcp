@@ -2857,7 +2857,7 @@ TEST(daemon_application_permanent_workspace_release_still_ends_watch) {
     bool db_ready = config_ready && project && app_test_create_empty_file(db_path);
     /* The root is $HOME, so only an explicit sensitive approval allows it. */
     char grant_error[APP_TEST_PATH_CAP];
-    bool approved = db_ready && cbm_workspace_grant_add(cache, sensitive, sensitive, true,
+    bool approved = db_ready && cbm_workspace_grant_add(cache, sensitive, sensitive, true, false,
                                                         grant_error, sizeof(grant_error));
     char grant_path[APP_TEST_PATH_CAP] = {0};
     bool grant_path_ok =
