@@ -1710,9 +1710,8 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
     /* SubagentStart carries no tool list, so agents defined without MCP tools
      * (e.g. tools: Read, Grep, Glob, Bash) still get this; point them at the CLI. */
     const char *cli_hint = strcmp(event, "SubagentStart") == 0
-                               ? " If the codebase-memory MCP tools are not available to you, run "
-                                 "the same tools from the shell: `codebase-memory-mcp cli <tool> "
-                                 "--help` shows each tool's flags."
+                               ? " The same tools are also available from the shell: "
+                                 "`codebase-memory-mcp cli <tool> --help` lists each tool's flags."
                                : "";
     if (project) {
         char safe_project[HA_METADATA_CAP];
